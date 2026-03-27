@@ -1,40 +1,25 @@
 # Decisions & Learnings
 
 > Last updated: 2026-03-27
->
-> Capture decisions, gotchas, and lessons learned for future reference.
 
 ## Key Decisions
 
-### Test structure: inline #[cfg(test)] modules
+### Quickstart-first README structure
 
-**Decision:** Put tests in `#[cfg(test)] mod tests` at the bottom of each source file
-**Rationale:** Idiomatic Rust, gives access to private functions, no new files needed
+**Decision:** Lead the README with a concise 3-step quickstart, keep detailed docs below
+**Rationale:** First-time users want to get running fast; detailed docs are for reference
 **Date:** 2026-03-27
 
-### TDD for new features, test existing pure functions too
+### bork init as primary onboarding
 
-**Decision:** Write failing tests for the 3 new features plus tests for existing untested pure functions
-**Rationale:** Establishes test coverage baseline and validates new feature contracts before implementation
-**Date:** 2026-03-27
-
-### done_at as Option<u64> on Issue struct
-
-**Decision:** Track when an issue moved to Done via a unix timestamp on the Issue struct
-**Rationale:** Persisted across restarts, simple, no separate tracking needed
-**Date:** 2026-03-27
-
-### done_session_ttl configurable, default 300s
-
-**Decision:** Add done_session_ttl to config.toml, default 5 minutes
-**Rationale:** Different projects may want different cleanup windows
+**Decision:** Replace manual `mkdir .bork` quick start with `bork init` as the recommended flow
+**Rationale:** `bork init` does everything automatically (clone, scaffold, install hooks)
 **Date:** 2026-03-27
 
 ## Gotchas & Warnings
 
-- Tests that reference new fields (done_at) or new config fields (done_session_ttl) will fail to compile until the struct changes are made
-- Need to ensure backwards compat: deserializing old state.json without done_at should default to None
+- bork init requires the repo to be cloneable (SSH keys or HTTPS auth)
 
 ## Lessons Learned
 
-- (to be filled during implementation)
+- (none yet)
