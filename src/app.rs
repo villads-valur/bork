@@ -402,20 +402,23 @@ impl App {
     /// Auto-assign worktree directories for issues that don't have one.
     /// Returns true if any assignments were made (signals a state save).
     pub fn auto_assign_worktrees(&mut self) -> bool {
-        let mut changed = false;
-        for i in 0..self.issues.len() {
-            if self.issues[i].worktree.is_some() {
-                continue;
-            }
-            if let Some(wt) = self.detect_worktree(&self.issues[i].clone()) {
-                self.issues[i].worktree = Some(wt.clone());
-                if self.issues[i].column == Column::Done {
-                    self.freeze_worktree_status(&wt);
-                }
-                changed = true;
+        // Collect assignments first to avoid borrow conflict with detect_worktree
+        let assignments: Vec<(usize, String)> = (0..self.issues.len())
+            .filter(|&i| self.issues[i].worktree.is_none())
+            .filter_map(|i| self.detect_worktree(&self.issues[i]).map(|wt| (i, wt)))
+            .collect();
+
+        if assignments.is_empty() {
+            return false;
+        }
+
+        for (i, wt) in assignments {
+            self.issues[i].worktree = Some(wt.clone());
+            if self.issues[i].column == Column::Done {
+                self.freeze_worktree_status(&wt);
             }
         }
-        changed
+        true
     }
 
     /// Clear worktree assignments that point to directories that no longer exist.

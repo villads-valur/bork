@@ -168,13 +168,10 @@ pub fn open_pr_in_browser(pr_number: u32, main_worktree: &Path) {
         .output();
 }
 
-/// Convert the raw Vec<PrStatus> into a HashMap keyed by branch name for O(1) lookup.
 pub fn index_by_branch(prs: Vec<PrStatus>) -> HashMap<String, PrStatus> {
-    let mut map = HashMap::with_capacity(prs.len());
-    for pr in prs {
-        map.insert(pr.head_branch.clone(), pr);
-    }
-    map
+    prs.into_iter()
+        .map(|pr| (pr.head_branch.clone(), pr))
+        .collect()
 }
 
 #[cfg(test)]

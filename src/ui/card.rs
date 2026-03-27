@@ -109,11 +109,8 @@ fn format_branch_line(
 
     let git_spans = format_git_status(git_status);
     let git_width: usize = git_spans.iter().map(|s| s.width()).sum();
-
-    // 2 chars indent + branch + gap + git changes
-    let indent = 2;
     let gap = if git_width > 0 { 1 } else { 0 };
-    let available_for_branch = max_width.saturating_sub(indent + gap + git_width);
+    let available_for_branch = max_width.saturating_sub(2 + gap + git_width);
 
     let mut spans = vec![
         Span::raw("  "),

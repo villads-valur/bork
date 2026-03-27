@@ -204,15 +204,14 @@ fn handle_normal(
             let Some(idx) = app.selected_issue_index() else {
                 return PostAction::None;
             };
-            if app.issues[idx].worktree.is_some() {
-                let old = app.issues[idx].worktree.take().unwrap();
-                app.set_message(format!("Cleared worktree '{}', re-detecting...", old));
+            if let Some(old) = app.issues[idx].worktree.take() {
+                app.set_message(format!("Cleared worktree '{old}', re-detecting..."));
             } else {
                 app.set_message("No worktree assigned, re-detecting...");
             }
             if app.auto_assign_worktrees() {
                 if let Some(wt) = app.issues[idx].worktree.as_ref() {
-                    app.set_message(format!("Assigned worktree: {}", wt));
+                    app.set_message(format!("Assigned worktree: {wt}"));
                 }
             }
             let _ = config::save_state(&app.to_state(), &app.config.project_root);

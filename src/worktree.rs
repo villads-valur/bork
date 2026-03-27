@@ -27,24 +27,19 @@ fn run_worktree_in(
         );
     }
 
-    // Use issue ID as the directory name
     let worktree_dir = issue_id;
-    let worktree_path = config.project_root.join(worktree_dir);
-
-    if worktree_path.exists() {
+    if config.project_root.join(worktree_dir).exists() {
         bail!(
             "Directory '{}' already exists. Use the existing worktree or remove it first.",
             worktree_dir
         );
     }
 
-    // Branch name: {issue_id}/{slug} or just {issue_id}
     let branch_name = match slug {
         Some(s) => format!("{}/{}", issue_id, s),
         None => issue_id.to_string(),
     };
 
-    // Create the git worktree
     let status = Command::new("git")
         .args([
             "worktree",
@@ -61,16 +56,9 @@ fn run_worktree_in(
         bail!("git worktree add failed");
     }
 
-    // Find or create the issue in state.json
-    let issue_exists = state.issues.iter().any(|i| i.id == issue_id);
-
-    if issue_exists {
-        // Update existing issue with worktree assignment
-        if let Some(issue) = state.issues.iter_mut().find(|i| i.id == issue_id) {
-            issue.worktree = Some(worktree_dir.to_string());
-        }
+    if let Some(issue) = state.issues.iter_mut().find(|i| i.id == issue_id) {
+        issue.worktree = Some(worktree_dir.to_string());
     } else if let Some(title) = title {
-        // Create new issue
         let issue = Issue {
             id: issue_id.to_string(),
             title: title.to_string(),
@@ -85,8 +73,6 @@ fn run_worktree_in(
         };
         state.issues.push(issue);
     } else {
-        // Issue doesn't exist and no title provided - just register worktree
-        // without creating an issue (the auto-detect will pick it up)
         println!(
             "Note: Issue '{}' not found in state.json. \
              The worktree was created but not linked to an issue. \
