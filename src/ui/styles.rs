@@ -37,10 +37,13 @@ pub fn card_title_style(selected: bool) -> Style {
 
 pub fn agent_status_color(status: &AgentStatus) -> Color {
     match status {
-        AgentStatus::Busy => Color::Green,
-        AgentStatus::NeedsAttention => Color::Yellow,
-        AgentStatus::Idle => Color::Blue,
         AgentStatus::Stopped => Color::Gray,
+        AgentStatus::Idle => Color::Blue,
+        AgentStatus::Busy => Color::Green,
+        AgentStatus::WaitingInput
+        | AgentStatus::WaitingPermission
+        | AgentStatus::WaitingApproval => Color::Yellow,
+        AgentStatus::Error => Color::Red,
     }
 }
 

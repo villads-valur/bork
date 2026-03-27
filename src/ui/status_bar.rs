@@ -35,6 +35,7 @@ pub fn render_header(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
+    // Confirm mode
     if app.input_mode == InputMode::Confirm {
         if let Some(ref msg) = app.confirm_message {
             let line = Line::from(Span::styled(
@@ -48,6 +49,12 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
 
+    // Dialog mode: footer is handled by the dialog overlay itself
+    if app.input_mode == InputMode::Dialog {
+        return;
+    }
+
+    // Temporary message
     if let Some(ref msg) = app.message {
         let line = Line::from(Span::styled(
             format!(" {msg}"),
@@ -57,13 +64,16 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    // Normal mode: show keybinding hints
     let bindings = vec![
         ("h/l", "prev/next"),
         ("j/k", "up/down"),
         ("Tab", "column"),
         ("Enter", "open"),
+        ("n", "new"),
+        ("d", "delete"),
         ("x", "kill"),
-        ("H/L", "move issue"),
+        ("H/L", "move"),
         ("q", "quit"),
     ];
 

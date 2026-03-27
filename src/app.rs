@@ -1,22 +1,98 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::config::{AppConfig, AppState};
-use crate::types::{AgentKind, AgentStatus, Column, Issue};
+use crate::types::{AgentMode, AgentStatus, AgentStatusInfo, Column, Issue, WorktreeStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
     Normal,
     Confirm,
+    Dialog,
 }
+
+#[derive(Debug, Clone)]
+pub enum ConfirmAction {
+    KillSession { session_name: String },
+    DeleteIssue { issue_index: usize },
+}
+
+pub struct DialogState {
+    pub title: String,
+    pub prompt: String,
+    pub worktree: String,
+    pub agent_mode: AgentMode,
+    pub focused_field: usize, // 0=title, 1=prompt, 2=worktree, 3=mode
+    pub editing_index: Option<usize>,
+}
+
+impl DialogState {
+    pub fn new() -> Self {
+        DialogState {
+            title: String::new(),
+            prompt: String::new(),
+            worktree: "main".into(),
+            agent_mode: AgentMode::Plan,
+            focused_field: 0,
+            editing_index: None,
+        }
+    }
+
+    pub fn from_issue(issue: &Issue, index: usize) -> Self {
+        DialogState {
+            title: issue.title.clone(),
+            prompt: issue.prompt.clone().unwrap_or_default(),
+            worktree: issue.worktree.clone().unwrap_or_default(),
+            agent_mode: issue.agent_mode,
+            focused_field: 0,
+            editing_index: Some(index),
+        }
+    }
+
+    pub fn push_char(&mut self, c: char) {
+        match self.focused_field {
+            0 => self.title.push(c),
+            1 => self.prompt.push(c),
+            2 => self.worktree.push(c),
+            3 => {
+                // On mode field: space/h/l toggle
+                if c == ' ' || c == 'h' || c == 'l' {
+                    self.agent_mode = self.agent_mode.toggle();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn delete_char(&mut self) {
+        match self.focused_field {
+            0 => {
+                self.title.pop();
+            }
+            1 => {
+                self.prompt.pop();
+            }
+            2 => {
+                self.worktree.pop();
+            }
+            _ => {}
+        }
+    }
+}
+
+pub const DIALOG_FIELD_COUNT: usize = 4;
 
 pub struct App {
     pub issues: Vec<Issue>,
     pub selected_column: usize,
     pub selected_row: [usize; 4],
     pub active_sessions: HashSet<String>,
+    pub agent_statuses: HashMap<String, AgentStatusInfo>,
+    pub worktree_statuses: HashMap<String, WorktreeStatus>,
+    pub worktree_branches: HashMap<String, String>,
     pub input_mode: InputMode,
     pub confirm_message: Option<String>,
-    pub confirm_session: Option<String>,
+    pub pending_confirm: Option<ConfirmAction>,
+    pub dialog: Option<DialogState>,
     pub should_quit: bool,
     pub message: Option<String>,
     pub busy_count: usize,
@@ -26,20 +102,18 @@ pub struct App {
 
 impl App {
     pub fn new(config: AppConfig, state: AppState) -> Self {
-        let issues = if state.issues.is_empty() {
-            sample_issues()
-        } else {
-            state.issues
-        };
-
         App {
-            issues,
+            issues: state.issues,
             selected_column: 0,
             selected_row: [0; 4],
             active_sessions: HashSet::new(),
+            agent_statuses: HashMap::new(),
+            worktree_statuses: HashMap::new(),
+            worktree_branches: HashMap::new(),
             input_mode: InputMode::Normal,
             confirm_message: None,
-            confirm_session: None,
+            pending_confirm: None,
+            dialog: None,
             should_quit: false,
             message: None,
             busy_count: 0,
@@ -89,7 +163,6 @@ impl App {
         }
     }
 
-    /// Tab/Shift+Tab: jump to next/prev column, preserving row position
     pub fn jump_column_left(&mut self) {
         if self.selected_column > 0 {
             self.selected_column -= 1;
@@ -104,15 +177,11 @@ impl App {
         }
     }
 
-    /// h/l: move to the adjacent issue in the flat reading order across all columns.
-    /// At the bottom of a column, `l` moves to the top of the next column.
-    /// At the top of a column, `h` moves to the bottom of the previous column.
     pub fn focus_left(&mut self) {
         let row = self.selected_row[self.selected_column];
         if row > 0 {
             self.selected_row[self.selected_column] = row - 1;
         } else {
-            // Move to the bottom of the previous non-empty column
             let mut col = self.selected_column;
             while col > 0 {
                 col -= 1;
@@ -137,7 +206,6 @@ impl App {
         if count > 0 && row < count - 1 {
             self.selected_row[self.selected_column] = row + 1;
         } else {
-            // Move to the top of the next non-empty column
             let mut col = self.selected_column;
             while col < 3 {
                 col += 1;
@@ -211,6 +279,116 @@ impl App {
         self.active_sessions.contains(session_name)
     }
 
+    pub fn resolved_agent_status(&self, issue: &Issue) -> AgentStatus {
+        let session_name = issue.session_name();
+
+        if let Some(info) = self.agent_statuses.get(&session_name) {
+            // Cross-reference with session liveness: if session is dead but
+            // status file says Busy/Idle, override to Stopped (stale file)
+            if !self.is_session_alive(&session_name) {
+                return AgentStatus::Stopped;
+            }
+            return info.status;
+        }
+
+        if self.is_session_alive(&session_name) {
+            return AgentStatus::Idle;
+        }
+
+        AgentStatus::Stopped
+    }
+
+    pub fn resolved_activity(&self, issue: &Issue) -> Option<&str> {
+        let session_name = issue.session_name();
+        self.agent_statuses
+            .get(&session_name)
+            .and_then(|info| info.activity.as_deref())
+    }
+
+    pub fn worktree_status_for(&self, issue: &Issue) -> Option<&WorktreeStatus> {
+        issue
+            .worktree
+            .as_ref()
+            .and_then(|w| self.worktree_statuses.get(w))
+    }
+
+    pub fn branch_for(&self, issue: &Issue) -> Option<&str> {
+        issue
+            .worktree
+            .as_ref()
+            .and_then(|w| self.worktree_branches.get(w))
+            .map(|s| s.as_str())
+    }
+
+    // --- Dialog ---
+
+    pub fn open_dialog(&mut self) {
+        self.dialog = Some(DialogState::new());
+        self.input_mode = InputMode::Dialog;
+    }
+
+    pub fn open_edit_dialog(&mut self, issue: &Issue, index: usize) {
+        self.dialog = Some(DialogState::from_issue(issue, index));
+        self.input_mode = InputMode::Dialog;
+    }
+
+    pub fn close_dialog(&mut self) {
+        self.dialog = None;
+        self.input_mode = InputMode::Normal;
+    }
+
+    // --- Issue ID generation ---
+
+    pub fn next_issue_id(&self) -> String {
+        let prefix = &self.config.project_name;
+        let max_num = self
+            .issues
+            .iter()
+            .filter_map(|issue| {
+                let id = &issue.id;
+                if let Some(suffix) = id.strip_prefix(&format!("{}-", prefix)) {
+                    suffix.parse::<u32>().ok()
+                } else {
+                    None
+                }
+            })
+            .max()
+            .unwrap_or(0);
+
+        format!("{}-{}", prefix, max_num + 1)
+    }
+
+    // --- Confirm ---
+
+    pub fn start_confirm(&mut self, message: String, action: ConfirmAction) {
+        self.input_mode = InputMode::Confirm;
+        self.confirm_message = Some(message);
+        self.pending_confirm = Some(action);
+    }
+
+    pub fn cancel_confirm(&mut self) {
+        self.input_mode = InputMode::Normal;
+        self.confirm_message = None;
+        self.pending_confirm = None;
+    }
+
+    pub fn take_confirm_action(&mut self) -> Option<ConfirmAction> {
+        self.input_mode = InputMode::Normal;
+        self.confirm_message = None;
+        self.pending_confirm.take()
+    }
+
+    pub fn clamp_all_rows(&mut self) {
+        for col in 0..4 {
+            let count = self.column_count(col);
+            if count == 0 {
+                self.selected_row[col] = 0;
+            } else if self.selected_row[col] >= count {
+                self.selected_row[col] = count - 1;
+            }
+        }
+    }
+
     fn clamp_row(&mut self) {
         let column = match Column::from_index(self.selected_column) {
             Some(c) => c,
@@ -224,130 +402,4 @@ impl App {
             *row = count - 1;
         }
     }
-}
-
-fn sample_issues() -> Vec<Issue> {
-    vec![
-        // Planning
-        Issue {
-            id: "BORK-1".to_string(),
-            title: "Set up CI pipeline".to_string(),
-            column: Column::Planning,
-            branch: None,
-            tmux_session: None,
-            agent_kind: AgentKind::OpenCode,
-            agent_status: AgentStatus::Stopped,
-        },
-        Issue {
-            id: "BORK-5".to_string(),
-            title: "Design database schema".to_string(),
-            column: Column::Planning,
-            branch: None,
-            tmux_session: None,
-            agent_kind: AgentKind::OpenCode,
-            agent_status: AgentStatus::Stopped,
-        },
-        Issue {
-            id: "BORK-9".to_string(),
-            title: "Write API documentation".to_string(),
-            column: Column::Planning,
-            branch: None,
-            tmux_session: None,
-            agent_kind: AgentKind::Claude,
-            agent_status: AgentStatus::Stopped,
-        },
-        // In Progress
-        Issue {
-            id: "BORK-2".to_string(),
-            title: "Add user authentication".to_string(),
-            column: Column::InProgress,
-            branch: Some("feat/auth".to_string()),
-            tmux_session: None,
-            agent_kind: AgentKind::OpenCode,
-            agent_status: AgentStatus::Busy,
-        },
-        Issue {
-            id: "BORK-6".to_string(),
-            title: "Implement search endpoint".to_string(),
-            column: Column::InProgress,
-            branch: Some("feat/search".to_string()),
-            tmux_session: None,
-            agent_kind: AgentKind::Claude,
-            agent_status: AgentStatus::NeedsAttention,
-        },
-        Issue {
-            id: "BORK-10".to_string(),
-            title: "Add rate limiting".to_string(),
-            column: Column::InProgress,
-            branch: Some("feat/rate-limit".to_string()),
-            tmux_session: None,
-            agent_kind: AgentKind::OpenCode,
-            agent_status: AgentStatus::Idle,
-        },
-        Issue {
-            id: "BORK-13".to_string(),
-            title: "Refactor error handling".to_string(),
-            column: Column::InProgress,
-            branch: Some("refactor/errors".to_string()),
-            tmux_session: None,
-            agent_kind: AgentKind::OpenCode,
-            agent_status: AgentStatus::Busy,
-        },
-        // Code Review
-        Issue {
-            id: "BORK-3".to_string(),
-            title: "Fix navigation regression".to_string(),
-            column: Column::CodeReview,
-            branch: Some("fix/nav".to_string()),
-            tmux_session: None,
-            agent_kind: AgentKind::Claude,
-            agent_status: AgentStatus::Idle,
-        },
-        Issue {
-            id: "BORK-7".to_string(),
-            title: "Add WebSocket support".to_string(),
-            column: Column::CodeReview,
-            branch: Some("feat/ws".to_string()),
-            tmux_session: None,
-            agent_kind: AgentKind::OpenCode,
-            agent_status: AgentStatus::Idle,
-        },
-        // Done
-        Issue {
-            id: "BORK-4".to_string(),
-            title: "Update dependencies".to_string(),
-            column: Column::Done,
-            branch: Some("chore/deps".to_string()),
-            tmux_session: None,
-            agent_kind: AgentKind::OpenCode,
-            agent_status: AgentStatus::Stopped,
-        },
-        Issue {
-            id: "BORK-8".to_string(),
-            title: "Fix memory leak in worker".to_string(),
-            column: Column::Done,
-            branch: Some("fix/mem-leak".to_string()),
-            tmux_session: None,
-            agent_kind: AgentKind::Claude,
-            agent_status: AgentStatus::Stopped,
-        },
-        Issue {
-            id: "BORK-11".to_string(),
-            title: "Set up monitoring".to_string(),
-            column: Column::Done,
-            branch: Some("feat/monitoring".to_string()),
-            tmux_session: None,
-            agent_kind: AgentKind::OpenCode,
-            agent_status: AgentStatus::Stopped,
-        },
-        Issue {
-            id: "BORK-12".to_string(),
-            title: "Migrate to new ORM".to_string(),
-            column: Column::Done,
-            branch: Some("chore/orm".to_string()),
-            tmux_session: None,
-            agent_kind: AgentKind::Claude,
-            agent_status: AgentStatus::Stopped,
-        },
-    ]
 }

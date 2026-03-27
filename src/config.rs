@@ -14,9 +14,10 @@ pub struct AppConfig {
 
 impl Default for AppConfig {
     fn default() -> Self {
+        let project_root = find_project_root();
         Self {
             project_name: "bork".to_string(),
-            project_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            project_root,
             agent_kind: AgentKind::OpenCode,
         }
     }
@@ -33,35 +34,68 @@ impl Default for AppState {
     }
 }
 
-pub fn config_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".config").join("bork")
+/// Walk up from cwd looking for a `.bork/` directory.
+/// This identifies the project container root.
+/// Falls back to cwd if not found.
+fn find_project_root() -> PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut dir = cwd.as_path();
+
+    loop {
+        if dir.join(".bork").is_dir() {
+            return dir.to_path_buf();
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => break,
+        }
+    }
+
+    cwd
 }
 
-fn state_path() -> PathBuf {
-    config_dir().join("state.json")
+fn config_dir(project_root: &PathBuf) -> PathBuf {
+    project_root.join(".bork")
 }
 
-fn config_path() -> PathBuf {
-    config_dir().join("config.toml")
+pub fn agent_status_dir(project_root: &PathBuf) -> PathBuf {
+    config_dir(project_root).join("agent-status")
+}
+
+pub fn ensure_agent_status_dir(project_root: &PathBuf) {
+    let dir = agent_status_dir(project_root);
+    let _ = fs::create_dir_all(&dir);
+}
+
+fn state_path(project_root: &PathBuf) -> PathBuf {
+    config_dir(project_root).join("state.json")
+}
+
+fn config_path(project_root: &PathBuf) -> PathBuf {
+    config_dir(project_root).join("config.toml")
 }
 
 pub fn load_config() -> AppConfig {
-    let path = config_path();
+    let project_root = find_project_root();
+    let path = config_path(&project_root);
+
     if path.exists() {
         if let Ok(contents) = fs::read_to_string(&path) {
-            if let Ok(config) = toml_parse(&contents) {
+            if let Ok(mut config) = toml_parse(&contents) {
+                config.project_root = project_root;
                 return config;
             }
         }
     }
-    let config = AppConfig::default();
-    let _ = save_config(&config);
-    config
+
+    AppConfig {
+        project_root,
+        ..AppConfig::default()
+    }
 }
 
-pub fn load_state() -> AppState {
-    let path = state_path();
+pub fn load_state(project_root: &PathBuf) -> AppState {
+    let path = state_path(project_root);
     if path.exists() {
         if let Ok(contents) = fs::read_to_string(&path) {
             if let Ok(state) = serde_json::from_str(&contents) {
@@ -72,14 +106,13 @@ pub fn load_state() -> AppState {
     AppState::default()
 }
 
-pub fn save_state(state: &AppState) -> anyhow::Result<()> {
-    let dir = config_dir();
+pub fn save_state(state: &AppState, project_root: &PathBuf) -> anyhow::Result<()> {
+    let dir = config_dir(project_root);
     fs::create_dir_all(&dir)?;
 
-    let path = state_path();
+    let path = state_path(project_root);
     let json = serde_json::to_string_pretty(state)?;
 
-    // Atomic write: write to temp file, then rename
     let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
     fs::write(&tmp_path, &json)?;
     fs::rename(&tmp_path, &path)?;
@@ -87,26 +120,8 @@ pub fn save_state(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn save_config(config: &AppConfig) -> anyhow::Result<()> {
-    let dir = config_dir();
-    fs::create_dir_all(&dir)?;
-
-    let path = config_path();
-    let toml = format!(
-        "project_name = {:?}\nproject_root = {:?}\nagent_kind = {:?}\n",
-        config.project_name,
-        config.project_root.display(),
-        format!("{}", config.agent_kind),
-    );
-
-    fs::write(&path, toml)?;
-    Ok(())
-}
-
-// Minimal TOML parsing (just key = "value" lines) to avoid adding a toml crate
 fn toml_parse(contents: &str) -> Result<AppConfig, String> {
     let mut project_name = None;
-    let mut project_root = None;
     let mut agent_kind = None;
 
     for line in contents.lines() {
@@ -119,7 +134,6 @@ fn toml_parse(contents: &str) -> Result<AppConfig, String> {
             let value = value.trim().trim_matches('"');
             match key {
                 "project_name" => project_name = Some(value.to_string()),
-                "project_root" => project_root = Some(PathBuf::from(value)),
                 "agent_kind" => {
                     agent_kind = Some(match value {
                         "claude" => AgentKind::Claude,
@@ -133,8 +147,7 @@ fn toml_parse(contents: &str) -> Result<AppConfig, String> {
 
     Ok(AppConfig {
         project_name: project_name.unwrap_or_else(|| "bork".to_string()),
-        project_root: project_root
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
+        project_root: PathBuf::from("."),
         agent_kind: agent_kind.unwrap_or(AgentKind::OpenCode),
     })
 }

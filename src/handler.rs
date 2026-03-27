@@ -1,19 +1,18 @@
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 
-use crate::app::{App, InputMode};
-use crate::config::AppConfig;
+use crate::app::{App, ConfirmAction, InputMode, DIALOG_FIELD_COUNT};
+use crate::config::{self, AppConfig};
 use crate::external::{opencode, tmux};
 use crate::input::Action;
+use crate::types::{AgentStatus, Column, Issue};
 
 pub struct ActionResult {
     pub message: String,
     pub session_to_open: Option<String>,
 }
 
-/// Command that the main loop must execute after handle_action returns.
-/// These are separated because some operations (like tmux popup) need to
-/// happen outside the handler, after state is saved.
 pub enum PostAction {
     None,
     OpenTmuxPopup { session_name: String },
@@ -28,6 +27,10 @@ pub fn handle_action(
     match app.input_mode {
         InputMode::Confirm => {
             handle_confirm(app, action, action_tx);
+            PostAction::None
+        }
+        InputMode::Dialog => {
+            handle_dialog(app, action);
             PostAction::None
         }
         InputMode::Normal => handle_normal(app, action, action_tx),
@@ -99,9 +102,39 @@ fn handle_normal(
                 return PostAction::None;
             }
 
-            app.confirm_message = Some(format!("Kill session '{}'? (y/n)", session_name));
-            app.confirm_session = Some(session_name);
-            app.input_mode = InputMode::Confirm;
+            app.start_confirm(
+                format!("Kill session '{}'? (y/n)", session_name),
+                ConfirmAction::KillSession { session_name },
+            );
+            PostAction::None
+        }
+
+        Action::CreateIssue => {
+            app.open_dialog();
+            PostAction::None
+        }
+
+        Action::EditIssue => {
+            let Some(idx) = app.selected_issue_index() else {
+                return PostAction::None;
+            };
+            let issue = app.issues[idx].clone();
+            app.open_edit_dialog(&issue, idx);
+            PostAction::None
+        }
+
+        Action::DeleteIssue => {
+            let Some(issue) = app.selected_issue() else {
+                return PostAction::None;
+            };
+            let Some(idx) = app.selected_issue_index() else {
+                return PostAction::None;
+            };
+
+            app.start_confirm(
+                format!("Delete {}: {}? (y/n)", issue.id, issue.title),
+                ConfirmAction::DeleteIssue { issue_index: idx },
+            );
             PostAction::None
         }
 
@@ -135,41 +168,191 @@ fn handle_normal(
             PostAction::None
         }
 
-        Action::ConfirmYes | Action::ConfirmNo | Action::Noop => PostAction::None,
+        _ => PostAction::None,
     }
 }
 
-fn handle_confirm(app: &mut App, action: Action, action_tx: &mpsc::Sender<ActionResult>) {
+fn handle_dialog(app: &mut App, action: Action) {
     match action {
-        Action::ConfirmYes => {
-            if let Some(session_name) = app.confirm_session.take() {
-                app.busy_count += 1;
-                let tx = action_tx.clone();
-
-                thread::spawn(move || {
-                    let message = match tmux::kill_session(&session_name) {
-                        Ok(()) => format!("Session '{}' killed", session_name),
-                        Err(e) => format!("Failed to kill session: {e}"),
-                    };
-                    let _ = tx.send(ActionResult {
-                        message,
-                        session_to_open: None,
-                    });
-                });
+        Action::DialogChar(c) => {
+            if let Some(ref mut dialog) = app.dialog {
+                dialog.push_char(c);
             }
-            app.confirm_message = None;
-            app.input_mode = InputMode::Normal;
         }
-        Action::ConfirmNo | Action::Quit => {
-            app.confirm_message = None;
-            app.confirm_session = None;
-            app.input_mode = InputMode::Normal;
+        Action::DialogBackspace => {
+            if let Some(ref mut dialog) = app.dialog {
+                dialog.delete_char();
+            }
+        }
+
+        Action::DialogNextField => {
+            // Pre-compute values before borrowing dialog mutably
+            let next_id = app.next_issue_id();
+
+            if let Some(ref mut dialog) = app.dialog {
+                let current = dialog.focused_field;
+                let next = current + 1;
+
+                if next >= DIALOG_FIELD_COUNT {
+                    // On last field, Enter = submit
+                    let _ = dialog;
+                    submit_dialog(app);
+                    return;
+                }
+
+                // When creating, auto-fill prompt from title if still empty
+                if dialog.editing_index.is_none()
+                    && current == 0
+                    && next == 1
+                    && dialog.prompt.is_empty()
+                {
+                    dialog.prompt = format!("Working on {}: {}", next_id, dialog.title);
+                }
+
+                dialog.focused_field = next;
+            }
+        }
+        Action::DialogSubmit => {
+            submit_dialog(app);
+        }
+        Action::DialogCancel => {
+            app.close_dialog();
         }
         _ => {}
     }
 }
 
-fn launch_and_report(issue: crate::types::Issue, config: AppConfig) -> ActionResult {
+fn submit_dialog(app: &mut App) {
+    let dialog = match app.dialog.take() {
+        Some(d) => d,
+        None => return,
+    };
+
+    app.input_mode = InputMode::Normal;
+
+    let title = dialog.title.trim().to_string();
+    if title.is_empty() {
+        app.set_message("Title cannot be empty");
+        return;
+    }
+
+    let prompt = if dialog.prompt.trim().is_empty() {
+        None
+    } else {
+        Some(dialog.prompt.trim().to_string())
+    };
+
+    let worktree = if dialog.worktree.trim().is_empty() {
+        None
+    } else {
+        Some(dialog.worktree.trim().to_string())
+    };
+
+    if let Some(idx) = dialog.editing_index {
+        if idx < app.issues.len() {
+            app.issues[idx].title = title;
+            app.issues[idx].prompt = prompt;
+            app.issues[idx].worktree = worktree;
+            app.issues[idx].agent_mode = dialog.agent_mode;
+            app.set_message(format!("Updated {}", app.issues[idx].id));
+            let _ = config::save_state(&app.to_state(), &app.config.project_root);
+        }
+        return;
+    }
+
+    let id = app.next_issue_id();
+    let column = Column::from_index(app.selected_column).unwrap_or(Column::Planning);
+
+    let issue = Issue {
+        id: id.clone(),
+        title,
+        column,
+        branch: None,
+        worktree,
+        tmux_session: None,
+        agent_kind: app.config.agent_kind,
+        agent_mode: dialog.agent_mode,
+        agent_status: AgentStatus::Stopped,
+        prompt,
+    };
+
+    app.issues.push(issue);
+    app.set_message(format!("Created {}", id));
+
+    let count = app.issues_in_column(column).len();
+    if count > 0 {
+        app.selected_row[app.selected_column] = count - 1;
+    }
+
+    let _ = config::save_state(&app.to_state(), &app.config.project_root);
+}
+
+fn handle_confirm(app: &mut App, action: Action, action_tx: &mpsc::Sender<ActionResult>) {
+    match action {
+        Action::ConfirmYes => {
+            if let Some(confirm_action) = app.take_confirm_action() {
+                match confirm_action {
+                    ConfirmAction::KillSession { session_name } => {
+                        app.busy_count += 1;
+                        let tx = action_tx.clone();
+                        let status_file =
+                            agent_status_file(&app.config.project_root, &session_name);
+
+                        thread::spawn(move || {
+                            let message = match tmux::kill_session(&session_name) {
+                                Ok(()) => {
+                                    let _ = std::fs::remove_file(&status_file);
+                                    format!("Session '{}' killed", session_name)
+                                }
+                                Err(e) => format!("Failed to kill session: {e}"),
+                            };
+                            let _ = tx.send(ActionResult {
+                                message,
+                                session_to_open: None,
+                            });
+                        });
+                    }
+                    ConfirmAction::DeleteIssue { issue_index } => {
+                        if issue_index < app.issues.len() {
+                            let issue = &app.issues[issue_index];
+                            let session_name = issue.session_name();
+                            let id = issue.id.clone();
+                            let status_file =
+                                agent_status_file(&app.config.project_root, &session_name);
+
+                            if app.is_session_alive(&session_name) {
+                                let tx = action_tx.clone();
+                                let sn = session_name.clone();
+                                thread::spawn(move || {
+                                    let _ = tmux::kill_session(&sn);
+                                    let _ = std::fs::remove_file(&status_file);
+                                    let _ = tx.send(ActionResult {
+                                        message: format!("Deleted {} and killed session", id),
+                                        session_to_open: None,
+                                    });
+                                });
+                                app.busy_count += 1;
+                            } else {
+                                let _ = std::fs::remove_file(&status_file);
+                                app.set_message(format!("Deleted {}", id));
+                            }
+
+                            app.issues.remove(issue_index);
+                            app.clamp_all_rows();
+                            let _ = config::save_state(&app.to_state(), &app.config.project_root);
+                        }
+                    }
+                }
+            }
+        }
+        Action::ConfirmNo | Action::Quit => {
+            app.cancel_confirm();
+        }
+        _ => {}
+    }
+}
+
+fn launch_and_report(issue: Issue, config: AppConfig) -> ActionResult {
     match opencode::launch_session(&issue, &config) {
         Ok(session_name) => ActionResult {
             message: format!("Session '{}' started", session_name),
@@ -180,4 +363,8 @@ fn launch_and_report(issue: crate::types::Issue, config: AppConfig) -> ActionRes
             session_to_open: None,
         },
     }
+}
+
+fn agent_status_file(project_root: &PathBuf, session_name: &str) -> PathBuf {
+    config::agent_status_dir(project_root).join(format!("{}.json", session_name))
 }

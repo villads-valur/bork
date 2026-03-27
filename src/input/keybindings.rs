@@ -7,6 +7,7 @@ pub fn map_key_to_action(key: KeyEvent, mode: InputMode) -> Action {
     match mode {
         InputMode::Normal => map_normal_key(key),
         InputMode::Confirm => map_confirm_key(key),
+        InputMode::Dialog => map_dialog_key(key),
     }
 }
 
@@ -32,6 +33,10 @@ fn map_normal_key(key: KeyEvent) -> Action {
         KeyCode::Enter => Action::OpenSession,
         KeyCode::Char('x') => Action::KillSession,
 
+        KeyCode::Char('n') => Action::CreateIssue,
+        KeyCode::Char('e') => Action::EditIssue,
+        KeyCode::Char('d') => Action::DeleteIssue,
+
         KeyCode::Char('H') => Action::MoveIssueLeft,
         KeyCode::Char('L') => Action::MoveIssueRight,
 
@@ -46,6 +51,30 @@ fn map_confirm_key(key: KeyEvent) -> Action {
     match key.code {
         KeyCode::Char('y') | KeyCode::Enter => Action::ConfirmYes,
         KeyCode::Char('n') | KeyCode::Esc => Action::ConfirmNo,
+        _ => Action::Noop,
+    }
+}
+
+fn map_dialog_key(key: KeyEvent) -> Action {
+    // Shift+Enter = submit from any field
+    if key.modifiers.contains(KeyModifiers::SHIFT) && key.code == KeyCode::Enter {
+        return Action::DialogSubmit;
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return match key.code {
+            KeyCode::Char('c') => Action::DialogCancel,
+            _ => Action::Noop,
+        };
+    }
+
+    match key.code {
+        KeyCode::Esc => Action::DialogCancel,
+        KeyCode::Enter => Action::DialogNextField,
+        KeyCode::Tab => Action::DialogNextField,
+        KeyCode::BackTab => Action::DialogNextField,
+        KeyCode::Backspace => Action::DialogBackspace,
+        KeyCode::Char(c) => Action::DialogChar(c),
         _ => Action::Noop,
     }
 }

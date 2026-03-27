@@ -1,5 +1,6 @@
 pub mod board;
 pub mod card;
+pub mod dialog;
 pub mod status_bar;
 pub mod styles;
 
@@ -21,4 +22,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     status_bar::render_header(frame, app, vertical[0]);
     board::render_board(frame, app, vertical[1]);
     status_bar::render_footer(frame, app, vertical[2]);
+
+    // Render dialog on top of everything if open
+    dialog::render_dialog(frame, app);
 }

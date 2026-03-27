@@ -50,16 +50,34 @@ src/
     └── styles.rs      # Colors, styles
 ```
 
+## Project Layout
+
+Bork uses a container directory pattern. The project root is NOT a git repo. It holds:
+
+```
+bork/                           # container (opencode's cwd)
+├── .bork/                      # bork state (config.toml, state.json)
+├── AGENTS.md                   # agent instructions
+├── opencode.jsonc              # opencode config
+├── main/                       # main branch worktree (this repo, owns .git/)
+└── {issue-id}/                 # issue worktrees (created by agent)
+```
+
+State lives in `.bork/` at the container root. Config is detected by walking up from cwd looking for a `.bork/` directory.
+
 ## Build & Run
 
 ```bash
-cargo build
-cargo run
+cd main && cargo build --release
 ```
+
+The binary is symlinked to `/opt/homebrew/bin/bork`.
 
 ## Conventions
 
 - Vim-style navigation: h/j/k/l
-- Config: ~/.config/bork/config.toml
-- State: ~/.config/bork/state.json (atomic writes)
+- State: {project_root}/.bork/state.json (atomic writes)
+- Config: {project_root}/.bork/config.toml
+- Issue IDs: {project_name}-{number} (e.g. bork-1, bork-2)
 - Tmux sessions named: bork-{issue-id}
+- Opencode launched at project root with --prompt for issue context

@@ -77,20 +77,55 @@ impl fmt::Display for AgentKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentMode {
+    Plan,
+    Build,
+}
+
+impl AgentMode {
+    pub fn toggle(self) -> Self {
+        match self {
+            AgentMode::Plan => AgentMode::Build,
+            AgentMode::Build => AgentMode::Plan,
+        }
+    }
+}
+
+impl fmt::Display for AgentMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AgentMode::Plan => write!(f, "plan"),
+            AgentMode::Build => write!(f, "build"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentStatus {
+    Stopped,
     Idle,
     Busy,
-    NeedsAttention,
-    Stopped,
+    WaitingInput,
+    WaitingPermission,
+    WaitingApproval,
+    Error,
 }
 
 impl AgentStatus {
+    pub fn needs_attention(self) -> bool {
+        matches!(
+            self,
+            Self::WaitingInput | Self::WaitingPermission | Self::WaitingApproval
+        )
+    }
+
     pub fn symbol(self) -> &'static str {
         match self {
-            AgentStatus::Idle => "○",
-            AgentStatus::Busy => "●",
-            AgentStatus::NeedsAttention => "◈",
-            AgentStatus::Stopped => "◌",
+            Self::Stopped => "◌",
+            Self::Idle => "○",
+            Self::Busy => "●",
+            Self::WaitingInput | Self::WaitingPermission | Self::WaitingApproval => "◈",
+            Self::Error => "✗",
         }
     }
 }
@@ -98,11 +133,34 @@ impl AgentStatus {
 impl fmt::Display for AgentStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            AgentStatus::Idle => write!(f, "idle"),
-            AgentStatus::Busy => write!(f, "busy"),
-            AgentStatus::NeedsAttention => write!(f, "attention"),
-            AgentStatus::Stopped => write!(f, "stopped"),
+            Self::Stopped => write!(f, "stopped"),
+            Self::Idle => write!(f, "idle"),
+            Self::Busy => write!(f, "busy"),
+            Self::WaitingInput => write!(f, "waiting for input"),
+            Self::WaitingPermission => write!(f, "needs permission"),
+            Self::WaitingApproval => write!(f, "needs approval"),
+            Self::Error => write!(f, "error"),
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentStatusInfo {
+    pub status: AgentStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity: Option<String>,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorktreeStatus {
+    pub staged: usize,
+    pub unstaged: usize,
+}
+
+impl WorktreeStatus {
+    pub fn is_clean(&self) -> bool {
+        self.staged == 0 && self.unstaged == 0
     }
 }
 
@@ -112,9 +170,27 @@ pub struct Issue {
     pub title: String,
     pub column: Column,
     pub branch: Option<String>,
+    #[serde(
+        default = "default_worktree",
+        deserialize_with = "deserialize_worktree"
+    )]
+    pub worktree: Option<String>,
     pub tmux_session: Option<String>,
     pub agent_kind: AgentKind,
+    pub agent_mode: AgentMode,
     pub agent_status: AgentStatus,
+    pub prompt: Option<String>,
+}
+
+fn default_worktree() -> Option<String> {
+    Some("main".into())
+}
+
+fn deserialize_worktree<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::deserialize(deserializer)?.or_else(default_worktree))
 }
 
 impl Issue {

@@ -98,9 +98,18 @@ fn render_column(frame: &mut Frame, app: &App, column: Column, area: Rect, is_se
 
         let card_area = Rect::new(inner.x, card_y, inner.width, CARD_HEIGHT);
         let is_selected = is_selected_col && (viewport_start + visible_idx) == selected_row;
-        let session_alive = app.is_session_alive(&issue.session_name());
 
-        card::render_card(frame, issue, card_area, is_selected, session_alive);
+        let ctx = card::CardContext {
+            issue,
+            selected: is_selected,
+            session_alive: app.is_session_alive(&issue.session_name()),
+            agent_status: app.resolved_agent_status(issue),
+            activity: app.resolved_activity(issue),
+            branch: app.branch_for(issue),
+            git_status: app.worktree_status_for(issue),
+        };
+
+        card::render_card(frame, &ctx, card_area);
     }
 
     if has_below {
