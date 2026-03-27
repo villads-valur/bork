@@ -425,3 +425,137 @@ impl App {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::config::{AppConfig, AppState};
+    use crate::types::{AgentKind, AgentMode, AgentStatus, PrState, PrStatus};
+
+    fn test_config() -> AppConfig {
+        AppConfig {
+            project_name: "test".into(),
+            project_root: PathBuf::from("/tmp/test"),
+            agent_kind: AgentKind::OpenCode,
+            default_prompt: None,
+        }
+    }
+
+    fn test_issue(id: &str, worktree: Option<&str>) -> Issue {
+        Issue {
+            id: id.into(),
+            title: format!("Issue {id}"),
+            column: Column::InProgress,
+            branch: None,
+            worktree: worktree.map(|s| s.into()),
+            tmux_session: None,
+            agent_kind: AgentKind::OpenCode,
+            agent_mode: AgentMode::Plan,
+            agent_status: AgentStatus::Stopped,
+            prompt: None,
+        }
+    }
+
+    fn test_pr(number: u32, branch: &str) -> PrStatus {
+        PrStatus {
+            number,
+            state: PrState::Open,
+            is_draft: false,
+            checks: Some(crate::types::ChecksStatus::Success),
+            review: Some(crate::types::ReviewDecision::Approved),
+            additions: 10,
+            deletions: 5,
+            head_branch: branch.into(),
+        }
+    }
+
+    #[test]
+    fn test_pr_for_with_matching_branch() {
+        let state = AppState {
+            issues: vec![test_issue("test-1", Some("bork-1"))],
+        };
+        let mut app = App::new(test_config(), state);
+        app.worktree_branches
+            .insert("bork-1".into(), "bork-1/my-feature".into());
+        app.pr_statuses
+            .insert("bork-1/my-feature".into(), test_pr(42, "bork-1/my-feature"));
+
+        let pr = app.pr_for(&app.issues[0].clone()).unwrap();
+        assert_eq!(pr.number, 42);
+    }
+
+    #[test]
+    fn test_pr_for_no_worktree() {
+        let state = AppState {
+            issues: vec![test_issue("test-1", None)],
+        };
+        let app = App::new(test_config(), state);
+        assert!(app.pr_for(&app.issues[0]).is_none());
+    }
+
+    #[test]
+    fn test_pr_for_no_branch_in_map() {
+        let state = AppState {
+            issues: vec![test_issue("test-1", Some("bork-1"))],
+        };
+        let app = App::new(test_config(), state);
+        // worktree_branches is empty, so no branch for "bork-1"
+        assert!(app.pr_for(&app.issues[0]).is_none());
+    }
+
+    #[test]
+    fn test_pr_for_no_matching_pr() {
+        let state = AppState {
+            issues: vec![test_issue("test-1", Some("bork-1"))],
+        };
+        let mut app = App::new(test_config(), state);
+        app.worktree_branches
+            .insert("bork-1".into(), "bork-1/my-feature".into());
+        // pr_statuses is empty
+        assert!(app.pr_for(&app.issues[0].clone()).is_none());
+    }
+
+    #[test]
+    fn test_pr_for_different_branches_get_correct_prs() {
+        let state = AppState {
+            issues: vec![
+                test_issue("test-1", Some("wt-a")),
+                test_issue("test-2", Some("wt-b")),
+            ],
+        };
+        let mut app = App::new(test_config(), state);
+        app.worktree_branches
+            .insert("wt-a".into(), "branch-a".into());
+        app.worktree_branches
+            .insert("wt-b".into(), "branch-b".into());
+        app.pr_statuses
+            .insert("branch-a".into(), test_pr(10, "branch-a"));
+        app.pr_statuses
+            .insert("branch-b".into(), test_pr(20, "branch-b"));
+
+        let issues = app.issues.clone();
+        assert_eq!(app.pr_for(&issues[0]).unwrap().number, 10);
+        assert_eq!(app.pr_for(&issues[1]).unwrap().number, 20);
+    }
+
+    #[test]
+    fn test_branch_for_with_worktree() {
+        let state = AppState {
+            issues: vec![test_issue("test-1", Some("main"))],
+        };
+        let mut app = App::new(test_config(), state);
+        app.worktree_branches.insert("main".into(), "main".into());
+        assert_eq!(app.branch_for(&app.issues[0]), Some("main"));
+    }
+
+    #[test]
+    fn test_branch_for_no_worktree() {
+        let state = AppState {
+            issues: vec![test_issue("test-1", None)],
+        };
+        let app = App::new(test_config(), state);
+        assert_eq!(app.branch_for(&app.issues[0]), None);
+    }
+}

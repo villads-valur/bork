@@ -84,3 +84,71 @@ pub fn review_icon(decision: Option<ReviewDecision>) -> (&'static str, Color) {
         None => ("–", Color::Gray),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_checks_icon_success() {
+        let (icon, color) = checks_icon(Some(ChecksStatus::Success));
+        assert_eq!(icon, "✓");
+        assert_eq!(color, Color::Green);
+    }
+
+    #[test]
+    fn test_checks_icon_failure() {
+        let (icon, color) = checks_icon(Some(ChecksStatus::Failure));
+        assert_eq!(icon, "✗");
+        assert_eq!(color, Color::Red);
+    }
+
+    #[test]
+    fn test_checks_icon_error() {
+        let (icon, color) = checks_icon(Some(ChecksStatus::Error));
+        assert_eq!(icon, "✗");
+        assert_eq!(color, Color::Red);
+    }
+
+    #[test]
+    fn test_checks_icon_pending() {
+        let (icon, color) = checks_icon(Some(ChecksStatus::Pending));
+        assert_eq!(icon, "◌");
+        assert_eq!(color, Color::Yellow);
+    }
+
+    #[test]
+    fn test_checks_icon_none() {
+        let (icon, color) = checks_icon(None);
+        assert_eq!(icon, "–");
+        assert_eq!(color, Color::Gray);
+    }
+
+    #[test]
+    fn test_review_icon_approved() {
+        let (icon, color) = review_icon(Some(ReviewDecision::Approved));
+        assert_eq!(icon, "●");
+        assert_eq!(color, Color::Green);
+    }
+
+    #[test]
+    fn test_review_icon_changes_requested() {
+        let (icon, color) = review_icon(Some(ReviewDecision::ChangesRequested));
+        assert_eq!(icon, "●");
+        assert_eq!(color, Color::Red);
+    }
+
+    #[test]
+    fn test_review_icon_review_required() {
+        let (icon, color) = review_icon(Some(ReviewDecision::ReviewRequired));
+        assert_eq!(icon, "○");
+        assert_eq!(color, Color::Yellow);
+    }
+
+    #[test]
+    fn test_review_icon_none() {
+        let (icon, color) = review_icon(None);
+        assert_eq!(icon, "–");
+        assert_eq!(color, Color::Gray);
+    }
+}

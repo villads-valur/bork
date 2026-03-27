@@ -245,3 +245,114 @@ pub struct PrStatus {
     pub deletions: u32,
     pub head_branch: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pr_state_display() {
+        assert_eq!(PrState::Open.to_string(), "open");
+        assert_eq!(PrState::Closed.to_string(), "closed");
+        assert_eq!(PrState::Merged.to_string(), "merged");
+    }
+
+    #[test]
+    fn test_pr_state_equality() {
+        assert_eq!(PrState::Open, PrState::Open);
+        assert_ne!(PrState::Open, PrState::Closed);
+    }
+
+    #[test]
+    fn test_checks_status_is_copy() {
+        let a = ChecksStatus::Success;
+        let b = a; // Copy
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_review_decision_is_copy() {
+        let a = ReviewDecision::Approved;
+        let b = a; // Copy
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_pr_status_clone() {
+        let pr = PrStatus {
+            number: 1,
+            state: PrState::Open,
+            is_draft: false,
+            checks: Some(ChecksStatus::Success),
+            review: Some(ReviewDecision::Approved),
+            additions: 10,
+            deletions: 5,
+            head_branch: "main".into(),
+        };
+        let cloned = pr.clone();
+        assert_eq!(cloned.number, 1);
+        assert_eq!(cloned.state, PrState::Open);
+        assert_eq!(cloned.checks, Some(ChecksStatus::Success));
+        assert_eq!(cloned.review, Some(ReviewDecision::Approved));
+        assert_eq!(cloned.head_branch, "main");
+    }
+
+    #[test]
+    fn test_worktree_status_is_clean() {
+        assert!(WorktreeStatus {
+            staged: 0,
+            unstaged: 0
+        }
+        .is_clean());
+        assert!(!WorktreeStatus {
+            staged: 1,
+            unstaged: 0
+        }
+        .is_clean());
+        assert!(!WorktreeStatus {
+            staged: 0,
+            unstaged: 1
+        }
+        .is_clean());
+    }
+
+    #[test]
+    fn test_issue_session_name() {
+        let issue = Issue {
+            id: "BORK-42".into(),
+            title: "test".into(),
+            column: Column::Todo,
+            branch: None,
+            worktree: Some("main".into()),
+            tmux_session: None,
+            agent_kind: AgentKind::OpenCode,
+            agent_mode: AgentMode::Plan,
+            agent_status: AgentStatus::Stopped,
+            prompt: None,
+        };
+        assert_eq!(issue.session_name(), "bork-bork-42");
+    }
+
+    #[test]
+    fn test_column_navigation() {
+        assert_eq!(Column::Todo.next(), Some(Column::InProgress));
+        assert_eq!(Column::Done.next(), None);
+        assert_eq!(Column::Todo.prev(), None);
+        assert_eq!(Column::Done.prev(), Some(Column::CodeReview));
+    }
+
+    #[test]
+    fn test_agent_status_symbol() {
+        assert_eq!(AgentStatus::Stopped.symbol(), "◌");
+        assert_eq!(AgentStatus::Idle.symbol(), "○");
+        assert_eq!(AgentStatus::Busy.symbol(), "●");
+        assert_eq!(AgentStatus::WaitingInput.symbol(), "◈");
+        assert_eq!(AgentStatus::Error.symbol(), "✗");
+    }
+
+    #[test]
+    fn test_agent_mode_toggle() {
+        assert_eq!(AgentMode::Plan.toggle(), AgentMode::Build);
+        assert_eq!(AgentMode::Build.toggle(), AgentMode::Plan);
+    }
+}

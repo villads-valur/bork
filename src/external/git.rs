@@ -98,3 +98,89 @@ fn parse_git_status(output: &str) -> WorktreeStatus {
 
     WorktreeStatus { staged, unstaged }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_clean_repo() {
+        let status = parse_git_status("");
+        assert_eq!(status.staged, 0);
+        assert_eq!(status.unstaged, 0);
+        assert!(status.is_clean());
+    }
+
+    #[test]
+    fn test_parse_untracked_files() {
+        let output = "?? new_file.txt\n?? another.rs\n";
+        let status = parse_git_status(output);
+        assert_eq!(status.staged, 0);
+        assert_eq!(status.unstaged, 2);
+    }
+
+    #[test]
+    fn test_parse_staged_modification() {
+        let output = "M  src/main.rs\n";
+        let status = parse_git_status(output);
+        assert_eq!(status.staged, 1);
+        assert_eq!(status.unstaged, 0);
+    }
+
+    #[test]
+    fn test_parse_unstaged_modification() {
+        let output = " M src/main.rs\n";
+        let status = parse_git_status(output);
+        assert_eq!(status.staged, 0);
+        assert_eq!(status.unstaged, 1);
+    }
+
+    #[test]
+    fn test_parse_staged_and_unstaged() {
+        // Staged modification + unstaged modification in same file
+        let output = "MM src/main.rs\n";
+        let status = parse_git_status(output);
+        assert_eq!(status.staged, 1);
+        assert_eq!(status.unstaged, 1);
+    }
+
+    #[test]
+    fn test_parse_mixed_statuses() {
+        let output = "M  staged.rs\n M unstaged.rs\n?? untracked.txt\nA  added.rs\n";
+        let status = parse_git_status(output);
+        assert_eq!(status.staged, 2); // M and A
+        assert_eq!(status.unstaged, 2); // M and ??
+    }
+
+    #[test]
+    fn test_parse_short_line_ignored() {
+        let output = "X\n";
+        let status = parse_git_status(output);
+        assert_eq!(status.staged, 0);
+        assert_eq!(status.unstaged, 0);
+    }
+
+    #[test]
+    fn test_parse_added_file() {
+        let output = "A  new_file.rs\n";
+        let status = parse_git_status(output);
+        assert_eq!(status.staged, 1);
+        assert_eq!(status.unstaged, 0);
+    }
+
+    #[test]
+    fn test_parse_deleted_file() {
+        let output = "D  removed.rs\n";
+        let status = parse_git_status(output);
+        assert_eq!(status.staged, 1);
+        assert_eq!(status.unstaged, 0);
+    }
+
+    #[test]
+    fn test_parse_renamed_file() {
+        let output = "R  old.rs -> new.rs\n";
+        let status = parse_git_status(output);
+        assert_eq!(status.staged, 1);
+        assert_eq!(status.unstaged, 0);
+    }
+}
