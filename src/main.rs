@@ -220,6 +220,8 @@ fn main() -> anyhow::Result<()> {
             let status_file = config::agent_status_dir(&app.config.project_root)
                 .join(format!("{}.json", session_name));
             let sn = session_name.clone();
+            // Remove from active set immediately so we don't re-fire on next tick
+            app.active_sessions.remove(&session_name);
             thread::spawn(move || {
                 let _ = external::tmux::kill_session(&sn);
                 let _ = std::fs::remove_file(&status_file);
