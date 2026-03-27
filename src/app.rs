@@ -791,6 +791,56 @@ mod tests {
         assert_eq!(app.issues[0].worktree, Some("bork-1".into()));
     }
 
+    #[test]
+    fn test_auto_assign_uses_frozen_keys_for_done_issues() {
+        let mut app = test_app(vec![test_issue("bork-1", Column::Done)]);
+        // Not in worktree_branches (git worker skips Done), but in frozen
+        app.frozen_worktree_branches
+            .insert("bork-1".into(), "bork-1/feature".into());
+        let changed = app.auto_assign_worktrees();
+        assert!(changed);
+        assert_eq!(app.issues[0].worktree, Some("bork-1".into()));
+    }
+
+    #[test]
+    fn test_auto_assign_multiple_issues() {
+        let mut app = test_app(vec![
+            test_issue("bork-1", Column::InProgress),
+            test_issue("bork-2", Column::InProgress),
+            test_issue("bork-99", Column::InProgress),
+        ]);
+        app.worktree_branches
+            .insert("bork-1".into(), "bork-1/feat".into());
+        app.worktree_branches
+            .insert("bork-2".into(), "bork-2/feat".into());
+        let changed = app.auto_assign_worktrees();
+        assert!(changed);
+        assert_eq!(app.issues[0].worktree, Some("bork-1".into()));
+        assert_eq!(app.issues[1].worktree, Some("bork-2".into()));
+        assert_eq!(app.issues[2].worktree, None); // no match for bork-99
+    }
+
+    #[test]
+    fn test_clear_stale_does_not_touch_none() {
+        let app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
+        // worktree is already None, should not count as changed
+        assert!(!app.issues[0].worktree.is_some());
+    }
+
+    #[test]
+    fn test_worktree_for_returns_persisted_value() {
+        let mut issue = test_issue("bork-1", Column::InProgress);
+        issue.worktree = Some("bork-1-custom".into());
+        let app = test_app(vec![issue]);
+        assert_eq!(app.worktree_for(&app.issues[0]), Some("bork-1-custom"));
+    }
+
+    #[test]
+    fn test_worktree_for_returns_none_when_unset() {
+        let app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
+        assert_eq!(app.worktree_for(&app.issues[0]), None);
+    }
+
     // ================================================================
     // branch_for / pr_for (use persisted worktree field)
     // ================================================================
