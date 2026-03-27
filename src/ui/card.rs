@@ -101,6 +101,12 @@ fn format_branch_line(
         return Line::from("");
     };
 
+    // Strip the "{issue-id}/" prefix since the card border already shows the issue ID
+    let display_branch = branch_name
+        .find('/')
+        .map(|i| &branch_name[i + 1..])
+        .unwrap_or(branch_name);
+
     let git_spans = format_git_status(git_status);
     let git_width: usize = git_spans.iter().map(|s| s.width()).sum();
 
@@ -112,7 +118,7 @@ fn format_branch_line(
     let mut spans = vec![
         Span::raw("  "),
         Span::styled(
-            truncate(branch_name, available_for_branch),
+            truncate(display_branch, available_for_branch),
             styles::dim_style(),
         ),
     ];
