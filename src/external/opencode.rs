@@ -33,15 +33,15 @@ pub fn launch_session(issue: &Issue, config: &AppConfig) -> Result<String, AppEr
 
     let agent_cmd = match issue.agent_kind {
         AgentKind::OpenCode => {
+            // opencode does not support --name
             let mode_flag = match issue.agent_mode {
                 AgentMode::Plan => " --agent plan",
                 AgentMode::Build => "",
             };
             format!(
-                "export BORK_SESSION='{}' BORK_STATUS_DIR='{}' && opencode --name '{}' --prompt '{}'{}",
+                "export BORK_SESSION='{}' BORK_STATUS_DIR='{}' && opencode --prompt '{}'{}",
                 shell_escape_single_quotes(&session_name),
                 shell_escape_single_quotes(status_dir_str),
-                escaped_name,
                 escaped_prompt,
                 mode_flag,
             )
