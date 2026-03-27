@@ -3,6 +3,7 @@ mod config;
 mod error;
 mod external;
 mod handler;
+mod init;
 mod input;
 mod types;
 mod ui;
@@ -14,6 +15,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+use clap::{Parser, Subcommand, ValueEnum};
 use crossterm::{
     event::{self, Event, KeyEventKind},
     execute,
@@ -24,7 +26,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use app::App;
 use handler::{ActionResult, PostAction};
 use input::map_key_to_action;
-use types::AgentStatusInfo;
+use types::{AgentKind, AgentStatusInfo};
 
 use external::git::GitPollResult;
 
@@ -94,15 +96,70 @@ fn spawn_git_status_worker(project_root: PathBuf) -> mpsc::Receiver<GitPollResul
     rx
 }
 
-fn main() -> anyhow::Result<()> {
-    // --- CLI subcommands ---
-    let args: Vec<String> = std::env::args().collect();
-    match args.get(1).map(|s| s.as_str()) {
-        Some("install") => return external::hooks::install(),
-        Some("uninstall") => return external::hooks::uninstall(),
-        _ => {}
-    }
+#[derive(Parser)]
+#[command(
+    name = "bork",
+    about = "Terminal kanban board for orchestrating coding sessions across git worktrees",
+    version
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
 
+#[derive(Subcommand)]
+enum Command {
+    /// Initialize a new bork project from a git repository
+    Init {
+        /// Git repository (owner/repo, HTTPS URL, or SSH URL)
+        repo: String,
+
+        /// Container directory name (defaults to repo name)
+        directory: Option<String>,
+
+        /// Agent kind
+        #[arg(long, default_value = "opencode")]
+        agent: AgentKindArg,
+    },
+
+    /// Install agent status hooks (OpenCode plugin + Claude Code hooks)
+    Install,
+
+    /// Remove agent status hooks
+    Uninstall,
+}
+
+#[derive(Clone, ValueEnum)]
+enum AgentKindArg {
+    Opencode,
+    Claude,
+}
+
+impl From<AgentKindArg> for AgentKind {
+    fn from(arg: AgentKindArg) -> Self {
+        match arg {
+            AgentKindArg::Opencode => AgentKind::OpenCode,
+            AgentKindArg::Claude => AgentKind::Claude,
+        }
+    }
+}
+
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Some(Command::Init {
+            repo,
+            directory,
+            agent,
+        }) => init::run_init(&repo, directory.as_deref(), agent.into(), None),
+        Some(Command::Install) => external::hooks::install(),
+        Some(Command::Uninstall) => external::hooks::uninstall(),
+        None => run_tui(),
+    }
+}
+
+fn run_tui() -> anyhow::Result<()> {
     // --- Tmux auto-wrap ---
     match external::tmux::ensure_bork_session()? {
         external::tmux::EnsureResult::AlreadyInside => {}

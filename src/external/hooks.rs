@@ -100,6 +100,16 @@ fn opencode_plugin_path() -> PathBuf {
 
 fn install_opencode_plugin() -> anyhow::Result<()> {
     let path = opencode_plugin_path();
+
+    if path.exists() {
+        if let Ok(existing) = fs::read_to_string(&path) {
+            if existing == OPENCODE_PLUGIN {
+                println!("  OpenCode plugin already installed (skipped)");
+                return Ok(());
+            }
+        }
+    }
+
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -124,8 +134,47 @@ fn claude_settings_path() -> PathBuf {
     PathBuf::from(home).join(".claude").join("settings.json")
 }
 
+fn claude_hooks_already_installed(path: &PathBuf) -> bool {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(settings) = serde_json::from_str::<serde_json::Value>(&contents) else {
+        return false;
+    };
+    let Some(hooks) = settings.get("hooks").and_then(|v| v.as_object()) else {
+        return false;
+    };
+    let Ok(bork_hooks) = serde_json::from_str::<serde_json::Value>(CLAUDE_HOOKS) else {
+        return false;
+    };
+    let Some(bork_hooks_obj) = bork_hooks.as_object() else {
+        return false;
+    };
+
+    for (event_name, bork_entries) in bork_hooks_obj {
+        let Some(existing) = hooks.get(event_name).and_then(|v| v.as_array()) else {
+            return false;
+        };
+        let Some(expected) = bork_entries.as_array() else {
+            return false;
+        };
+        // Check that every expected bork hook entry exists in the current hooks
+        for entry in expected {
+            if !existing.contains(entry) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn install_claude_hooks() -> anyhow::Result<()> {
     let path = claude_settings_path();
+
+    if path.exists() && claude_hooks_already_installed(&path) {
+        println!("  Claude Code hooks already installed (skipped)");
+        return Ok(());
+    }
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
