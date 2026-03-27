@@ -170,28 +170,11 @@ pub struct Issue {
     pub id: String,
     pub title: String,
     pub column: Column,
-    pub branch: Option<String>,
-    #[serde(
-        default = "default_worktree",
-        deserialize_with = "deserialize_worktree"
-    )]
-    pub worktree: Option<String>,
     pub tmux_session: Option<String>,
     pub agent_kind: AgentKind,
     pub agent_mode: AgentMode,
     pub agent_status: AgentStatus,
     pub prompt: Option<String>,
-}
-
-fn default_worktree() -> Option<String> {
-    Some("main".into())
-}
-
-fn deserialize_worktree<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Ok(Option::deserialize(deserializer)?.or_else(default_worktree))
 }
 
 impl Issue {
@@ -322,8 +305,6 @@ mod tests {
             id: "BORK-42".into(),
             title: "test".into(),
             column: Column::Todo,
-            branch: None,
-            worktree: Some("main".into()),
             tmux_session: None,
             agent_kind: AgentKind::OpenCode,
             agent_mode: AgentMode::Plan,

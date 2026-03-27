@@ -22,9 +22,8 @@ pub enum ConfirmAction {
 pub struct DialogState {
     pub title: String,
     pub prompt: String,
-    pub worktree: String,
     pub agent_mode: AgentMode,
-    pub focused_field: usize, // 0=title, 1=prompt, 2=worktree, 3=mode
+    pub focused_field: usize, // 0=title, 1=prompt, 2=mode
     pub editing_index: Option<usize>,
 }
 
@@ -33,7 +32,6 @@ impl DialogState {
         DialogState {
             title: String::new(),
             prompt: String::new(),
-            worktree: "main".into(),
             agent_mode: AgentMode::Plan,
             focused_field: 0,
             editing_index: None,
@@ -44,7 +42,6 @@ impl DialogState {
         DialogState {
             title: issue.title.clone(),
             prompt: issue.prompt.clone().unwrap_or_default(),
-            worktree: issue.worktree.clone().unwrap_or_default(),
             agent_mode: issue.agent_mode,
             focused_field: 0,
             editing_index: Some(index),
@@ -55,9 +52,7 @@ impl DialogState {
         match self.focused_field {
             0 => self.title.push(c),
             1 => self.prompt.push(c),
-            2 => self.worktree.push(c),
-            3 => {
-                // On mode field: space/h/l toggle
+            2 => {
                 if c == ' ' || c == 'h' || c == 'l' {
                     self.agent_mode = self.agent_mode.toggle();
                 }
@@ -74,15 +69,12 @@ impl DialogState {
             1 => {
                 self.prompt.pop();
             }
-            2 => {
-                self.worktree.pop();
-            }
             _ => {}
         }
     }
 }
 
-pub const DIALOG_FIELD_COUNT: usize = 4;
+pub const DIALOG_FIELD_COUNT: usize = 3;
 
 pub struct App {
     pub issues: Vec<Issue>,
@@ -322,19 +314,40 @@ impl App {
             .and_then(|info| info.activity.as_deref())
     }
 
+    /// Auto-detect the worktree directory for an issue by matching the issue ID
+    /// against known worktree directory names from the git worker.
+    ///
+    /// Matching rules:
+    /// 1. Exact match (case-insensitive): dir name == issue ID
+    /// 2. Prefix match: dir starts with "{issue_id}-" (e.g. "bork-12-pr-status" matches "bork-12")
+    /// 3. Among prefix matches, the shortest directory name wins
+    pub fn resolved_worktree(&self, issue: &Issue) -> Option<&str> {
+        let issue_id_lower = issue.id.to_lowercase();
+
+        let mut best: Option<&str> = None;
+        for dir_name in self.worktree_branches.keys() {
+            let dir_lower = dir_name.to_lowercase();
+            if dir_lower == issue_id_lower {
+                return Some(dir_name.as_str());
+            }
+            if let Some(rest) = dir_lower.strip_prefix(issue_id_lower.as_str()) {
+                if rest.starts_with('-') && (best.is_none() || dir_name.len() < best.unwrap().len())
+                {
+                    best = Some(dir_name.as_str());
+                }
+            }
+        }
+        best
+    }
+
     pub fn worktree_status_for(&self, issue: &Issue) -> Option<&WorktreeStatus> {
-        issue
-            .worktree
-            .as_ref()
-            .and_then(|w| self.worktree_statuses.get(w))
+        let wt = self.resolved_worktree(issue)?;
+        self.worktree_statuses.get(wt)
     }
 
     pub fn branch_for(&self, issue: &Issue) -> Option<&str> {
-        issue
-            .worktree
-            .as_ref()
-            .and_then(|w| self.worktree_branches.get(w))
-            .map(|s| s.as_str())
+        let wt = self.resolved_worktree(issue)?;
+        self.worktree_branches.get(wt).map(|s| s.as_str())
     }
 
     pub fn pr_for(&self, issue: &Issue) -> Option<&PrStatus> {
@@ -443,13 +456,11 @@ mod tests {
         }
     }
 
-    fn test_issue(id: &str, worktree: Option<&str>) -> Issue {
+    fn test_issue(id: &str) -> Issue {
         Issue {
             id: id.into(),
             title: format!("Issue {id}"),
             column: Column::InProgress,
-            branch: None,
-            worktree: worktree.map(|s| s.into()),
             tmux_session: None,
             agent_kind: AgentKind::OpenCode,
             agent_mode: AgentMode::Plan,
@@ -471,10 +482,145 @@ mod tests {
         }
     }
 
+    // --- resolved_worktree ---
+
+    #[test]
+    fn test_resolved_worktree_exact_match() {
+        let state = AppState {
+            issues: vec![test_issue("bork-8")],
+        };
+        let mut app = App::new(test_config(), state);
+        app.worktree_branches
+            .insert("bork-8".into(), "bork-8/init-cli".into());
+
+        assert_eq!(
+            app.resolved_worktree(&app.issues[0].clone()),
+            Some("bork-8")
+        );
+    }
+
+    #[test]
+    fn test_resolved_worktree_prefix_match() {
+        let state = AppState {
+            issues: vec![test_issue("bork-12")],
+        };
+        let mut app = App::new(test_config(), state);
+        app.worktree_branches
+            .insert("bork-12-pr-status".into(), "bork-12/pr-status".into());
+
+        assert_eq!(
+            app.resolved_worktree(&app.issues[0].clone()),
+            Some("bork-12-pr-status")
+        );
+    }
+
+    #[test]
+    fn test_resolved_worktree_no_false_prefix() {
+        // bork-1 should NOT match bork-10 (next char is '0', not '-')
+        let state = AppState {
+            issues: vec![test_issue("bork-1")],
+        };
+        let mut app = App::new(test_config(), state);
+        app.worktree_branches
+            .insert("bork-10".into(), "bork-10/something".into());
+
+        assert_eq!(app.resolved_worktree(&app.issues[0].clone()), None);
+    }
+
+    #[test]
+    fn test_resolved_worktree_no_match() {
+        let state = AppState {
+            issues: vec![test_issue("bork-99")],
+        };
+        let mut app = App::new(test_config(), state);
+        app.worktree_branches
+            .insert("bork-8".into(), "bork-8/init-cli".into());
+
+        assert_eq!(app.resolved_worktree(&app.issues[0].clone()), None);
+    }
+
+    #[test]
+    fn test_resolved_worktree_shortest_prefix_wins() {
+        let state = AppState {
+            issues: vec![test_issue("bork-1")],
+        };
+        let mut app = App::new(test_config(), state);
+        app.worktree_branches
+            .insert("bork-1-abc".into(), "bork-1/abc".into());
+        app.worktree_branches
+            .insert("bork-1-a".into(), "bork-1/a".into());
+        app.worktree_branches
+            .insert("bork-1-abcdef".into(), "bork-1/abcdef".into());
+
+        assert_eq!(
+            app.resolved_worktree(&app.issues[0].clone()),
+            Some("bork-1-a")
+        );
+    }
+
+    #[test]
+    fn test_resolved_worktree_exact_preferred_over_prefix() {
+        let state = AppState {
+            issues: vec![test_issue("bork-1")],
+        };
+        let mut app = App::new(test_config(), state);
+        app.worktree_branches
+            .insert("bork-1".into(), "bork-1/feature".into());
+        app.worktree_branches
+            .insert("bork-1-extended".into(), "bork-1/extended".into());
+
+        assert_eq!(
+            app.resolved_worktree(&app.issues[0].clone()),
+            Some("bork-1")
+        );
+    }
+
+    #[test]
+    fn test_resolved_worktree_case_insensitive() {
+        let state = AppState {
+            issues: vec![test_issue("BORK-8")],
+        };
+        let mut app = App::new(test_config(), state);
+        app.worktree_branches
+            .insert("bork-8".into(), "bork-8/feature".into());
+
+        assert_eq!(
+            app.resolved_worktree(&app.issues[0].clone()),
+            Some("bork-8")
+        );
+    }
+
+    // --- branch_for ---
+
+    #[test]
+    fn test_branch_for_with_matching_worktree() {
+        let state = AppState {
+            issues: vec![test_issue("bork-8")],
+        };
+        let mut app = App::new(test_config(), state);
+        app.worktree_branches
+            .insert("bork-8".into(), "bork-8/init-cli".into());
+        assert_eq!(
+            app.branch_for(&app.issues[0].clone()),
+            Some("bork-8/init-cli")
+        );
+    }
+
+    #[test]
+    fn test_branch_for_no_matching_worktree() {
+        let state = AppState {
+            issues: vec![test_issue("bork-99")],
+        };
+        let app = App::new(test_config(), state);
+        assert_eq!(app.branch_for(&app.issues[0]), None);
+    }
+
+    // --- pr_for ---
+
     #[test]
     fn test_pr_for_with_matching_branch() {
         let state = AppState {
-            issues: vec![test_issue("test-1", Some("bork-1"))],
+            issues: vec![test_issue("bork-1")],
         };
         let mut app = App::new(test_config(), state);
         app.worktree_branches
@@ -487,28 +633,18 @@ mod tests {
     }
 
     #[test]
-    fn test_pr_for_no_worktree() {
+    fn test_pr_for_no_matching_worktree_dir() {
         let state = AppState {
-            issues: vec![test_issue("test-1", None)],
+            issues: vec![test_issue("bork-99")],
         };
         let app = App::new(test_config(), state);
-        assert!(app.pr_for(&app.issues[0]).is_none());
-    }
-
-    #[test]
-    fn test_pr_for_no_branch_in_map() {
-        let state = AppState {
-            issues: vec![test_issue("test-1", Some("bork-1"))],
-        };
-        let app = App::new(test_config(), state);
-        // worktree_branches is empty, so no branch for "bork-1"
         assert!(app.pr_for(&app.issues[0]).is_none());
     }
 
     #[test]
     fn test_pr_for_no_matching_pr() {
         let state = AppState {
-            issues: vec![test_issue("test-1", Some("bork-1"))],
+            issues: vec![test_issue("bork-1")],
         };
         let mut app = App::new(test_config(), state);
         app.worktree_branches
@@ -518,18 +654,15 @@ mod tests {
     }
 
     #[test]
-    fn test_pr_for_different_branches_get_correct_prs() {
+    fn test_pr_for_different_issues_get_correct_prs() {
         let state = AppState {
-            issues: vec![
-                test_issue("test-1", Some("wt-a")),
-                test_issue("test-2", Some("wt-b")),
-            ],
+            issues: vec![test_issue("bork-1"), test_issue("bork-2")],
         };
         let mut app = App::new(test_config(), state);
         app.worktree_branches
-            .insert("wt-a".into(), "branch-a".into());
+            .insert("bork-1".into(), "branch-a".into());
         app.worktree_branches
-            .insert("wt-b".into(), "branch-b".into());
+            .insert("bork-2".into(), "branch-b".into());
         app.pr_statuses
             .insert("branch-a".into(), test_pr(10, "branch-a"));
         app.pr_statuses
@@ -541,21 +674,17 @@ mod tests {
     }
 
     #[test]
-    fn test_branch_for_with_worktree() {
+    fn test_pr_for_via_prefix_worktree_match() {
         let state = AppState {
-            issues: vec![test_issue("test-1", Some("main"))],
+            issues: vec![test_issue("bork-12")],
         };
         let mut app = App::new(test_config(), state);
-        app.worktree_branches.insert("main".into(), "main".into());
-        assert_eq!(app.branch_for(&app.issues[0]), Some("main"));
-    }
+        app.worktree_branches
+            .insert("bork-12-pr-status".into(), "bork-12/pr-status".into());
+        app.pr_statuses
+            .insert("bork-12/pr-status".into(), test_pr(99, "bork-12/pr-status"));
 
-    #[test]
-    fn test_branch_for_no_worktree() {
-        let state = AppState {
-            issues: vec![test_issue("test-1", None)],
-        };
-        let app = App::new(test_config(), state);
-        assert_eq!(app.branch_for(&app.issues[0]), None);
+        let pr = app.pr_for(&app.issues[0].clone()).unwrap();
+        assert_eq!(pr.number, 99);
     }
 }

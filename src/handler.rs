@@ -279,17 +279,10 @@ fn submit_dialog(app: &mut App) {
         Some(dialog.prompt.trim().to_string())
     };
 
-    let worktree = if dialog.worktree.trim().is_empty() {
-        None
-    } else {
-        Some(dialog.worktree.trim().to_string())
-    };
-
     if let Some(idx) = dialog.editing_index {
         if idx < app.issues.len() {
             app.issues[idx].title = title;
             app.issues[idx].prompt = prompt;
-            app.issues[idx].worktree = worktree;
             app.issues[idx].agent_mode = dialog.agent_mode;
             app.set_message(format!("Updated {}", app.issues[idx].id));
             let _ = config::save_state(&app.to_state(), &app.config.project_root);
@@ -304,8 +297,6 @@ fn submit_dialog(app: &mut App) {
         id: id.clone(),
         title,
         column,
-        branch: None,
-        worktree,
         tmux_session: None,
         agent_kind: app.config.agent_kind,
         agent_mode: dialog.agent_mode,

@@ -8,7 +8,7 @@ use crate::app::App;
 use crate::types::AgentMode;
 use crate::ui::styles;
 
-const DIALOG_HEIGHT: u16 = 21;
+const DIALOG_HEIGHT: u16 = 19;
 const DIALOG_MIN_WIDTH: u16 = 44;
 const DIALOG_MAX_WIDTH: u16 = 80;
 const PROMPT_VISIBLE_LINES: usize = 3;
@@ -86,27 +86,14 @@ pub fn render_dialog(frame: &mut Frame, app: &App) {
         field_width,
     );
 
-    // --- Worktree field (row 7, after the 3-line prompt) ---
-    let worktree_row = 3 + PROMPT_VISIBLE_LINES as u16 + 1;
-    let worktree_area = Rect::new(inner.x + 1, inner.y + worktree_row, inner.width - 2, 1);
-    render_single_line_field(
-        frame,
-        "Worktree:",
-        &dialog.worktree,
-        worktree_area,
-        dialog.focused_field == 2,
-        label_width,
-        field_width,
-    );
-
-    // --- Mode field (row 9) ---
-    let mode_row = worktree_row + 2;
+    // --- Mode field (after the 3-line prompt) ---
+    let mode_row = 3 + PROMPT_VISIBLE_LINES as u16 + 1;
     let mode_area = Rect::new(inner.x + 1, inner.y + mode_row, inner.width - 2, 1);
     render_mode_field(
         frame,
         &dialog.agent_mode,
         mode_area,
-        dialog.focused_field == 3,
+        dialog.focused_field == 2,
         label_width,
     );
 
