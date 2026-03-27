@@ -4,31 +4,25 @@
 
 ## Active Task
 
-**Task:** TDD test suite for session lifecycle features
+**Task:** Rewrite README with quickstart guide and distribution docs
 **Status:** In Progress
 
 ## Plan
 
-1. Write failing tests for auto-move to In Progress on session start
-2. Write failing tests for Done session TTL (done_at timestamp, config parsing, cleanup logic)
-3. Write failing tests for git polling skip/freeze for Done issues
-4. Write tests for existing pure functions (parse_git_status, Column nav, Issue serde)
-5. Verify all tests compile and fail for expected reasons
-6. Hand off to implementation phase
+1. Add concise Quickstart section after Overview (3 steps: install, init, launch)
+2. Update Installation section (keep "From source" details)
+3. Replace manual Quick Start with bork init as primary flow
+4. Document bork init under Usage/Commands
+5. Note that bork init auto-installs hooks
 
 ## Progress
 
-- [ ] Worktree created
-- [ ] Feature 1 tests: auto-move to InProgress
-- [ ] Feature 2 tests: done_at + TTL + cleanup
-- [ ] Feature 3 tests: git polling skip + frozen status
-- [ ] Existing logic tests: parse_git_status, Column, serde compat
-- [ ] All tests compile and fail correctly
+- [x] Created worktree
+- [ ] Rewrite README
+- [ ] Verify markdown renders correctly
 
 ## Notes
 
-TDD approach: write tests first, then implement features to make them pass.
-Three features:
-1. Auto-move issue from Todo -> InProgress when starting a session (Enter key)
-2. Auto-kill tmux sessions for Done issues after configurable TTL (default 5 min)
-3. Stop git polling for Done worktrees, freeze their last-known status
+- Target reader: someone who has never used bork, first-time install
+- Build from source is fine for v1
+- bork init is the primary onboarding flow
