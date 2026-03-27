@@ -38,36 +38,14 @@ pub fn launch_session(issue: &Issue, config: &AppConfig) -> Result<String, AppEr
     let status_dir = config::agent_status_dir(&config.project_root);
     let status_dir_str = status_dir.to_str().unwrap_or("");
 
-    let agent_cmd = match issue.agent_kind {
-        AgentKind::OpenCode => {
-            // opencode does not support --name
-            let mode_flag = match issue.agent_mode {
-                AgentMode::Plan => " --agent plan",
-                AgentMode::Build => "",
-            };
-            format!(
-                "export BORK_SESSION='{}' BORK_STATUS_DIR='{}' && opencode --prompt '{}'{}",
-                shell_escape_single_quotes(&session_name),
-                shell_escape_single_quotes(status_dir_str),
-                escaped_prompt,
-                mode_flag,
-            )
-        }
-        AgentKind::Claude => {
-            let mode_flag = match issue.agent_mode {
-                AgentMode::Plan => " --permission-mode plan",
-                AgentMode::Build => "",
-            };
-            format!(
-                "export BORK_SESSION='{}' BORK_STATUS_DIR='{}' && claude --name '{}'{} '{}'",
-                shell_escape_single_quotes(&session_name),
-                shell_escape_single_quotes(status_dir_str),
-                escaped_name,
-                mode_flag,
-                escaped_prompt,
-            )
-        }
-    };
+    let agent_cmd = build_agent_cmd(
+        issue.agent_kind,
+        issue.agent_mode,
+        &session_name,
+        status_dir_str,
+        &escaped_name,
+        &escaped_prompt,
+    );
     tmux::send_keys(&session_name, &agent_cmd)?;
 
     // Second window: bare terminal for ad-hoc commands
@@ -91,6 +69,45 @@ fn build_prompt(id: &str, title: &str, default_prompt: &str, user_prompt: Option
     }
 
     prompt
+}
+
+/// Build the shell command that launches the agent in the tmux session.
+fn build_agent_cmd(
+    agent_kind: AgentKind,
+    agent_mode: AgentMode,
+    session_name: &str,
+    status_dir: &str,
+    escaped_name: &str,
+    escaped_prompt: &str,
+) -> String {
+    let escaped_session = shell_escape_single_quotes(session_name);
+    let escaped_status_dir = shell_escape_single_quotes(status_dir);
+
+    match agent_kind {
+        AgentKind::OpenCode => {
+            // opencode does not support --name
+            let mode_flag = match agent_mode {
+                AgentMode::Plan => " --agent plan",
+                // Yolo is Claude-only; treat as build for OpenCode
+                AgentMode::Build | AgentMode::Yolo => "",
+            };
+            format!(
+                "export BORK_SESSION='{}' BORK_STATUS_DIR='{}' && opencode --prompt '{}'{}",
+                escaped_session, escaped_status_dir, escaped_prompt, mode_flag,
+            )
+        }
+        AgentKind::Claude => {
+            let mode_flag = match agent_mode {
+                AgentMode::Plan => " --permission-mode plan",
+                AgentMode::Yolo => " --dangerously-skip-permissions",
+                AgentMode::Build => "",
+            };
+            format!(
+                "export BORK_SESSION='{}' BORK_STATUS_DIR='{}' && claude --name '{}'{} '{}'",
+                escaped_session, escaped_status_dir, escaped_name, mode_flag, escaped_prompt,
+            )
+        }
+    }
 }
 
 /// Escape a string for use inside single quotes in a shell command.
@@ -186,5 +203,105 @@ mod tests {
     #[test]
     fn shell_escape_with_single_quotes() {
         assert_eq!(shell_escape_single_quotes("it's a test"), "it'\\''s a test");
+    }
+
+    // --- build_agent_cmd ---
+
+    #[test]
+    fn claude_plan_mode_uses_permission_mode_flag() {
+        let cmd = build_agent_cmd(
+            AgentKind::Claude,
+            AgentMode::Plan,
+            "bork-bork-1",
+            "/tmp/status",
+            "bork-1: Fix auth",
+            "Do the work",
+        );
+        assert!(cmd.contains("--permission-mode plan"));
+        assert!(!cmd.contains("--dangerously-skip-permissions"));
+    }
+
+    #[test]
+    fn claude_build_mode_has_no_mode_flag() {
+        let cmd = build_agent_cmd(
+            AgentKind::Claude,
+            AgentMode::Build,
+            "bork-bork-1",
+            "/tmp/status",
+            "bork-1: Fix auth",
+            "Do the work",
+        );
+        assert!(!cmd.contains("--permission-mode"));
+        assert!(!cmd.contains("--dangerously-skip-permissions"));
+    }
+
+    #[test]
+    fn claude_yolo_mode_uses_dangerously_skip_permissions() {
+        let cmd = build_agent_cmd(
+            AgentKind::Claude,
+            AgentMode::Yolo,
+            "bork-bork-1",
+            "/tmp/status",
+            "bork-1: Fix auth",
+            "Do the work",
+        );
+        assert!(cmd.contains("--dangerously-skip-permissions"));
+        assert!(!cmd.contains("--permission-mode"));
+    }
+
+    #[test]
+    fn claude_cmd_includes_name_and_prompt() {
+        let cmd = build_agent_cmd(
+            AgentKind::Claude,
+            AgentMode::Build,
+            "bork-bork-1",
+            "/tmp/status",
+            "bork-1: Fix auth",
+            "Do the work",
+        );
+        assert!(cmd.contains("claude --name 'bork-1: Fix auth'"));
+        assert!(cmd.contains("'Do the work'"));
+    }
+
+    #[test]
+    fn opencode_plan_mode_uses_agent_plan_flag() {
+        let cmd = build_agent_cmd(
+            AgentKind::OpenCode,
+            AgentMode::Plan,
+            "bork-bork-1",
+            "/tmp/status",
+            "bork-1: Fix auth",
+            "Do the work",
+        );
+        assert!(cmd.contains("--agent plan"));
+    }
+
+    #[test]
+    fn opencode_yolo_mode_treated_as_build() {
+        let cmd = build_agent_cmd(
+            AgentKind::OpenCode,
+            AgentMode::Yolo,
+            "bork-bork-1",
+            "/tmp/status",
+            "bork-1: Fix auth",
+            "Do the work",
+        );
+        assert!(!cmd.contains("--agent plan"));
+        assert!(!cmd.contains("--dangerously-skip-permissions"));
+        assert!(cmd.contains("opencode --prompt"));
+    }
+
+    #[test]
+    fn opencode_cmd_has_no_name_flag() {
+        let cmd = build_agent_cmd(
+            AgentKind::OpenCode,
+            AgentMode::Build,
+            "bork-bork-1",
+            "/tmp/status",
+            "bork-1: Fix auth",
+            "Do the work",
+        );
+        assert!(!cmd.contains("--name"));
+        assert!(cmd.contains("opencode --prompt"));
     }
 }

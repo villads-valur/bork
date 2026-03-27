@@ -3,7 +3,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::{AppConfig, AppState};
 use crate::types::{
-    AgentMode, AgentStatus, AgentStatusInfo, Column, Issue, PrStatus, WorktreeStatus,
+    AgentKind, AgentMode, AgentStatus, AgentStatusInfo, Column, Issue, PrStatus, WorktreeStatus,
 };
 
 fn unix_now() -> u64 {
@@ -31,16 +31,18 @@ pub struct DialogState {
     pub title: String,
     pub prompt: String,
     pub agent_mode: AgentMode,
+    pub agent_kind: AgentKind,
     pub focused_field: usize, // 0=title, 1=prompt, 2=mode
     pub editing_index: Option<usize>,
 }
 
 impl DialogState {
-    pub fn new() -> Self {
+    pub fn new(agent_kind: AgentKind) -> Self {
         DialogState {
             title: String::new(),
             prompt: String::new(),
             agent_mode: AgentMode::Plan,
+            agent_kind,
             focused_field: 0,
             editing_index: None,
         }
@@ -51,6 +53,7 @@ impl DialogState {
             title: issue.title.clone(),
             prompt: issue.prompt.clone().unwrap_or_default(),
             agent_mode: issue.agent_mode,
+            agent_kind: issue.agent_kind,
             focused_field: 0,
             editing_index: Some(index),
         }
@@ -62,7 +65,10 @@ impl DialogState {
             1 => self.prompt.push(c),
             2 => {
                 if c == ' ' || c == 'h' || c == 'l' {
-                    self.agent_mode = self.agent_mode.toggle();
+                    self.agent_mode = match self.agent_kind {
+                        AgentKind::Claude => self.agent_mode.next_for_claude(),
+                        AgentKind::OpenCode => self.agent_mode.toggle(),
+                    };
                 }
             }
             _ => {}
@@ -512,7 +518,7 @@ impl App {
     // --- Dialog ---
 
     pub fn open_dialog(&mut self) {
-        self.dialog = Some(DialogState::new());
+        self.dialog = Some(DialogState::new(self.config.agent_kind));
         self.input_mode = InputMode::Dialog;
     }
 
@@ -1020,6 +1026,70 @@ mod tests {
         let issues = app.issues.clone();
         assert_eq!(app.pr_for(&issues[0]).unwrap().number, 10);
         assert_eq!(app.pr_for(&issues[1]).unwrap().number, 20);
+    }
+
+    // ================================================================
+    // DialogState: mode cycling (field 2 = mode in our 3-field dialog)
+    // ================================================================
+
+    fn claude_dialog() -> DialogState {
+        DialogState::new(crate::types::AgentKind::Claude)
+    }
+
+    fn opencode_dialog() -> DialogState {
+        DialogState::new(crate::types::AgentKind::OpenCode)
+    }
+
+    #[test]
+    fn dialog_claude_mode_cycles_plan_build_yolo() {
+        let mut d = claude_dialog();
+        assert_eq!(d.agent_mode, crate::types::AgentMode::Plan);
+        d.focused_field = 2;
+        d.push_char(' ');
+        assert_eq!(d.agent_mode, crate::types::AgentMode::Build);
+        d.push_char(' ');
+        assert_eq!(d.agent_mode, crate::types::AgentMode::Yolo);
+        d.push_char(' ');
+        assert_eq!(d.agent_mode, crate::types::AgentMode::Plan);
+    }
+
+    #[test]
+    fn dialog_opencode_mode_cycles_plan_build_only() {
+        let mut d = opencode_dialog();
+        d.focused_field = 2;
+        d.push_char(' ');
+        assert_eq!(d.agent_mode, crate::types::AgentMode::Build);
+        d.push_char(' ');
+        assert_eq!(d.agent_mode, crate::types::AgentMode::Plan);
+        d.push_char(' ');
+        assert_eq!(d.agent_mode, crate::types::AgentMode::Build);
+    }
+
+    #[test]
+    fn dialog_mode_toggle_with_h_and_l_keys() {
+        let mut d = claude_dialog();
+        d.focused_field = 2;
+        d.push_char('l');
+        assert_eq!(d.agent_mode, crate::types::AgentMode::Build);
+        d.push_char('h');
+        assert_eq!(d.agent_mode, crate::types::AgentMode::Yolo);
+    }
+
+    #[test]
+    fn dialog_new_uses_config_agent_kind() {
+        let config = test_config();
+        let d = DialogState::new(config.agent_kind);
+        assert_eq!(d.agent_kind, crate::types::AgentKind::OpenCode);
+    }
+
+    #[test]
+    fn dialog_from_issue_preserves_agent_kind() {
+        let mut issue = test_issue("bork-1", Column::Todo);
+        issue.agent_kind = crate::types::AgentKind::Claude;
+        issue.agent_mode = crate::types::AgentMode::Yolo;
+        let d = DialogState::from_issue(&issue, 0);
+        assert_eq!(d.agent_kind, crate::types::AgentKind::Claude);
+        assert_eq!(d.agent_mode, crate::types::AgentMode::Yolo);
     }
 
     // ================================================================

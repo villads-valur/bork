@@ -65,7 +65,7 @@ Press `n` to create an issue, `Enter` to launch an agent session. You're up and 
 - **GitHub PR status** &mdash; Background polling shows checks, review status, and diff stats on cards
 - **Git worktree tracking** &mdash; Live staged/unstaged change counts and branch names
 - **Tmux integration** &mdash; Auto-wraps in tmux, sessions open as 90% screen popups
-- **Plan and Build modes** &mdash; Toggle between planning and building per issue
+- **Plan, Build, and Yolo modes** &mdash; Toggle between modes per issue; Claude also supports Yolo (skips all permission prompts)
 - **Vim-style navigation** &mdash; h/j/k/l, g/G, and familiar modal keybindings
 - **ANSI 16 colors** &mdash; Adapts to any terminal theme, no hardcoded RGB
 - **Zero-dependency state** &mdash; JSON file persistence with atomic writes, no database
@@ -190,7 +190,7 @@ These are installed automatically by `bork init`. Use `bork install` / `bork uni
 | `Shift+Tab` | Previous field |
 | `Shift+Enter` | Submit from any field |
 | `Esc` / `Ctrl+c` | Cancel |
-| `Space` / `h` / `l` | Toggle Plan/Build mode (on mode field) |
+| `Space` / `h` / `l` | Cycle mode: Plan → Build (→ Yolo for Claude) |
 
 ### Confirm Mode
 

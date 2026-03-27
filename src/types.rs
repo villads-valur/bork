@@ -81,13 +81,25 @@ impl fmt::Display for AgentKind {
 pub enum AgentMode {
     Plan,
     Build,
+    /// Claude-only: launches with --dangerously-skip-permissions
+    Yolo,
 }
 
 impl AgentMode {
+    /// Cycles Plan → Build → Plan (for OpenCode, which has no yolo mode).
     pub fn toggle(self) -> Self {
         match self {
             AgentMode::Plan => AgentMode::Build,
-            AgentMode::Build => AgentMode::Plan,
+            AgentMode::Build | AgentMode::Yolo => AgentMode::Plan,
+        }
+    }
+
+    /// Cycles Plan → Build → Yolo → Plan (for Claude).
+    pub fn next_for_claude(self) -> Self {
+        match self {
+            AgentMode::Plan => AgentMode::Build,
+            AgentMode::Build => AgentMode::Yolo,
+            AgentMode::Yolo => AgentMode::Plan,
         }
     }
 }
@@ -97,6 +109,7 @@ impl fmt::Display for AgentMode {
         match self {
             AgentMode::Plan => write!(f, "plan"),
             AgentMode::Build => write!(f, "build"),
+            AgentMode::Yolo => write!(f, "yolo"),
         }
     }
 }
@@ -440,6 +453,34 @@ mod tests {
         }"#;
         let issue: Issue = serde_json::from_str(json).unwrap();
         assert_eq!(issue.id, "bork-1");
+    }
+
+    // --- AgentMode ---
+
+    #[test]
+    fn agent_mode_toggle_cycles_plan_build() {
+        assert_eq!(AgentMode::Plan.toggle(), AgentMode::Build);
+        assert_eq!(AgentMode::Build.toggle(), AgentMode::Plan);
+    }
+
+    #[test]
+    fn agent_mode_toggle_yolo_returns_to_plan() {
+        // Yolo falls back to Plan via toggle (OpenCode path)
+        assert_eq!(AgentMode::Yolo.toggle(), AgentMode::Plan);
+    }
+
+    #[test]
+    fn agent_mode_next_for_claude_full_cycle() {
+        assert_eq!(AgentMode::Plan.next_for_claude(), AgentMode::Build);
+        assert_eq!(AgentMode::Build.next_for_claude(), AgentMode::Yolo);
+        assert_eq!(AgentMode::Yolo.next_for_claude(), AgentMode::Plan);
+    }
+
+    #[test]
+    fn agent_mode_display() {
+        assert_eq!(AgentMode::Plan.to_string(), "plan");
+        assert_eq!(AgentMode::Build.to_string(), "build");
+        assert_eq!(AgentMode::Yolo.to_string(), "yolo");
     }
 
     // --- AgentStatus ---
