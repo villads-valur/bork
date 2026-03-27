@@ -113,13 +113,6 @@ pub enum AgentStatus {
 }
 
 impl AgentStatus {
-    pub fn needs_attention(self) -> bool {
-        matches!(
-            self,
-            Self::WaitingInput | Self::WaitingPermission | Self::WaitingApproval
-        )
-    }
-
     pub fn symbol(self) -> &'static str {
         match self {
             Self::Stopped => "◌",
