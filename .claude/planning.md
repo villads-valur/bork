@@ -4,31 +4,34 @@
 
 ## Active Task
 
-**Task:** TDD test suite for session lifecycle features
+**Task:** Vim-style incremental search for issue titles
 **Status:** In Progress
 
 ## Plan
 
-1. Write failing tests for auto-move to In Progress on session start
-2. Write failing tests for Done session TTL (done_at timestamp, config parsing, cleanup logic)
-3. Write failing tests for git polling skip/freeze for Done issues
-4. Write tests for existing pure functions (parse_git_status, Column nav, Issue serde)
-5. Verify all tests compile and fail for expected reasons
-6. Hand off to implementation phase
+1. Add search action variants to `input/action.rs`
+2. Add `InputMode::Search`, `search_query` field, and search helpers to `app.rs`
+3. Modify `issues_in_column()` to filter by search query
+4. Wire up keybindings in `input/keybindings.rs` (`/`, Esc, char input)
+5. Add search action handling in `handler.rs`
+6. Render search query in footer (`ui/status_bar.rs`)
+7. Build + verify with `cargo check` and `cargo clippy`
 
 ## Progress
 
-- [ ] Worktree created
-- [ ] Feature 1 tests: auto-move to InProgress
-- [ ] Feature 2 tests: done_at + TTL + cleanup
-- [ ] Feature 3 tests: git polling skip + frozen status
-- [ ] Existing logic tests: parse_git_status, Column, serde compat
-- [ ] All tests compile and fail correctly
+- [ ] action.rs — add SearchStart, SearchChar, SearchBackspace, SearchConfirm, SearchCancel, ClearSearch
+- [ ] app.rs — InputMode::Search, search_query field, filtered issues_in_column, helpers
+- [ ] keybindings.rs — map_search_key, `/` in normal, Esc in normal
+- [ ] handler.rs — handle_search, ClearSearch in normal mode
+- [ ] status_bar.rs — search prompt in footer
+- [ ] cargo check + clippy
 
 ## Notes
 
-TDD approach: write tests first, then implement features to make them pass.
-Three features:
-1. Auto-move issue from Todo -> InProgress when starting a session (Enter key)
-2. Auto-kill tmux sessions for Done issues after configurable TTL (default 5 min)
-3. Stop git polling for Done worktrees, freeze their last-known status
+- Filter mode: non-matching issues hidden from board while search active
+- Incremental: filter updates as you type
+- Search scope: all columns, title-only match (case-insensitive)
+- Esc clears search from any mode
+- `/` starts search, Enter confirms (returns to normal with filter active)
+- `n` stays mapped to CreateIssue (no conflict since we use filter, not jump)
+- Esc in normal mode always emits ClearSearch; handler ignores when no search active

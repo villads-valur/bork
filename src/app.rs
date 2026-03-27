@@ -16,6 +16,7 @@ pub enum InputMode {
     Normal,
     Confirm,
     Dialog,
+    Search,
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +109,7 @@ pub struct App {
     pub message_set_at: Option<Instant>,
     pub busy_count: usize,
     pub spinner_tick: usize,
+    pub search_query: String,
     pub config: AppConfig,
 }
 
@@ -140,15 +142,25 @@ impl App {
             message_set_at: None,
             busy_count: 0,
             spinner_tick: 0,
+            search_query: String::new(),
             config,
         }
     }
 
     pub fn issues_in_column(&self, column: Column) -> Vec<(usize, &Issue)> {
+        let query = self.search_query.to_lowercase();
         self.issues
             .iter()
             .enumerate()
-            .filter(|(_, issue)| issue.column == column)
+            .filter(|(_, issue)| {
+                if issue.column != column {
+                    return false;
+                }
+                if query.is_empty() {
+                    return true;
+                }
+                issue.title.to_lowercase().contains(&query)
+            })
             .collect()
     }
 
@@ -471,6 +483,44 @@ impl App {
         self.input_mode = InputMode::Normal;
         self.confirm_message = None;
         self.pending_confirm.take()
+    }
+
+    // --- Search ---
+
+    pub fn start_search(&mut self) {
+        self.search_query.clear();
+        self.input_mode = InputMode::Search;
+    }
+
+    pub fn search_push_char(&mut self, c: char) {
+        self.search_query.push(c);
+        self.clamp_all_rows();
+    }
+
+    pub fn search_delete_char(&mut self) {
+        self.search_query.pop();
+        self.clamp_all_rows();
+    }
+
+    pub fn confirm_search(&mut self) {
+        self.input_mode = InputMode::Normal;
+    }
+
+    pub fn cancel_search(&mut self) {
+        self.search_query.clear();
+        self.input_mode = InputMode::Normal;
+        self.clamp_all_rows();
+    }
+
+    pub fn clear_search(&mut self) {
+        if !self.search_query.is_empty() {
+            self.search_query.clear();
+            self.clamp_all_rows();
+        }
+    }
+
+    pub fn has_active_search(&self) -> bool {
+        !self.search_query.is_empty()
     }
 
     pub fn clamp_all_rows(&mut self) {

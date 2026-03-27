@@ -1,39 +1,31 @@
 # Decisions & Learnings
 
 > Last updated: 2026-03-27
->
-> Capture decisions, gotchas, and lessons learned for future reference.
 
 ## Key Decisions
 
-### Test structure: inline #[cfg(test)] modules
+### Filter mode over highlight+jump
 
-**Decision:** Put tests in `#[cfg(test)] mod tests` at the bottom of each source file
-**Rationale:** Idiomatic Rust, gives access to private functions, no new files needed
+**Decision:** Search hides non-matching issues rather than just highlighting matches
+**Rationale:** User preference, simpler UX for a kanban board context
 **Date:** 2026-03-27
 
-### TDD for new features, test existing pure functions too
+### Esc always emits ClearSearch in normal mode
 
-**Decision:** Write failing tests for the 3 new features plus tests for existing untested pure functions
-**Rationale:** Establishes test coverage baseline and validates new feature contracts before implementation
+**Decision:** Rather than passing app state to the keybinding mapper, Esc in normal mode always emits ClearSearch and the handler ignores it when no search is active
+**Rationale:** Keeps `map_key_to_action` signature simple (no app state dependency)
 **Date:** 2026-03-27
 
-### done_at as Option<u64> on Issue struct
+### No n/N cycling
 
-**Decision:** Track when an issue moved to Done via a unix timestamp on the Issue struct
-**Rationale:** Persisted across restarts, simple, no separate tracking needed
-**Date:** 2026-03-27
-
-### done_session_ttl configurable, default 300s
-
-**Decision:** Add done_session_ttl to config.toml, default 5 minutes
-**Rationale:** Different projects may want different cleanup windows
+**Decision:** No next/prev match cycling since filter mode makes it unnecessary
+**Rationale:** With filtering, j/k navigation works naturally. Avoids remapping `n` from CreateIssue
 **Date:** 2026-03-27
 
 ## Gotchas & Warnings
 
-- Tests that reference new fields (done_at) or new config fields (done_session_ttl) will fail to compile until the struct changes are made
-- Need to ensure backwards compat: deserializing old state.json without done_at should default to None
+- `issues_in_column()` is used everywhere (navigation, rendering, selection) so filtering there propagates automatically
+- `clamp_all_rows()` must be called whenever search_query changes to prevent out-of-bounds selection
 
 ## Lessons Learned
 
