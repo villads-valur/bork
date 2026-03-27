@@ -13,6 +13,8 @@ pub enum Action {
     MoveIssueRight,
     ScrollToTop,
     ScrollToBottom,
+    SyncPRs,
+    OpenPR,
     CreateIssue,
     EditIssue,
     DeleteIssue,

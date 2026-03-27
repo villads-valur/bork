@@ -199,3 +199,49 @@ impl Issue {
         format!("bork-{}", self.id.to_lowercase())
     }
 }
+
+// --- PR types (ephemeral, not persisted) ---
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrState {
+    Open,
+    Closed,
+    Merged,
+}
+
+impl fmt::Display for PrState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PrState::Open => write!(f, "open"),
+            PrState::Closed => write!(f, "closed"),
+            PrState::Merged => write!(f, "merged"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChecksStatus {
+    Success,
+    Failure,
+    Pending,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewDecision {
+    Approved,
+    ChangesRequested,
+    ReviewRequired,
+}
+
+#[derive(Debug, Clone)]
+pub struct PrStatus {
+    pub number: u32,
+    pub state: PrState,
+    pub is_draft: bool,
+    pub checks: Option<ChecksStatus>,
+    pub review: Option<ReviewDecision>,
+    pub additions: u32,
+    pub deletions: u32,
+    pub head_branch: String,
+}

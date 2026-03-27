@@ -65,7 +65,9 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     // Normal mode: show keybinding hints
-    let bindings = vec![
+    let has_pr = app.selected_issue().and_then(|i| app.pr_for(i)).is_some();
+
+    let mut bindings = vec![
         ("h/l", "focus"),
         ("j/k", "up/down"),
         ("Tab", "column"),
@@ -75,8 +77,14 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         ("d", "delete"),
         ("x", "kill"),
         ("H/L", "move"),
-        ("q", "quit"),
+        ("P", "sync prs"),
     ];
+
+    if has_pr {
+        bindings.push(("o", "open pr"));
+    }
+
+    bindings.push(("q", "quit"));
 
     let mut spans = vec![Span::raw(" ")];
     for (i, (key, desc)) in bindings.iter().enumerate() {

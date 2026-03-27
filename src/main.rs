@@ -12,7 +12,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::{
     event::{self, Event, KeyEventKind},
@@ -27,10 +27,12 @@ use input::map_key_to_action;
 use types::AgentStatusInfo;
 
 use external::git::GitPollResult;
+use types::PrStatus;
 
 const TICK_RATE: Duration = Duration::from_millis(50);
 const TMUX_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const GIT_POLL_INTERVAL: Duration = Duration::from_secs(3);
+const PR_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 struct SessionPollResult {
     sessions: HashSet<String>,
@@ -94,6 +96,38 @@ fn spawn_git_status_worker(project_root: PathBuf) -> mpsc::Receiver<GitPollResul
     rx
 }
 
+/// PR poll worker with wake-up support for force-sync.
+/// The wake_rx channel allows the main thread to trigger an immediate poll.
+fn spawn_pr_poll_worker(
+    main_worktree: PathBuf,
+    wake_rx: mpsc::Receiver<()>,
+) -> mpsc::Receiver<HashMap<String, PrStatus>> {
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || loop {
+        let prs = external::github::fetch_open_prs(&main_worktree);
+        let indexed = external::github::index_by_branch(prs);
+        if tx.send(indexed).is_err() {
+            break;
+        }
+
+        // Sleep in small increments so we can wake up early for force-sync
+        let deadline = Instant::now() + PR_POLL_INTERVAL;
+        loop {
+            if Instant::now() >= deadline {
+                break;
+            }
+            match wake_rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(()) => break, // Force-sync requested
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return, // Main thread dropped
+            }
+        }
+    });
+
+    rx
+}
+
 fn main() -> anyhow::Result<()> {
     // --- CLI subcommands ---
     let args: Vec<String> = std::env::args().collect();
@@ -139,6 +173,9 @@ fn main() -> anyhow::Result<()> {
     let status_dir = config::agent_status_dir(&app.config.project_root);
     let session_rx = spawn_session_status_worker(status_dir);
     let git_rx = spawn_git_status_worker(app.config.project_root.clone());
+    let (pr_wake_tx, pr_wake_rx) = mpsc::channel::<()>();
+    let main_worktree = app.config.project_root.join("main");
+    let pr_rx = spawn_pr_poll_worker(main_worktree, pr_wake_rx);
 
     let mut pending_popup_session: Option<String> = None;
     let mut pending_popup_for_launch: Option<usize> = None;
@@ -154,7 +191,8 @@ fn main() -> anyhow::Result<()> {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
                         let action = map_key_to_action(key, app.input_mode);
-                        let post_action = handler::handle_action(&mut app, action, &action_tx);
+                        let post_action =
+                            handler::handle_action(&mut app, action, &action_tx, &pr_wake_tx);
 
                         match post_action {
                             PostAction::None => {}
@@ -204,6 +242,10 @@ fn main() -> anyhow::Result<()> {
         while let Ok(git_result) = git_rx.try_recv() {
             app.worktree_statuses = git_result.statuses;
             app.worktree_branches = git_result.branches;
+        }
+
+        while let Ok(pr_result) = pr_rx.try_recv() {
+            app.pr_statuses = pr_result;
         }
 
         if app.busy_count > 0 {

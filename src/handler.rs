@@ -4,9 +4,11 @@ use std::thread;
 
 use crate::app::{App, ConfirmAction, InputMode, DIALOG_FIELD_COUNT};
 use crate::config::{self, AppConfig};
-use crate::external::{opencode, tmux};
+use crate::external::{github, opencode, tmux};
 use crate::input::Action;
 use crate::types::{AgentStatus, Column, Issue};
+
+pub type PrWakeTx = mpsc::Sender<()>;
 
 pub struct ActionResult {
     pub message: String,
@@ -23,6 +25,7 @@ pub fn handle_action(
     app: &mut App,
     action: Action,
     action_tx: &mpsc::Sender<ActionResult>,
+    pr_wake_tx: &PrWakeTx,
 ) -> PostAction {
     match app.input_mode {
         InputMode::Confirm => {
@@ -33,7 +36,7 @@ pub fn handle_action(
             handle_dialog(app, action);
             PostAction::None
         }
-        InputMode::Normal => handle_normal(app, action, action_tx),
+        InputMode::Normal => handle_normal(app, action, action_tx, pr_wake_tx),
     }
 }
 
@@ -41,6 +44,7 @@ fn handle_normal(
     app: &mut App,
     action: Action,
     action_tx: &mpsc::Sender<ActionResult>,
+    pr_wake_tx: &PrWakeTx,
 ) -> PostAction {
     match action {
         Action::Quit => {
@@ -167,6 +171,28 @@ fn handle_normal(
                 return PostAction::LaunchAndOpenPopup { issue_index: idx };
             }
 
+            PostAction::None
+        }
+
+        Action::SyncPRs => {
+            let _ = pr_wake_tx.send(());
+            app.set_message("Syncing PRs...");
+            PostAction::None
+        }
+
+        Action::OpenPR => {
+            let Some(issue) = app.selected_issue() else {
+                return PostAction::None;
+            };
+            let Some(pr) = app.pr_for(issue) else {
+                app.set_message("No PR found for this issue");
+                return PostAction::None;
+            };
+            let pr_number = pr.number;
+            let main_worktree = app.config.project_root.join("main");
+            thread::spawn(move || {
+                github::open_pr_in_browser(pr_number, &main_worktree);
+            });
             PostAction::None
         }
 

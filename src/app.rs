@@ -2,7 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use crate::config::{AppConfig, AppState};
-use crate::types::{AgentMode, AgentStatus, AgentStatusInfo, Column, Issue, WorktreeStatus};
+use crate::types::{
+    AgentMode, AgentStatus, AgentStatusInfo, Column, Issue, PrStatus, WorktreeStatus,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
@@ -90,6 +92,7 @@ pub struct App {
     pub agent_statuses: HashMap<String, AgentStatusInfo>,
     pub worktree_statuses: HashMap<String, WorktreeStatus>,
     pub worktree_branches: HashMap<String, String>,
+    pub pr_statuses: HashMap<String, PrStatus>,
     pub input_mode: InputMode,
     pub confirm_message: Option<String>,
     pub pending_confirm: Option<ConfirmAction>,
@@ -112,6 +115,7 @@ impl App {
             agent_statuses: HashMap::new(),
             worktree_statuses: HashMap::new(),
             worktree_branches: HashMap::new(),
+            pr_statuses: HashMap::new(),
             input_mode: InputMode::Normal,
             confirm_message: None,
             pending_confirm: None,
@@ -331,6 +335,11 @@ impl App {
             .as_ref()
             .and_then(|w| self.worktree_branches.get(w))
             .map(|s| s.as_str())
+    }
+
+    pub fn pr_for(&self, issue: &Issue) -> Option<&PrStatus> {
+        let branch = self.branch_for(issue)?;
+        self.pr_statuses.get(branch)
     }
 
     // --- Dialog ---

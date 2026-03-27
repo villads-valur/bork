@@ -4,10 +4,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-use crate::types::{AgentStatus, Issue, WorktreeStatus};
+use crate::types::{AgentStatus, Issue, PrStatus, WorktreeStatus};
 use crate::ui::styles;
 
-pub const CARD_HEIGHT: u16 = 4;
+pub const CARD_HEIGHT: u16 = 5;
 
 pub struct CardContext<'a> {
     pub issue: &'a Issue,
@@ -17,6 +17,7 @@ pub struct CardContext<'a> {
     pub activity: Option<&'a str>,
     pub branch: Option<&'a str>,
     pub git_status: Option<&'a WorktreeStatus>,
+    pub pr: Option<&'a PrStatus>,
 }
 
 pub fn render_card(frame: &mut Frame, ctx: &CardContext, area: Rect) {
@@ -91,6 +92,9 @@ pub fn render_card(frame: &mut Frame, ctx: &CardContext, area: Rect) {
     if inner.height > 1 {
         lines.push(status_line);
     }
+    if inner.height > 2 {
+        lines.push(format_pr_line(ctx.pr, inner.width as usize));
+    }
 
     let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, inner);
@@ -126,6 +130,43 @@ fn format_git_status(status: Option<&WorktreeStatus>) -> Vec<Span<'static>> {
     }
 
     spans
+}
+
+fn format_pr_line(pr: Option<&PrStatus>, _max_width: usize) -> Line<'static> {
+    let Some(pr) = pr else {
+        return Line::from("");
+    };
+
+    let (checks_sym, checks_color) = styles::checks_icon(pr.checks);
+    let (review_sym, review_color) = styles::review_icon(pr.review);
+
+    let mut spans = vec![
+        Span::styled(format!("#{}", pr.number), styles::dim_style()),
+        Span::raw(" "),
+        Span::styled(checks_sym, Style::default().fg(checks_color)),
+        Span::raw(" "),
+        Span::styled(review_sym, Style::default().fg(review_color)),
+    ];
+
+    if pr.additions > 0 || pr.deletions > 0 {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!("+{}", pr.additions),
+            Style::default().fg(Color::Green),
+        ));
+        spans.push(Span::styled("/", styles::dim_style()));
+        spans.push(Span::styled(
+            format!("-{}", pr.deletions),
+            Style::default().fg(Color::Red),
+        ));
+    }
+
+    if pr.is_draft {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled("draft", styles::dim_style()));
+    }
+
+    Line::from(spans)
 }
 
 fn truncate(s: &str, max: usize) -> String {
