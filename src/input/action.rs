@@ -24,5 +24,12 @@ pub enum Action {
     DialogPrevField,
     DialogSubmit,
     DialogCancel,
+    OpenLinearPicker,
+    LinearPickerDown,
+    LinearPickerUp,
+    LinearPickerSelect,
+    LinearPickerClose,
+    LinearPickerChar(char),
+    LinearPickerBackspace,
     Noop,
 }

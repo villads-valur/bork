@@ -33,6 +33,10 @@ pub fn handle_action(
             handle_dialog(app, action);
             PostAction::None
         }
+        InputMode::LinearPicker => {
+            handle_linear_picker(app, action);
+            PostAction::None
+        }
         InputMode::Normal => handle_normal(app, action, action_tx),
     }
 }
@@ -137,6 +141,11 @@ fn handle_normal(
                 format!("Delete {}: {}? (y/n)", issue.id, issue.title),
                 ConfirmAction::DeleteIssue { issue_index: idx },
             );
+            PostAction::None
+        }
+
+        Action::OpenLinearPicker => {
+            app.open_linear_picker();
             PostAction::None
         }
 
@@ -286,6 +295,11 @@ fn submit_dialog(app: &mut App) {
         agent_status: AgentStatus::Stopped,
         prompt,
         done_at: None,
+        linear_id: None,
+        linear_identifier: None,
+        linear_url: None,
+        linear_state: None,
+        linear_branch: None,
     };
 
     app.issues.push(issue);
@@ -294,6 +308,110 @@ fn submit_dialog(app: &mut App) {
     let count = app.issues_in_column(column).len();
     if count > 0 {
         app.selected_row[app.selected_column] = count - 1;
+    }
+
+    let _ = config::save_state(&app.to_state(), &app.config.project_root);
+}
+
+fn handle_linear_picker(app: &mut App, action: Action) {
+    match action {
+        Action::LinearPickerClose => {
+            app.close_linear_picker();
+        }
+        Action::LinearPickerDown => {
+            let count = app.filtered_linear_issues().len();
+            if let Some(ref mut picker) = app.linear_picker {
+                if count > 0 && picker.selected < count - 1 {
+                    picker.selected += 1;
+                }
+            }
+        }
+        Action::LinearPickerUp => {
+            if let Some(ref mut picker) = app.linear_picker {
+                if picker.selected > 0 {
+                    picker.selected -= 1;
+                }
+            }
+        }
+        Action::LinearPickerChar(c) => {
+            if let Some(ref mut picker) = app.linear_picker {
+                picker.search.push(c);
+                picker.selected = 0;
+                picker.scroll_offset = 0;
+            }
+        }
+        Action::LinearPickerBackspace => {
+            if let Some(ref mut picker) = app.linear_picker {
+                picker.search.pop();
+                picker.selected = 0;
+                picker.scroll_offset = 0;
+            }
+        }
+        Action::LinearPickerSelect => {
+            import_linear_issue(app);
+        }
+        _ => {}
+    }
+}
+
+fn import_linear_issue(app: &mut App) {
+    let filtered = app.filtered_linear_issues();
+    let selected_idx = app.linear_picker.as_ref().map(|p| p.selected).unwrap_or(0);
+
+    let linear_issue = match filtered.get(selected_idx) {
+        Some(i) => (*i).clone(),
+        None => return,
+    };
+
+    // Use the Linear identifier as the bork issue ID (e.g. "BORK-14")
+    let id = linear_issue.identifier.to_lowercase();
+
+    // Check for collision
+    if app.issues.iter().any(|i| i.id == id) {
+        app.set_message(format!(
+            "{} is already on the board",
+            linear_issue.identifier
+        ));
+        app.close_linear_picker();
+        return;
+    }
+
+    let issue = Issue {
+        id,
+        title: linear_issue.title.clone(),
+        column: Column::Todo,
+        branch: if linear_issue.branch_name.is_empty() {
+            None
+        } else {
+            Some(linear_issue.branch_name.clone())
+        },
+        worktree: None,
+        tmux_session: None,
+        agent_kind: app.config.agent_kind,
+        agent_mode: crate::types::AgentMode::Plan,
+        agent_status: AgentStatus::Stopped,
+        prompt: None,
+        done_at: None,
+        linear_id: Some(linear_issue.id.clone()),
+        linear_identifier: Some(linear_issue.identifier.clone()),
+        linear_url: Some(linear_issue.url.clone()),
+        linear_state: Some(linear_issue.state_name.clone()),
+        linear_branch: if linear_issue.branch_name.is_empty() {
+            None
+        } else {
+            Some(linear_issue.branch_name.clone())
+        },
+    };
+
+    app.issues.push(issue);
+    app.set_message(format!("Imported {}", linear_issue.identifier));
+    app.close_linear_picker();
+
+    // Select the new issue in the Todo column
+    let count = app.issues_in_column(Column::Todo).len();
+    if count > 0 {
+        app.selected_column = 0;
+        app.selected_row[0] = count - 1;
     }
 
     let _ = config::save_state(&app.to_state(), &app.config.project_root);

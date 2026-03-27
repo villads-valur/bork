@@ -29,10 +29,12 @@ use input::map_key_to_action;
 use types::{AgentKind, AgentStatusInfo};
 
 use external::git::GitPollResult;
+use external::linear::LinearPollResult;
 
 const TICK_RATE: Duration = Duration::from_millis(50);
 const TMUX_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const GIT_POLL_INTERVAL: Duration = Duration::from_secs(3);
+const LINEAR_POLL_INTERVAL: Duration = Duration::from_secs(45);
 
 struct SessionPollResult {
     sessions: HashSet<String>,
@@ -95,6 +97,23 @@ fn spawn_git_status_worker(
             break;
         }
         thread::sleep(GIT_POLL_INTERVAL);
+    });
+
+    rx
+}
+
+fn spawn_linear_worker() -> mpsc::Receiver<LinearPollResult> {
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || loop {
+        let issues = match external::linear::fetch_assigned_issues() {
+            Ok(issues) => issues,
+            Err(_) => Vec::new(),
+        };
+        if tx.send(LinearPollResult { issues }).is_err() {
+            break;
+        }
+        thread::sleep(LINEAR_POLL_INTERVAL);
     });
 
     rx
@@ -202,6 +221,14 @@ fn run_tui() -> anyhow::Result<()> {
     let git_skip_set = Arc::new(Mutex::new(app.done_worktree_names()));
     let git_rx = spawn_git_status_worker(app.config.project_root.clone(), git_skip_set.clone());
 
+    // Linear: non-blocking availability check, poll worker starts only if CLI is found
+    let (linear_check_tx, linear_check_rx) = mpsc::channel::<bool>();
+    thread::spawn(move || {
+        let available = external::linear::check_available();
+        let _ = linear_check_tx.send(available);
+    });
+    let mut linear_rx: Option<mpsc::Receiver<LinearPollResult>> = None;
+
     let mut pending_popup_session: Option<String> = None;
     let mut pending_popup_for_launch: Option<usize> = None;
 
@@ -294,6 +321,26 @@ fn run_tui() -> anyhow::Result<()> {
         // --- Update git skip set for Done worktrees ---
         if let Ok(mut skip) = git_skip_set.lock() {
             *skip = app.done_worktree_names();
+        }
+
+        // --- Linear: check availability then consume poll results ---
+        if let Ok(true) = linear_check_rx.try_recv() {
+            app.linear_available = true;
+            linear_rx = Some(spawn_linear_worker());
+        }
+        if let Some(ref rx) = linear_rx {
+            while let Ok(result) = rx.try_recv() {
+                app.linear_issues = result.issues;
+                // Refresh metadata for issues already on the board
+                for issue in &mut app.issues {
+                    if let Some(ref lid) = issue.linear_id {
+                        if let Some(fresh) = app.linear_issues.iter().find(|i| i.id == *lid) {
+                            issue.linear_state = Some(fresh.state_name.clone());
+                            issue.title = fresh.title.clone();
+                        }
+                    }
+                }
+            }
         }
 
         if app.busy_count > 0 {

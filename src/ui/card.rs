@@ -7,7 +7,7 @@ use ratatui::Frame;
 use crate::types::{AgentStatus, Issue, WorktreeStatus};
 use crate::ui::styles;
 
-pub const CARD_HEIGHT: u16 = 4;
+pub const CARD_HEIGHT: u16 = 5;
 
 pub struct CardContext<'a> {
     pub issue: &'a Issue,
@@ -90,6 +90,23 @@ pub fn render_card(frame: &mut Frame, ctx: &CardContext, area: Rect) {
     let mut lines = vec![title_line];
     if inner.height > 1 {
         lines.push(status_line);
+    }
+
+    // Linear metadata line (if this is a Linear-sourced issue)
+    if inner.height > 2 {
+        if let Some(ref identifier) = ctx.issue.linear_identifier {
+            let mut spans = vec![Span::styled(
+                format!("\u{25c8} {}", identifier),
+                Style::default().fg(Color::Blue),
+            )];
+            if let Some(ref state) = ctx.issue.linear_state {
+                spans.push(Span::styled(
+                    format!(" \u{25cf} {}", state),
+                    styles::dim_style(),
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
     }
 
     let paragraph = Paragraph::new(lines);

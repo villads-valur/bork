@@ -49,8 +49,8 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    // Dialog mode: footer is handled by the dialog overlay itself
-    if app.input_mode == InputMode::Dialog {
+    // Dialog/picker mode: footer is handled by the overlay itself
+    if app.input_mode == InputMode::Dialog || app.input_mode == InputMode::LinearPicker {
         return;
     }
 
@@ -65,7 +65,7 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     // Normal mode: show keybinding hints
-    let bindings = vec![
+    let mut bindings = vec![
         ("h/l", "focus"),
         ("j/k", "up/down"),
         ("Tab", "column"),
@@ -75,8 +75,11 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         ("d", "delete"),
         ("x", "kill"),
         ("H/L", "move"),
-        ("q", "quit"),
     ];
+    if app.linear_available {
+        bindings.push(("I", "linear"));
+    }
+    bindings.push(("q", "quit"));
 
     let mut spans = vec![Span::raw(" ")];
     for (i, (key, desc)) in bindings.iter().enumerate() {

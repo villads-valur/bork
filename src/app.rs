@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::{AppConfig, AppState};
+use crate::external::linear::LinearIssue;
 use crate::types::{AgentMode, AgentStatus, AgentStatusInfo, Column, Issue, WorktreeStatus};
 
 fn unix_now() -> u64 {
@@ -16,6 +17,13 @@ pub enum InputMode {
     Normal,
     Confirm,
     Dialog,
+    LinearPicker,
+}
+
+pub struct LinearPickerState {
+    pub search: String,
+    pub selected: usize,
+    pub scroll_offset: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +117,9 @@ pub struct App {
     pub busy_count: usize,
     pub spinner_tick: usize,
     pub config: AppConfig,
+    pub linear_available: bool,
+    pub linear_issues: Vec<LinearIssue>,
+    pub linear_picker: Option<LinearPickerState>,
 }
 
 impl App {
@@ -141,6 +152,9 @@ impl App {
             busy_count: 0,
             spinner_tick: 0,
             config,
+            linear_available: false,
+            linear_issues: Vec::new(),
+            linear_picker: None,
         }
     }
 
@@ -432,6 +446,52 @@ impl App {
         self.input_mode = InputMode::Normal;
     }
 
+    // --- Linear Picker ---
+
+    pub fn open_linear_picker(&mut self) {
+        if self.linear_issues.is_empty() {
+            return;
+        }
+        self.linear_picker = Some(LinearPickerState {
+            search: String::new(),
+            selected: 0,
+            scroll_offset: 0,
+        });
+        self.input_mode = InputMode::LinearPicker;
+    }
+
+    pub fn close_linear_picker(&mut self) {
+        self.linear_picker = None;
+        self.input_mode = InputMode::Normal;
+    }
+
+    pub fn filtered_linear_issues(&self) -> Vec<&LinearIssue> {
+        let picker = match &self.linear_picker {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+
+        let existing_linear_ids: std::collections::HashSet<&str> = self
+            .issues
+            .iter()
+            .filter_map(|i| i.linear_id.as_deref())
+            .collect();
+
+        let query = picker.search.to_lowercase();
+        self.linear_issues
+            .iter()
+            .filter(|i| !existing_linear_ids.contains(i.id.as_str()))
+            .filter(|i| {
+                if query.is_empty() {
+                    return true;
+                }
+                i.title.to_lowercase().contains(&query)
+                    || i.identifier.to_lowercase().contains(&query)
+                    || i.team_key.to_lowercase().contains(&query)
+            })
+            .collect()
+    }
+
     // --- Issue ID generation ---
 
     pub fn next_issue_id(&self) -> String {
@@ -529,6 +589,11 @@ mod tests {
             agent_status: AgentStatus::Stopped,
             prompt: None,
             done_at: None,
+            linear_id: None,
+            linear_identifier: None,
+            linear_url: None,
+            linear_state: None,
+            linear_branch: None,
         }
     }
 

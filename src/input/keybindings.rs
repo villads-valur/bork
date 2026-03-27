@@ -8,6 +8,7 @@ pub fn map_key_to_action(key: KeyEvent, mode: InputMode) -> Action {
         InputMode::Normal => map_normal_key(key),
         InputMode::Confirm => map_confirm_key(key),
         InputMode::Dialog => map_dialog_key(key),
+        InputMode::LinearPicker => map_linear_picker_key(key),
     }
 }
 
@@ -43,6 +44,8 @@ fn map_normal_key(key: KeyEvent) -> Action {
         KeyCode::Char('g') => Action::ScrollToTop,
         KeyCode::Char('G') => Action::ScrollToBottom,
 
+        KeyCode::Char('I') => Action::OpenLinearPicker,
+
         _ => Action::Noop,
     }
 }
@@ -51,6 +54,29 @@ fn map_confirm_key(key: KeyEvent) -> Action {
     match key.code {
         KeyCode::Char('y') | KeyCode::Enter => Action::ConfirmYes,
         KeyCode::Char('n') | KeyCode::Esc => Action::ConfirmNo,
+        _ => Action::Noop,
+    }
+}
+
+fn map_linear_picker_key(key: KeyEvent) -> Action {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return match key.code {
+            KeyCode::Char('c') => Action::LinearPickerClose,
+            KeyCode::Char('n') => Action::LinearPickerDown,
+            KeyCode::Char('p') => Action::LinearPickerUp,
+            _ => Action::Noop,
+        };
+    }
+
+    match key.code {
+        KeyCode::Esc => Action::LinearPickerClose,
+        KeyCode::Enter => Action::LinearPickerSelect,
+        KeyCode::Down => Action::LinearPickerDown,
+        KeyCode::Up => Action::LinearPickerUp,
+        KeyCode::Tab => Action::LinearPickerDown,
+        KeyCode::BackTab => Action::LinearPickerUp,
+        KeyCode::Backspace => Action::LinearPickerBackspace,
+        KeyCode::Char(c) => Action::LinearPickerChar(c),
         _ => Action::Noop,
     }
 }

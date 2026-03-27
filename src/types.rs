@@ -176,6 +176,16 @@ pub struct Issue {
     pub prompt: Option<String>,
     #[serde(default)]
     pub done_at: Option<u64>,
+    #[serde(default)]
+    pub linear_id: Option<String>,
+    #[serde(default)]
+    pub linear_identifier: Option<String>,
+    #[serde(default)]
+    pub linear_url: Option<String>,
+    #[serde(default)]
+    pub linear_state: Option<String>,
+    #[serde(default)]
+    pub linear_branch: Option<String>,
 }
 
 fn default_worktree() -> Option<String> {
@@ -212,6 +222,11 @@ mod tests {
             agent_status: AgentStatus::Stopped,
             prompt: None,
             done_at: None,
+            linear_id: None,
+            linear_identifier: None,
+            linear_url: None,
+            linear_state: None,
+            linear_branch: None,
         }
     }
 
