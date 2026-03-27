@@ -10,7 +10,10 @@ pub struct AppConfig {
     pub project_name: String,
     pub project_root: PathBuf,
     pub agent_kind: AgentKind,
+    pub default_prompt: Option<String>,
 }
+
+pub const DEFAULT_PROMPT_FALLBACK: &str = "Check AGENTS.md for project context. The source code is in main/. Use the worktree skill to create worktrees for new issues.";
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -19,6 +22,7 @@ impl Default for AppConfig {
             project_name: "bork".to_string(),
             project_root,
             agent_kind: AgentKind::OpenCode,
+            default_prompt: None,
         }
     }
 }
@@ -123,6 +127,7 @@ pub fn save_state(state: &AppState, project_root: &PathBuf) -> anyhow::Result<()
 fn toml_parse(contents: &str) -> Result<AppConfig, String> {
     let mut project_name = None;
     let mut agent_kind = None;
+    let mut default_prompt = None;
 
     for line in contents.lines() {
         let line = line.trim();
@@ -140,6 +145,7 @@ fn toml_parse(contents: &str) -> Result<AppConfig, String> {
                         _ => AgentKind::OpenCode,
                     });
                 }
+                "default_prompt" => default_prompt = Some(value.to_string()),
                 _ => {}
             }
         }
@@ -149,5 +155,6 @@ fn toml_parse(contents: &str) -> Result<AppConfig, String> {
         project_name: project_name.unwrap_or_else(|| "bork".to_string()),
         project_root: PathBuf::from("."),
         agent_kind: agent_kind.unwrap_or(AgentKind::OpenCode),
+        default_prompt,
     })
 }

@@ -25,6 +25,9 @@ pub fn launch_session(issue: &Issue, config: &AppConfig) -> Result<String, AppEr
         .unwrap_or_else(|| format!("Working on {}: {}", issue.id, issue.title));
     let escaped_prompt = shell_escape_single_quotes(&prompt);
 
+    let session_display_name = format!("{}: {}", issue.id, issue.title);
+    let escaped_name = shell_escape_single_quotes(&session_display_name);
+
     let status_dir = config::agent_status_dir(&config.project_root);
     let status_dir_str = status_dir.to_str().unwrap_or("");
 
@@ -35,9 +38,10 @@ pub fn launch_session(issue: &Issue, config: &AppConfig) -> Result<String, AppEr
                 AgentMode::Build => "",
             };
             format!(
-                "export BORK_SESSION='{}' BORK_STATUS_DIR='{}' && opencode --prompt '{}'{}",
+                "export BORK_SESSION='{}' BORK_STATUS_DIR='{}' && opencode --name '{}' --prompt '{}'{}",
                 shell_escape_single_quotes(&session_name),
                 shell_escape_single_quotes(status_dir_str),
+                escaped_name,
                 escaped_prompt,
                 mode_flag,
             )
@@ -48,9 +52,10 @@ pub fn launch_session(issue: &Issue, config: &AppConfig) -> Result<String, AppEr
                 AgentMode::Build => "",
             };
             format!(
-                "export BORK_SESSION='{}' BORK_STATUS_DIR='{}' && claude{} '{}'",
+                "export BORK_SESSION='{}' BORK_STATUS_DIR='{}' && claude --name '{}'{} '{}'",
                 shell_escape_single_quotes(&session_name),
                 shell_escape_single_quotes(status_dir_str),
+                escaped_name,
                 mode_flag,
                 escaped_prompt,
             )

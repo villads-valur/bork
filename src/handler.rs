@@ -188,7 +188,11 @@ fn handle_dialog(app: &mut App, action: Action) {
         }
 
         Action::DialogNextField => {
-            let next_id = app.next_issue_id();
+            let default_prompt = app
+                .config
+                .default_prompt
+                .clone()
+                .unwrap_or_else(|| config::DEFAULT_PROMPT_FALLBACK.to_string());
 
             if let Some(ref mut dialog) = app.dialog {
                 let current = dialog.focused_field;
@@ -200,12 +204,13 @@ fn handle_dialog(app: &mut App, action: Action) {
                     return;
                 }
 
+                // Auto-fill prompt with default_prompt when creating a new issue
                 if dialog.editing_index.is_none()
                     && current == 0
                     && next == 1
                     && dialog.prompt.is_empty()
                 {
-                    dialog.prompt = format!("Working on {}: {}", next_id, dialog.title);
+                    dialog.prompt = default_prompt;
                 }
 
                 dialog.focused_field = next;
