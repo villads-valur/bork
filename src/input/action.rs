@@ -15,6 +15,7 @@ pub enum Action {
     ScrollToBottom,
     SyncPRs,
     OpenPR,
+    AssignWorktree,
     CreateIssue,
     EditIssue,
     DeleteIssue,

@@ -276,6 +276,13 @@ fn main() -> anyhow::Result<()> {
             app.pr_statuses = pr_result;
         }
 
+        // --- Auto-assign worktrees for issues that don't have one ---
+        let mut worktree_changed = app.auto_assign_worktrees();
+        worktree_changed = app.clear_stale_worktrees() || worktree_changed;
+        if worktree_changed {
+            let _ = config::save_state(&app.to_state(), &app.config.project_root);
+        }
+
         // --- Update git skip set for Done worktrees ---
         if let Ok(mut skip) = git_skip_set.lock() {
             *skip = app.done_worktree_names();

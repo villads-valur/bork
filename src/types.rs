@@ -169,6 +169,8 @@ pub struct Issue {
     pub agent_status: AgentStatus,
     pub prompt: Option<String>,
     #[serde(default)]
+    pub worktree: Option<String>,
+    #[serde(default)]
     pub done_at: Option<u64>,
 }
 
@@ -238,6 +240,7 @@ mod tests {
             agent_mode: AgentMode::Plan,
             agent_status: AgentStatus::Stopped,
             prompt: None,
+            worktree: None,
             done_at: None,
         }
     }

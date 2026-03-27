@@ -84,6 +84,16 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         bindings.push(("o", "open pr"));
     }
 
+    let has_worktree = app
+        .selected_issue()
+        .and_then(|i| i.worktree.as_ref())
+        .is_some();
+    if has_worktree {
+        bindings.push(("W", "reset wt"));
+    } else {
+        bindings.push(("W", "worktree"));
+    }
+
     bindings.push(("q", "quit"));
 
     let mut spans = vec![Span::raw(" ")];

@@ -196,6 +196,25 @@ fn handle_normal(
             PostAction::None
         }
 
+        Action::AssignWorktree => {
+            let Some(idx) = app.selected_issue_index() else {
+                return PostAction::None;
+            };
+            if app.issues[idx].worktree.is_some() {
+                let old = app.issues[idx].worktree.take().unwrap();
+                app.set_message(format!("Cleared worktree '{}', re-detecting...", old));
+            } else {
+                app.set_message("No worktree assigned, re-detecting...");
+            }
+            if app.auto_assign_worktrees() {
+                if let Some(wt) = app.issues[idx].worktree.as_ref() {
+                    app.set_message(format!("Assigned worktree: {}", wt));
+                }
+            }
+            let _ = config::save_state(&app.to_state(), &app.config.project_root);
+            PostAction::None
+        }
+
         _ => PostAction::None,
     }
 }
@@ -302,6 +321,7 @@ fn submit_dialog(app: &mut App) {
         agent_mode: dialog.agent_mode,
         agent_status: AgentStatus::Stopped,
         prompt,
+        worktree: None,
         done_at: None,
     };
 

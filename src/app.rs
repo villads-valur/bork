@@ -262,9 +262,7 @@ impl App {
     pub fn move_issue_right(&mut self) {
         if let Some(idx) = self.selected_issue_index() {
             if let Some(next) = self.issues[idx].column.next() {
-                let wt = self
-                    .resolved_worktree(&self.issues[idx].clone())
-                    .map(|s| s.to_string());
+                let wt = self.issues[idx].worktree.clone();
                 self.issues[idx].column = next;
                 if next == Column::Done {
                     self.issues[idx].done_at = Some(unix_now());
@@ -280,9 +278,7 @@ impl App {
         if let Some(idx) = self.selected_issue_index() {
             let was_done = self.issues[idx].column == Column::Done;
             if let Some(prev) = self.issues[idx].column.prev() {
-                let wt = self
-                    .resolved_worktree(&self.issues[idx].clone())
-                    .map(|s| s.to_string());
+                let wt = self.issues[idx].worktree.clone();
                 self.issues[idx].column = prev;
                 if was_done {
                     self.issues[idx].done_at = None;
@@ -352,21 +348,33 @@ impl App {
             .and_then(|info| info.activity.as_deref())
     }
 
-    /// Auto-detect the worktree directory for an issue by matching the issue ID
-    /// against known worktree directory names from the git worker.
+    // --- Worktree resolution ---
+
+    /// Return the persisted worktree directory for an issue.
+    pub fn worktree_for<'a>(&self, issue: &'a Issue) -> Option<&'a str> {
+        issue.worktree.as_deref()
+    }
+
+    /// Auto-detect a worktree directory for an issue by matching its ID
+    /// against known directory names from both live and frozen worktree maps.
     ///
     /// Matching rules:
     /// 1. Exact match (case-insensitive): dir name == issue ID
-    /// 2. Prefix match: dir starts with "{issue_id}-" (e.g. "bork-12-pr-status" matches "bork-12")
-    /// 3. Among prefix matches, the shortest directory name wins
-    pub fn resolved_worktree(&self, issue: &Issue) -> Option<&str> {
+    /// 2. Prefix match: dir starts with "{issue_id}-"
+    /// 3. Among prefix matches, shortest directory name wins
+    fn detect_worktree(&self, issue: &Issue) -> Option<String> {
         let issue_id_lower = issue.id.to_lowercase();
 
         let mut best: Option<&str> = None;
-        for dir_name in self.worktree_branches.keys() {
+        let all_keys = self
+            .worktree_branches
+            .keys()
+            .chain(self.frozen_worktree_branches.keys());
+
+        for dir_name in all_keys {
             let dir_lower = dir_name.to_lowercase();
             if dir_lower == issue_id_lower {
-                return Some(dir_name.as_str());
+                return Some(dir_name.clone());
             }
             if let Some(rest) = dir_lower.strip_prefix(issue_id_lower.as_str()) {
                 if rest.starts_with('-') && (best.is_none() || dir_name.len() < best.unwrap().len())
@@ -375,11 +383,45 @@ impl App {
                 }
             }
         }
-        best
+        best.map(|s| s.to_string())
+    }
+
+    /// Auto-assign worktree directories for issues that don't have one.
+    /// Returns true if any assignments were made (signals a state save).
+    pub fn auto_assign_worktrees(&mut self) -> bool {
+        let mut changed = false;
+        for i in 0..self.issues.len() {
+            if self.issues[i].worktree.is_some() {
+                continue;
+            }
+            if let Some(wt) = self.detect_worktree(&self.issues[i].clone()) {
+                self.issues[i].worktree = Some(wt);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Clear worktree assignments that point to directories that no longer exist.
+    /// Returns true if any were cleared (signals a state save).
+    pub fn clear_stale_worktrees(&mut self) -> bool {
+        let mut changed = false;
+        for issue in &mut self.issues {
+            let Some(wt) = issue.worktree.as_ref() else {
+                continue;
+            };
+            let exists = self.worktree_branches.contains_key(wt)
+                || self.frozen_worktree_branches.contains_key(wt);
+            if !exists {
+                issue.worktree = None;
+                changed = true;
+            }
+        }
+        changed
     }
 
     pub fn worktree_status_for(&self, issue: &Issue) -> Option<&WorktreeStatus> {
-        let wt = self.resolved_worktree(issue)?;
+        let wt = self.worktree_for(issue)?;
         if issue.column == Column::Done {
             if let Some(frozen) = self.frozen_worktree_statuses.get(wt) {
                 return Some(frozen);
@@ -389,7 +431,7 @@ impl App {
     }
 
     pub fn branch_for(&self, issue: &Issue) -> Option<&str> {
-        let wt = self.resolved_worktree(issue)?;
+        let wt = self.worktree_for(issue)?;
         if issue.column == Column::Done {
             if let Some(frozen) = self.frozen_worktree_branches.get(wt) {
                 return Some(frozen.as_str());
@@ -407,7 +449,7 @@ impl App {
         self.issues
             .iter()
             .filter(|i| i.column == Column::Done)
-            .filter_map(|i| self.resolved_worktree(i).map(|s| s.to_string()))
+            .filter_map(|i| i.worktree.clone())
             .collect()
     }
 
@@ -560,6 +602,7 @@ mod tests {
             agent_mode: AgentMode::Plan,
             agent_status: AgentStatus::Stopped,
             prompt: None,
+            worktree: None,
             done_at: None,
         }
     }
@@ -583,49 +626,49 @@ mod tests {
     }
 
     // ================================================================
-    // resolved_worktree
+    // detect_worktree (auto-detection logic)
     // ================================================================
 
     #[test]
-    fn test_resolved_worktree_exact_match() {
+    fn test_detect_worktree_exact_match() {
         let mut app = test_app(vec![test_issue("bork-8", Column::InProgress)]);
         app.worktree_branches
             .insert("bork-8".into(), "bork-8/init-cli".into());
         assert_eq!(
-            app.resolved_worktree(&app.issues[0].clone()),
-            Some("bork-8")
+            app.detect_worktree(&app.issues[0].clone()),
+            Some("bork-8".into())
         );
     }
 
     #[test]
-    fn test_resolved_worktree_prefix_match() {
+    fn test_detect_worktree_prefix_match() {
         let mut app = test_app(vec![test_issue("bork-12", Column::InProgress)]);
         app.worktree_branches
             .insert("bork-12-pr-status".into(), "bork-12/pr-status".into());
         assert_eq!(
-            app.resolved_worktree(&app.issues[0].clone()),
-            Some("bork-12-pr-status")
+            app.detect_worktree(&app.issues[0].clone()),
+            Some("bork-12-pr-status".into())
         );
     }
 
     #[test]
-    fn test_resolved_worktree_no_false_prefix() {
+    fn test_detect_worktree_no_false_prefix() {
         let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
         app.worktree_branches
             .insert("bork-10".into(), "bork-10/something".into());
-        assert_eq!(app.resolved_worktree(&app.issues[0].clone()), None);
+        assert_eq!(app.detect_worktree(&app.issues[0].clone()), None);
     }
 
     #[test]
-    fn test_resolved_worktree_no_match() {
+    fn test_detect_worktree_no_match() {
         let mut app = test_app(vec![test_issue("bork-99", Column::InProgress)]);
         app.worktree_branches
             .insert("bork-8".into(), "bork-8/init-cli".into());
-        assert_eq!(app.resolved_worktree(&app.issues[0].clone()), None);
+        assert_eq!(app.detect_worktree(&app.issues[0].clone()), None);
     }
 
     #[test]
-    fn test_resolved_worktree_shortest_prefix_wins() {
+    fn test_detect_worktree_shortest_prefix_wins() {
         let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
         app.worktree_branches
             .insert("bork-1-abc".into(), "bork-1/abc".into());
@@ -634,42 +677,129 @@ mod tests {
         app.worktree_branches
             .insert("bork-1-abcdef".into(), "bork-1/abcdef".into());
         assert_eq!(
-            app.resolved_worktree(&app.issues[0].clone()),
-            Some("bork-1-a")
+            app.detect_worktree(&app.issues[0].clone()),
+            Some("bork-1-a".into())
         );
     }
 
     #[test]
-    fn test_resolved_worktree_exact_preferred_over_prefix() {
+    fn test_detect_worktree_exact_preferred_over_prefix() {
         let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
         app.worktree_branches
             .insert("bork-1".into(), "bork-1/feature".into());
         app.worktree_branches
             .insert("bork-1-extended".into(), "bork-1/extended".into());
         assert_eq!(
-            app.resolved_worktree(&app.issues[0].clone()),
-            Some("bork-1")
+            app.detect_worktree(&app.issues[0].clone()),
+            Some("bork-1".into())
         );
     }
 
     #[test]
-    fn test_resolved_worktree_case_insensitive() {
+    fn test_detect_worktree_case_insensitive() {
         let mut app = test_app(vec![test_issue("BORK-8", Column::InProgress)]);
         app.worktree_branches
             .insert("bork-8".into(), "bork-8/feature".into());
         assert_eq!(
-            app.resolved_worktree(&app.issues[0].clone()),
-            Some("bork-8")
+            app.detect_worktree(&app.issues[0].clone()),
+            Some("bork-8".into())
+        );
+    }
+
+    #[test]
+    fn test_detect_worktree_searches_frozen_keys() {
+        let mut app = test_app(vec![test_issue("bork-1", Column::Done)]);
+        // Not in worktree_branches (git worker skipped it)
+        // But in frozen_worktree_branches
+        app.frozen_worktree_branches
+            .insert("bork-1".into(), "bork-1/feature".into());
+        assert_eq!(
+            app.detect_worktree(&app.issues[0].clone()),
+            Some("bork-1".into())
         );
     }
 
     // ================================================================
-    // branch_for / pr_for
+    // auto_assign_worktrees / clear_stale_worktrees
     // ================================================================
 
     #[test]
-    fn test_branch_for_with_matching_worktree() {
+    fn test_auto_assign_sets_worktree_on_none() {
         let mut app = test_app(vec![test_issue("bork-8", Column::InProgress)]);
+        app.worktree_branches
+            .insert("bork-8".into(), "bork-8/init-cli".into());
+        assert!(app.issues[0].worktree.is_none());
+        let changed = app.auto_assign_worktrees();
+        assert!(changed);
+        assert_eq!(app.issues[0].worktree, Some("bork-8".into()));
+    }
+
+    #[test]
+    fn test_auto_assign_skips_already_assigned() {
+        let mut issue = test_issue("bork-8", Column::InProgress);
+        issue.worktree = Some("bork-8".into());
+        let mut app = test_app(vec![issue]);
+        app.worktree_branches
+            .insert("bork-8".into(), "bork-8/init-cli".into());
+        let changed = app.auto_assign_worktrees();
+        assert!(!changed);
+    }
+
+    #[test]
+    fn test_auto_assign_returns_false_when_no_match() {
+        let mut app = test_app(vec![test_issue("bork-99", Column::InProgress)]);
+        app.worktree_branches
+            .insert("bork-8".into(), "bork-8/init-cli".into());
+        let changed = app.auto_assign_worktrees();
+        assert!(!changed);
+        assert!(app.issues[0].worktree.is_none());
+    }
+
+    #[test]
+    fn test_clear_stale_removes_missing_worktree() {
+        let mut issue = test_issue("bork-1", Column::InProgress);
+        issue.worktree = Some("bork-1-deleted".into());
+        let mut app = test_app(vec![issue]);
+        // No entries in worktree_branches or frozen for "bork-1-deleted"
+        let changed = app.clear_stale_worktrees();
+        assert!(changed);
+        assert!(app.issues[0].worktree.is_none());
+    }
+
+    #[test]
+    fn test_clear_stale_keeps_valid_worktree() {
+        let mut issue = test_issue("bork-1", Column::InProgress);
+        issue.worktree = Some("bork-1".into());
+        let mut app = test_app(vec![issue]);
+        app.worktree_branches
+            .insert("bork-1".into(), "bork-1/feature".into());
+        let changed = app.clear_stale_worktrees();
+        assert!(!changed);
+        assert_eq!(app.issues[0].worktree, Some("bork-1".into()));
+    }
+
+    #[test]
+    fn test_clear_stale_keeps_frozen_worktree() {
+        let mut issue = test_issue("bork-1", Column::Done);
+        issue.worktree = Some("bork-1".into());
+        let mut app = test_app(vec![issue]);
+        // Not in worktree_branches, but in frozen
+        app.frozen_worktree_branches
+            .insert("bork-1".into(), "bork-1/feature".into());
+        let changed = app.clear_stale_worktrees();
+        assert!(!changed);
+        assert_eq!(app.issues[0].worktree, Some("bork-1".into()));
+    }
+
+    // ================================================================
+    // branch_for / pr_for (use persisted worktree field)
+    // ================================================================
+
+    #[test]
+    fn test_branch_for_with_persisted_worktree() {
+        let mut issue = test_issue("bork-8", Column::InProgress);
+        issue.worktree = Some("bork-8".into());
+        let mut app = test_app(vec![issue]);
         app.worktree_branches
             .insert("bork-8".into(), "bork-8/init-cli".into());
         assert_eq!(
@@ -679,14 +809,16 @@ mod tests {
     }
 
     #[test]
-    fn test_branch_for_no_matching_worktree() {
+    fn test_branch_for_no_worktree_assigned() {
         let app = test_app(vec![test_issue("bork-99", Column::InProgress)]);
         assert_eq!(app.branch_for(&app.issues[0]), None);
     }
 
     #[test]
-    fn test_pr_for_with_matching_branch() {
-        let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
+    fn test_pr_for_with_persisted_worktree() {
+        let mut issue = test_issue("bork-1", Column::InProgress);
+        issue.worktree = Some("bork-1".into());
+        let mut app = test_app(vec![issue]);
         app.worktree_branches
             .insert("bork-1".into(), "bork-1/my-feature".into());
         app.pr_statuses
@@ -696,25 +828,18 @@ mod tests {
     }
 
     #[test]
-    fn test_pr_for_no_matching_worktree_dir() {
+    fn test_pr_for_no_worktree_returns_none() {
         let app = test_app(vec![test_issue("bork-99", Column::InProgress)]);
         assert!(app.pr_for(&app.issues[0]).is_none());
     }
 
     #[test]
-    fn test_pr_for_no_matching_pr() {
-        let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
-        app.worktree_branches
-            .insert("bork-1".into(), "bork-1/my-feature".into());
-        assert!(app.pr_for(&app.issues[0].clone()).is_none());
-    }
-
-    #[test]
     fn test_pr_for_different_issues_get_correct_prs() {
-        let mut app = test_app(vec![
-            test_issue("bork-1", Column::InProgress),
-            test_issue("bork-2", Column::InProgress),
-        ]);
+        let mut issue1 = test_issue("bork-1", Column::InProgress);
+        issue1.worktree = Some("bork-1".into());
+        let mut issue2 = test_issue("bork-2", Column::InProgress);
+        issue2.worktree = Some("bork-2".into());
+        let mut app = test_app(vec![issue1, issue2]);
         app.worktree_branches
             .insert("bork-1".into(), "branch-a".into());
         app.worktree_branches
@@ -726,17 +851,6 @@ mod tests {
         let issues = app.issues.clone();
         assert_eq!(app.pr_for(&issues[0]).unwrap().number, 10);
         assert_eq!(app.pr_for(&issues[1]).unwrap().number, 20);
-    }
-
-    #[test]
-    fn test_pr_for_via_prefix_worktree_match() {
-        let mut app = test_app(vec![test_issue("bork-12", Column::InProgress)]);
-        app.worktree_branches
-            .insert("bork-12-pr-status".into(), "bork-12/pr-status".into());
-        app.pr_statuses
-            .insert("bork-12/pr-status".into(), test_pr(99, "bork-12/pr-status"));
-        let pr = app.pr_for(&app.issues[0].clone()).unwrap();
-        assert_eq!(pr.number, 99);
     }
 
     // ================================================================
@@ -983,17 +1097,13 @@ mod tests {
 
     #[test]
     fn done_worktree_names_returns_done_issue_worktrees() {
-        let mut app = test_app(vec![
-            test_issue("bork-1", Column::Done),
-            test_issue("bork-2", Column::InProgress),
-            test_issue("bork-3", Column::Done),
-        ]);
-        app.worktree_branches
-            .insert("bork-1".into(), "branch-1".into());
-        app.worktree_branches
-            .insert("bork-2".into(), "branch-2".into());
-        app.worktree_branches
-            .insert("bork-3".into(), "branch-3".into());
+        let mut issue1 = test_issue("bork-1", Column::Done);
+        issue1.worktree = Some("bork-1".into());
+        let mut issue2 = test_issue("bork-2", Column::InProgress);
+        issue2.worktree = Some("bork-2".into());
+        let mut issue3 = test_issue("bork-3", Column::Done);
+        issue3.worktree = Some("bork-3".into());
+        let app = test_app(vec![issue1, issue2, issue3]);
         let names = app.done_worktree_names();
         assert!(names.contains("bork-1"));
         assert!(!names.contains("bork-2"));
@@ -1003,22 +1113,16 @@ mod tests {
 
     #[test]
     fn done_worktree_names_empty_when_no_done_issues() {
-        let mut app = test_app(vec![
-            test_issue("bork-1", Column::Todo),
-            test_issue("bork-2", Column::InProgress),
-        ]);
-        app.worktree_branches
-            .insert("bork-1".into(), "branch-1".into());
-        app.worktree_branches
-            .insert("bork-2".into(), "branch-2".into());
+        let mut issue1 = test_issue("bork-1", Column::Todo);
+        issue1.worktree = Some("bork-1".into());
+        let app = test_app(vec![issue1]);
         let names = app.done_worktree_names();
         assert!(names.is_empty());
     }
 
     #[test]
-    fn done_worktree_names_skips_issues_without_matching_worktree() {
+    fn done_worktree_names_skips_issues_without_worktree() {
         let app = test_app(vec![test_issue("bork-99", Column::Done)]);
-        // No worktree_branches entry for bork-99
         let names = app.done_worktree_names();
         assert!(names.is_empty());
     }
@@ -1029,7 +1133,9 @@ mod tests {
 
     #[test]
     fn freeze_worktree_copies_current_status() {
-        let mut app = test_app(vec![test_issue("bork-1", Column::Done)]);
+        let mut issue = test_issue("bork-1", Column::Done);
+        issue.worktree = Some("bork-1".into());
+        let mut app = test_app(vec![issue]);
         app.worktree_statuses.insert(
             "bork-1".to_string(),
             WorktreeStatus {
@@ -1073,12 +1179,10 @@ mod tests {
 
     #[test]
     fn worktree_status_for_done_issue_uses_frozen() {
-        let mut app = test_app(vec![test_issue("bork-1", Column::Done)]);
-        app.worktree_branches
-            .insert("bork-1".into(), "branch-1".into());
+        let mut issue = test_issue("bork-1", Column::Done);
+        issue.worktree = Some("bork-1".into());
+        let mut app = test_app(vec![issue]);
 
-        // No live status for bork-1
-        // But frozen status exists
         app.frozen_worktree_statuses.insert(
             "bork-1".to_string(),
             WorktreeStatus {
@@ -1096,9 +1200,9 @@ mod tests {
 
     #[test]
     fn worktree_status_for_non_done_issue_uses_live() {
-        let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
-        app.worktree_branches
-            .insert("bork-1".into(), "branch-1".into());
+        let mut issue = test_issue("bork-1", Column::InProgress);
+        issue.worktree = Some("bork-1".into());
+        let mut app = test_app(vec![issue]);
 
         app.worktree_statuses.insert(
             "bork-1".to_string(),
@@ -1126,9 +1230,9 @@ mod tests {
 
     #[test]
     fn branch_for_done_issue_uses_frozen() {
-        let mut app = test_app(vec![test_issue("bork-1", Column::Done)]);
-        app.worktree_branches
-            .insert("bork-1".into(), "branch-1".into());
+        let mut issue = test_issue("bork-1", Column::Done);
+        issue.worktree = Some("bork-1".into());
+        let mut app = test_app(vec![issue]);
 
         app.frozen_worktree_branches
             .insert("bork-1".to_string(), "feature/done".to_string());
