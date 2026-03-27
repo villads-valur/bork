@@ -36,6 +36,10 @@ pub fn handle_action(
             handle_dialog(app, action);
             PostAction::None
         }
+        InputMode::Search => {
+            handle_search(app, action);
+            PostAction::None
+        }
         InputMode::Normal => handle_normal(app, action, action_tx, pr_wake_tx),
     }
 }
@@ -215,7 +219,27 @@ fn handle_normal(
             PostAction::None
         }
 
+        Action::SearchStart => {
+            app.start_search();
+            PostAction::None
+        }
+
+        Action::ClearSearch => {
+            app.clear_search();
+            PostAction::None
+        }
+
         _ => PostAction::None,
+    }
+}
+
+fn handle_search(app: &mut App, action: Action) {
+    match action {
+        Action::SearchChar(c) => app.search_push_char(c),
+        Action::SearchBackspace => app.search_delete_char(),
+        Action::SearchConfirm => app.confirm_search(),
+        Action::SearchCancel => app.cancel_search(),
+        _ => {}
     }
 }
 
@@ -233,29 +257,13 @@ fn handle_dialog(app: &mut App, action: Action) {
         }
 
         Action::DialogNextField => {
-            let default_prompt = app
-                .config
-                .default_prompt
-                .clone()
-                .unwrap_or_else(|| config::DEFAULT_PROMPT_FALLBACK.to_string());
-
             if let Some(ref mut dialog) = app.dialog {
-                let current = dialog.focused_field;
-                let next = current + 1;
+                let next = dialog.focused_field + 1;
 
                 if next >= DIALOG_FIELD_COUNT {
                     let _ = dialog;
                     submit_dialog(app);
                     return;
-                }
-
-                // Auto-fill prompt with default_prompt when creating a new issue
-                if dialog.editing_index.is_none()
-                    && current == 0
-                    && next == 1
-                    && dialog.prompt.is_empty()
-                {
-                    dialog.prompt = default_prompt;
                 }
 
                 dialog.focused_field = next;
@@ -416,4 +424,255 @@ fn launch_and_report(issue: Issue, config: AppConfig) -> ActionResult {
 
 fn agent_status_file(project_root: &PathBuf, session_name: &str) -> PathBuf {
     config::agent_status_dir(project_root).join(format!("{}.json", session_name))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::mpsc;
+
+    use super::*;
+    use crate::app::{App, DialogState};
+    use crate::config::DEFAULT_DONE_SESSION_TTL;
+    use crate::input::Action;
+    use crate::types::Column;
+
+    fn pr_wake_tx() -> mpsc::Sender<()> {
+        mpsc::channel().0
+    }
+
+    fn test_config() -> AppConfig {
+        AppConfig {
+            project_name: "bork".to_string(),
+            project_root: PathBuf::from("/tmp/test-bork"),
+            agent_kind: crate::types::AgentKind::OpenCode,
+            default_prompt: Some("Check AGENTS.md for context.".to_string()),
+            done_session_ttl: DEFAULT_DONE_SESSION_TTL,
+        }
+    }
+
+    fn test_app() -> App {
+        let state = crate::config::AppState { issues: vec![] };
+        App::new(test_config(), state)
+    }
+
+    // ================================================================
+    // Dialog: prompt field stays empty on field navigation
+    // ================================================================
+
+    #[test]
+    fn dialog_next_field_does_not_auto_fill_prompt() {
+        let mut app = test_app();
+        app.open_dialog();
+
+        // Type a title
+        handle_action(
+            &mut app,
+            Action::DialogChar('H'),
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+        handle_action(
+            &mut app,
+            Action::DialogChar('i'),
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+
+        // Move from title (field 0) to prompt (field 1)
+        handle_action(
+            &mut app,
+            Action::DialogNextField,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+
+        let dialog = app.dialog.as_ref().unwrap();
+        assert_eq!(dialog.focused_field, 1);
+        assert_eq!(
+            dialog.prompt, "",
+            "prompt should remain empty after navigating from title"
+        );
+    }
+
+    #[test]
+    fn dialog_next_field_preserves_user_typed_prompt() {
+        let mut app = test_app();
+        app.open_dialog();
+
+        // Move to prompt field
+        handle_action(
+            &mut app,
+            Action::DialogNextField,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+
+        // Type something in the prompt
+        handle_action(
+            &mut app,
+            Action::DialogChar('g'),
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+        handle_action(
+            &mut app,
+            Action::DialogChar('o'),
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+
+        let dialog = app.dialog.as_ref().unwrap();
+        assert_eq!(dialog.prompt, "go");
+    }
+
+    #[test]
+    fn dialog_next_field_advances_through_all_fields() {
+        let mut app = test_app();
+        app.open_dialog();
+
+        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 0);
+
+        handle_action(
+            &mut app,
+            Action::DialogNextField,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 1);
+
+        handle_action(
+            &mut app,
+            Action::DialogNextField,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 2);
+        // Field 2 is the last (mode). Next field from here submits the dialog.
+    }
+
+    #[test]
+    fn dialog_prev_field_goes_back() {
+        let mut app = test_app();
+        app.open_dialog();
+
+        // Advance to prompt
+        handle_action(
+            &mut app,
+            Action::DialogNextField,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 1);
+
+        // Go back to title
+        handle_action(
+            &mut app,
+            Action::DialogPrevField,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 0);
+    }
+
+    #[test]
+    fn dialog_prev_field_does_not_go_below_zero() {
+        let mut app = test_app();
+        app.open_dialog();
+
+        handle_action(
+            &mut app,
+            Action::DialogPrevField,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 0);
+    }
+
+    #[test]
+    fn dialog_space_char_appended_to_prompt() {
+        let mut app = test_app();
+        app.open_dialog();
+
+        // Move to prompt field
+        handle_action(
+            &mut app,
+            Action::DialogNextField,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+
+        handle_action(
+            &mut app,
+            Action::DialogChar('a'),
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+        handle_action(
+            &mut app,
+            Action::DialogChar(' '),
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+        handle_action(
+            &mut app,
+            Action::DialogChar('b'),
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+
+        assert_eq!(app.dialog.as_ref().unwrap().prompt, "a b");
+    }
+
+    #[test]
+    fn dialog_cancel_closes_dialog() {
+        let mut app = test_app();
+        app.open_dialog();
+        assert!(app.dialog.is_some());
+
+        handle_action(
+            &mut app,
+            Action::DialogCancel,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+        assert!(app.dialog.is_none());
+    }
+
+    #[test]
+    fn edit_dialog_does_not_inject_default_prompt() {
+        let mut app = test_app();
+
+        // Create an issue first
+        app.issues.push(crate::types::Issue {
+            id: "bork-1".to_string(),
+            title: "Test".to_string(),
+            column: Column::Todo,
+            worktree: Some("main".to_string()),
+            tmux_session: None,
+            agent_kind: crate::types::AgentKind::OpenCode,
+            agent_mode: crate::types::AgentMode::Plan,
+            agent_status: crate::types::AgentStatus::Stopped,
+            prompt: None,
+            done_at: None,
+        });
+
+        // Open edit dialog
+        let issue = app.issues[0].clone();
+        app.open_edit_dialog(&issue, 0);
+
+        // Move from title to prompt
+        handle_action(
+            &mut app,
+            Action::DialogNextField,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+
+        let dialog = app.dialog.as_ref().unwrap();
+        assert_eq!(
+            dialog.prompt, "",
+            "edit dialog prompt should stay empty when issue had no prompt"
+        );
+    }
 }

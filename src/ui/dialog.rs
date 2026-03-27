@@ -238,6 +238,7 @@ fn render_multiline_field(
 
 /// Simple word-wrap: break text into lines of at most `max_width` characters.
 /// Breaks on word boundaries when possible, otherwise hard-wraps.
+/// Preserves trailing spaces so the cursor position stays accurate.
 fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
     if text.is_empty() {
         return Vec::new();
@@ -245,45 +246,86 @@ fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
 
     let mut lines = Vec::new();
     let mut current_line = String::new();
+    let mut line_len: usize = 0;
 
-    for word in text.split_whitespace() {
-        let word_len = word.chars().count();
-
-        if current_line.is_empty() {
-            if word_len > max_width {
-                // Hard-wrap long words
-                let mut chars = word.chars();
-                while chars.clone().count() > 0 {
-                    let chunk: String = chars.by_ref().take(max_width).collect();
-                    if chunk.is_empty() {
-                        break;
-                    }
-                    lines.push(chunk);
-                }
-            } else {
-                current_line = word.to_string();
+    // Split into segments of (whitespace, word) pairs to preserve spaces
+    let mut chars = text.char_indices().peekable();
+    while chars.peek().is_some() {
+        // Collect a word (non-space characters)
+        let mut word = String::new();
+        while let Some(&(_, c)) = chars.peek() {
+            if c == ' ' {
+                break;
             }
-        } else {
-            let new_len = current_line.chars().count() + 1 + word_len;
-            if new_len <= max_width {
-                current_line.push(' ');
-                current_line.push_str(word);
-            } else {
-                lines.push(current_line);
+            word.push(c);
+            chars.next();
+        }
+
+        if !word.is_empty() {
+            let word_len = word.chars().count();
+
+            if line_len == 0 {
                 if word_len > max_width {
-                    let mut chars = word.chars();
-                    while chars.clone().count() > 0 {
-                        let chunk: String = chars.by_ref().take(max_width).collect();
+                    let mut wchars = word.chars();
+                    while wchars.clone().count() > 0 {
+                        let chunk: String = wchars.by_ref().take(max_width).collect();
                         if chunk.is_empty() {
                             break;
                         }
-                        lines.push(chunk);
+                        let chunk_len = chunk.chars().count();
+                        if wchars.clone().count() > 0 {
+                            lines.push(chunk);
+                        } else {
+                            current_line = chunk;
+                            line_len = chunk_len;
+                        }
                     }
-                    current_line = String::new();
                 } else {
-                    current_line = word.to_string();
+                    current_line.push_str(&word);
+                    line_len += word_len;
+                }
+            } else if line_len + word_len <= max_width {
+                current_line.push_str(&word);
+                line_len += word_len;
+            } else {
+                lines.push(current_line);
+                if word_len > max_width {
+                    let mut wchars = word.chars();
+                    current_line = String::new();
+                    line_len = 0;
+                    while wchars.clone().count() > 0 {
+                        let chunk: String = wchars.by_ref().take(max_width).collect();
+                        if chunk.is_empty() {
+                            break;
+                        }
+                        let chunk_len = chunk.chars().count();
+                        if wchars.clone().count() > 0 {
+                            lines.push(chunk);
+                        } else {
+                            current_line = chunk;
+                            line_len = chunk_len;
+                        }
+                    }
+                } else {
+                    current_line = word;
+                    line_len = word_len;
                 }
             }
+        }
+
+        // Collect spaces after the word
+        while let Some(&(_, c)) = chars.peek() {
+            if c != ' ' {
+                break;
+            }
+            if line_len >= max_width {
+                lines.push(current_line);
+                current_line = String::new();
+                line_len = 0;
+            }
+            current_line.push(' ');
+            line_len += 1;
+            chars.next();
         }
     }
 
@@ -344,6 +386,98 @@ fn render_mode_field(
     ]);
 
     frame.render_widget(Paragraph::new(line), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrap_text_empty_string() {
+        assert_eq!(wrap_text("", 20), Vec::<String>::new());
+    }
+
+    #[test]
+    fn wrap_text_single_word_fits() {
+        assert_eq!(wrap_text("hello", 20), vec!["hello"]);
+    }
+
+    #[test]
+    fn wrap_text_multiple_words_fit_one_line() {
+        assert_eq!(wrap_text("hello world", 20), vec!["hello world"]);
+    }
+
+    #[test]
+    fn wrap_text_wraps_at_word_boundary() {
+        assert_eq!(
+            wrap_text("hello world foo", 11),
+            vec!["hello world", " foo"]
+        );
+    }
+
+    #[test]
+    fn wrap_text_hard_wraps_long_word() {
+        assert_eq!(wrap_text("abcdefghij", 5), vec!["abcde", "fghij"]);
+    }
+
+    #[test]
+    fn wrap_text_preserves_trailing_space() {
+        let result = wrap_text("hello ", 20);
+        assert_eq!(result, vec!["hello "]);
+    }
+
+    #[test]
+    fn wrap_text_preserves_space_between_words() {
+        let result = wrap_text("a b", 20);
+        assert_eq!(result, vec!["a b"]);
+    }
+
+    #[test]
+    fn wrap_text_trailing_space_after_wrap() {
+        let result = wrap_text("hello world ", 20);
+        assert_eq!(result, vec!["hello world "]);
+    }
+
+    #[test]
+    fn wrap_text_multiple_trailing_spaces() {
+        let result = wrap_text("hi   ", 20);
+        assert_eq!(result, vec!["hi   "]);
+    }
+
+    #[test]
+    fn wrap_text_space_causes_line_wrap() {
+        // Line is exactly at max_width, then space pushes to next line
+        let result = wrap_text("12345 ", 5);
+        assert_eq!(result, vec!["12345", " "]);
+    }
+
+    #[test]
+    fn wrap_text_multiple_lines_with_trailing_space() {
+        let result = wrap_text("aaa bbb ccc ", 7);
+        assert_eq!(result, vec!["aaa bbb", " ccc "]);
+    }
+
+    #[test]
+    fn wrap_text_just_spaces() {
+        let result = wrap_text("   ", 10);
+        assert_eq!(result, vec!["   "]);
+    }
+
+    #[test]
+    fn wrap_text_word_exactly_max_width() {
+        assert_eq!(wrap_text("hello", 5), vec!["hello"]);
+    }
+
+    #[test]
+    fn wrap_text_two_words_exactly_max_width() {
+        assert_eq!(wrap_text("ab cd", 5), vec!["ab cd"]);
+    }
+
+    #[test]
+    fn wrap_text_long_sentence_wraps_correctly() {
+        let result = wrap_text("the quick brown fox", 10);
+        assert_eq!(result, vec!["the quick ", "brown fox"]);
+    }
 }
 
 fn field_label_style(focused: bool) -> Style {

@@ -49,6 +49,21 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
 
+    // Search mode: show /query with cursor
+    if app.input_mode == InputMode::Search {
+        let line = Line::from(vec![
+            Span::styled(
+                format!(" /{}", app.search_query),
+                Style::default()
+                    .fg(styles::TEXT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("\u{2588}", Style::default().fg(styles::ACCENT)),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+
     // Dialog mode: footer is handled by the dialog overlay itself
     if app.input_mode == InputMode::Dialog {
         return;
@@ -60,6 +75,21 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             format!(" {msg}"),
             Style::default().fg(ratatui::style::Color::Yellow),
         ));
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+
+    // Active search filter indicator
+    if app.has_active_search() {
+        let line = Line::from(vec![
+            Span::styled(
+                format!(" /{}", app.search_query),
+                Style::default().fg(styles::ACCENT),
+            ),
+            Span::raw("  "),
+            Span::styled("Esc", styles::statusbar_key_style()),
+            Span::styled(":clear", styles::statusbar_desc_style()),
+        ]);
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
@@ -78,6 +108,7 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         ("x", "kill"),
         ("H/L", "move"),
         ("P", "sync prs"),
+        ("/", "search"),
     ];
 
     if has_pr {
