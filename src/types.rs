@@ -122,6 +122,13 @@ impl AgentStatus {
             Self::Error => "✗",
         }
     }
+
+    pub fn needs_attention(self) -> bool {
+        matches!(
+            self,
+            Self::WaitingInput | Self::WaitingPermission | Self::WaitingApproval
+        )
+    }
 }
 
 impl fmt::Display for AgentStatus {
