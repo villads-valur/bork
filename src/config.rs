@@ -11,7 +11,10 @@ pub struct AppConfig {
     pub project_root: PathBuf,
     pub agent_kind: AgentKind,
     pub default_prompt: Option<String>,
+    pub done_session_ttl: u64,
 }
+
+pub const DEFAULT_DONE_SESSION_TTL: u64 = 300;
 
 pub const DEFAULT_PROMPT_FALLBACK: &str = "Check AGENTS.md for project context. The source code is in main/. Use the worktree skill to create worktrees for new issues.";
 
@@ -23,6 +26,7 @@ impl Default for AppConfig {
             project_root,
             agent_kind: AgentKind::OpenCode,
             default_prompt: None,
+            done_session_ttl: DEFAULT_DONE_SESSION_TTL,
         }
     }
 }
@@ -124,10 +128,11 @@ pub fn save_state(state: &AppState, project_root: &PathBuf) -> anyhow::Result<()
     Ok(())
 }
 
-fn toml_parse(contents: &str) -> Result<AppConfig, String> {
+pub(crate) fn toml_parse(contents: &str) -> Result<AppConfig, String> {
     let mut project_name = None;
     let mut agent_kind = None;
     let mut default_prompt = None;
+    let mut done_session_ttl = None;
 
     for line in contents.lines() {
         let line = line.trim();
@@ -146,6 +151,9 @@ fn toml_parse(contents: &str) -> Result<AppConfig, String> {
                     });
                 }
                 "default_prompt" => default_prompt = Some(value.to_string()),
+                "done_session_ttl" => {
+                    done_session_ttl = value.parse::<u64>().ok();
+                }
                 _ => {}
             }
         }
@@ -156,5 +164,77 @@ fn toml_parse(contents: &str) -> Result<AppConfig, String> {
         project_root: PathBuf::from("."),
         agent_kind: agent_kind.unwrap_or(AgentKind::OpenCode),
         default_prompt,
+        done_session_ttl: done_session_ttl.unwrap_or(DEFAULT_DONE_SESSION_TTL),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toml_parse_with_done_session_ttl() {
+        let contents = r#"
+project_name = "myproject"
+agent_kind = "opencode"
+done_session_ttl = "600"
+"#;
+        let config = toml_parse(contents).unwrap();
+        assert_eq!(config.done_session_ttl, 600);
+    }
+
+    #[test]
+    fn toml_parse_without_done_session_ttl_uses_default() {
+        let contents = r#"
+project_name = "myproject"
+agent_kind = "opencode"
+"#;
+        let config = toml_parse(contents).unwrap();
+        assert_eq!(config.done_session_ttl, DEFAULT_DONE_SESSION_TTL);
+        assert_eq!(config.done_session_ttl, 300);
+    }
+
+    #[test]
+    fn toml_parse_basic_fields() {
+        let contents = r#"
+project_name = "bork"
+agent_kind = "claude"
+default_prompt = "Do the thing"
+"#;
+        let config = toml_parse(contents).unwrap();
+        assert_eq!(config.project_name, "bork");
+        assert_eq!(config.agent_kind, AgentKind::Claude);
+        assert_eq!(config.default_prompt, Some("Do the thing".to_string()));
+    }
+
+    #[test]
+    fn toml_parse_empty_config_uses_defaults() {
+        let config = toml_parse("").unwrap();
+        assert_eq!(config.project_name, "bork");
+        assert_eq!(config.agent_kind, AgentKind::OpenCode);
+        assert_eq!(config.default_prompt, None);
+        assert_eq!(config.done_session_ttl, DEFAULT_DONE_SESSION_TTL);
+    }
+
+    #[test]
+    fn toml_parse_ignores_comments_and_blanks() {
+        let contents = r#"
+# This is a comment
+project_name = "test"
+
+# Another comment
+agent_kind = "opencode"
+"#;
+        let config = toml_parse(contents).unwrap();
+        assert_eq!(config.project_name, "test");
+    }
+
+    #[test]
+    fn toml_parse_invalid_ttl_uses_default() {
+        let contents = r#"
+done_session_ttl = "notanumber"
+"#;
+        let config = toml_parse(contents).unwrap();
+        assert_eq!(config.done_session_ttl, DEFAULT_DONE_SESSION_TTL);
+    }
 }
