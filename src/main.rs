@@ -10,9 +10,9 @@ mod ui;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::{
     event::{self, Event, KeyEventKind},
@@ -82,11 +82,15 @@ fn read_agent_statuses(status_dir: &PathBuf) -> HashMap<String, AgentStatusInfo>
     statuses
 }
 
-fn spawn_git_status_worker(project_root: PathBuf) -> mpsc::Receiver<GitPollResult> {
+fn spawn_git_status_worker(
+    project_root: PathBuf,
+    skip: Arc<Mutex<HashSet<String>>>,
+) -> mpsc::Receiver<GitPollResult> {
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || loop {
-        let result = external::git::poll_all_worktrees(&project_root);
+        let skip_set = skip.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let result = external::git::poll_all_worktrees(&project_root, &skip_set);
         if tx.send(result).is_err() {
             break;
         }
@@ -172,7 +176,8 @@ fn main() -> anyhow::Result<()> {
     let (action_tx, action_rx) = mpsc::channel::<ActionResult>();
     let status_dir = config::agent_status_dir(&app.config.project_root);
     let session_rx = spawn_session_status_worker(status_dir);
-    let git_rx = spawn_git_status_worker(app.config.project_root.clone());
+    let git_skip_set = Arc::new(Mutex::new(app.done_worktree_names()));
+    let git_rx = spawn_git_status_worker(app.config.project_root.clone(), git_skip_set.clone());
     let (pr_wake_tx, pr_wake_rx) = mpsc::channel::<()>();
     let main_worktree = app.config.project_root.join("main");
     let pr_rx = spawn_pr_poll_worker(main_worktree, pr_wake_rx);
@@ -223,6 +228,9 @@ fn main() -> anyhow::Result<()> {
             if let Some(session_name) = result.session_to_open {
                 if let Some(launch_idx) = pending_popup_for_launch.take() {
                     app.issues[launch_idx].tmux_session = Some(session_name.clone());
+                    if app.issues[launch_idx].column == types::Column::Todo {
+                        app.issues[launch_idx].column = types::Column::InProgress;
+                    }
                     pending_popup_session = Some(session_name);
                 }
             }
@@ -239,6 +247,26 @@ fn main() -> anyhow::Result<()> {
             app.agent_statuses = poll.agent_statuses;
         }
 
+        // --- Auto-kill Done sessions past TTL ---
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let cleanup_indices = app.issues_needing_session_cleanup(now);
+        for idx in cleanup_indices {
+            let session_name = app.issues[idx].session_name();
+            let status_file = config::agent_status_dir(&app.config.project_root)
+                .join(format!("{}.json", session_name));
+            let sn = session_name.clone();
+            // Remove from active set immediately so we don't re-fire on next tick
+            app.active_sessions.remove(&session_name);
+            thread::spawn(move || {
+                let _ = external::tmux::kill_session(&sn);
+                let _ = std::fs::remove_file(&status_file);
+            });
+            app.set_message(format!("Auto-killed session '{}' (done TTL)", session_name));
+        }
+
         while let Ok(git_result) = git_rx.try_recv() {
             app.worktree_statuses = git_result.statuses;
             app.worktree_branches = git_result.branches;
@@ -246,6 +274,11 @@ fn main() -> anyhow::Result<()> {
 
         while let Ok(pr_result) = pr_rx.try_recv() {
             app.pr_statuses = pr_result;
+        }
+
+        // --- Update git skip set for Done worktrees ---
+        if let Ok(mut skip) = git_skip_set.lock() {
+            *skip = app.done_worktree_names();
         }
 
         if app.busy_count > 0 {

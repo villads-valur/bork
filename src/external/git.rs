@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 
@@ -9,7 +9,7 @@ pub struct GitPollResult {
     pub branches: HashMap<String, String>,
 }
 
-pub fn poll_all_worktrees(project_root: &Path) -> GitPollResult {
+pub fn poll_all_worktrees(project_root: &Path, skip: &HashSet<String>) -> GitPollResult {
     let mut statuses = HashMap::new();
     let mut branches = HashMap::new();
 
@@ -27,6 +27,9 @@ pub fn poll_all_worktrees(project_root: &Path) -> GitPollResult {
             continue;
         };
         if dir_name.starts_with('.') || !path.join(".git").exists() {
+            continue;
+        }
+        if skip.contains(&dir_name) {
             continue;
         }
 
@@ -71,7 +74,7 @@ fn get_branch_name(worktree_path: &Path) -> Option<String> {
     }
 }
 
-fn parse_git_status(output: &str) -> WorktreeStatus {
+pub(crate) fn parse_git_status(output: &str) -> WorktreeStatus {
     let mut staged = 0;
     let mut unstaged = 0;
 
@@ -137,7 +140,6 @@ mod tests {
 
     #[test]
     fn test_parse_staged_and_unstaged() {
-        // Staged modification + unstaged modification in same file
         let output = "MM src/main.rs\n";
         let status = parse_git_status(output);
         assert_eq!(status.staged, 1);
@@ -148,8 +150,8 @@ mod tests {
     fn test_parse_mixed_statuses() {
         let output = "M  staged.rs\n M unstaged.rs\n?? untracked.txt\nA  added.rs\n";
         let status = parse_git_status(output);
-        assert_eq!(status.staged, 2); // M and A
-        assert_eq!(status.unstaged, 2); // M and ??
+        assert_eq!(status.staged, 2);
+        assert_eq!(status.unstaged, 2);
     }
 
     #[test]
@@ -182,5 +184,12 @@ mod tests {
         let status = parse_git_status(output);
         assert_eq!(status.staged, 1);
         assert_eq!(status.unstaged, 0);
+    }
+
+    #[test]
+    fn test_poll_skip_set_excludes_done_worktrees() {
+        let skip: HashSet<String> = ["done-worktree".to_string()].into_iter().collect();
+        let result = poll_all_worktrees(std::path::Path::new("/nonexistent"), &skip);
+        assert!(result.statuses.is_empty());
     }
 }

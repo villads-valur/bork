@@ -113,13 +113,6 @@ pub enum AgentStatus {
 }
 
 impl AgentStatus {
-    pub fn needs_attention(self) -> bool {
-        matches!(
-            self,
-            Self::WaitingInput | Self::WaitingPermission | Self::WaitingApproval
-        )
-    }
-
     pub fn symbol(self) -> &'static str {
         match self {
             Self::Stopped => "◌",
@@ -175,6 +168,8 @@ pub struct Issue {
     pub agent_mode: AgentMode,
     pub agent_status: AgentStatus,
     pub prompt: Option<String>,
+    #[serde(default)]
+    pub done_at: Option<u64>,
 }
 
 impl Issue {
@@ -233,6 +228,22 @@ pub struct PrStatus {
 mod tests {
     use super::*;
 
+    fn test_issue(id: &str, column: Column) -> Issue {
+        Issue {
+            id: id.to_string(),
+            title: format!("Test issue {}", id),
+            column,
+            tmux_session: None,
+            agent_kind: AgentKind::OpenCode,
+            agent_mode: AgentMode::Plan,
+            agent_status: AgentStatus::Stopped,
+            prompt: None,
+            done_at: None,
+        }
+    }
+
+    // --- PR types ---
+
     #[test]
     fn test_pr_state_display() {
         assert_eq!(PrState::Open.to_string(), "open");
@@ -249,14 +260,14 @@ mod tests {
     #[test]
     fn test_checks_status_is_copy() {
         let a = ChecksStatus::Success;
-        let b = a; // Copy
+        let b = a;
         assert_eq!(a, b);
     }
 
     #[test]
     fn test_review_decision_is_copy() {
         let a = ReviewDecision::Approved;
-        let b = a; // Copy
+        let b = a;
         assert_eq!(a, b);
     }
 
@@ -280,6 +291,8 @@ mod tests {
         assert_eq!(cloned.head_branch, "main");
     }
 
+    // --- WorktreeStatus ---
+
     #[test]
     fn test_worktree_status_is_clean() {
         assert!(WorktreeStatus {
@@ -299,28 +312,127 @@ mod tests {
         .is_clean());
     }
 
+    // --- Column navigation ---
+
     #[test]
-    fn test_issue_session_name() {
-        let issue = Issue {
-            id: "BORK-42".into(),
-            title: "test".into(),
-            column: Column::Todo,
-            tmux_session: None,
-            agent_kind: AgentKind::OpenCode,
-            agent_mode: AgentMode::Plan,
-            agent_status: AgentStatus::Stopped,
-            prompt: None,
-        };
-        assert_eq!(issue.session_name(), "bork-bork-42");
+    fn column_next_from_todo() {
+        assert_eq!(Column::Todo.next(), Some(Column::InProgress));
     }
 
     #[test]
-    fn test_column_navigation() {
-        assert_eq!(Column::Todo.next(), Some(Column::InProgress));
+    fn column_next_from_done_is_none() {
         assert_eq!(Column::Done.next(), None);
+    }
+
+    #[test]
+    fn column_prev_from_todo_is_none() {
         assert_eq!(Column::Todo.prev(), None);
+    }
+
+    #[test]
+    fn column_prev_from_done() {
         assert_eq!(Column::Done.prev(), Some(Column::CodeReview));
     }
+
+    #[test]
+    fn column_roundtrip_index() {
+        for col in Column::ALL {
+            assert_eq!(Column::from_index(col.index()), Some(col));
+        }
+    }
+
+    #[test]
+    fn column_from_index_out_of_range() {
+        assert_eq!(Column::from_index(4), None);
+        assert_eq!(Column::from_index(99), None);
+    }
+
+    // --- Issue session_name ---
+
+    #[test]
+    fn session_name_lowercases_id() {
+        let issue = test_issue("BORK-3", Column::Todo);
+        assert_eq!(issue.session_name(), "bork-bork-3");
+    }
+
+    // --- Issue serialization with done_at ---
+
+    #[test]
+    fn issue_serializes_done_at_when_set() {
+        let mut issue = test_issue("bork-1", Column::Done);
+        issue.done_at = Some(1700000000);
+        let json = serde_json::to_string(&issue).unwrap();
+        assert!(json.contains("\"done_at\":1700000000"));
+    }
+
+    #[test]
+    fn issue_deserializes_without_done_at_defaults_to_none() {
+        let json = r#"{
+            "id": "bork-1",
+            "title": "Test",
+            "column": "Todo",
+            "tmux_session": null,
+            "agent_kind": "OpenCode",
+            "agent_mode": "Plan",
+            "agent_status": "Stopped",
+            "prompt": null
+        }"#;
+        let issue: Issue = serde_json::from_str(json).unwrap();
+        assert_eq!(issue.done_at, None);
+    }
+
+    #[test]
+    fn issue_deserializes_with_done_at() {
+        let json = r#"{
+            "id": "bork-1",
+            "title": "Test",
+            "column": "Done",
+            "tmux_session": null,
+            "agent_kind": "OpenCode",
+            "agent_mode": "Plan",
+            "agent_status": "Stopped",
+            "prompt": null,
+            "done_at": 1700000000
+        }"#;
+        let issue: Issue = serde_json::from_str(json).unwrap();
+        assert_eq!(issue.done_at, Some(1700000000));
+    }
+
+    #[test]
+    fn column_deserializes_planning_alias_as_todo() {
+        let json = r#"{
+            "id": "bork-1",
+            "title": "Test",
+            "column": "Planning",
+            "tmux_session": null,
+            "agent_kind": "OpenCode",
+            "agent_mode": "Plan",
+            "agent_status": "Stopped",
+            "prompt": null
+        }"#;
+        let issue: Issue = serde_json::from_str(json).unwrap();
+        assert_eq!(issue.column, Column::Todo);
+    }
+
+    #[test]
+    fn issue_ignores_unknown_fields_from_old_state() {
+        let json = r#"{
+            "id": "bork-1",
+            "title": "Test",
+            "column": "Todo",
+            "branch": null,
+            "worktree": "main",
+            "tmux_session": null,
+            "agent_kind": "OpenCode",
+            "agent_mode": "Plan",
+            "agent_status": "Stopped",
+            "prompt": null
+        }"#;
+        let issue: Issue = serde_json::from_str(json).unwrap();
+        assert_eq!(issue.id, "bork-1");
+    }
+
+    // --- AgentStatus ---
 
     #[test]
     fn test_agent_status_symbol() {
