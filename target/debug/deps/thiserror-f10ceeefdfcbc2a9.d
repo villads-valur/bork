@@ -1,0 +1,14 @@
+/Users/villads-valur/developer/bork/target/debug/deps/thiserror-f10ceeefdfcbc2a9.d: /Users/villads-valur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/lib.rs /Users/villads-valur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/aserror.rs /Users/villads-valur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/display.rs /Users/villads-valur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/var.rs /Users/villads-valur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/private.rs /Users/villads-valur/developer/bork/target/debug/build/thiserror-b84c3459e91921f8/out/private.rs
+
+/Users/villads-valur/developer/bork/target/debug/deps/libthiserror-f10ceeefdfcbc2a9.rlib: /Users/villads-valur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/lib.rs /Users/villads-valur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/aserror.rs /Users/villads-valur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/display.rs /Users/villads-valur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/var.rs /Users/villads-valur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/private.rs /Users/villads-valur/developer/bork/target/debug/build/thiserror-b84c3459e91921f8/out/private.rs
+
+/Users/villads-valur/developer/bork/target/debug/deps/libthiserror-f10ceeefdfcbc2a9.rmeta: /Users/villads-valur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/lib.rs /Users/villads-valur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/aserror.rs /Users/villads-valur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/display.rs /Users/villads-valur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/var.rs /Users/villads-valur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/private.rs /Users/villads-valur/developer/bork/target/debug/build/thiserror-b84c3459e91921f8/out/private.rs
+
+/Users/villads-valur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/lib.rs:
+/Users/villads-valur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/aserror.rs:
+/Users/villads-valur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/display.rs:
+/Users/villads-valur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/var.rs:
+/Users/villads-valur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/private.rs:
+/Users/villads-valur/developer/bork/target/debug/build/thiserror-b84c3459e91921f8/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/villads-valur/developer/bork/target/debug/build/thiserror-b84c3459e91921f8/out
