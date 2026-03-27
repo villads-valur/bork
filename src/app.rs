@@ -113,8 +113,16 @@ pub struct App {
 
 impl App {
     pub fn new(config: AppConfig, state: AppState) -> Self {
+        let mut issues = state.issues;
+        let now = unix_now();
+        for issue in &mut issues {
+            if issue.column == Column::Done && issue.done_at.is_none() {
+                issue.done_at = Some(now);
+            }
+        }
+
         App {
-            issues: state.issues,
+            issues,
             selected_column: 0,
             selected_row: [0; 4],
             active_sessions: HashSet::new(),
@@ -607,6 +615,43 @@ mod tests {
         assert_eq!(app.issues[0].done_at, None);
         app.selected_column = 1;
         app.move_issue_right(); // InProgress -> CodeReview
+        assert_eq!(app.issues[0].done_at, None);
+    }
+
+    #[test]
+    fn backfill_done_at_on_startup() {
+        // Legacy issues in Done without done_at should get backfilled on App::new
+        let mut issue = test_issue("bork-1", Column::Done);
+        issue.done_at = None;
+        let state = AppState {
+            issues: vec![issue],
+        };
+        let app = App::new(test_config(), state);
+        assert!(
+            app.issues[0].done_at.is_some(),
+            "Done issue with no done_at should be backfilled on startup"
+        );
+    }
+
+    #[test]
+    fn backfill_does_not_overwrite_existing_done_at() {
+        let mut issue = test_issue("bork-1", Column::Done);
+        issue.done_at = Some(1000);
+        let state = AppState {
+            issues: vec![issue],
+        };
+        let app = App::new(test_config(), state);
+        assert_eq!(app.issues[0].done_at, Some(1000));
+    }
+
+    #[test]
+    fn backfill_skips_non_done_issues() {
+        let mut issue = test_issue("bork-1", Column::Todo);
+        issue.done_at = None;
+        let state = AppState {
+            issues: vec![issue],
+        };
+        let app = App::new(test_config(), state);
         assert_eq!(app.issues[0].done_at, None);
     }
 
