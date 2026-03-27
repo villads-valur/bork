@@ -44,6 +44,10 @@ fn map_normal_key(key: KeyEvent) -> Action {
         KeyCode::Char('g') => Action::ScrollToTop,
         KeyCode::Char('G') => Action::ScrollToBottom,
 
+        KeyCode::Char('P') => Action::SyncPRs,
+        KeyCode::Char('o') => Action::OpenPR,
+        KeyCode::Char('W') => Action::AssignWorktree,
+
         KeyCode::Char('/') => Action::SearchStart,
         KeyCode::Esc => Action::ClearSearch,
 

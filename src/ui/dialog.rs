@@ -5,10 +5,10 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::App;
-use crate::types::AgentMode;
+use crate::types::{AgentKind, AgentMode};
 use crate::ui::styles;
 
-const DIALOG_HEIGHT: u16 = 21;
+const DIALOG_HEIGHT: u16 = 19;
 const DIALOG_MIN_WIDTH: u16 = 44;
 const DIALOG_MAX_WIDTH: u16 = 80;
 const PROMPT_VISIBLE_LINES: usize = 3;
@@ -86,27 +86,15 @@ pub fn render_dialog(frame: &mut Frame, app: &App) {
         field_width,
     );
 
-    // --- Worktree field (row 7, after the 3-line prompt) ---
-    let worktree_row = 3 + PROMPT_VISIBLE_LINES as u16 + 1;
-    let worktree_area = Rect::new(inner.x + 1, inner.y + worktree_row, inner.width - 2, 1);
-    render_single_line_field(
-        frame,
-        "Worktree:",
-        &dialog.worktree,
-        worktree_area,
-        dialog.focused_field == 2,
-        label_width,
-        field_width,
-    );
-
-    // --- Mode field (row 9) ---
-    let mode_row = worktree_row + 2;
+    // --- Mode field (after the 3-line prompt) ---
+    let mode_row = 3 + PROMPT_VISIBLE_LINES as u16 + 1;
     let mode_area = Rect::new(inner.x + 1, inner.y + mode_row, inner.width - 2, 1);
     render_mode_field(
         frame,
         &dialog.agent_mode,
+        dialog.agent_kind,
         mode_area,
-        dialog.focused_field == 3,
+        dialog.focused_field == 2,
         label_width,
     );
 
@@ -352,53 +340,49 @@ fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
 fn render_mode_field(
     frame: &mut Frame,
     mode: &AgentMode,
+    agent_kind: AgentKind,
     area: Rect,
     focused: bool,
     label_width: usize,
 ) {
     let label_style = field_label_style(focused);
 
+    let selected_style = Style::default()
+        .fg(styles::ACCENT)
+        .add_modifier(Modifier::BOLD);
+    let unselected_style = styles::dim_style();
+
+    let indicator = |selected: bool| if selected { "\u{25cf}" } else { "\u{25cb}" };
+
     let plan_selected = *mode == AgentMode::Plan;
     let build_selected = *mode == AgentMode::Build;
+    let yolo_selected = *mode == AgentMode::Yolo;
 
-    let plan_style = if plan_selected {
-        Style::default()
-            .fg(styles::ACCENT)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        styles::dim_style()
-    };
-
-    let build_style = if build_selected {
-        Style::default()
-            .fg(styles::ACCENT)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        styles::dim_style()
-    };
-
-    let plan_indicator = if plan_selected {
-        "\u{25cf}"
-    } else {
-        "\u{25cb}"
-    };
-    let build_indicator = if build_selected {
-        "\u{25cf}"
-    } else {
-        "\u{25cb}"
-    };
-
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             format!("{:<width$}", "Mode:", width = label_width),
             label_style,
         ),
-        Span::styled(format!("[{} plan]", plan_indicator), plan_style),
+        Span::styled(
+            format!("[{} plan]", indicator(plan_selected)),
+            if plan_selected { selected_style } else { unselected_style },
+        ),
         Span::raw("  "),
-        Span::styled(format!("[{} build]", build_indicator), build_style),
-    ]);
+        Span::styled(
+            format!("[{} build]", indicator(build_selected)),
+            if build_selected { selected_style } else { unselected_style },
+        ),
+    ];
 
-    frame.render_widget(Paragraph::new(line), area);
+    if agent_kind == AgentKind::Claude {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("[{} yolo]", indicator(yolo_selected)),
+            if yolo_selected { selected_style } else { unselected_style },
+        ));
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 #[cfg(test)]

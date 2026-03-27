@@ -107,6 +107,7 @@ fn render_column(frame: &mut Frame, app: &App, column: Column, area: Rect, is_se
             activity: app.resolved_activity(issue),
             branch: app.branch_for(issue),
             git_status: app.worktree_status_for(issue),
+            pr: app.pr_for(issue),
         };
 
         card::render_card(frame, &ctx, card_area);

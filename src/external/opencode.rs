@@ -65,9 +65,10 @@ fn build_agent_cmd(
             if let Some(ref sid) = issue.session_id {
                 // Resume existing OpenCode session — skip --prompt, history is preserved
                 let escaped_sid = shell_escape_single_quotes(sid);
+                // Yolo is Claude-only; treat as Build for OpenCode
                 let mode_flag = match issue.agent_mode {
                     AgentMode::Plan => " --agent plan",
-                    AgentMode::Build => "",
+                    AgentMode::Build | AgentMode::Yolo => "",
                 };
                 let cmd = format!(
                     "{} && opencode --session '{}'{}",
@@ -86,9 +87,10 @@ fn build_agent_cmd(
                     issue.prompt.as_deref(),
                 );
                 let escaped_prompt = shell_escape_single_quotes(&prompt);
+                // Yolo is Claude-only; treat as Build for OpenCode
                 let mode_flag = match issue.agent_mode {
                     AgentMode::Plan => " --agent plan",
-                    AgentMode::Build => "",
+                    AgentMode::Build | AgentMode::Yolo => "",
                 };
                 let cmd = format!(
                     "{} && opencode --prompt '{}'{}",
@@ -102,6 +104,7 @@ fn build_agent_cmd(
             let escaped_name = shell_escape_single_quotes(&session_display_name);
             let mode_flag = match issue.agent_mode {
                 AgentMode::Plan => " --permission-mode plan",
+                AgentMode::Yolo => " --dangerously-skip-permissions",
                 AgentMode::Build => "",
             };
 
@@ -169,8 +172,6 @@ fn generate_uuid() -> Option<String> {
 }
 
 /// Poll `opencode session list` to detect a newly created session.
-/// Compares against the sessions that existed before launch (captured beforehand is not
-/// available here, so we take a brief snapshot and look for the most recent ses_ entry).
 /// Returns the session ID if found within ~5 seconds, otherwise None.
 fn detect_opencode_session_id() -> Option<String> {
     // Give OpenCode a moment to create its session before polling
@@ -213,7 +214,6 @@ fn parse_newest_session_id(output: &str) -> Option<String> {
 }
 
 /// Snapshot the current set of OpenCode session IDs before launching.
-/// Used to identify which session was newly created after launch.
 #[allow(dead_code)]
 fn snapshot_opencode_sessions() -> HashSet<String> {
     let output = Command::new("opencode")
@@ -324,7 +324,7 @@ mod tests {
         );
         assert!(result.starts_with("You are working on bork-6: New feature."));
         assert!(result.contains("Check AGENTS.md for project context"));
-        assert!(result.contains("worktree skill"));
+        assert!(result.contains("bork worktree"));
     }
 
     #[test]

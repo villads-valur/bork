@@ -62,9 +62,10 @@ Press `n` to create an issue, `Enter` to launch an agent session. You're up and 
 - **4-column kanban board** &mdash; To Do, In Progress, Code Review, Done
 - **AI agent sessions** &mdash; Launch OpenCode or Claude Code per issue in tmux popups
 - **Real-time status monitoring** &mdash; See agent state on each card (Idle, Busy, Waiting, Error)
+- **GitHub PR status** &mdash; Background polling shows checks, review status, and diff stats on cards
 - **Git worktree tracking** &mdash; Live staged/unstaged change counts and branch names
 - **Tmux integration** &mdash; Auto-wraps in tmux, sessions open as 90% screen popups
-- **Plan and Build modes** &mdash; Toggle between planning and building per issue
+- **Plan, Build, and Yolo modes** &mdash; Toggle between modes per issue; Claude also supports Yolo (skips all permission prompts)
 - **Vim-style navigation** &mdash; h/j/k/l, g/G, and familiar modal keybindings
 - **ANSI 16 colors** &mdash; Adapts to any terminal theme, no hardcoded RGB
 - **Zero-dependency state** &mdash; JSON file persistence with atomic writes, no database
@@ -75,6 +76,7 @@ Press `n` to create an issue, `Enter` to launch an agent session. You're up and 
 |------------|---------|
 | [tmux](https://github.com/tmux/tmux) | Session management and popup overlays |
 | [git](https://git-scm.com/) | Worktree status and branch detection |
+| [gh](https://cli.github.com/) | GitHub PR status polling (optional) |
 | [OpenCode](https://opencode.ai) or [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | AI coding agent (at least one) |
 | [gh](https://cli.github.com/) | GitHub PR status (optional) |
 | [Rust toolchain](https://rustup.rs/) | Building from source |
@@ -165,6 +167,8 @@ These are installed automatically by `bork init`. Use `bork install` / `bork uni
 | `g` | Scroll to top |
 | `G` | Scroll to bottom |
 | `Enter` | Open session (launch if none, attach if exists) |
+| `P` | Force-sync PR statuses from GitHub |
+| `o` | Open PR in browser (if issue has a matching PR) |
 | `q` / `Ctrl+c` | Quit |
 
 ### Issue Management
@@ -186,7 +190,7 @@ These are installed automatically by `bork init`. Use `bork install` / `bork uni
 | `Shift+Tab` | Previous field |
 | `Shift+Enter` | Submit from any field |
 | `Esc` / `Ctrl+c` | Cancel |
-| `Space` / `h` / `l` | Toggle Plan/Build mode (on mode field) |
+| `Space` / `h` / `l` | Cycle mode: Plan → Build (→ Yolo for Claude) |
 
 ### Confirm Mode
 
@@ -222,6 +226,25 @@ Each issue card shows the current agent status:
 | `●` | Busy |
 | `◈` | Waiting for input |
 | `✗` | Error |
+
+## GitHub PR Integration
+
+Bork polls GitHub for open PRs every 60 seconds using a single GraphQL query via the `gh` CLI. PRs are matched to issues by comparing the PR's head branch name against each issue's worktree branch.
+
+Each card shows PR status when a matching PR is found:
+
+| Element | Meaning |
+|---------|---------|
+| `#42` | PR number |
+| `✓` (green) | CI checks passing |
+| `✗` (red) | CI checks failing |
+| `◌` (yellow) | CI checks pending |
+| `●` (green) | Review approved |
+| `●` (red) | Changes requested |
+| `○` (yellow) | Review required |
+| `+12/-3` | Lines added/removed |
+
+The `gh` CLI must be installed and authenticated. If `gh` is not available or the repo is not on GitHub, PR polling is silently skipped.
 
 ## Project Layout
 

@@ -4,9 +4,11 @@ use std::thread;
 
 use crate::app::{App, ConfirmAction, InputMode, DIALOG_FIELD_COUNT};
 use crate::config::{self, AppConfig};
-use crate::external::{opencode, tmux};
+use crate::external::{github, opencode, tmux};
 use crate::input::Action;
 use crate::types::{AgentStatus, Column, Issue};
+
+pub type PrWakeTx = mpsc::Sender<()>;
 
 pub struct ActionResult {
     pub message: String,
@@ -26,6 +28,7 @@ pub fn handle_action(
     app: &mut App,
     action: Action,
     action_tx: &mpsc::Sender<ActionResult>,
+    pr_wake_tx: &PrWakeTx,
 ) -> PostAction {
     match app.input_mode {
         InputMode::Confirm => {
@@ -40,7 +43,7 @@ pub fn handle_action(
             handle_search(app, action);
             PostAction::None
         }
-        InputMode::Normal => handle_normal(app, action, action_tx),
+        InputMode::Normal => handle_normal(app, action, action_tx, pr_wake_tx),
     }
 }
 
@@ -48,6 +51,7 @@ fn handle_normal(
     app: &mut App,
     action: Action,
     action_tx: &mpsc::Sender<ActionResult>,
+    pr_wake_tx: &PrWakeTx,
 ) -> PostAction {
     match action {
         Action::Quit => {
@@ -177,6 +181,46 @@ fn handle_normal(
             PostAction::None
         }
 
+        Action::SyncPRs => {
+            let _ = pr_wake_tx.send(());
+            app.set_message("Syncing PRs...");
+            PostAction::None
+        }
+
+        Action::OpenPR => {
+            let Some(issue) = app.selected_issue() else {
+                return PostAction::None;
+            };
+            let Some(pr) = app.pr_for(issue) else {
+                app.set_message("No PR found for this issue");
+                return PostAction::None;
+            };
+            let pr_number = pr.number;
+            let main_worktree = app.config.project_root.join("main");
+            thread::spawn(move || {
+                github::open_pr_in_browser(pr_number, &main_worktree);
+            });
+            PostAction::None
+        }
+
+        Action::AssignWorktree => {
+            let Some(idx) = app.selected_issue_index() else {
+                return PostAction::None;
+            };
+            if let Some(old) = app.issues[idx].worktree.take() {
+                app.set_message(format!("Cleared worktree '{old}', re-detecting..."));
+            } else {
+                app.set_message("No worktree assigned, re-detecting...");
+            }
+            if app.auto_assign_worktrees() {
+                if let Some(wt) = app.issues[idx].worktree.as_ref() {
+                    app.set_message(format!("Assigned worktree: {wt}"));
+                }
+            }
+            let _ = config::save_state(&app.to_state(), &app.config.project_root);
+            PostAction::None
+        }
+
         Action::SearchStart => {
             app.start_search();
             PostAction::None
@@ -264,17 +308,10 @@ fn submit_dialog(app: &mut App) {
         Some(dialog.prompt.trim().to_string())
     };
 
-    let worktree = if dialog.worktree.trim().is_empty() {
-        None
-    } else {
-        Some(dialog.worktree.trim().to_string())
-    };
-
     if let Some(idx) = dialog.editing_index {
         if idx < app.issues.len() {
             app.issues[idx].title = title;
             app.issues[idx].prompt = prompt;
-            app.issues[idx].worktree = worktree;
             app.issues[idx].agent_mode = dialog.agent_mode;
             app.set_message(format!("Updated {}", app.issues[idx].id));
             let _ = config::save_state(&app.to_state(), &app.config.project_root);
@@ -289,13 +326,12 @@ fn submit_dialog(app: &mut App) {
         id: id.clone(),
         title,
         column,
-        branch: None,
-        worktree,
         tmux_session: None,
         agent_kind: app.config.agent_kind,
         agent_mode: dialog.agent_mode,
         agent_status: AgentStatus::Stopped,
         prompt,
+        worktree: None,
         done_at: None,
         session_id: None,
     };
@@ -408,6 +444,10 @@ mod tests {
     use crate::input::Action;
     use crate::types::Column;
 
+    fn pr_wake_tx() -> mpsc::Sender<()> {
+        mpsc::channel().0
+    }
+
     fn test_config() -> AppConfig {
         AppConfig {
             project_name: "bork".to_string(),
@@ -433,11 +473,26 @@ mod tests {
         app.open_dialog();
 
         // Type a title
-        handle_action(&mut app, Action::DialogChar('H'), &mpsc::channel().0);
-        handle_action(&mut app, Action::DialogChar('i'), &mpsc::channel().0);
+        handle_action(
+            &mut app,
+            Action::DialogChar('H'),
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+        handle_action(
+            &mut app,
+            Action::DialogChar('i'),
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
 
         // Move from title (field 0) to prompt (field 1)
-        handle_action(&mut app, Action::DialogNextField, &mpsc::channel().0);
+        handle_action(
+            &mut app,
+            Action::DialogNextField,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
 
         let dialog = app.dialog.as_ref().unwrap();
         assert_eq!(dialog.focused_field, 1);
@@ -453,11 +508,26 @@ mod tests {
         app.open_dialog();
 
         // Move to prompt field
-        handle_action(&mut app, Action::DialogNextField, &mpsc::channel().0);
+        handle_action(
+            &mut app,
+            Action::DialogNextField,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
 
         // Type something in the prompt
-        handle_action(&mut app, Action::DialogChar('g'), &mpsc::channel().0);
-        handle_action(&mut app, Action::DialogChar('o'), &mpsc::channel().0);
+        handle_action(
+            &mut app,
+            Action::DialogChar('g'),
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+        handle_action(
+            &mut app,
+            Action::DialogChar('o'),
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
 
         let dialog = app.dialog.as_ref().unwrap();
         assert_eq!(dialog.prompt, "go");
@@ -470,14 +540,22 @@ mod tests {
 
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 0);
 
-        handle_action(&mut app, Action::DialogNextField, &mpsc::channel().0);
+        handle_action(
+            &mut app,
+            Action::DialogNextField,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 1);
 
-        handle_action(&mut app, Action::DialogNextField, &mpsc::channel().0);
+        handle_action(
+            &mut app,
+            Action::DialogNextField,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 2);
-
-        handle_action(&mut app, Action::DialogNextField, &mpsc::channel().0);
-        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 3);
+        // Field 2 is the last (mode). Next field from here submits the dialog.
     }
 
     #[test]
@@ -486,11 +564,21 @@ mod tests {
         app.open_dialog();
 
         // Advance to prompt
-        handle_action(&mut app, Action::DialogNextField, &mpsc::channel().0);
+        handle_action(
+            &mut app,
+            Action::DialogNextField,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 1);
 
         // Go back to title
-        handle_action(&mut app, Action::DialogPrevField, &mpsc::channel().0);
+        handle_action(
+            &mut app,
+            Action::DialogPrevField,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 0);
     }
 
@@ -499,7 +587,12 @@ mod tests {
         let mut app = test_app();
         app.open_dialog();
 
-        handle_action(&mut app, Action::DialogPrevField, &mpsc::channel().0);
+        handle_action(
+            &mut app,
+            Action::DialogPrevField,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 0);
     }
 
@@ -509,11 +602,31 @@ mod tests {
         app.open_dialog();
 
         // Move to prompt field
-        handle_action(&mut app, Action::DialogNextField, &mpsc::channel().0);
+        handle_action(
+            &mut app,
+            Action::DialogNextField,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
 
-        handle_action(&mut app, Action::DialogChar('a'), &mpsc::channel().0);
-        handle_action(&mut app, Action::DialogChar(' '), &mpsc::channel().0);
-        handle_action(&mut app, Action::DialogChar('b'), &mpsc::channel().0);
+        handle_action(
+            &mut app,
+            Action::DialogChar('a'),
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+        handle_action(
+            &mut app,
+            Action::DialogChar(' '),
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+        handle_action(
+            &mut app,
+            Action::DialogChar('b'),
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
 
         assert_eq!(app.dialog.as_ref().unwrap().prompt, "a b");
     }
@@ -524,7 +637,12 @@ mod tests {
         app.open_dialog();
         assert!(app.dialog.is_some());
 
-        handle_action(&mut app, Action::DialogCancel, &mpsc::channel().0);
+        handle_action(
+            &mut app,
+            Action::DialogCancel,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
         assert!(app.dialog.is_none());
     }
 
@@ -537,7 +655,6 @@ mod tests {
             id: "bork-1".to_string(),
             title: "Test".to_string(),
             column: Column::Todo,
-            branch: None,
             worktree: Some("main".to_string()),
             tmux_session: None,
             agent_kind: crate::types::AgentKind::OpenCode,
@@ -553,7 +670,12 @@ mod tests {
         app.open_edit_dialog(&issue, 0);
 
         // Move from title to prompt
-        handle_action(&mut app, Action::DialogNextField, &mpsc::channel().0);
+        handle_action(
+            &mut app,
+            Action::DialogNextField,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
 
         let dialog = app.dialog.as_ref().unwrap();
         assert_eq!(

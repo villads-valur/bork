@@ -2,7 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::{AppConfig, AppState};
-use crate::types::{AgentMode, AgentStatus, AgentStatusInfo, Column, Issue, WorktreeStatus};
+use crate::types::{
+    AgentKind, AgentMode, AgentStatus, AgentStatusInfo, Column, Issue, PrStatus, WorktreeStatus,
+};
 
 fn unix_now() -> u64 {
     SystemTime::now()
@@ -28,19 +30,19 @@ pub enum ConfirmAction {
 pub struct DialogState {
     pub title: String,
     pub prompt: String,
-    pub worktree: String,
     pub agent_mode: AgentMode,
-    pub focused_field: usize, // 0=title, 1=prompt, 2=worktree, 3=mode
+    pub agent_kind: AgentKind,
+    pub focused_field: usize, // 0=title, 1=prompt, 2=mode
     pub editing_index: Option<usize>,
 }
 
 impl DialogState {
-    pub fn new() -> Self {
+    pub fn new(agent_kind: AgentKind) -> Self {
         DialogState {
             title: String::new(),
             prompt: String::new(),
-            worktree: "main".into(),
             agent_mode: AgentMode::Plan,
+            agent_kind,
             focused_field: 0,
             editing_index: None,
         }
@@ -50,8 +52,8 @@ impl DialogState {
         DialogState {
             title: issue.title.clone(),
             prompt: issue.prompt.clone().unwrap_or_default(),
-            worktree: issue.worktree.clone().unwrap_or_default(),
             agent_mode: issue.agent_mode,
+            agent_kind: issue.agent_kind,
             focused_field: 0,
             editing_index: Some(index),
         }
@@ -61,11 +63,12 @@ impl DialogState {
         match self.focused_field {
             0 => self.title.push(c),
             1 => self.prompt.push(c),
-            2 => self.worktree.push(c),
-            3 => {
-                // On mode field: space/h/l toggle
+            2 => {
                 if c == ' ' || c == 'h' || c == 'l' {
-                    self.agent_mode = self.agent_mode.toggle();
+                    self.agent_mode = match self.agent_kind {
+                        AgentKind::Claude => self.agent_mode.next_for_claude(),
+                        AgentKind::OpenCode => self.agent_mode.toggle(),
+                    };
                 }
             }
             _ => {}
@@ -80,15 +83,12 @@ impl DialogState {
             1 => {
                 self.prompt.pop();
             }
-            2 => {
-                self.worktree.pop();
-            }
             _ => {}
         }
     }
 }
 
-pub const DIALOG_FIELD_COUNT: usize = 4;
+pub const DIALOG_FIELD_COUNT: usize = 3;
 
 pub struct App {
     pub issues: Vec<Issue>,
@@ -98,6 +98,7 @@ pub struct App {
     pub agent_statuses: HashMap<String, AgentStatusInfo>,
     pub worktree_statuses: HashMap<String, WorktreeStatus>,
     pub worktree_branches: HashMap<String, String>,
+    pub pr_statuses: HashMap<String, PrStatus>,
     pub frozen_worktree_statuses: HashMap<String, WorktreeStatus>,
     pub frozen_worktree_branches: HashMap<String, String>,
     pub input_mode: InputMode,
@@ -131,6 +132,7 @@ impl App {
             agent_statuses: HashMap::new(),
             worktree_statuses: HashMap::new(),
             worktree_branches: HashMap::new(),
+            pr_statuses: HashMap::new(),
             frozen_worktree_statuses: HashMap::new(),
             frozen_worktree_branches: HashMap::new(),
             input_mode: InputMode::Normal,
@@ -279,10 +281,11 @@ impl App {
     pub fn move_issue_right(&mut self) {
         if let Some(idx) = self.selected_issue_index() {
             if let Some(next) = self.issues[idx].column.next() {
+                let wt = self.issues[idx].worktree.clone();
                 self.issues[idx].column = next;
                 if next == Column::Done {
                     self.issues[idx].done_at = Some(unix_now());
-                    if let Some(w) = self.issues[idx].worktree.clone() {
+                    if let Some(w) = wt {
                         self.freeze_worktree_status(&w);
                     }
                 }
@@ -294,10 +297,11 @@ impl App {
         if let Some(idx) = self.selected_issue_index() {
             let was_done = self.issues[idx].column == Column::Done;
             if let Some(prev) = self.issues[idx].column.prev() {
+                let wt = self.issues[idx].worktree.clone();
                 self.issues[idx].column = prev;
                 if was_done {
                     self.issues[idx].done_at = None;
-                    if let Some(w) = self.issues[idx].worktree.clone() {
+                    if let Some(w) = wt {
                         self.unfreeze_worktree_status(&w);
                     }
                 }
@@ -363,24 +367,107 @@ impl App {
             .and_then(|info| info.activity.as_deref())
     }
 
+    // --- Worktree resolution ---
+
+    /// Return the persisted worktree directory for an issue.
+    pub fn worktree_for<'a>(&self, issue: &'a Issue) -> Option<&'a str> {
+        issue.worktree.as_deref()
+    }
+
+    /// Auto-detect a worktree directory for an issue by matching its ID
+    /// against known directory names from both live and frozen worktree maps.
+    ///
+    /// Matching rules:
+    /// 1. Exact match (case-insensitive): dir name == issue ID
+    /// 2. Prefix match: dir starts with "{issue_id}-"
+    /// 3. Among prefix matches, shortest directory name wins
+    fn detect_worktree(&self, issue: &Issue) -> Option<String> {
+        let issue_id_lower = issue.id.to_lowercase();
+
+        let mut best: Option<&str> = None;
+        let all_keys = self
+            .worktree_branches
+            .keys()
+            .chain(self.frozen_worktree_branches.keys());
+
+        for dir_name in all_keys {
+            let dir_lower = dir_name.to_lowercase();
+            if dir_lower == issue_id_lower {
+                return Some(dir_name.clone());
+            }
+            if let Some(rest) = dir_lower.strip_prefix(issue_id_lower.as_str()) {
+                if rest.starts_with('-') && (best.is_none() || dir_name.len() < best.unwrap().len())
+                {
+                    best = Some(dir_name.as_str());
+                }
+            }
+        }
+        best.map(|s| s.to_string())
+    }
+
+    /// Auto-assign worktree directories for issues that don't have one.
+    /// Returns true if any assignments were made (signals a state save).
+    pub fn auto_assign_worktrees(&mut self) -> bool {
+        // Collect assignments first to avoid borrow conflict with detect_worktree
+        let assignments: Vec<(usize, String)> = (0..self.issues.len())
+            .filter(|&i| self.issues[i].worktree.is_none())
+            .filter_map(|i| self.detect_worktree(&self.issues[i]).map(|wt| (i, wt)))
+            .collect();
+
+        if assignments.is_empty() {
+            return false;
+        }
+
+        for (i, wt) in assignments {
+            self.issues[i].worktree = Some(wt.clone());
+            if self.issues[i].column == Column::Done {
+                self.freeze_worktree_status(&wt);
+            }
+        }
+        true
+    }
+
+    /// Clear worktree assignments that point to directories that no longer exist.
+    /// Returns true if any were cleared (signals a state save).
+    pub fn clear_stale_worktrees(&mut self) -> bool {
+        let mut changed = false;
+        for issue in &mut self.issues {
+            let Some(wt) = issue.worktree.as_ref() else {
+                continue;
+            };
+            let exists = self.worktree_branches.contains_key(wt)
+                || self.frozen_worktree_branches.contains_key(wt);
+            if !exists {
+                issue.worktree = None;
+                changed = true;
+            }
+        }
+        changed
+    }
+
     pub fn worktree_status_for(&self, issue: &Issue) -> Option<&WorktreeStatus> {
-        let w = issue.worktree.as_ref()?;
+        let wt = self.worktree_for(issue)?;
         if issue.column == Column::Done {
-            if let Some(frozen) = self.frozen_worktree_statuses.get(w) {
+            if let Some(frozen) = self.frozen_worktree_statuses.get(wt) {
                 return Some(frozen);
             }
         }
-        self.worktree_statuses.get(w)
+        self.worktree_statuses.get(wt)
     }
 
     pub fn branch_for(&self, issue: &Issue) -> Option<&str> {
-        let w = issue.worktree.as_ref()?;
+        let wt = self.worktree_for(issue)?;
         if issue.column == Column::Done {
-            if let Some(frozen) = self.frozen_worktree_branches.get(w) {
+            if let Some(frozen) = self.frozen_worktree_branches.get(wt) {
                 return Some(frozen.as_str());
             }
         }
-        self.worktree_branches.get(w).map(|s| s.as_str())
+        self.worktree_branches.get(wt).map(|s| s.as_str())
+    }
+
+    pub fn pr_for(&self, issue: &Issue) -> Option<&PrStatus> {
+        let branch = self.branch_for(issue)?;
+        self.pr_statuses.get(branch)
     }
 
     pub fn done_worktree_names(&self) -> HashSet<String> {
@@ -431,7 +518,7 @@ impl App {
     // --- Dialog ---
 
     pub fn open_dialog(&mut self) {
-        self.dialog = Some(DialogState::new());
+        self.dialog = Some(DialogState::new(self.config.agent_kind));
         self.input_mode = InputMode::Dialog;
     }
 
@@ -571,12 +658,13 @@ mod tests {
 
     use super::*;
     use crate::config::DEFAULT_DONE_SESSION_TTL;
+    use crate::types::{AgentKind, AgentMode, PrState, PrStatus};
 
     fn test_config() -> AppConfig {
         AppConfig {
-            project_name: "bork".to_string(),
+            project_name: "bork".into(),
             project_root: PathBuf::from("/tmp/test-bork"),
-            agent_kind: crate::types::AgentKind::OpenCode,
+            agent_kind: AgentKind::OpenCode,
             default_prompt: None,
             done_session_ttl: DEFAULT_DONE_SESSION_TTL,
         }
@@ -587,13 +675,12 @@ mod tests {
             id: id.to_string(),
             title: format!("Test issue {}", id),
             column,
-            branch: None,
-            worktree: Some("main".to_string()),
             tmux_session: None,
-            agent_kind: crate::types::AgentKind::OpenCode,
-            agent_mode: crate::types::AgentMode::Plan,
+            agent_kind: AgentKind::OpenCode,
+            agent_mode: AgentMode::Plan,
             agent_status: AgentStatus::Stopped,
             prompt: None,
+            worktree: None,
             done_at: None,
             session_id: None,
         }
@@ -616,18 +703,404 @@ mod tests {
         App::new(test_config(), state)
     }
 
+    fn test_pr(number: u32, branch: &str) -> PrStatus {
+        PrStatus {
+            number,
+            state: PrState::Open,
+            is_draft: false,
+            checks: Some(crate::types::ChecksStatus::Success),
+            review: Some(crate::types::ReviewDecision::Approved),
+            additions: 10,
+            deletions: 5,
+            head_branch: branch.into(),
+        }
+    }
+
     // ================================================================
-    // Feature 1: Auto-move to InProgress on session start
+    // detect_worktree (auto-detection logic)
     // ================================================================
-    // The auto-move happens in main.rs when the async launch completes,
-    // but the column mutation itself is on App. We test the expected
-    // behavior: after a session launches on a Todo issue, it should be
-    // InProgress.
+
+    #[test]
+    fn test_detect_worktree_exact_match() {
+        let mut app = test_app(vec![test_issue("bork-8", Column::InProgress)]);
+        app.worktree_branches
+            .insert("bork-8".into(), "bork-8/init-cli".into());
+        assert_eq!(
+            app.detect_worktree(&app.issues[0].clone()),
+            Some("bork-8".into())
+        );
+    }
+
+    #[test]
+    fn test_detect_worktree_prefix_match() {
+        let mut app = test_app(vec![test_issue("bork-12", Column::InProgress)]);
+        app.worktree_branches
+            .insert("bork-12-pr-status".into(), "bork-12/pr-status".into());
+        assert_eq!(
+            app.detect_worktree(&app.issues[0].clone()),
+            Some("bork-12-pr-status".into())
+        );
+    }
+
+    #[test]
+    fn test_detect_worktree_no_false_prefix() {
+        let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
+        app.worktree_branches
+            .insert("bork-10".into(), "bork-10/something".into());
+        assert_eq!(app.detect_worktree(&app.issues[0].clone()), None);
+    }
+
+    #[test]
+    fn test_detect_worktree_no_match() {
+        let mut app = test_app(vec![test_issue("bork-99", Column::InProgress)]);
+        app.worktree_branches
+            .insert("bork-8".into(), "bork-8/init-cli".into());
+        assert_eq!(app.detect_worktree(&app.issues[0].clone()), None);
+    }
+
+    #[test]
+    fn test_detect_worktree_shortest_prefix_wins() {
+        let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
+        app.worktree_branches
+            .insert("bork-1-abc".into(), "bork-1/abc".into());
+        app.worktree_branches
+            .insert("bork-1-a".into(), "bork-1/a".into());
+        app.worktree_branches
+            .insert("bork-1-abcdef".into(), "bork-1/abcdef".into());
+        assert_eq!(
+            app.detect_worktree(&app.issues[0].clone()),
+            Some("bork-1-a".into())
+        );
+    }
+
+    #[test]
+    fn test_detect_worktree_exact_preferred_over_prefix() {
+        let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
+        app.worktree_branches
+            .insert("bork-1".into(), "bork-1/feature".into());
+        app.worktree_branches
+            .insert("bork-1-extended".into(), "bork-1/extended".into());
+        assert_eq!(
+            app.detect_worktree(&app.issues[0].clone()),
+            Some("bork-1".into())
+        );
+    }
+
+    #[test]
+    fn test_detect_worktree_case_insensitive() {
+        let mut app = test_app(vec![test_issue("BORK-8", Column::InProgress)]);
+        app.worktree_branches
+            .insert("bork-8".into(), "bork-8/feature".into());
+        assert_eq!(
+            app.detect_worktree(&app.issues[0].clone()),
+            Some("bork-8".into())
+        );
+    }
+
+    #[test]
+    fn test_detect_worktree_searches_frozen_keys() {
+        let mut app = test_app(vec![test_issue("bork-1", Column::Done)]);
+        // Not in worktree_branches (git worker skipped it)
+        // But in frozen_worktree_branches
+        app.frozen_worktree_branches
+            .insert("bork-1".into(), "bork-1/feature".into());
+        assert_eq!(
+            app.detect_worktree(&app.issues[0].clone()),
+            Some("bork-1".into())
+        );
+    }
+
+    // ================================================================
+    // auto_assign_worktrees / clear_stale_worktrees
+    // ================================================================
+
+    #[test]
+    fn test_auto_assign_sets_worktree_on_none() {
+        let mut app = test_app(vec![test_issue("bork-8", Column::InProgress)]);
+        app.worktree_branches
+            .insert("bork-8".into(), "bork-8/init-cli".into());
+        assert!(app.issues[0].worktree.is_none());
+        let changed = app.auto_assign_worktrees();
+        assert!(changed);
+        assert_eq!(app.issues[0].worktree, Some("bork-8".into()));
+    }
+
+    #[test]
+    fn test_auto_assign_skips_already_assigned() {
+        let mut issue = test_issue("bork-8", Column::InProgress);
+        issue.worktree = Some("bork-8".into());
+        let mut app = test_app(vec![issue]);
+        app.worktree_branches
+            .insert("bork-8".into(), "bork-8/init-cli".into());
+        let changed = app.auto_assign_worktrees();
+        assert!(!changed);
+    }
+
+    #[test]
+    fn test_auto_assign_returns_false_when_no_match() {
+        let mut app = test_app(vec![test_issue("bork-99", Column::InProgress)]);
+        app.worktree_branches
+            .insert("bork-8".into(), "bork-8/init-cli".into());
+        let changed = app.auto_assign_worktrees();
+        assert!(!changed);
+        assert!(app.issues[0].worktree.is_none());
+    }
+
+    #[test]
+    fn test_clear_stale_removes_missing_worktree() {
+        let mut issue = test_issue("bork-1", Column::InProgress);
+        issue.worktree = Some("bork-1-deleted".into());
+        let mut app = test_app(vec![issue]);
+        // No entries in worktree_branches or frozen for "bork-1-deleted"
+        let changed = app.clear_stale_worktrees();
+        assert!(changed);
+        assert!(app.issues[0].worktree.is_none());
+    }
+
+    #[test]
+    fn test_clear_stale_keeps_valid_worktree() {
+        let mut issue = test_issue("bork-1", Column::InProgress);
+        issue.worktree = Some("bork-1".into());
+        let mut app = test_app(vec![issue]);
+        app.worktree_branches
+            .insert("bork-1".into(), "bork-1/feature".into());
+        let changed = app.clear_stale_worktrees();
+        assert!(!changed);
+        assert_eq!(app.issues[0].worktree, Some("bork-1".into()));
+    }
+
+    #[test]
+    fn test_clear_stale_keeps_frozen_worktree() {
+        let mut issue = test_issue("bork-1", Column::Done);
+        issue.worktree = Some("bork-1".into());
+        let mut app = test_app(vec![issue]);
+        // Not in worktree_branches, but in frozen
+        app.frozen_worktree_branches
+            .insert("bork-1".into(), "bork-1/feature".into());
+        let changed = app.clear_stale_worktrees();
+        assert!(!changed);
+        assert_eq!(app.issues[0].worktree, Some("bork-1".into()));
+    }
+
+    #[test]
+    fn test_auto_assign_freezes_done_issues() {
+        let mut app = test_app(vec![test_issue("bork-1", Column::Done)]);
+        app.worktree_branches
+            .insert("bork-1".into(), "bork-1/feature".into());
+        app.worktree_statuses.insert(
+            "bork-1".into(),
+            WorktreeStatus {
+                staged: 3,
+                unstaged: 1,
+            },
+        );
+        let changed = app.auto_assign_worktrees();
+        assert!(changed);
+        assert_eq!(app.issues[0].worktree, Some("bork-1".into()));
+        // Should have frozen the worktree data
+        assert!(app.frozen_worktree_branches.contains_key("bork-1"));
+        assert_eq!(
+            app.frozen_worktree_branches.get("bork-1"),
+            Some(&"bork-1/feature".into())
+        );
+        assert!(app.frozen_worktree_statuses.contains_key("bork-1"));
+        assert_eq!(app.frozen_worktree_statuses["bork-1"].staged, 3);
+    }
+
+    #[test]
+    fn test_auto_assign_does_not_freeze_non_done_issues() {
+        let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
+        app.worktree_branches
+            .insert("bork-1".into(), "bork-1/feature".into());
+        app.auto_assign_worktrees();
+        assert!(app.frozen_worktree_branches.is_empty());
+        assert!(app.frozen_worktree_statuses.is_empty());
+    }
+
+    #[test]
+    fn test_auto_assign_uses_frozen_keys_for_done_issues() {
+        let mut app = test_app(vec![test_issue("bork-1", Column::Done)]);
+        // Not in worktree_branches (git worker skips Done), but in frozen
+        app.frozen_worktree_branches
+            .insert("bork-1".into(), "bork-1/feature".into());
+        let changed = app.auto_assign_worktrees();
+        assert!(changed);
+        assert_eq!(app.issues[0].worktree, Some("bork-1".into()));
+    }
+
+    #[test]
+    fn test_auto_assign_multiple_issues() {
+        let mut app = test_app(vec![
+            test_issue("bork-1", Column::InProgress),
+            test_issue("bork-2", Column::InProgress),
+            test_issue("bork-99", Column::InProgress),
+        ]);
+        app.worktree_branches
+            .insert("bork-1".into(), "bork-1/feat".into());
+        app.worktree_branches
+            .insert("bork-2".into(), "bork-2/feat".into());
+        let changed = app.auto_assign_worktrees();
+        assert!(changed);
+        assert_eq!(app.issues[0].worktree, Some("bork-1".into()));
+        assert_eq!(app.issues[1].worktree, Some("bork-2".into()));
+        assert_eq!(app.issues[2].worktree, None); // no match for bork-99
+    }
+
+    #[test]
+    fn test_clear_stale_does_not_touch_none() {
+        let app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
+        // worktree is already None, should not count as changed
+        assert!(!app.issues[0].worktree.is_some());
+    }
+
+    #[test]
+    fn test_worktree_for_returns_persisted_value() {
+        let mut issue = test_issue("bork-1", Column::InProgress);
+        issue.worktree = Some("bork-1-custom".into());
+        let app = test_app(vec![issue]);
+        assert_eq!(app.worktree_for(&app.issues[0]), Some("bork-1-custom"));
+    }
+
+    #[test]
+    fn test_worktree_for_returns_none_when_unset() {
+        let app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
+        assert_eq!(app.worktree_for(&app.issues[0]), None);
+    }
+
+    // ================================================================
+    // branch_for / pr_for (use persisted worktree field)
+    // ================================================================
+
+    #[test]
+    fn test_branch_for_with_persisted_worktree() {
+        let mut issue = test_issue("bork-8", Column::InProgress);
+        issue.worktree = Some("bork-8".into());
+        let mut app = test_app(vec![issue]);
+        app.worktree_branches
+            .insert("bork-8".into(), "bork-8/init-cli".into());
+        assert_eq!(
+            app.branch_for(&app.issues[0].clone()),
+            Some("bork-8/init-cli")
+        );
+    }
+
+    #[test]
+    fn test_branch_for_no_worktree_assigned() {
+        let app = test_app(vec![test_issue("bork-99", Column::InProgress)]);
+        assert_eq!(app.branch_for(&app.issues[0]), None);
+    }
+
+    #[test]
+    fn test_pr_for_with_persisted_worktree() {
+        let mut issue = test_issue("bork-1", Column::InProgress);
+        issue.worktree = Some("bork-1".into());
+        let mut app = test_app(vec![issue]);
+        app.worktree_branches
+            .insert("bork-1".into(), "bork-1/my-feature".into());
+        app.pr_statuses
+            .insert("bork-1/my-feature".into(), test_pr(42, "bork-1/my-feature"));
+        let pr = app.pr_for(&app.issues[0].clone()).unwrap();
+        assert_eq!(pr.number, 42);
+    }
+
+    #[test]
+    fn test_pr_for_no_worktree_returns_none() {
+        let app = test_app(vec![test_issue("bork-99", Column::InProgress)]);
+        assert!(app.pr_for(&app.issues[0]).is_none());
+    }
+
+    #[test]
+    fn test_pr_for_different_issues_get_correct_prs() {
+        let mut issue1 = test_issue("bork-1", Column::InProgress);
+        issue1.worktree = Some("bork-1".into());
+        let mut issue2 = test_issue("bork-2", Column::InProgress);
+        issue2.worktree = Some("bork-2".into());
+        let mut app = test_app(vec![issue1, issue2]);
+        app.worktree_branches
+            .insert("bork-1".into(), "branch-a".into());
+        app.worktree_branches
+            .insert("bork-2".into(), "branch-b".into());
+        app.pr_statuses
+            .insert("branch-a".into(), test_pr(10, "branch-a"));
+        app.pr_statuses
+            .insert("branch-b".into(), test_pr(20, "branch-b"));
+        let issues = app.issues.clone();
+        assert_eq!(app.pr_for(&issues[0]).unwrap().number, 10);
+        assert_eq!(app.pr_for(&issues[1]).unwrap().number, 20);
+    }
+
+    // ================================================================
+    // DialogState: mode cycling (field 2 = mode in our 3-field dialog)
+    // ================================================================
+
+    fn claude_dialog() -> DialogState {
+        DialogState::new(crate::types::AgentKind::Claude)
+    }
+
+    fn opencode_dialog() -> DialogState {
+        DialogState::new(crate::types::AgentKind::OpenCode)
+    }
+
+    #[test]
+    fn dialog_claude_mode_cycles_plan_build_yolo() {
+        let mut d = claude_dialog();
+        assert_eq!(d.agent_mode, crate::types::AgentMode::Plan);
+        d.focused_field = 2;
+        d.push_char(' ');
+        assert_eq!(d.agent_mode, crate::types::AgentMode::Build);
+        d.push_char(' ');
+        assert_eq!(d.agent_mode, crate::types::AgentMode::Yolo);
+        d.push_char(' ');
+        assert_eq!(d.agent_mode, crate::types::AgentMode::Plan);
+    }
+
+    #[test]
+    fn dialog_opencode_mode_cycles_plan_build_only() {
+        let mut d = opencode_dialog();
+        d.focused_field = 2;
+        d.push_char(' ');
+        assert_eq!(d.agent_mode, crate::types::AgentMode::Build);
+        d.push_char(' ');
+        assert_eq!(d.agent_mode, crate::types::AgentMode::Plan);
+        d.push_char(' ');
+        assert_eq!(d.agent_mode, crate::types::AgentMode::Build);
+    }
+
+    #[test]
+    fn dialog_mode_toggle_with_h_and_l_keys() {
+        let mut d = claude_dialog();
+        d.focused_field = 2;
+        d.push_char('l');
+        assert_eq!(d.agent_mode, crate::types::AgentMode::Build);
+        d.push_char('h');
+        assert_eq!(d.agent_mode, crate::types::AgentMode::Yolo);
+    }
+
+    #[test]
+    fn dialog_new_uses_config_agent_kind() {
+        let config = test_config();
+        let d = DialogState::new(config.agent_kind);
+        assert_eq!(d.agent_kind, crate::types::AgentKind::OpenCode);
+    }
+
+    #[test]
+    fn dialog_from_issue_preserves_agent_kind() {
+        let mut issue = test_issue("bork-1", Column::Todo);
+        issue.agent_kind = crate::types::AgentKind::Claude;
+        issue.agent_mode = crate::types::AgentMode::Yolo;
+        let d = DialogState::from_issue(&issue, 0);
+        assert_eq!(d.agent_kind, crate::types::AgentKind::Claude);
+        assert_eq!(d.agent_mode, crate::types::AgentMode::Yolo);
+    }
+
+    // ================================================================
+    // Column movement + done_at
+    // ================================================================
 
     #[test]
     fn move_issue_right_from_todo_goes_to_in_progress() {
         let mut app = test_app(vec![test_issue("bork-1", Column::Todo)]);
-        app.selected_column = 0; // Todo column
+        app.selected_column = 0;
         app.move_issue_right();
         assert_eq!(app.issues[0].column, Column::InProgress);
     }
@@ -635,7 +1108,7 @@ mod tests {
     #[test]
     fn move_issue_right_from_done_stays_in_done() {
         let mut app = test_app(vec![test_issue("bork-1", Column::Done)]);
-        app.selected_column = 3; // Done column
+        app.selected_column = 3;
         app.move_issue_right();
         assert_eq!(app.issues[0].column, Column::Done);
     }
@@ -643,41 +1116,29 @@ mod tests {
     #[test]
     fn move_issue_left_from_in_progress_goes_to_todo() {
         let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
-        app.selected_column = 1; // InProgress column
+        app.selected_column = 1;
         app.move_issue_left();
         assert_eq!(app.issues[0].column, Column::Todo);
     }
 
-    // ================================================================
-    // Feature 2: Done session TTL - done_at timestamp management
-    // ================================================================
-
     #[test]
     fn move_issue_to_done_sets_done_at() {
-        // When an issue moves to Done, done_at should be set to a timestamp
         let mut app = test_app(vec![test_issue("bork-1", Column::CodeReview)]);
-        app.selected_column = 2; // CodeReview column
-        app.move_issue_right(); // -> Done
+        app.selected_column = 2;
+        app.move_issue_right();
         assert_eq!(app.issues[0].column, Column::Done);
-        assert!(
-            app.issues[0].done_at.is_some(),
-            "done_at should be set when moving to Done"
-        );
+        assert!(app.issues[0].done_at.is_some());
     }
 
     #[test]
     fn move_issue_out_of_done_clears_done_at() {
-        // When an issue moves out of Done, done_at should be cleared
         let mut issue = test_issue("bork-1", Column::Done);
         issue.done_at = Some(1700000000);
         let mut app = test_app(vec![issue]);
-        app.selected_column = 3; // Done column
-        app.move_issue_left(); // -> CodeReview
+        app.selected_column = 3;
+        app.move_issue_left();
         assert_eq!(app.issues[0].column, Column::CodeReview);
-        assert_eq!(
-            app.issues[0].done_at, None,
-            "done_at should be cleared when moving out of Done"
-        );
+        assert_eq!(app.issues[0].done_at, None);
     }
 
     #[test]
@@ -876,11 +1337,13 @@ mod tests {
 
     #[test]
     fn done_worktree_names_returns_done_issue_worktrees() {
-        let app = test_app(vec![
-            test_issue_with_worktree("bork-1", Column::Done, "bork-1"),
-            test_issue_with_worktree("bork-2", Column::InProgress, "bork-2"),
-            test_issue_with_worktree("bork-3", Column::Done, "bork-3"),
-        ]);
+        let mut issue1 = test_issue("bork-1", Column::Done);
+        issue1.worktree = Some("bork-1".into());
+        let mut issue2 = test_issue("bork-2", Column::InProgress);
+        issue2.worktree = Some("bork-2".into());
+        let mut issue3 = test_issue("bork-3", Column::Done);
+        issue3.worktree = Some("bork-3".into());
+        let app = test_app(vec![issue1, issue2, issue3]);
         let names = app.done_worktree_names();
         assert!(names.contains("bork-1"));
         assert!(!names.contains("bork-2"));
@@ -890,19 +1353,16 @@ mod tests {
 
     #[test]
     fn done_worktree_names_empty_when_no_done_issues() {
-        let app = test_app(vec![
-            test_issue_with_worktree("bork-1", Column::Todo, "bork-1"),
-            test_issue_with_worktree("bork-2", Column::InProgress, "bork-2"),
-        ]);
+        let mut issue1 = test_issue("bork-1", Column::Todo);
+        issue1.worktree = Some("bork-1".into());
+        let app = test_app(vec![issue1]);
         let names = app.done_worktree_names();
         assert!(names.is_empty());
     }
 
     #[test]
     fn done_worktree_names_skips_issues_without_worktree() {
-        let mut issue = test_issue("bork-1", Column::Done);
-        issue.worktree = None;
-        let app = test_app(vec![issue]);
+        let app = test_app(vec![test_issue("bork-99", Column::Done)]);
         let names = app.done_worktree_names();
         assert!(names.is_empty());
     }
@@ -913,11 +1373,9 @@ mod tests {
 
     #[test]
     fn freeze_worktree_copies_current_status() {
-        let mut app = test_app(vec![test_issue_with_worktree(
-            "bork-1",
-            Column::Done,
-            "bork-1",
-        )]);
+        let mut issue = test_issue("bork-1", Column::Done);
+        issue.worktree = Some("bork-1".into());
+        let mut app = test_app(vec![issue]);
         app.worktree_statuses.insert(
             "bork-1".to_string(),
             WorktreeStatus {
@@ -961,13 +1419,10 @@ mod tests {
 
     #[test]
     fn worktree_status_for_done_issue_uses_frozen() {
-        // When an issue is in Done and its worktree is NOT in live statuses
-        // but IS in frozen statuses, it should return the frozen status
-        let issue = test_issue_with_worktree("bork-1", Column::Done, "bork-1");
+        let mut issue = test_issue("bork-1", Column::Done);
+        issue.worktree = Some("bork-1".into());
         let mut app = test_app(vec![issue]);
 
-        // No live status for bork-1
-        // But frozen status exists
         app.frozen_worktree_statuses.insert(
             "bork-1".to_string(),
             WorktreeStatus {
@@ -985,8 +1440,8 @@ mod tests {
 
     #[test]
     fn worktree_status_for_non_done_issue_uses_live() {
-        // InProgress issue should always use live data, never frozen
-        let issue = test_issue_with_worktree("bork-1", Column::InProgress, "bork-1");
+        let mut issue = test_issue("bork-1", Column::InProgress);
+        issue.worktree = Some("bork-1".into());
         let mut app = test_app(vec![issue]);
 
         app.worktree_statuses.insert(
@@ -1015,7 +1470,8 @@ mod tests {
 
     #[test]
     fn branch_for_done_issue_uses_frozen() {
-        let issue = test_issue_with_worktree("bork-1", Column::Done, "bork-1");
+        let mut issue = test_issue("bork-1", Column::Done);
+        issue.worktree = Some("bork-1".into());
         let mut app = test_app(vec![issue]);
 
         app.frozen_worktree_branches

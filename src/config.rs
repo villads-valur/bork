@@ -16,7 +16,7 @@ pub struct AppConfig {
 
 pub const DEFAULT_DONE_SESSION_TTL: u64 = 300;
 
-pub const DEFAULT_PROMPT_FALLBACK: &str = "Check AGENTS.md for project context. The source code is in main/. Use the worktree skill to create worktrees for new issues.";
+pub const DEFAULT_PROMPT_FALLBACK: &str = "Check AGENTS.md for project context. The source code is in main/. Use `bork worktree <issue-id> <slug>` to create worktrees for new issues.";
 
 impl Default for AppConfig {
     fn default() -> Self {

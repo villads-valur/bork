@@ -7,13 +7,14 @@ mod init;
 mod input;
 mod types;
 mod ui;
+mod worktree;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use crossterm::{
@@ -29,10 +30,12 @@ use input::map_key_to_action;
 use types::{AgentKind, AgentStatusInfo};
 
 use external::git::GitPollResult;
+use types::PrStatus;
 
 const TICK_RATE: Duration = Duration::from_millis(50);
 const TMUX_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const GIT_POLL_INTERVAL: Duration = Duration::from_secs(3);
+const PR_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 struct SessionPollResult {
     sessions: HashSet<String>,
@@ -100,6 +103,36 @@ fn spawn_git_status_worker(
     rx
 }
 
+/// PR poll worker with wake-up support for force-sync.
+fn spawn_pr_poll_worker(
+    main_worktree: PathBuf,
+    wake_rx: mpsc::Receiver<()>,
+) -> mpsc::Receiver<HashMap<String, PrStatus>> {
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || loop {
+        let prs = external::github::fetch_open_prs(&main_worktree);
+        let indexed = external::github::index_by_branch(prs);
+        if tx.send(indexed).is_err() {
+            break;
+        }
+
+        let deadline = Instant::now() + PR_POLL_INTERVAL;
+        loop {
+            if Instant::now() >= deadline {
+                break;
+            }
+            match wake_rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(()) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        }
+    });
+
+    rx
+}
+
 #[derive(Parser)]
 #[command(
     name = "bork",
@@ -131,6 +164,19 @@ enum Command {
 
     /// Remove agent status hooks
     Uninstall,
+
+    /// Create a git worktree and register it with bork
+    Worktree {
+        /// Issue ID (e.g. bork-14)
+        issue_id: String,
+
+        /// Branch slug (e.g. add-search -> branch bork-14/add-search)
+        slug: Option<String>,
+
+        /// Create the issue if it doesn't exist (with this title)
+        #[arg(long)]
+        title: Option<String>,
+    },
 }
 
 #[derive(Clone, ValueEnum)]
@@ -159,6 +205,11 @@ fn main() -> anyhow::Result<()> {
         }) => init::run_init(&repo, directory.as_deref(), agent.into(), None),
         Some(Command::Install) => external::hooks::install(),
         Some(Command::Uninstall) => external::hooks::uninstall(),
+        Some(Command::Worktree {
+            issue_id,
+            slug,
+            title,
+        }) => worktree::run_worktree(&issue_id, slug.as_deref(), title.as_deref()),
         None => run_tui(),
     }
 }
@@ -201,6 +252,9 @@ fn run_tui() -> anyhow::Result<()> {
     let session_rx = spawn_session_status_worker(status_dir);
     let git_skip_set = Arc::new(Mutex::new(app.done_worktree_names()));
     let git_rx = spawn_git_status_worker(app.config.project_root.clone(), git_skip_set.clone());
+    let (pr_wake_tx, pr_wake_rx) = mpsc::channel::<()>();
+    let main_worktree = app.config.project_root.join("main");
+    let pr_rx = spawn_pr_poll_worker(main_worktree, pr_wake_rx);
 
     let mut pending_popup_session: Option<String> = None;
     let mut pending_popup_for_launch: Option<usize> = None;
@@ -216,7 +270,8 @@ fn run_tui() -> anyhow::Result<()> {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
                         let action = map_key_to_action(key, app.input_mode);
-                        let post_action = handler::handle_action(&mut app, action, &action_tx);
+                        let post_action =
+                            handler::handle_action(&mut app, action, &action_tx, &pr_wake_tx);
 
                         match post_action {
                             PostAction::None => {}
@@ -295,6 +350,17 @@ fn run_tui() -> anyhow::Result<()> {
         while let Ok(git_result) = git_rx.try_recv() {
             app.worktree_statuses = git_result.statuses;
             app.worktree_branches = git_result.branches;
+        }
+
+        while let Ok(pr_result) = pr_rx.try_recv() {
+            app.pr_statuses = pr_result;
+        }
+
+        // --- Auto-assign worktrees for issues that don't have one ---
+        let mut worktree_changed = app.auto_assign_worktrees();
+        worktree_changed = app.clear_stale_worktrees() || worktree_changed;
+        if worktree_changed {
+            let _ = config::save_state(&app.to_state(), &app.config.project_root);
         }
 
         // --- Update git skip set for Done worktrees ---
