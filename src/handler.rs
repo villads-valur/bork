@@ -285,6 +285,7 @@ fn submit_dialog(app: &mut App) {
         agent_mode: dialog.agent_mode,
         agent_status: AgentStatus::Stopped,
         prompt,
+        done_at: None,
     };
 
     app.issues.push(issue);

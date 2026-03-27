@@ -158,6 +158,7 @@ pub fn create_session(name: &str, cwd: &Path) -> Result<(), AppError> {
 pub fn kill_session(name: &str) -> Result<(), AppError> {
     let _ = Command::new("tmux")
         .args(["kill-session", "-t", name])
+        .stderr(std::process::Stdio::null())
         .status();
     Ok(())
 }
