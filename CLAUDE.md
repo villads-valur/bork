@@ -59,7 +59,7 @@ src/
 Bork uses a container directory pattern. The project root is NOT a git repo. It holds:
 
 ```
-bork/                           # container (opencode's cwd)
+bork/                           # container (the agent's cwd)
 ├── .bork/                      # bork state (config.toml, state.json)
 ├── AGENTS.md                   # agent instructions
 ├── opencode.jsonc              # opencode config
