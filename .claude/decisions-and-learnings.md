@@ -1,8 +1,6 @@
 # Decisions & Learnings
 
 > Last updated: 2026-03-27
->
-> Capture decisions, gotchas, and lessons learned for future reference.
 
 ## Key Decisions
 

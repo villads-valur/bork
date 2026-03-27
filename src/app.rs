@@ -16,6 +16,7 @@ pub enum InputMode {
     Normal,
     Confirm,
     Dialog,
+    Search,
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +109,7 @@ pub struct App {
     pub message_set_at: Option<Instant>,
     pub busy_count: usize,
     pub spinner_tick: usize,
+    pub search_query: String,
     pub config: AppConfig,
 }
 
@@ -140,15 +142,26 @@ impl App {
             message_set_at: None,
             busy_count: 0,
             spinner_tick: 0,
+            search_query: String::new(),
             config,
         }
     }
 
     pub fn issues_in_column(&self, column: Column) -> Vec<(usize, &Issue)> {
+        let query = self.search_query.to_lowercase();
         self.issues
             .iter()
             .enumerate()
-            .filter(|(_, issue)| issue.column == column)
+            .filter(|(_, issue)| {
+                if issue.column != column {
+                    return false;
+                }
+                if query.is_empty() {
+                    return true;
+                }
+                issue.title.to_lowercase().contains(&query)
+                    || issue.id.to_lowercase().contains(&query)
+            })
             .collect()
     }
 
@@ -473,6 +486,59 @@ impl App {
         self.pending_confirm.take()
     }
 
+    // --- Search ---
+
+    pub fn start_search(&mut self) {
+        self.input_mode = InputMode::Search;
+    }
+
+    pub fn search_push_char(&mut self, c: char) {
+        self.search_query.push(c);
+        self.clamp_all_rows();
+        self.focus_first_match();
+    }
+
+    pub fn search_delete_char(&mut self) {
+        if self.search_query.is_empty() {
+            self.cancel_search();
+            return;
+        }
+        self.search_query.pop();
+        self.clamp_all_rows();
+        self.focus_first_match();
+    }
+
+    pub fn confirm_search(&mut self) {
+        self.input_mode = InputMode::Normal;
+    }
+
+    pub fn cancel_search(&mut self) {
+        self.search_query.clear();
+        self.input_mode = InputMode::Normal;
+        self.clamp_all_rows();
+    }
+
+    pub fn clear_search(&mut self) {
+        if !self.search_query.is_empty() {
+            self.search_query.clear();
+            self.clamp_all_rows();
+        }
+    }
+
+    fn focus_first_match(&mut self) {
+        for col in 0..4 {
+            if self.column_count(col) > 0 {
+                self.selected_column = col;
+                self.selected_row[col] = 0;
+                return;
+            }
+        }
+    }
+
+    pub fn has_active_search(&self) -> bool {
+        !self.search_query.is_empty()
+    }
+
     pub fn clamp_all_rows(&mut self) {
         for col in 0..4 {
             let count = self.column_count(col);
@@ -530,6 +596,12 @@ mod tests {
             prompt: None,
             done_at: None,
         }
+    }
+
+    fn test_issue_titled(id: &str, title: &str, column: Column) -> Issue {
+        let mut issue = test_issue(id, column);
+        issue.title = title.to_string();
+        issue
     }
 
     fn test_issue_with_worktree(id: &str, column: Column, worktree: &str) -> Issue {
@@ -1041,5 +1113,496 @@ mod tests {
         assert_eq!(todo.len(), 2);
         assert_eq!(todo[0].1.id, "bork-1");
         assert_eq!(todo[1].1.id, "bork-3");
+    }
+
+    // ================================================================
+    // Search: issues_in_column filtering
+    // ================================================================
+
+    #[test]
+    fn search_filters_issues_by_title() {
+        let mut app = test_app(vec![
+            test_issue_titled("bork-1", "Fix login bug", Column::Todo),
+            test_issue_titled("bork-2", "Add dark mode", Column::Todo),
+            test_issue_titled("bork-3", "Fix logout crash", Column::Todo),
+        ]);
+        app.search_query = "fix".to_string();
+        let results = app.issues_in_column(Column::Todo);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].1.id, "bork-1");
+        assert_eq!(results[1].1.id, "bork-3");
+    }
+
+    #[test]
+    fn search_is_case_insensitive() {
+        let mut app = test_app(vec![test_issue_titled(
+            "bork-1",
+            "Fix Login Bug",
+            Column::Todo,
+        )]);
+        app.search_query = "fix login".to_string();
+        assert_eq!(app.issues_in_column(Column::Todo).len(), 1);
+
+        app.search_query = "FIX LOGIN".to_string();
+        assert_eq!(app.issues_in_column(Column::Todo).len(), 1);
+    }
+
+    #[test]
+    fn search_matches_issue_id() {
+        let mut app = test_app(vec![
+            test_issue_titled("bork-1", "Fix login bug", Column::Todo),
+            test_issue_titled("bork-2", "Add dark mode", Column::Todo),
+        ]);
+        app.search_query = "bork-2".to_string();
+        let results = app.issues_in_column(Column::Todo);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1.id, "bork-2");
+    }
+
+    #[test]
+    fn search_matches_partial_id() {
+        let mut app = test_app(vec![
+            test_issue_titled("bork-1", "Fix login", Column::Todo),
+            test_issue_titled("bork-12", "Add feature", Column::Todo),
+        ]);
+        app.search_query = "bork-1".to_string();
+        let results = app.issues_in_column(Column::Todo);
+        assert_eq!(results.len(), 2, "bork-1 and bork-12 both contain 'bork-1'");
+    }
+
+    #[test]
+    fn search_empty_query_returns_all() {
+        let mut app = test_app(vec![
+            test_issue("bork-1", Column::Todo),
+            test_issue("bork-2", Column::Todo),
+        ]);
+        app.search_query = String::new();
+        assert_eq!(app.issues_in_column(Column::Todo).len(), 2);
+    }
+
+    #[test]
+    fn search_no_matches_returns_empty() {
+        let mut app = test_app(vec![test_issue_titled(
+            "bork-1",
+            "Fix login bug",
+            Column::Todo,
+        )]);
+        app.search_query = "zzzzz".to_string();
+        assert_eq!(app.issues_in_column(Column::Todo).len(), 0);
+    }
+
+    #[test]
+    fn search_filters_across_columns() {
+        let mut app = test_app(vec![
+            test_issue_titled("bork-1", "Fix login", Column::Todo),
+            test_issue_titled("bork-2", "Fix crash", Column::InProgress),
+            test_issue_titled("bork-3", "Add feature", Column::Todo),
+            test_issue_titled("bork-4", "Fix timeout", Column::Done),
+        ]);
+        app.search_query = "fix".to_string();
+        assert_eq!(app.issues_in_column(Column::Todo).len(), 1);
+        assert_eq!(app.issues_in_column(Column::InProgress).len(), 1);
+        assert_eq!(app.issues_in_column(Column::CodeReview).len(), 0);
+        assert_eq!(app.issues_in_column(Column::Done).len(), 1);
+    }
+
+    #[test]
+    fn search_preserves_global_indices() {
+        let mut app = test_app(vec![
+            test_issue_titled("bork-1", "Add feature", Column::Todo),
+            test_issue_titled("bork-2", "Fix bug", Column::Todo),
+            test_issue_titled("bork-3", "Fix crash", Column::Todo),
+        ]);
+        app.search_query = "fix".to_string();
+        let results = app.issues_in_column(Column::Todo);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, 1, "global index of bork-2 should be 1");
+        assert_eq!(results[1].0, 2, "global index of bork-3 should be 2");
+    }
+
+    // ================================================================
+    // Search: start_search
+    // ================================================================
+
+    #[test]
+    fn start_search_enters_search_mode() {
+        let mut app = test_app(vec![]);
+        assert_eq!(app.input_mode, InputMode::Normal);
+        app.start_search();
+        assert_eq!(app.input_mode, InputMode::Search);
+    }
+
+    #[test]
+    fn start_search_preserves_existing_query() {
+        let mut app = test_app(vec![]);
+        app.search_query = "fix".to_string();
+        app.confirm_search();
+        assert_eq!(app.input_mode, InputMode::Normal);
+
+        app.start_search();
+        assert_eq!(app.input_mode, InputMode::Search);
+        assert_eq!(app.search_query, "fix", "/ should preserve existing query");
+    }
+
+    // ================================================================
+    // Search: confirm_search
+    // ================================================================
+
+    #[test]
+    fn confirm_search_returns_to_normal_with_filter_active() {
+        let mut app = test_app(vec![test_issue_titled("bork-1", "Fix login", Column::Todo)]);
+        app.start_search();
+        app.search_push_char('f');
+        app.confirm_search();
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert_eq!(app.search_query, "f", "filter should remain after confirm");
+    }
+
+    // ================================================================
+    // Search: cancel_search
+    // ================================================================
+
+    #[test]
+    fn cancel_search_clears_query_and_returns_to_normal() {
+        let mut app = test_app(vec![]);
+        app.start_search();
+        app.search_push_char('f');
+        app.search_push_char('i');
+        app.cancel_search();
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert!(app.search_query.is_empty());
+    }
+
+    // ================================================================
+    // Search: clear_search (Esc in normal mode)
+    // ================================================================
+
+    #[test]
+    fn clear_search_removes_active_filter() {
+        let mut app = test_app(vec![
+            test_issue_titled("bork-1", "Fix login", Column::Todo),
+            test_issue_titled("bork-2", "Add feature", Column::Todo),
+        ]);
+        app.search_query = "fix".to_string();
+        assert_eq!(app.issues_in_column(Column::Todo).len(), 1);
+
+        app.clear_search();
+        assert!(app.search_query.is_empty());
+        assert_eq!(app.issues_in_column(Column::Todo).len(), 2);
+    }
+
+    #[test]
+    fn clear_search_noop_when_no_filter() {
+        let mut app = test_app(vec![test_issue("bork-1", Column::Todo)]);
+        app.clear_search();
+        assert!(app.search_query.is_empty());
+        assert_eq!(app.issues_in_column(Column::Todo).len(), 1);
+    }
+
+    // ================================================================
+    // Search: has_active_search
+    // ================================================================
+
+    #[test]
+    fn has_active_search_false_when_empty() {
+        let app = test_app(vec![]);
+        assert!(!app.has_active_search());
+    }
+
+    #[test]
+    fn has_active_search_true_when_query_set() {
+        let mut app = test_app(vec![]);
+        app.search_query = "test".to_string();
+        assert!(app.has_active_search());
+    }
+
+    // ================================================================
+    // Search: search_push_char + auto-focus first match
+    // ================================================================
+
+    #[test]
+    fn search_push_char_appends_to_query() {
+        let mut app = test_app(vec![test_issue_titled("bork-1", "Fix bug", Column::Todo)]);
+        app.start_search();
+        app.search_push_char('f');
+        assert_eq!(app.search_query, "f");
+        app.search_push_char('i');
+        assert_eq!(app.search_query, "fi");
+        app.search_push_char('x');
+        assert_eq!(app.search_query, "fix");
+    }
+
+    #[test]
+    fn search_auto_focuses_first_match_column() {
+        let mut app = test_app(vec![
+            test_issue_titled("bork-1", "Add feature", Column::Todo),
+            test_issue_titled("bork-2", "Fix bug", Column::InProgress),
+        ]);
+        app.selected_column = 0;
+        app.start_search();
+        app.search_push_char('f');
+        app.search_push_char('i');
+        app.search_push_char('x');
+
+        assert_eq!(
+            app.selected_column, 1,
+            "should focus InProgress where the match is"
+        );
+        assert_eq!(app.selected_row[1], 0);
+    }
+
+    #[test]
+    fn search_auto_focus_skips_empty_columns() {
+        let mut app = test_app(vec![
+            test_issue_titled("bork-1", "Add feature", Column::Todo),
+            test_issue_titled("bork-2", "Deploy fix", Column::Done),
+        ]);
+        app.selected_column = 0;
+        app.start_search();
+        app.search_push_char('d');
+        app.search_push_char('e');
+
+        assert_eq!(
+            app.selected_column, 3,
+            "should skip empty columns and focus Done"
+        );
+    }
+
+    #[test]
+    fn search_auto_focus_stays_when_current_column_has_matches() {
+        let mut app = test_app(vec![
+            test_issue_titled("bork-1", "Fix login", Column::Todo),
+            test_issue_titled("bork-2", "Fix crash", Column::InProgress),
+        ]);
+        app.selected_column = 0;
+        app.start_search();
+        app.search_push_char('f');
+
+        assert_eq!(
+            app.selected_column, 0,
+            "Todo has a match so focus should be on first column with matches"
+        );
+    }
+
+    // ================================================================
+    // Search: search_delete_char
+    // ================================================================
+
+    #[test]
+    fn search_delete_char_removes_last_char() {
+        let mut app = test_app(vec![test_issue_titled("bork-1", "Fix bug", Column::Todo)]);
+        app.start_search();
+        app.search_push_char('f');
+        app.search_push_char('i');
+        app.search_push_char('x');
+        app.search_delete_char();
+        assert_eq!(app.search_query, "fi");
+    }
+
+    #[test]
+    fn search_backspace_on_empty_cancels_search() {
+        let mut app = test_app(vec![]);
+        app.start_search();
+        assert_eq!(app.input_mode, InputMode::Search);
+
+        app.search_delete_char();
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert!(app.search_query.is_empty());
+    }
+
+    #[test]
+    fn search_backspace_on_single_char_stays_in_search() {
+        let mut app = test_app(vec![test_issue_titled("bork-1", "Fix bug", Column::Todo)]);
+        app.start_search();
+        app.search_push_char('f');
+        app.search_delete_char();
+
+        assert_eq!(app.input_mode, InputMode::Search);
+        assert!(app.search_query.is_empty());
+    }
+
+    #[test]
+    fn search_delete_char_refocuses_first_match() {
+        let mut app = test_app(vec![
+            test_issue_titled("bork-1", "Add feature", Column::Todo),
+            test_issue_titled("bork-2", "Add dark mode", Column::InProgress),
+        ]);
+        app.start_search();
+        // Type "add f" — only matches "Add feature" in Todo
+        for c in "add f".chars() {
+            app.search_push_char(c);
+        }
+        assert_eq!(app.selected_column, 0);
+
+        // Delete "f" — now "add" matches both columns
+        app.search_delete_char();
+        assert_eq!(app.selected_column, 0, "first match is still in Todo");
+    }
+
+    // ================================================================
+    // Search: clamp_all_rows during search
+    // ================================================================
+
+    #[test]
+    fn search_clamps_row_when_filtered_list_shrinks() {
+        let mut app = test_app(vec![
+            test_issue_titled("bork-1", "Fix login", Column::Todo),
+            test_issue_titled("bork-2", "Fix crash", Column::Todo),
+            test_issue_titled("bork-3", "Add feature", Column::Todo),
+        ]);
+        app.selected_column = 0;
+        app.selected_row[0] = 2; // selecting "Add feature"
+
+        app.start_search();
+        app.search_push_char('f');
+        app.search_push_char('i');
+        app.search_push_char('x');
+
+        // Only 2 results remain (bork-1 and bork-2), row 2 is out of bounds
+        let count = app.issues_in_column(Column::Todo).len();
+        assert_eq!(count, 2);
+        assert!(
+            app.selected_row[0] < count,
+            "row should be clamped to valid range"
+        );
+    }
+
+    #[test]
+    fn search_clamps_row_to_zero_when_column_empty() {
+        let mut app = test_app(vec![test_issue_titled("bork-1", "Fix login", Column::Todo)]);
+        app.selected_column = 0;
+        app.selected_row[0] = 0;
+
+        app.start_search();
+        app.search_push_char('z');
+        app.search_push_char('z');
+
+        assert_eq!(app.issues_in_column(Column::Todo).len(), 0);
+        assert_eq!(app.selected_row[0], 0);
+    }
+
+    // ================================================================
+    // Search: full interaction flow
+    // ================================================================
+
+    #[test]
+    fn search_full_flow_type_confirm_clear() {
+        let mut app = test_app(vec![
+            test_issue_titled("bork-1", "Fix login", Column::Todo),
+            test_issue_titled("bork-2", "Add feature", Column::InProgress),
+        ]);
+
+        // Start search
+        app.start_search();
+        assert_eq!(app.input_mode, InputMode::Search);
+
+        // Type query
+        app.search_push_char('f');
+        app.search_push_char('i');
+        app.search_push_char('x');
+        assert_eq!(app.issues_in_column(Column::Todo).len(), 1);
+        assert_eq!(app.issues_in_column(Column::InProgress).len(), 0);
+
+        // Confirm — filter stays, back to normal
+        app.confirm_search();
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert_eq!(app.search_query, "fix");
+        assert_eq!(app.issues_in_column(Column::Todo).len(), 1);
+
+        // Clear — all issues visible again
+        app.clear_search();
+        assert!(app.search_query.is_empty());
+        assert_eq!(app.issues_in_column(Column::Todo).len(), 1);
+        assert_eq!(app.issues_in_column(Column::InProgress).len(), 1);
+    }
+
+    #[test]
+    fn search_full_flow_type_cancel() {
+        let mut app = test_app(vec![
+            test_issue_titled("bork-1", "Fix login", Column::Todo),
+            test_issue_titled("bork-2", "Add feature", Column::Todo),
+        ]);
+
+        app.start_search();
+        app.search_push_char('f');
+        app.search_push_char('i');
+        assert_eq!(app.issues_in_column(Column::Todo).len(), 1);
+
+        // Cancel — clears query, all issues back
+        app.cancel_search();
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert!(app.search_query.is_empty());
+        assert_eq!(app.issues_in_column(Column::Todo).len(), 2);
+    }
+
+    #[test]
+    fn search_reenter_preserves_and_refines_query() {
+        let mut app = test_app(vec![
+            test_issue_titled("bork-1", "Fix login bug", Column::Todo),
+            test_issue_titled("bork-2", "Fix logout crash", Column::Todo),
+        ]);
+
+        // First search: "fix"
+        app.start_search();
+        app.search_push_char('f');
+        app.search_push_char('i');
+        app.search_push_char('x');
+        app.confirm_search();
+        assert_eq!(app.issues_in_column(Column::Todo).len(), 2);
+
+        // Re-enter: query still "fix", refine to "fix log"
+        app.start_search();
+        assert_eq!(app.search_query, "fix");
+        app.search_push_char(' ');
+        app.search_push_char('l');
+        app.search_push_char('o');
+        app.search_push_char('g');
+        assert_eq!(app.issues_in_column(Column::Todo).len(), 2);
+
+        // Refine further to "fix login"
+        app.search_push_char('i');
+        app.search_push_char('n');
+        assert_eq!(app.issues_in_column(Column::Todo).len(), 1);
+        assert_eq!(app.issues_in_column(Column::Todo)[0].1.id, "bork-1");
+    }
+
+    #[test]
+    fn search_selected_issue_works_with_filter() {
+        let mut app = test_app(vec![
+            test_issue_titled("bork-1", "Add feature", Column::Todo),
+            test_issue_titled("bork-2", "Fix bug", Column::Todo),
+            test_issue_titled("bork-3", "Fix crash", Column::Todo),
+        ]);
+        app.selected_column = 0;
+
+        app.search_query = "fix".to_string();
+        app.clamp_all_rows();
+        app.selected_row[0] = 0;
+
+        let issue = app.selected_issue().expect("should have selected issue");
+        assert_eq!(issue.id, "bork-2", "first filtered result should be bork-2");
+
+        app.selected_row[0] = 1;
+        let issue = app.selected_issue().expect("should have selected issue");
+        assert_eq!(
+            issue.id, "bork-3",
+            "second filtered result should be bork-3"
+        );
+    }
+
+    #[test]
+    fn search_selected_issue_index_returns_global_index() {
+        let mut app = test_app(vec![
+            test_issue_titled("bork-1", "Add feature", Column::Todo),
+            test_issue_titled("bork-2", "Fix bug", Column::Todo),
+        ]);
+        app.selected_column = 0;
+
+        app.search_query = "fix".to_string();
+        app.clamp_all_rows();
+        app.selected_row[0] = 0;
+
+        let idx = app.selected_issue_index().expect("should have index");
+        assert_eq!(idx, 1, "global index of 'Fix bug' is 1, not 0");
     }
 }

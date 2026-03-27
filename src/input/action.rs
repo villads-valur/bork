@@ -24,5 +24,11 @@ pub enum Action {
     DialogPrevField,
     DialogSubmit,
     DialogCancel,
+    SearchStart,
+    SearchChar(char),
+    SearchBackspace,
+    SearchConfirm,
+    SearchCancel,
+    ClearSearch,
     Noop,
 }

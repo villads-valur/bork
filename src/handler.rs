@@ -33,6 +33,10 @@ pub fn handle_action(
             handle_dialog(app, action);
             PostAction::None
         }
+        InputMode::Search => {
+            handle_search(app, action);
+            PostAction::None
+        }
         InputMode::Normal => handle_normal(app, action, action_tx),
     }
 }
@@ -170,7 +174,27 @@ fn handle_normal(
             PostAction::None
         }
 
+        Action::SearchStart => {
+            app.start_search();
+            PostAction::None
+        }
+
+        Action::ClearSearch => {
+            app.clear_search();
+            PostAction::None
+        }
+
         _ => PostAction::None,
+    }
+}
+
+fn handle_search(app: &mut App, action: Action) {
+    match action {
+        Action::SearchChar(c) => app.search_push_char(c),
+        Action::SearchBackspace => app.search_delete_char(),
+        Action::SearchConfirm => app.confirm_search(),
+        Action::SearchCancel => app.cancel_search(),
+        _ => {}
     }
 }
 

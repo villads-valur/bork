@@ -18,8 +18,8 @@
 ## Progress
 
 - [x] Created worktree
-- [ ] Rewrite README
-- [ ] Verify markdown renders correctly
+- [x] Rewrite README
+- [x] Verify markdown renders correctly
 
 ## Notes
 
