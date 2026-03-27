@@ -11,6 +11,9 @@ use crate::types::{AgentStatus, Column, Issue};
 pub struct ActionResult {
     pub message: String,
     pub session_to_open: Option<String>,
+    /// If the launch detected an agent session ID, carries (issue_id, agent_session_id)
+    /// so main.rs can persist it on the issue.
+    pub session_id: Option<(String, String)>,
 }
 
 pub enum PostAction {
@@ -294,6 +297,7 @@ fn submit_dialog(app: &mut App) {
         agent_status: AgentStatus::Stopped,
         prompt,
         done_at: None,
+        session_id: None,
     };
 
     app.issues.push(issue);
@@ -329,6 +333,7 @@ fn handle_confirm(app: &mut App, action: Action, action_tx: &mpsc::Sender<Action
                             let _ = tx.send(ActionResult {
                                 message,
                                 session_to_open: None,
+                                session_id: None,
                             });
                         });
                     }
@@ -349,6 +354,7 @@ fn handle_confirm(app: &mut App, action: Action, action_tx: &mpsc::Sender<Action
                                     let _ = tx.send(ActionResult {
                                         message: format!("Deleted {} and killed session", id),
                                         session_to_open: None,
+                                        session_id: None,
                                     });
                                 });
                                 app.busy_count += 1;
@@ -374,13 +380,15 @@ fn handle_confirm(app: &mut App, action: Action, action_tx: &mpsc::Sender<Action
 
 fn launch_and_report(issue: Issue, config: AppConfig) -> ActionResult {
     match opencode::launch_session(&issue, &config) {
-        Ok(session_name) => ActionResult {
+        Ok((session_name, agent_sid)) => ActionResult {
             message: format!("Session '{}' started", session_name),
             session_to_open: Some(session_name),
+            session_id: agent_sid.map(|sid| (issue.id.clone(), sid)),
         },
         Err(e) => ActionResult {
             message: format!("Failed to launch: {e}"),
             session_to_open: None,
+            session_id: None,
         },
     }
 }
@@ -537,6 +545,7 @@ mod tests {
             agent_status: crate::types::AgentStatus::Stopped,
             prompt: None,
             done_at: None,
+            session_id: None,
         });
 
         // Open edit dialog

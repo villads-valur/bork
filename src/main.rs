@@ -244,6 +244,12 @@ fn run_tui() -> anyhow::Result<()> {
             app.busy_count = app.busy_count.saturating_sub(1);
             app.set_message(result.message);
 
+            if let Some((issue_id, agent_sid)) = result.session_id {
+                if let Some(issue) = app.issues.iter_mut().find(|i| i.id == issue_id) {
+                    issue.session_id = Some(agent_sid);
+                }
+            }
+
             if let Some(session_name) = result.session_to_open {
                 if let Some(launch_idx) = pending_popup_for_launch.take() {
                     app.issues[launch_idx].tmux_session = Some(session_name.clone());

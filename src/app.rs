@@ -595,6 +595,7 @@ mod tests {
             agent_status: AgentStatus::Stopped,
             prompt: None,
             done_at: None,
+            session_id: None,
         }
     }
 
