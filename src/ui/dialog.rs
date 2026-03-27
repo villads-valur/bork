@@ -126,8 +126,11 @@ fn render_field(
     };
 
     let max_value_len = field_width.saturating_sub(label_width + 1);
-    let display_value = if value.len() > max_value_len && max_value_len > 3 {
-        format!("...{}", &value[value.len() - (max_value_len - 3)..])
+    let char_count = value.chars().count();
+    let display_value = if char_count > max_value_len && max_value_len > 3 {
+        let skip = char_count - (max_value_len - 3);
+        let tail: String = value.chars().skip(skip).collect();
+        format!("...{}", tail)
     } else {
         value.to_string()
     };

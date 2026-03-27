@@ -21,6 +21,7 @@ pub enum Action {
     DialogChar(char),
     DialogBackspace,
     DialogNextField,
+    DialogPrevField,
     DialogSubmit,
     DialogCancel,
     Noop,

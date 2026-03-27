@@ -129,11 +129,12 @@ fn format_git_status(status: Option<&WorktreeStatus>) -> Vec<Span<'static>> {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
     } else if max > 3 {
-        format!("{}...", &s[..max - 3])
+        let end: String = s.chars().take(max - 3).collect();
+        format!("{}...", end)
     } else {
-        s[..max].to_string()
+        s.chars().take(max).collect()
     }
 }

@@ -72,7 +72,7 @@ fn map_dialog_key(key: KeyEvent) -> Action {
         KeyCode::Esc => Action::DialogCancel,
         KeyCode::Enter => Action::DialogNextField,
         KeyCode::Tab => Action::DialogNextField,
-        KeyCode::BackTab => Action::DialogNextField,
+        KeyCode::BackTab => Action::DialogPrevField,
         KeyCode::Backspace => Action::DialogBackspace,
         KeyCode::Char(c) => Action::DialogChar(c),
         _ => Action::Noop,

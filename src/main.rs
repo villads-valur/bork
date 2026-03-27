@@ -209,6 +209,8 @@ fn main() -> anyhow::Result<()> {
         if app.busy_count > 0 {
             app.spinner_tick = app.spinner_tick.wrapping_add(1);
         }
+
+        app.clear_expired_message();
     }
 
     let _ = config::save_state(&app.to_state(), &app.config.project_root);

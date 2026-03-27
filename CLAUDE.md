@@ -6,13 +6,14 @@ Terminal kanban board for orchestrating OpenCode/Claude coding sessions across g
 
 - **Language**: Rust (no async runtime, pure `std::thread` + `mpsc`)
 - **TUI**: ratatui + crossterm
-- **External tools**: tmux, gh, linear, git, opencode/claude (all via `std::process::Command`)
+- **External tools**: tmux, git, opencode/claude (all via `std::process::Command`)
 
 ### Threading Model
 
 ```
 Main Thread (50ms tick event loop)
-├── Tmux Status Worker (persistent, polls every 2s)
+├── Session Status Worker (persistent, polls every 2s - tmux sessions + agent status files)
+├── Git Status Worker (persistent, polls every 3s - worktree changes + branches)
 └── Action Threads (fire-and-forget per user action)
 ```
 
@@ -41,13 +42,16 @@ src/
 ├── external/
 │   ├── mod.rs
 │   ├── tmux.rs       # Tmux session management
-│   └── opencode.rs   # Agent session launcher
+│   ├── opencode.rs   # Agent session launcher (opencode + claude)
+│   ├── git.rs        # Git worktree status polling
+│   └── hooks.rs      # Agent status hooks (install/uninstall for opencode + claude)
 └── ui/
     ├── mod.rs         # Root render, layout composition
-    ├── board.rs       # 4-column kanban board
-    ├── card.rs        # Issue card widget
+    ├── board.rs       # 4-column kanban board (To Do, In Progress, Code Review, Done)
+    ├── card.rs        # Issue card widget (status, branch, git changes)
+    ├── dialog.rs      # New/edit issue dialog overlay
     ├── status_bar.rs  # Header + footer
-    └── styles.rs      # Colors, styles
+    └── styles.rs      # Colors, styles (ANSI 16 only)
 ```
 
 ## Project Layout

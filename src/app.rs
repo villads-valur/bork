@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use crate::config::{AppConfig, AppState};
 use crate::types::{AgentMode, AgentStatus, AgentStatusInfo, Column, Issue, WorktreeStatus};
@@ -95,6 +96,7 @@ pub struct App {
     pub dialog: Option<DialogState>,
     pub should_quit: bool,
     pub message: Option<String>,
+    pub message_set_at: Option<Instant>,
     pub busy_count: usize,
     pub spinner_tick: usize,
     pub config: AppConfig,
@@ -116,6 +118,7 @@ impl App {
             dialog: None,
             should_quit: false,
             message: None,
+            message_set_at: None,
             busy_count: 0,
             spinner_tick: 0,
             config,
@@ -259,6 +262,16 @@ impl App {
 
     pub fn set_message(&mut self, msg: impl Into<String>) {
         self.message = Some(msg.into());
+        self.message_set_at = Some(Instant::now());
+    }
+
+    pub fn clear_expired_message(&mut self) {
+        if let Some(set_at) = self.message_set_at {
+            if set_at.elapsed().as_secs() >= 3 {
+                self.message = None;
+                self.message_set_at = None;
+            }
+        }
     }
 
     pub fn to_state(&self) -> AppState {

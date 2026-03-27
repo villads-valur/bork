@@ -84,10 +84,12 @@ fn handle_normal(
 
         Action::MoveIssueRight => {
             app.move_issue_right();
+            let _ = config::save_state(&app.to_state(), &app.config.project_root);
             PostAction::None
         }
         Action::MoveIssueLeft => {
             app.move_issue_left();
+            let _ = config::save_state(&app.to_state(), &app.config.project_root);
             PostAction::None
         }
 
@@ -186,7 +188,6 @@ fn handle_dialog(app: &mut App, action: Action) {
         }
 
         Action::DialogNextField => {
-            // Pre-compute values before borrowing dialog mutably
             let next_id = app.next_issue_id();
 
             if let Some(ref mut dialog) = app.dialog {
@@ -194,13 +195,11 @@ fn handle_dialog(app: &mut App, action: Action) {
                 let next = current + 1;
 
                 if next >= DIALOG_FIELD_COUNT {
-                    // On last field, Enter = submit
                     let _ = dialog;
                     submit_dialog(app);
                     return;
                 }
 
-                // When creating, auto-fill prompt from title if still empty
                 if dialog.editing_index.is_none()
                     && current == 0
                     && next == 1
@@ -210,6 +209,13 @@ fn handle_dialog(app: &mut App, action: Action) {
                 }
 
                 dialog.focused_field = next;
+            }
+        }
+        Action::DialogPrevField => {
+            if let Some(ref mut dialog) = app.dialog {
+                if dialog.focused_field > 0 {
+                    dialog.focused_field -= 1;
+                }
             }
         }
         Action::DialogSubmit => {
@@ -261,7 +267,7 @@ fn submit_dialog(app: &mut App) {
     }
 
     let id = app.next_issue_id();
-    let column = Column::from_index(app.selected_column).unwrap_or(Column::Planning);
+    let column = Column::from_index(app.selected_column).unwrap_or(Column::Todo);
 
     let issue = Issue {
         id: id.clone(),

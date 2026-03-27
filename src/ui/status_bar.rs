@@ -66,11 +66,12 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
 
     // Normal mode: show keybinding hints
     let bindings = vec![
-        ("h/l", "prev/next"),
+        ("h/l", "focus"),
         ("j/k", "up/down"),
         ("Tab", "column"),
         ("Enter", "open"),
         ("n", "new"),
+        ("e", "edit"),
         ("d", "delete"),
         ("x", "kill"),
         ("H/L", "move"),

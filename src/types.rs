@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Column {
-    Planning,
+    #[serde(alias = "Planning")]
+    Todo,
     InProgress,
     CodeReview,
     Done,
@@ -12,7 +13,7 @@ pub enum Column {
 
 impl Column {
     pub const ALL: [Column; 4] = [
-        Column::Planning,
+        Column::Todo,
         Column::InProgress,
         Column::CodeReview,
         Column::Done,
@@ -20,7 +21,7 @@ impl Column {
 
     pub fn index(self) -> usize {
         match self {
-            Column::Planning => 0,
+            Column::Todo => 0,
             Column::InProgress => 1,
             Column::CodeReview => 2,
             Column::Done => 3,
@@ -29,7 +30,7 @@ impl Column {
 
     pub fn from_index(i: usize) -> Option<Column> {
         match i {
-            0 => Some(Column::Planning),
+            0 => Some(Column::Todo),
             1 => Some(Column::InProgress),
             2 => Some(Column::CodeReview),
             3 => Some(Column::Done),
@@ -53,7 +54,7 @@ impl Column {
 impl fmt::Display for Column {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Column::Planning => write!(f, "Planning"),
+            Column::Todo => write!(f, "To Do"),
             Column::InProgress => write!(f, "In Progress"),
             Column::CodeReview => write!(f, "Code Review"),
             Column::Done => write!(f, "Done"),
