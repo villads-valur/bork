@@ -395,7 +395,10 @@ impl App {
                 continue;
             }
             if let Some(wt) = self.detect_worktree(&self.issues[i].clone()) {
-                self.issues[i].worktree = Some(wt);
+                self.issues[i].worktree = Some(wt.clone());
+                if self.issues[i].column == Column::Done {
+                    self.freeze_worktree_status(&wt);
+                }
                 changed = true;
             }
         }
@@ -789,6 +792,41 @@ mod tests {
         let changed = app.clear_stale_worktrees();
         assert!(!changed);
         assert_eq!(app.issues[0].worktree, Some("bork-1".into()));
+    }
+
+    #[test]
+    fn test_auto_assign_freezes_done_issues() {
+        let mut app = test_app(vec![test_issue("bork-1", Column::Done)]);
+        app.worktree_branches
+            .insert("bork-1".into(), "bork-1/feature".into());
+        app.worktree_statuses.insert(
+            "bork-1".into(),
+            WorktreeStatus {
+                staged: 3,
+                unstaged: 1,
+            },
+        );
+        let changed = app.auto_assign_worktrees();
+        assert!(changed);
+        assert_eq!(app.issues[0].worktree, Some("bork-1".into()));
+        // Should have frozen the worktree data
+        assert!(app.frozen_worktree_branches.contains_key("bork-1"));
+        assert_eq!(
+            app.frozen_worktree_branches.get("bork-1"),
+            Some(&"bork-1/feature".into())
+        );
+        assert!(app.frozen_worktree_statuses.contains_key("bork-1"));
+        assert_eq!(app.frozen_worktree_statuses["bork-1"].staged, 3);
+    }
+
+    #[test]
+    fn test_auto_assign_does_not_freeze_non_done_issues() {
+        let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
+        app.worktree_branches
+            .insert("bork-1".into(), "bork-1/feature".into());
+        app.auto_assign_worktrees();
+        assert!(app.frozen_worktree_branches.is_empty());
+        assert!(app.frozen_worktree_statuses.is_empty());
     }
 
     #[test]
