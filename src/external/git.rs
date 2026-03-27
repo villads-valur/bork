@@ -107,74 +107,89 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_empty_status() {
-        let result = parse_git_status("");
-        assert_eq!(result.staged, 0);
-        assert_eq!(result.unstaged, 0);
-        assert!(result.is_clean());
+    fn test_parse_clean_repo() {
+        let status = parse_git_status("");
+        assert_eq!(status.staged, 0);
+        assert_eq!(status.unstaged, 0);
+        assert!(status.is_clean());
     }
 
     #[test]
-    fn parse_untracked_files() {
-        let output = "?? newfile.rs\n?? another.rs\n";
-        let result = parse_git_status(output);
-        assert_eq!(result.staged, 0);
-        assert_eq!(result.unstaged, 2);
+    fn test_parse_untracked_files() {
+        let output = "?? new_file.txt\n?? another.rs\n";
+        let status = parse_git_status(output);
+        assert_eq!(status.staged, 0);
+        assert_eq!(status.unstaged, 2);
     }
 
     #[test]
-    fn parse_staged_files() {
-        let output = "M  src/app.rs\nA  src/new.rs\n";
-        let result = parse_git_status(output);
-        assert_eq!(result.staged, 2);
-        assert_eq!(result.unstaged, 0);
+    fn test_parse_staged_modification() {
+        let output = "M  src/main.rs\n";
+        let status = parse_git_status(output);
+        assert_eq!(status.staged, 1);
+        assert_eq!(status.unstaged, 0);
     }
 
     #[test]
-    fn parse_modified_unstaged() {
-        let output = " M src/app.rs\n";
-        let result = parse_git_status(output);
-        assert_eq!(result.staged, 0);
-        assert_eq!(result.unstaged, 1);
+    fn test_parse_unstaged_modification() {
+        let output = " M src/main.rs\n";
+        let status = parse_git_status(output);
+        assert_eq!(status.staged, 0);
+        assert_eq!(status.unstaged, 1);
     }
 
     #[test]
-    fn parse_both_staged_and_unstaged() {
-        // MM = staged modification + unstaged modification
-        let output = "MM src/app.rs\n";
-        let result = parse_git_status(output);
-        assert_eq!(result.staged, 1);
-        assert_eq!(result.unstaged, 1);
+    fn test_parse_staged_and_unstaged() {
+        let output = "MM src/main.rs\n";
+        let status = parse_git_status(output);
+        assert_eq!(status.staged, 1);
+        assert_eq!(status.unstaged, 1);
     }
 
     #[test]
-    fn parse_mixed_status() {
-        let output = "M  staged.rs\n M unstaged.rs\n?? untracked.rs\nA  added.rs\n";
-        let result = parse_git_status(output);
-        assert_eq!(result.staged, 2); // M staged.rs + A added.rs
-        assert_eq!(result.unstaged, 2); // M unstaged.rs + ?? untracked.rs
+    fn test_parse_mixed_statuses() {
+        let output = "M  staged.rs\n M unstaged.rs\n?? untracked.txt\nA  added.rs\n";
+        let status = parse_git_status(output);
+        assert_eq!(status.staged, 2);
+        assert_eq!(status.unstaged, 2);
     }
 
     #[test]
-    fn parse_short_lines_ignored() {
+    fn test_parse_short_line_ignored() {
         let output = "X\n";
-        let result = parse_git_status(output);
-        assert_eq!(result.staged, 0);
-        assert_eq!(result.unstaged, 0);
+        let status = parse_git_status(output);
+        assert_eq!(status.staged, 0);
+        assert_eq!(status.unstaged, 0);
     }
 
-    // --- Skip set for poll_all_worktrees ---
+    #[test]
+    fn test_parse_added_file() {
+        let output = "A  new_file.rs\n";
+        let status = parse_git_status(output);
+        assert_eq!(status.staged, 1);
+        assert_eq!(status.unstaged, 0);
+    }
 
     #[test]
-    fn poll_skip_set_excludes_done_worktrees() {
-        // This tests the filtering logic within poll_all_worktrees.
-        // We can't easily test with real git repos in unit tests,
-        // but we can verify the skip set is respected by checking
-        // that the function signature accepts it.
+    fn test_parse_deleted_file() {
+        let output = "D  removed.rs\n";
+        let status = parse_git_status(output);
+        assert_eq!(status.staged, 1);
+        assert_eq!(status.unstaged, 0);
+    }
+
+    #[test]
+    fn test_parse_renamed_file() {
+        let output = "R  old.rs -> new.rs\n";
+        let status = parse_git_status(output);
+        assert_eq!(status.staged, 1);
+        assert_eq!(status.unstaged, 0);
+    }
+
+    #[test]
+    fn test_poll_skip_set_excludes_done_worktrees() {
         let skip: HashSet<String> = ["done-worktree".to_string()].into_iter().collect();
-        // The function exists and compiles with the skip parameter
-        let _result = poll_all_worktrees(std::path::Path::new("/nonexistent"), &skip);
-        // The result should be empty since the path doesn't exist
-        assert!(_result.statuses.is_empty());
+        let result = poll_all_worktrees(std::path::Path::new("/nonexistent"), &skip);
+        assert!(result.statuses.is_empty());
     }
 }

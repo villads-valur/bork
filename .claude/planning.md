@@ -4,25 +4,28 @@
 
 ## Active Task
 
-**Task:** Rewrite README with quickstart guide and distribution docs
-**Status:** In Progress
+**Task:** Background PR status polling via `gh api graphql`, match PRs to branches, show PR status on cards
+**Status:** Done
 
 ## Plan
 
-1. Add concise Quickstart section after Overview (3 steps: install, init, launch)
-2. Update Installation section (keep "From source" details)
-3. Replace manual Quick Start with bork init as primary flow
-4. Document bork init under Usage/Commands
-5. Note that bork init auto-installs hooks
+1. Add PR domain types to `types.rs` (PrState, ChecksStatus, ReviewDecision, PrStatus)
+2. Create `external/github.rs` - GraphQL-based PR fetching via `gh api graphql`
+3. Add PR poll worker in `main.rs` (60s interval, wake-up channel for force-sync)
+4. Add `pr_statuses: HashMap<String, PrStatus>` to `App` + `pr_for()` lookup method
+5. Bump `CARD_HEIGHT` from 4 to 5, add dedicated PR line to card rendering
+6. Add PR display helpers in `ui/styles.rs` (checks icon/color, review icon/color)
+7. Pass `PrStatus` through `CardContext` in `board.rs`
+8. Add `SyncPRs` (P) and `OpenPR` (o) actions
+9. Update status bar hints
 
 ## Progress
 
-- [x] Created worktree
-- [x] Rewrite README
-- [x] Verify markdown renders correctly
-
-## Notes
-
-- Target reader: someone who has never used bork, first-time install
-- Build from source is fine for v1
-- bork init is the primary onboarding flow
+- [x] Types (PrState, ChecksStatus, ReviewDecision, PrStatus)
+- [x] GitHub module (GraphQL fetch, repo identity caching, browser open)
+- [x] PR poll worker (60s interval with wake-up channel)
+- [x] App state integration (pr_statuses HashMap, pr_for() lookup)
+- [x] Card rendering (CARD_HEIGHT=5, dedicated PR line)
+- [x] Keybindings (P=sync, o=open PR)
+- [x] Status bar hints (contextual "open pr" when PR exists)
+- [x] Build verification (cargo check + clippy + fmt)

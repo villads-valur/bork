@@ -4,22 +4,44 @@
 
 ## Key Decisions
 
-### Quickstart-first README structure
+### Use GraphQL instead of `gh pr list --json`
 
-**Decision:** Lead the README with a concise 3-step quickstart, keep detailed docs below
-**Rationale:** First-time users want to get running fast; detailed docs are for reference
+**Decision:** Use `gh api graphql` with a single query to fetch all open PRs
+**Rationale:** Single API point for up to 100 PRs. Gets statusCheckRollup, reviewDecision, and diff stats in one call. Same approach as tdeck.
 **Date:** 2026-03-27
 
-### bork init as primary onboarding
+### Branch-name matching for PR association
 
-**Decision:** Replace manual `mkdir .bork` quick start with `bork init` as the recommended flow
-**Rationale:** `bork init` does everything automatically (clone, scaffold, install hooks)
+**Decision:** Match PRs to issues via worktree -> branch name -> PR headRefName
+**Rationale:** Already have worktree_branches populated by the git worker. No need to store PR numbers on issues. Ephemeral matching is simpler and always up-to-date.
+**Date:** 2026-03-27
+
+### Bump CARD_HEIGHT to 5
+
+**Decision:** Add a dedicated line for PR info instead of cramming it onto the status line
+**Rationale:** The status line is already dense (session indicator + agent status + branch + git changes). A separate PR line gives room for PR number, checks, review, and diff stats.
+**Date:** 2026-03-27
+
+### PR data is ephemeral (not persisted)
+
+**Decision:** PR statuses are only kept in memory, re-fetched on startup
+**Rationale:** PRs change frequently. Persisting stale data adds complexity for little benefit. First poll happens immediately on startup.
+**Date:** 2026-03-27
+
+### Wake-up channel for force-sync
+
+**Decision:** Use a separate `mpsc::Sender<()>` to wake the PR worker from its sleep early
+**Rationale:** The worker sleeps in 500ms increments checking the wake channel, so pressing P triggers an immediate poll without complex thread synchronization.
 **Date:** 2026-03-27
 
 ## Gotchas & Warnings
 
-- bork init requires the repo to be cloneable (SSH keys or HTTPS auth)
+- `gh` CLI must be authenticated and the cwd must be a git repo with a GitHub remote
+- GraphQL statusCheckRollup can be null if no CI is configured
+- reviewDecision can be null if no reviewers are assigned
+- OnceLock caches repo identity for the entire process lifetime
 
 ## Lessons Learned
 
-- (none yet)
+- tdeck caches repo identity since it never changes within a session, OnceLock is the idiomatic Rust equivalent
+- `recv_timeout` in a loop gives interruptible sleep without unsafe or extra crates
