@@ -161,7 +161,7 @@ mod tests {
         );
         assert!(result.starts_with("You are working on bork-6: New feature."));
         assert!(result.contains("Check AGENTS.md for project context"));
-        assert!(result.contains("worktree skill"));
+        assert!(result.contains("bork worktree"));
     }
 
     #[test]

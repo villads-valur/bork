@@ -6,7 +6,12 @@ use anyhow::{bail, Context};
 
 use crate::types::AgentKind;
 
-const WORKTREE_SKILL: &str = r#"# Skill: worktree
+const WORKTREE_SKILL: &str = r#"---
+name: worktree
+description: Create git worktrees and register them with bork for issue tracking
+---
+
+# Worktree Management
 
 Create and manage git worktrees in a bork project.
 
