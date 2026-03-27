@@ -24,6 +24,39 @@
 
 Bork is a terminal UI for managing multiple AI coding sessions. It gives you a 4-column kanban board where each issue maps to a git worktree and a tmux session running [OpenCode](https://opencode.ai) or [Claude Code](https://docs.anthropic.com/en/docs/claude-code). Switch between sessions with a keypress, see agent status at a glance, and keep your work organized.
 
+## Quickstart
+
+You need [tmux](https://github.com/tmux/tmux), [git](https://git-scm.com/), a [Rust toolchain](https://rustup.rs/), and at least one AI coding agent ([OpenCode](https://opencode.ai) or [Claude Code](https://docs.anthropic.com/en/docs/claude-code)).
+
+**1. Install bork**
+
+```bash
+git clone https://github.com/villads-valur/bork.git
+cd bork
+cargo build --release
+# Add to PATH (pick one)
+ln -sf "$(pwd)/target/release/bork" /opt/homebrew/bin/bork   # macOS
+sudo ln -sf "$(pwd)/target/release/bork" /usr/local/bin/bork # Linux
+```
+
+**2. Set up a project**
+
+```bash
+bork init owner/repo          # GitHub shorthand
+bork init git@github.com:owner/repo.git   # or SSH/HTTPS URL
+```
+
+This clones the repo, scaffolds the `.bork/` directory, and installs agent status hooks automatically.
+
+**3. Launch**
+
+```bash
+cd repo
+bork
+```
+
+Press `n` to create an issue, `Enter` to launch an agent session. You're up and running.
+
 ## Features
 
 - **4-column kanban board** &mdash; To Do, In Progress, Code Review, Done
@@ -43,6 +76,7 @@ Bork is a terminal UI for managing multiple AI coding sessions. It gives you a 4
 | [tmux](https://github.com/tmux/tmux) | Session management and popup overlays |
 | [git](https://git-scm.com/) | Worktree status and branch detection |
 | [OpenCode](https://opencode.ai) or [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | AI coding agent (at least one) |
+| [gh](https://cli.github.com/) | GitHub PR status (optional) |
 | [Rust toolchain](https://rustup.rs/) | Building from source |
 
 ## Installation
@@ -65,42 +99,56 @@ ln -sf "$(pwd)/target/release/bork" /opt/homebrew/bin/bork
 sudo ln -sf "$(pwd)/target/release/bork" /usr/local/bin/bork
 ```
 
-### Agent status hooks
-
-Bork ships with hooks that report agent status back to the board in real time. Install them after building:
+Verify it works:
 
 ```bash
-bork install      # Installs hooks for OpenCode (plugin) and Claude Code (settings.json)
-bork uninstall    # Removes hooks
+bork --help
 ```
-
-## Quick Start
-
-1. **Initialize** &mdash; Create a `.bork/` directory in your project root (this is where bork stores config and state)
-
-   ```bash
-   mkdir .bork
-   ```
-
-2. **Launch** &mdash; Run `bork` from anywhere inside the project tree
-
-   ```bash
-   bork
-   ```
-
-   If you're not already in tmux, bork wraps itself in a tmux session automatically.
-
-3. **Create an issue** &mdash; Press `n` to open the new issue dialog. Fill in a title, prompt, and worktree path.
-
-4. **Start coding** &mdash; Press `Enter` on an issue to launch an AI agent session in a tmux popup. Press `Ctrl+q` to return to the board.
 
 ## Usage
 
 | Command | Description |
 |---------|-------------|
 | `bork` | Launch the TUI kanban board |
-| `bork install` | Install agent status hooks (OpenCode plugin + Claude Code hooks) |
+| `bork init <repo>` | Set up a new bork project from a git repo |
+| `bork install` | Install agent status hooks |
 | `bork uninstall` | Remove agent status hooks |
+
+### `bork init`
+
+Sets up a new bork project by cloning a repo and scaffolding the container directory structure.
+
+```bash
+bork init owner/repo                      # GitHub shorthand (clones via HTTPS)
+bork init git@github.com:owner/repo.git   # SSH URL
+bork init https://github.com/owner/repo   # HTTPS URL
+bork init owner/repo myproject            # Custom directory name
+bork init owner/repo --agent claude       # Use Claude Code instead of OpenCode
+```
+
+This creates:
+
+```
+repo/                        # Container directory
+├── .bork/                   # Config, state, agent status
+│   ├── config.toml
+│   ├── state.json
+│   └── agent-status/
+├── main/                    # Main branch worktree (the cloned repo)
+├── opencode.jsonc           # OpenCode config
+└── .claude/skills/worktree/ # Worktree skill for Claude Code
+```
+
+Agent status hooks are installed automatically. The directory name defaults to the repo name, or you can pass a second argument to override it.
+
+### `bork install` / `bork uninstall`
+
+Bork ships with hooks that report agent status (Idle, Busy, Waiting, Error) back to the board in real time.
+
+- **OpenCode**: Installs as a plugin
+- **Claude Code**: Adds hooks to `settings.json`
+
+These are installed automatically by `bork init`. Use `bork install` / `bork uninstall` to manage them manually.
 
 ## Keybindings
 
