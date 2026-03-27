@@ -29,6 +29,7 @@ Bork is a terminal UI for managing multiple AI coding sessions. It gives you a 4
 - **4-column kanban board** &mdash; To Do, In Progress, Code Review, Done
 - **AI agent sessions** &mdash; Launch OpenCode or Claude Code per issue in tmux popups
 - **Real-time status monitoring** &mdash; See agent state on each card (Idle, Busy, Waiting, Error)
+- **GitHub PR status** &mdash; Background polling shows checks, review status, and diff stats on cards
 - **Git worktree tracking** &mdash; Live staged/unstaged change counts and branch names
 - **Tmux integration** &mdash; Auto-wraps in tmux, sessions open as 90% screen popups
 - **Plan and Build modes** &mdash; Toggle between planning and building per issue
@@ -42,6 +43,7 @@ Bork is a terminal UI for managing multiple AI coding sessions. It gives you a 4
 |------------|---------|
 | [tmux](https://github.com/tmux/tmux) | Session management and popup overlays |
 | [git](https://git-scm.com/) | Worktree status and branch detection |
+| [gh](https://cli.github.com/) | GitHub PR status polling (optional) |
 | [OpenCode](https://opencode.ai) or [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | AI coding agent (at least one) |
 | [Rust toolchain](https://rustup.rs/) | Building from source |
 
@@ -117,6 +119,8 @@ bork uninstall    # Removes hooks
 | `g` | Scroll to top |
 | `G` | Scroll to bottom |
 | `Enter` | Open session (launch if none, attach if exists) |
+| `P` | Force-sync PR statuses from GitHub |
+| `o` | Open PR in browser (if issue has a matching PR) |
 | `q` / `Ctrl+c` | Quit |
 
 ### Issue Management
@@ -174,6 +178,25 @@ Each issue card shows the current agent status:
 | `●` | Busy |
 | `◈` | Waiting for input |
 | `✗` | Error |
+
+## GitHub PR Integration
+
+Bork polls GitHub for open PRs every 60 seconds using a single GraphQL query via the `gh` CLI. PRs are matched to issues by comparing the PR's head branch name against each issue's worktree branch.
+
+Each card shows PR status when a matching PR is found:
+
+| Element | Meaning |
+|---------|---------|
+| `#42` | PR number |
+| `✓` (green) | CI checks passing |
+| `✗` (red) | CI checks failing |
+| `◌` (yellow) | CI checks pending |
+| `●` (green) | Review approved |
+| `●` (red) | Changes requested |
+| `○` (yellow) | Review required |
+| `+12/-3` | Lines added/removed |
+
+The `gh` CLI must be installed and authenticated. If `gh` is not available or the repo is not on GitHub, PR polling is silently skipped.
 
 ## Project Layout
 
