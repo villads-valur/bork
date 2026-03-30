@@ -53,6 +53,10 @@ pub fn handle_action(
             handle_linear_picker(app, action);
             PostAction::None
         }
+        InputMode::Help => {
+            handle_help(app, action);
+            PostAction::None
+        }
         InputMode::Normal => handle_normal(app, action, action_tx, pr_wake_tx),
     }
 }
@@ -147,6 +151,12 @@ fn handle_normal(
             PostAction::None
         }
 
+        Action::AddIssue => {
+            let column = Column::from_index(app.selected_column).unwrap_or(Column::Todo);
+            app.open_dialog_in_column(column);
+            PostAction::None
+        }
+
         Action::EditIssue => {
             let Some(idx) = app.selected_issue_index() else {
                 return PostAction::None;
@@ -173,6 +183,11 @@ fn handle_normal(
 
         Action::OpenLinearPicker => {
             app.open_linear_picker();
+            PostAction::None
+        }
+
+        Action::ShowHelp => {
+            app.open_help();
             PostAction::None
         }
 
@@ -277,6 +292,16 @@ fn handle_search(app: &mut App, action: Action) {
     }
 }
 
+fn handle_help(app: &mut App, action: Action) {
+    match action {
+        Action::CloseHelp => app.close_help(),
+        Action::Quit => {
+            app.should_quit = true;
+        }
+        _ => {}
+    }
+}
+
 fn handle_dialog(app: &mut App, action: Action) {
     match action {
         Action::DialogChar(c) => {
@@ -352,7 +377,8 @@ fn submit_dialog(app: &mut App) {
     }
 
     let id = app.next_issue_id();
-    let column = Column::from_index(app.selected_column).unwrap_or(Column::Todo);
+    let column = dialog.target_column.unwrap_or(Column::Todo);
+    let column_index = column.index();
 
     let issue = Issue {
         id: id.clone(),
@@ -377,9 +403,10 @@ fn submit_dialog(app: &mut App) {
     app.issues.push(issue);
     app.set_message(format!("Created {}", id));
 
+    app.selected_column = column_index;
     let count = app.issues_in_column(column).len();
     if count > 0 {
-        app.selected_row[app.selected_column] = count - 1;
+        app.selected_row[column_index] = count - 1;
     }
 
     let _ = config::save_state(&app.to_state(), &app.config.project_root);

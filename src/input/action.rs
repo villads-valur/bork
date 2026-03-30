@@ -19,6 +19,7 @@ pub enum Action {
     OpenPR,
     AssignWorktree,
     CreateIssue,
+    AddIssue,
     EditIssue,
     DeleteIssue,
     ConfirmYes,
@@ -42,5 +43,7 @@ pub enum Action {
     LinearPickerClose,
     LinearPickerChar(char),
     LinearPickerBackspace,
+    ShowHelp,
+    CloseHelp,
     Noop,
 }
