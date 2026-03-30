@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -19,6 +21,12 @@ pub fn render_linear_picker(frame: &mut Frame, app: &App) {
 
     let filtered = app.filtered_linear_issues();
     let count = filtered.len();
+
+    let imported_ids: HashSet<&str> = app
+        .issues
+        .iter()
+        .filter_map(|i| i.linear_id.as_deref())
+        .collect();
 
     let area = frame.area();
     let width = (area.width * 70 / 100).clamp(PICKER_MIN_WIDTH, PICKER_MAX_WIDTH);
@@ -117,6 +125,7 @@ pub fn render_linear_picker(frame: &mut Frame, app: &App) {
 
             let issue = filtered[idx];
             let is_selected = idx == picker.selected;
+            let is_imported = imported_ids.contains(issue.id.as_str());
             let y = list_start_y + i as u16;
             let row_area = Rect::new(inner.x + 1, y, inner.width - 2, 1);
 
@@ -129,27 +138,42 @@ pub fn render_linear_picker(frame: &mut Frame, app: &App) {
                 Style::default()
             };
 
-            let priority_str = match issue.priority {
-                1 => "!!! ",
-                2 => "!!  ",
-                3 => "!   ",
-                _ => "    ",
+            let priority_str = if is_imported {
+                "\u{2713}   "
+            } else {
+                match issue.priority {
+                    1 => "!!! ",
+                    2 => "!!  ",
+                    3 => "!   ",
+                    _ => "    ",
+                }
             };
 
             let id_width = issue.identifier.len();
-            let state_str = format!(" \u{25cf} {}", issue.state_name);
+            let state_str = if is_imported {
+                " \u{25cf} on board".to_string()
+            } else {
+                format!(" \u{25cf} {}", issue.state_name)
+            };
             let overhead = 2 + priority_str.len() + id_width + 1 + state_str.len();
             let title_budget = field_width.saturating_sub(overhead);
             let title = truncate(&issue.title, title_budget);
 
-            let title_style = Style::default().fg(styles::TEXT);
+            let title_style = if is_imported {
+                styles::dim_style()
+            } else {
+                Style::default().fg(styles::TEXT)
+            };
+
+            let priority_style = if is_imported {
+                Style::default().fg(styles::ACCENT)
+            } else {
+                Style::default().fg(ratatui::style::Color::Yellow)
+            };
 
             let line = Line::from(vec![
                 Span::styled(pointer, pointer_style),
-                Span::styled(
-                    priority_str,
-                    Style::default().fg(ratatui::style::Color::Yellow),
-                ),
+                Span::styled(priority_str, priority_style),
                 Span::styled(&issue.identifier, styles::dim_style()),
                 Span::raw(" "),
                 Span::styled(title, title_style),
@@ -173,6 +197,8 @@ pub fn render_linear_picker(frame: &mut Frame, app: &App) {
         Span::styled(select_hint, styles::statusbar_desc_style()),
         Span::styled("\u{2191}\u{2193}", styles::statusbar_key_style()),
         Span::styled(":navigate  ", styles::statusbar_desc_style()),
+        Span::styled("^R", styles::statusbar_key_style()),
+        Span::styled(":refresh  ", styles::statusbar_desc_style()),
         Span::styled("Esc", styles::statusbar_key_style()),
         Span::styled(":close", styles::statusbar_desc_style()),
         Span::styled(
