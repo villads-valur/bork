@@ -64,8 +64,11 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    // Dialog/picker mode: footer is handled by the overlay itself
-    if app.input_mode == InputMode::Dialog || app.input_mode == InputMode::LinearPicker {
+    // Overlay modes: footer is handled by the overlay itself
+    if matches!(
+        app.input_mode,
+        InputMode::Dialog | InputMode::LinearPicker | InputMode::Help
+    ) {
         return;
     }
 
@@ -94,45 +97,14 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    // Normal mode: show keybinding hints
-    let has_pr = app.selected_issue().and_then(|i| app.pr_for(i)).is_some();
-
-    let mut bindings = vec![
+    let bindings: &[(&str, &str)] = &[
         ("h/l", "focus"),
-        ("j/k", "up/down"),
-        ("Tab", "column"),
+        ("j/k", "nav"),
         ("Enter", "open"),
-        ("a", "add"),
         ("n", "new"),
-        ("e", "edit"),
-        ("d", "delete"),
-        ("x", "kill"),
-        ("H/L", "move"),
-        ("D", "done"),
-        ("T", "todo"),
-        ("P", "sync prs"),
-        ("/", "search"),
+        ("?", "help"),
+        ("q", "quit"),
     ];
-    if app.linear_available {
-        bindings.push(("I", "linear"));
-    }
-    bindings.push(("q", "quit"));
-
-    if has_pr {
-        bindings.push(("o", "open pr"));
-    }
-
-    let has_worktree = app
-        .selected_issue()
-        .and_then(|i| i.worktree.as_ref())
-        .is_some();
-    if has_worktree {
-        bindings.push(("W", "reset wt"));
-    } else {
-        bindings.push(("W", "worktree"));
-    }
-
-    bindings.push(("q", "quit"));
 
     let mut spans = vec![Span::raw(" ")];
     for (i, (key, desc)) in bindings.iter().enumerate() {
