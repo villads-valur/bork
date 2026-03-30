@@ -682,6 +682,7 @@ mod tests {
             prompt: None,
             worktree: None,
             done_at: None,
+            session_id: None,
         }
     }
 

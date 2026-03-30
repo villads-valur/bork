@@ -70,6 +70,7 @@ fn run_worktree_in(
             prompt: None,
             worktree: Some(worktree_dir.to_string()),
             done_at: None,
+            session_id: None,
         };
         state.issues.push(issue);
     } else {

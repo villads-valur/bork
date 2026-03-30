@@ -192,6 +192,10 @@ pub struct Issue {
     pub worktree: Option<String>,
     #[serde(default)]
     pub done_at: Option<u64>,
+    /// The agent's internal session ID — used to resume conversations.
+    /// OpenCode: "ses_xxx..." format. Claude: UUID format.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 impl Issue {
@@ -262,6 +266,7 @@ mod tests {
             prompt: None,
             worktree: None,
             done_at: None,
+            session_id: None,
         }
     }
 
@@ -481,6 +486,36 @@ mod tests {
         assert_eq!(AgentMode::Plan.to_string(), "plan");
         assert_eq!(AgentMode::Build.to_string(), "build");
         assert_eq!(AgentMode::Yolo.to_string(), "yolo");
+    }
+
+    // --- Issue session_id ---
+
+    #[test]
+    fn issue_deserializes_without_session_id_defaults_to_none() {
+        let json = r#"{
+            "id": "bork-1",
+            "title": "Test",
+            "column": "Todo",
+            "branch": null,
+            "worktree": "main",
+            "tmux_session": null,
+            "agent_kind": "OpenCode",
+            "agent_mode": "Plan",
+            "agent_status": "Stopped",
+            "prompt": null
+        }"#;
+        let issue: Issue = serde_json::from_str(json).unwrap();
+        assert_eq!(issue.session_id, None);
+    }
+
+    #[test]
+    fn issue_serializes_and_deserializes_session_id() {
+        let mut issue = test_issue("bork-1", Column::InProgress);
+        issue.session_id = Some("ses_abc123xyz".to_string());
+        let json = serde_json::to_string(&issue).unwrap();
+        assert!(json.contains("\"session_id\":\"ses_abc123xyz\""));
+        let roundtrip: Issue = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip.session_id, Some("ses_abc123xyz".to_string()));
     }
 
     // --- AgentStatus ---
