@@ -111,7 +111,7 @@ fn spawn_pr_poll_worker(
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || loop {
-        let prs = external::github::fetch_open_prs(&main_worktree);
+        let prs = external::github::fetch_prs(&main_worktree);
         let indexed = external::github::index_by_branch(prs);
         if tx.send(indexed).is_err() {
             break;

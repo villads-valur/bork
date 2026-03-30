@@ -51,7 +51,7 @@ fn get_repo_identity(main_worktree: &Path) -> Option<&'static RepoIdentity> {
         .as_ref()
 }
 
-pub fn fetch_open_prs(main_worktree: &Path) -> Vec<PrStatus> {
+pub fn fetch_prs(main_worktree: &Path) -> Vec<PrStatus> {
     let Some(repo) = get_repo_identity(main_worktree) else {
         return Vec::new();
     };
@@ -59,7 +59,7 @@ pub fn fetch_open_prs(main_worktree: &Path) -> Vec<PrStatus> {
     let query = format!(
         r#"query($owner: String!, $repo: String!) {{
             repository(owner: $owner, name: $repo) {{
-                pullRequests(states: OPEN, first: 100, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{
+                pullRequests(states: [OPEN, MERGED, CLOSED], first: 100, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{
                     nodes {{
                         {PR_FIELDS}
                     }}
