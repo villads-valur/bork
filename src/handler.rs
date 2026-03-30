@@ -397,6 +397,7 @@ fn submit_dialog(app: &mut App) {
         linear_url: None,
         linear_state: None,
         linear_branch: None,
+        pr_number: None,
     };
 
     app.issues.push(issue);
@@ -493,6 +494,7 @@ fn import_linear_issue(app: &mut App) {
         } else {
             Some(linear_issue.branch_name.clone())
         },
+        pr_number: None,
     };
 
     app.issues.push(issue);
@@ -830,6 +832,7 @@ mod tests {
             linear_url: None,
             linear_state: None,
             linear_branch: None,
+            pr_number: None,
         });
 
         // Open edit dialog

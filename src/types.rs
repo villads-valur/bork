@@ -206,6 +206,9 @@ pub struct Issue {
     pub linear_state: Option<String>,
     #[serde(default)]
     pub linear_branch: Option<String>,
+    /// PR number if this issue was auto-imported from a GitHub PR.
+    #[serde(default)]
+    pub pr_number: Option<u32>,
 }
 
 impl Issue {
@@ -251,6 +254,9 @@ pub enum ReviewDecision {
 #[derive(Debug, Clone)]
 pub struct PrStatus {
     pub number: u32,
+    pub title: String,
+    pub url: String,
+    pub author: String,
     pub state: PrState,
     pub is_draft: bool,
     pub checks: Option<ChecksStatus>,
@@ -282,6 +288,7 @@ mod tests {
             linear_url: None,
             linear_state: None,
             linear_branch: None,
+            pr_number: None,
         }
     }
 
@@ -318,6 +325,9 @@ mod tests {
     fn test_pr_status_clone() {
         let pr = PrStatus {
             number: 1,
+            title: "Fix bug".into(),
+            url: "https://github.com/test/repo/pull/1".into(),
+            author: "testuser".into(),
             state: PrState::Open,
             is_draft: false,
             checks: Some(ChecksStatus::Success),

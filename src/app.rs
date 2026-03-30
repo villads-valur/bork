@@ -4,7 +4,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use crate::config::{AppConfig, AppState};
 use crate::external::linear::LinearIssue;
 use crate::types::{
-    AgentKind, AgentMode, AgentStatus, AgentStatusInfo, Column, Issue, PrStatus, WorktreeStatus,
+    AgentKind, AgentMode, AgentStatus, AgentStatusInfo, Column, Issue, PrState, PrStatus,
+    WorktreeStatus,
 };
 
 fn unix_now() -> u64 {
@@ -127,6 +128,8 @@ pub struct App {
     pub linear_available: bool,
     pub linear_issues: Vec<LinearIssue>,
     pub linear_picker: Option<LinearPickerState>,
+    pub github_user: Option<String>,
+    pub user_prs: Vec<PrStatus>,
 }
 
 impl App {
@@ -164,6 +167,8 @@ impl App {
             linear_available: false,
             linear_issues: Vec::new(),
             linear_picker: None,
+            github_user: None,
+            user_prs: Vec::new(),
         }
     }
 
@@ -510,6 +515,106 @@ impl App {
         self.pr_statuses.get(branch)
     }
 
+    /// Auto-import open, non-draft PRs authored by the current GitHub user as
+    /// issues in the Code Review column. Uses 3-layer deduplication:
+    ///   1. Issue ID prefix match on branch (catches follow-up PRs)
+    ///   2. Exact branch match via branch_for() (catches normal PR-per-issue)
+    ///   3. PR number match (catches reimport edge cases)
+    /// Returns true if any issues were created (signals a state save).
+    pub fn sync_prs_as_issues(&mut self) -> bool {
+        if self.user_prs.is_empty() {
+            return false;
+        }
+
+        // Layer 2: collect all branches claimed by existing issues
+        let claimed_branches: HashSet<String> = self
+            .issues
+            .iter()
+            .filter_map(|issue| self.branch_for(issue).map(|b| b.to_string()))
+            .collect();
+
+        // Layer 3: collect all PR numbers already tracked by issues
+        let claimed_pr_numbers: HashSet<u32> = self
+            .issues
+            .iter()
+            .filter_map(|issue| issue.pr_number)
+            .collect();
+
+        // Collect issue IDs (lowercased) for layer 1 prefix matching
+        let issue_ids: Vec<String> = self.issues.iter().map(|i| i.id.to_lowercase()).collect();
+
+        let mut new_issues: Vec<Issue> = Vec::new();
+
+        for pr in &self.user_prs {
+            if pr.state != PrState::Open {
+                continue;
+            }
+            if pr.is_draft {
+                continue;
+            }
+
+            let branch = &pr.head_branch;
+            if branch == "main" || branch == "master" {
+                continue;
+            }
+
+            // Layer 2: exact branch match
+            if claimed_branches.contains(branch) {
+                continue;
+            }
+
+            // Layer 1: issue ID prefix match on branch
+            // Matches both "issue-id/slug" and "issue-id-slug" patterns
+            let branch_lower = branch.to_lowercase();
+            let has_prefix_match = issue_ids.iter().any(|id| {
+                branch_lower.starts_with(&format!("{}/", id))
+                    || branch_lower.starts_with(&format!("{}-", id))
+            });
+            if has_prefix_match {
+                continue;
+            }
+
+            // Layer 3: PR number match
+            if claimed_pr_numbers.contains(&pr.number) {
+                continue;
+            }
+
+            let id = self.next_issue_id_after(new_issues.len() as u32);
+            new_issues.push(Issue {
+                id,
+                title: pr.title.clone(),
+                column: Column::CodeReview,
+                worktree: None,
+                tmux_session: None,
+                agent_kind: self.config.agent_kind,
+                agent_mode: AgentMode::Plan,
+                agent_status: AgentStatus::Stopped,
+                prompt: None,
+                done_at: None,
+                session_id: None,
+                linear_id: None,
+                linear_identifier: None,
+                linear_url: None,
+                linear_state: None,
+                linear_branch: None,
+                pr_number: Some(pr.number),
+            });
+        }
+
+        if new_issues.is_empty() {
+            return false;
+        }
+
+        let count = new_issues.len();
+        self.issues.append(&mut new_issues);
+        self.set_message(format!(
+            "Imported {} PR{} from GitHub",
+            count,
+            if count == 1 { "" } else { "s" }
+        ));
+        true
+    }
+
     pub fn done_worktree_names(&self) -> HashSet<String> {
         self.issues
             .iter()
@@ -657,6 +762,27 @@ impl App {
         format!("{}-{}", prefix, max_num + 1)
     }
 
+    /// Like `next_issue_id` but accounts for `offset` additional issues that
+    /// will be created in the same batch (so each gets a unique ID).
+    fn next_issue_id_after(&self, offset: u32) -> String {
+        let prefix = &self.config.project_name;
+        let max_num = self
+            .issues
+            .iter()
+            .filter_map(|issue| {
+                let id = &issue.id;
+                if let Some(suffix) = id.strip_prefix(&format!("{}-", prefix)) {
+                    suffix.parse::<u32>().ok()
+                } else {
+                    None
+                }
+            })
+            .max()
+            .unwrap_or(0);
+
+        format!("{}-{}", prefix, max_num + 1 + offset)
+    }
+
     // --- Confirm ---
 
     pub fn start_confirm(&mut self, message: String, action: ConfirmAction) {
@@ -792,6 +918,7 @@ mod tests {
             linear_url: None,
             linear_state: None,
             linear_branch: None,
+            pr_number: None,
         }
     }
 
@@ -815,6 +942,9 @@ mod tests {
     fn test_pr(number: u32, branch: &str) -> PrStatus {
         PrStatus {
             number,
+            title: format!("PR #{}", number),
+            url: format!("https://github.com/test/repo/pull/{}", number),
+            author: "testuser".into(),
             state: PrState::Open,
             is_draft: false,
             checks: Some(crate::types::ChecksStatus::Success),
@@ -1181,6 +1311,183 @@ mod tests {
         assert_eq!(app.pr_for(&issues[1]).unwrap().number, 20);
     }
 
+    // ================================================================
+    // sync_prs_as_issues (auto-import PRs)
+    // ================================================================
+
+    #[test]
+    fn sync_prs_imports_open_pr_as_issue() {
+        let mut app = test_app(vec![]);
+        app.user_prs = vec![test_pr(1, "feature/new")];
+
+        assert!(app.sync_prs_as_issues());
+        assert_eq!(app.issues.len(), 1);
+        assert_eq!(app.issues[0].title, "PR #1");
+        assert_eq!(app.issues[0].column, Column::CodeReview);
+        assert_eq!(app.issues[0].pr_number, Some(1));
+    }
+
+    #[test]
+    fn sync_prs_skips_when_no_user_prs() {
+        let mut app = test_app(vec![]);
+        // user_prs is empty by default
+        assert!(!app.sync_prs_as_issues());
+        assert!(app.issues.is_empty());
+    }
+
+    #[test]
+    fn sync_prs_skips_draft_prs() {
+        let mut app = test_app(vec![]);
+        let mut pr = test_pr(1, "feature/new");
+        pr.is_draft = true;
+        app.user_prs = vec![pr];
+
+        assert!(!app.sync_prs_as_issues());
+        assert!(app.issues.is_empty());
+    }
+
+    #[test]
+    fn sync_prs_skips_closed_prs() {
+        let mut app = test_app(vec![]);
+        let mut pr = test_pr(1, "feature/new");
+        pr.state = PrState::Closed;
+        app.user_prs = vec![pr];
+
+        assert!(!app.sync_prs_as_issues());
+        assert!(app.issues.is_empty());
+    }
+
+    #[test]
+    fn sync_prs_skips_merged_prs() {
+        let mut app = test_app(vec![]);
+        let mut pr = test_pr(1, "feature/new");
+        pr.state = PrState::Merged;
+        app.user_prs = vec![pr];
+
+        assert!(!app.sync_prs_as_issues());
+        assert!(app.issues.is_empty());
+    }
+
+    #[test]
+    fn sync_prs_skips_main_branch() {
+        let mut app = test_app(vec![]);
+        app.user_prs = vec![test_pr(1, "main")];
+
+        assert!(!app.sync_prs_as_issues());
+        assert!(app.issues.is_empty());
+    }
+
+    #[test]
+    fn sync_prs_dedup_by_branch_match() {
+        let mut issue = test_issue("bork-1", Column::InProgress);
+        issue.worktree = Some("bork-1".into());
+        let mut app = test_app(vec![issue]);
+        app.worktree_branches
+            .insert("bork-1".into(), "feature/thing".into());
+        app.user_prs = vec![test_pr(1, "feature/thing")];
+
+        assert!(!app.sync_prs_as_issues());
+        assert_eq!(app.issues.len(), 1);
+    }
+
+    #[test]
+    fn sync_prs_dedup_by_issue_id_prefix() {
+        let issue = test_issue("bork-5", Column::InProgress);
+        let mut app = test_app(vec![issue]);
+        app.user_prs = vec![test_pr(1, "bork-5/follow-up")];
+
+        assert!(!app.sync_prs_as_issues());
+        assert_eq!(app.issues.len(), 1);
+    }
+
+    #[test]
+    fn sync_prs_dedup_by_pr_number() {
+        let mut issue = test_issue("bork-1", Column::CodeReview);
+        issue.pr_number = Some(42);
+        let mut app = test_app(vec![issue]);
+        app.user_prs = vec![test_pr(42, "some/branch")];
+
+        assert!(!app.sync_prs_as_issues());
+        assert_eq!(app.issues.len(), 1);
+    }
+
+    #[test]
+    fn sync_prs_reimports_after_delete() {
+        let mut app = test_app(vec![]);
+        app.user_prs = vec![test_pr(42, "feature/new")];
+
+        assert!(app.sync_prs_as_issues());
+        assert_eq!(app.issues.len(), 1);
+        assert_eq!(app.issues[0].pr_number, Some(42));
+
+        app.issues.clear();
+
+        assert!(app.sync_prs_as_issues());
+        assert_eq!(app.issues.len(), 1);
+        assert_eq!(app.issues[0].pr_number, Some(42));
+    }
+
+    #[test]
+    fn sync_prs_multiple_prs_get_unique_ids() {
+        let mut app = test_app(vec![]);
+        app.user_prs = vec![
+            test_pr(1, "feature/a"),
+            test_pr(2, "feature/b"),
+            test_pr(3, "feature/c"),
+        ];
+
+        assert!(app.sync_prs_as_issues());
+        assert_eq!(app.issues.len(), 3);
+
+        let ids: HashSet<&str> = app.issues.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids.len(), 3);
+    }
+
+    #[test]
+    fn sync_prs_no_duplicate_on_second_call() {
+        let mut app = test_app(vec![]);
+        app.user_prs = vec![test_pr(1, "feature/new")];
+
+        assert!(app.sync_prs_as_issues());
+        assert_eq!(app.issues.len(), 1);
+
+        assert!(!app.sync_prs_as_issues());
+        assert_eq!(app.issues.len(), 1);
+    }
+
+    #[test]
+    fn sync_prs_dedup_by_issue_id_prefix_with_dash() {
+        let issue = test_issue("doc-1917", Column::InProgress);
+        let mut app = test_app(vec![issue]);
+        app.user_prs = vec![test_pr(1, "DOC-1917-attachment-selection-search")];
+
+        assert!(!app.sync_prs_as_issues());
+        assert_eq!(app.issues.len(), 1);
+    }
+
+    #[test]
+    fn sync_prs_prefix_no_false_match_on_similar_ids() {
+        // Issue "bork-1" should NOT match branch "bork-10/something"
+        let issue = test_issue("bork-1", Column::InProgress);
+        let mut app = test_app(vec![issue]);
+        app.user_prs = vec![test_pr(1, "bork-10/something")];
+
+        assert!(app.sync_prs_as_issues());
+        assert_eq!(app.issues.len(), 2); // new issue created
+    }
+
+    #[test]
+    fn sync_prs_prefix_match_is_case_insensitive() {
+        let issue = test_issue("BORK-5", Column::InProgress);
+        let mut app = test_app(vec![issue]);
+        app.user_prs = vec![test_pr(1, "bork-5/fix")];
+
+        assert!(!app.sync_prs_as_issues());
+        assert_eq!(app.issues.len(), 1);
+    }
+
+    // ================================================================
+    // DialogState: mode cycling (field 2 = mode in our 3-field dialog)
     // ================================================================
     // DialogState: mode cycling (field 2 = mode in our 3-field dialog)
     // ================================================================

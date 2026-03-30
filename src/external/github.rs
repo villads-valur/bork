@@ -14,6 +14,7 @@ static REPO_IDENTITY: OnceLock<Option<RepoIdentity>> = OnceLock::new();
 
 const PR_FIELDS: &str = r#"
     number url title state isDraft headRefName
+    author { login }
     reviewDecision
     additions deletions
     commits(last: 1) {
@@ -24,6 +25,8 @@ const PR_FIELDS: &str = r#"
         }
     }
 "#;
+
+static GITHUB_USER: OnceLock<Option<String>> = OnceLock::new();
 
 fn parse_repo_identity(json_str: &str) -> Option<RepoIdentity> {
     let parsed: serde_json::Value = serde_json::from_str(json_str.trim()).ok()?;
@@ -111,6 +114,13 @@ fn parse_graphql_response(json_str: &str) -> Vec<PrStatus> {
 
 fn parse_pr_node(node: &serde_json::Value) -> Option<PrStatus> {
     let number = node.get("number")?.as_u64()? as u32;
+    let title = node.get("title")?.as_str()?.to_string();
+    let url = node.get("url")?.as_str()?.to_string();
+    let author = node
+        .pointer("/author/login")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let state_str = node.get("state")?.as_str()?;
     let is_draft = node
         .get("isDraft")
@@ -151,6 +161,9 @@ fn parse_pr_node(node: &serde_json::Value) -> Option<PrStatus> {
 
     Some(PrStatus {
         number,
+        title,
+        url,
+        author,
         state,
         is_draft,
         checks,
@@ -159,6 +172,96 @@ fn parse_pr_node(node: &serde_json::Value) -> Option<PrStatus> {
         deletions,
         head_branch,
     })
+}
+
+/// Fetch the current user's open PRs using GitHub's search API.
+/// This avoids the pagination limit of the pullRequests query and
+/// guarantees we find all open PRs authored by the current user.
+pub fn fetch_user_prs(main_worktree: &Path) -> Vec<PrStatus> {
+    let Some(repo) = get_repo_identity(main_worktree) else {
+        return Vec::new();
+    };
+    let Some(user) = fetch_current_user(main_worktree) else {
+        return Vec::new();
+    };
+
+    let search_query = format!(
+        "repo:{}/{} is:pr is:open author:{}",
+        repo.owner, repo.name, user
+    );
+
+    let query = format!(
+        r#"query($search: String!) {{
+            search(query: $search, type: ISSUE, first: 50) {{
+                nodes {{
+                    ... on PullRequest {{
+                        {PR_FIELDS}
+                    }}
+                }}
+            }}
+        }}"#
+    );
+
+    let output = Command::new("gh")
+        .args([
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={query}"),
+            "-f",
+            &format!("search={search_query}"),
+        ])
+        .current_dir(main_worktree)
+        .output();
+
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_search_response(&stdout)
+}
+
+fn parse_search_response(json_str: &str) -> Vec<PrStatus> {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) else {
+        return Vec::new();
+    };
+
+    let Some(nodes) = parsed
+        .pointer("/data/search/nodes")
+        .and_then(|v| v.as_array())
+    else {
+        return Vec::new();
+    };
+
+    nodes.iter().filter_map(parse_pr_node).collect()
+}
+
+pub fn fetch_current_user(main_worktree: &Path) -> Option<String> {
+    GITHUB_USER
+        .get_or_init(|| {
+            let output = Command::new("gh")
+                .args(["api", "user", "-q", ".login"])
+                .current_dir(main_worktree)
+                .output()
+                .ok()?;
+
+            if !output.status.success() {
+                return None;
+            }
+
+            let login = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if login.is_empty() {
+                None
+            } else {
+                Some(login)
+            }
+        })
+        .clone()
 }
 
 pub fn open_pr_in_browser(pr_number: u32, main_worktree: &Path) {
@@ -181,6 +284,9 @@ mod tests {
     fn make_pr_node(overrides: &str) -> serde_json::Value {
         let base = r#"{
             "number": 42,
+            "title": "Fix the thing",
+            "url": "https://github.com/test/repo/pull/42",
+            "author": { "login": "testuser" },
             "state": "OPEN",
             "isDraft": false,
             "headRefName": "feature/my-branch",
@@ -228,6 +334,9 @@ mod tests {
         let node = make_pr_node("");
         let pr = parse_pr_node(&node).unwrap();
         assert_eq!(pr.number, 42);
+        assert_eq!(pr.title, "Fix the thing");
+        assert_eq!(pr.url, "https://github.com/test/repo/pull/42");
+        assert_eq!(pr.author, "testuser");
         assert_eq!(pr.state, PrState::Open);
         assert!(!pr.is_draft);
         assert_eq!(pr.head_branch, "feature/my-branch");
@@ -499,18 +608,25 @@ mod tests {
         assert!(map.is_empty());
     }
 
-    #[test]
-    fn test_index_single_pr() {
-        let pr = PrStatus {
-            number: 42,
+    fn test_pr_status(number: u32, branch: &str) -> PrStatus {
+        PrStatus {
+            number,
+            title: format!("PR #{}", number),
+            url: format!("https://github.com/test/repo/pull/{}", number),
+            author: "testuser".into(),
             state: PrState::Open,
             is_draft: false,
             checks: None,
             review: None,
             additions: 0,
             deletions: 0,
-            head_branch: "feature/foo".into(),
-        };
+            head_branch: branch.into(),
+        }
+    }
+
+    #[test]
+    fn test_index_single_pr() {
+        let pr = test_pr_status(42, "feature/foo");
         let map = index_by_branch(vec![pr]);
         assert_eq!(map.len(), 1);
         assert_eq!(map["feature/foo"].number, 42);
@@ -518,28 +634,7 @@ mod tests {
 
     #[test]
     fn test_index_multiple_prs() {
-        let prs = vec![
-            PrStatus {
-                number: 1,
-                state: PrState::Open,
-                is_draft: false,
-                checks: None,
-                review: None,
-                additions: 0,
-                deletions: 0,
-                head_branch: "branch-a".into(),
-            },
-            PrStatus {
-                number: 2,
-                state: PrState::Open,
-                is_draft: false,
-                checks: None,
-                review: None,
-                additions: 0,
-                deletions: 0,
-                head_branch: "branch-b".into(),
-            },
-        ];
+        let prs = vec![test_pr_status(1, "branch-a"), test_pr_status(2, "branch-b")];
         let map = index_by_branch(prs);
         assert_eq!(map.len(), 2);
         assert_eq!(map["branch-a"].number, 1);
@@ -549,26 +644,8 @@ mod tests {
     #[test]
     fn test_index_duplicate_branch_last_wins() {
         let prs = vec![
-            PrStatus {
-                number: 1,
-                state: PrState::Open,
-                is_draft: false,
-                checks: None,
-                review: None,
-                additions: 0,
-                deletions: 0,
-                head_branch: "same-branch".into(),
-            },
-            PrStatus {
-                number: 2,
-                state: PrState::Open,
-                is_draft: false,
-                checks: None,
-                review: None,
-                additions: 0,
-                deletions: 0,
-                head_branch: "same-branch".into(),
-            },
+            test_pr_status(1, "same-branch"),
+            test_pr_status(2, "same-branch"),
         ];
         let map = index_by_branch(prs);
         assert_eq!(map.len(), 1);
