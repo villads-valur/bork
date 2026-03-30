@@ -51,6 +51,7 @@ pub fn fetch_assigned_issues() -> Result<Vec<LinearIssue>, AppError> {
         serde_json::from_str(&stdout).map_err(|e| AppError::Linear(format!("parse error: {e}")))?;
 
     let issues = response
+        .data
         .viewer
         .assigned_issues
         .nodes
@@ -74,6 +75,11 @@ pub fn fetch_assigned_issues() -> Result<Vec<LinearIssue>, AppError> {
 
 #[derive(Deserialize)]
 struct GraphqlResponse {
+    data: GraphqlData,
+}
+
+#[derive(Deserialize)]
+struct GraphqlData {
     viewer: Viewer,
 }
 
