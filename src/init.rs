@@ -6,7 +6,12 @@ use anyhow::{bail, Context};
 
 use crate::types::AgentKind;
 
-const WORKTREE_SKILL: &str = r#"# Skill: worktree
+const WORKTREE_SKILL: &str = r#"---
+name: worktree
+description: Create git worktrees and register them with bork for issue tracking
+---
+
+# Worktree Management
 
 Create and manage git worktrees in a bork project.
 
@@ -27,20 +32,26 @@ The `main/` directory is a regular git repo. All worktrees are created from it a
 
 ## Creating a worktree
 
-When asked to work on an issue or create a worktree:
+**Always use `bork worktree` to create worktrees.** This creates the git worktree AND registers it with bork's state so the TUI can track it.
 
 ```bash
-git -C main worktree add ../{issue-id} -b {issue-id}/{slug}
+bork worktree {issue-id} {slug}
 ```
 
 **Example:**
 ```bash
-git -C main worktree add ../bork-14 -b bork-14/add-worktree-support
+bork worktree bork-14 add-worktree-support
 ```
 
 This creates:
 - Directory: `bork-14/` (sibling of `main/`)
 - Branch: `bork-14/add-worktree-support` (branched from current HEAD of main)
+- Updates `.bork/state.json` to link the issue to the worktree
+
+To also create the issue if it doesn't exist:
+```bash
+bork worktree bork-14 add-worktree-support --title "Add worktree support"
+```
 
 ## Naming conventions
 

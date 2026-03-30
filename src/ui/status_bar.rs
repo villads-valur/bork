@@ -95,6 +95,8 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     // Normal mode: show keybinding hints
+    let has_pr = app.selected_issue().and_then(|i| app.pr_for(i)).is_some();
+
     let mut bindings = vec![
         ("h/l", "focus"),
         ("j/k", "up/down"),
@@ -105,11 +107,28 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         ("d", "delete"),
         ("x", "kill"),
         ("H/L", "move"),
+        ("P", "sync prs"),
         ("/", "search"),
     ];
     if app.linear_available {
         bindings.push(("I", "linear"));
     }
+    bindings.push(("q", "quit"));
+
+    if has_pr {
+        bindings.push(("o", "open pr"));
+    }
+
+    let has_worktree = app
+        .selected_issue()
+        .and_then(|i| i.worktree.as_ref())
+        .is_some();
+    if has_worktree {
+        bindings.push(("W", "reset wt"));
+    } else {
+        bindings.push(("W", "worktree"));
+    }
+
     bindings.push(("q", "quit"));
 
     let mut spans = vec![Span::raw(" ")];

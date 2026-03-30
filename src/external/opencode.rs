@@ -1,3 +1,7 @@
+use std::collections::HashSet;
+use std::process::Command;
+use std::time::Duration;
+
 use crate::config::{self, AppConfig};
 use crate::error::AppError;
 use crate::external::tmux;
@@ -8,72 +12,233 @@ use crate::types::{AgentKind, AgentMode, Issue};
 ///   1. The agent (opencode/claude) launched at the project root with issue context
 ///   2. A bare terminal
 /// Exports BORK_SESSION and BORK_STATUS_DIR so hooks/plugins can write status files.
-/// Returns the tmux session name.
-pub fn launch_session(issue: &Issue, config: &AppConfig) -> Result<String, AppError> {
-    let session_name = issue.session_name();
+/// Returns (tmux_session_name, agent_session_id).
+/// The agent_session_id is the agent's internal session ID for resuming conversations:
+///   - Claude: UUID pre-assigned via --session-id
+///   - OpenCode: ses_xxx detected by polling `opencode session list` after launch
+pub fn launch_session(
+    issue: &Issue,
+    config: &AppConfig,
+) -> Result<(String, Option<String>), AppError> {
+    let session_name = issue.session_name(&config.project_name);
     let cwd = &config.project_root;
 
     if tmux::session_exists(&session_name) {
-        return Ok(session_name);
+        return Ok((session_name, issue.session_id.clone()));
     }
 
     tmux::create_session(&session_name, cwd)?;
 
-    let default_prompt = config
-        .default_prompt
-        .as_deref()
-        .unwrap_or(config::DEFAULT_PROMPT_FALLBACK);
-
-    let prompt = build_prompt(
-        &issue.id,
-        &issue.title,
-        default_prompt,
-        issue.prompt.as_deref(),
-    );
-    let escaped_prompt = shell_escape_single_quotes(&prompt);
-
-    let session_display_name = format!("{}: {}", issue.id, issue.title);
-    let escaped_name = shell_escape_single_quotes(&session_display_name);
-
     let status_dir = config::agent_status_dir(&config.project_root);
     let status_dir_str = status_dir.to_str().unwrap_or("");
 
-    let agent_cmd = match issue.agent_kind {
-        AgentKind::OpenCode => {
-            // opencode does not support --name
-            let mode_flag = match issue.agent_mode {
-                AgentMode::Plan => " --agent plan",
-                AgentMode::Build => "",
-            };
-            format!(
-                "export BORK_SESSION='{}' BORK_STATUS_DIR='{}' && opencode --prompt '{}'{}",
-                shell_escape_single_quotes(&session_name),
-                shell_escape_single_quotes(status_dir_str),
-                escaped_prompt,
-                mode_flag,
-            )
-        }
-        AgentKind::Claude => {
-            let mode_flag = match issue.agent_mode {
-                AgentMode::Plan => " --permission-mode plan",
-                AgentMode::Build => "",
-            };
-            format!(
-                "export BORK_SESSION='{}' BORK_STATUS_DIR='{}' && claude --name '{}'{} '{}'",
-                shell_escape_single_quotes(&session_name),
-                shell_escape_single_quotes(status_dir_str),
-                escaped_name,
-                mode_flag,
-                escaped_prompt,
-            )
-        }
-    };
+    let (agent_cmd, pre_assigned_session_id) =
+        build_agent_cmd(issue, config, &session_name, status_dir_str);
+
     tmux::send_keys(&session_name, &agent_cmd)?;
 
     // Second window: bare terminal for ad-hoc commands
     tmux::create_window(&session_name, "terminal", cwd)?;
 
-    Ok(session_name)
+    // For OpenCode, detect the session ID by polling `opencode session list`
+    let agent_session_id = match pre_assigned_session_id {
+        Some(id) => Some(id),
+        None => detect_opencode_session_id(),
+    };
+
+    Ok((session_name, agent_session_id))
+}
+
+/// Build the agent launch command and return (command, pre_assigned_session_id).
+/// For Claude, pre-assigns a UUID and returns it. For OpenCode, returns None (ID detected post-launch).
+/// If the issue already has a session_id, builds a resume command instead.
+fn build_agent_cmd(
+    issue: &Issue,
+    config: &AppConfig,
+    session_name: &str,
+    status_dir_str: &str,
+) -> (String, Option<String>) {
+    let env_prefix = format!(
+        "export BORK_SESSION='{}' BORK_STATUS_DIR='{}'",
+        shell_escape_single_quotes(session_name),
+        shell_escape_single_quotes(status_dir_str),
+    );
+
+    match issue.agent_kind {
+        AgentKind::OpenCode => {
+            if let Some(ref sid) = issue.session_id {
+                // Resume existing OpenCode session — skip --prompt, history is preserved
+                let escaped_sid = shell_escape_single_quotes(sid);
+                // Yolo is Claude-only; treat as Build for OpenCode
+                let mode_flag = match issue.agent_mode {
+                    AgentMode::Plan => " --agent plan",
+                    AgentMode::Build | AgentMode::Yolo => "",
+                };
+                let cmd = format!(
+                    "{} && opencode --session '{}'{}",
+                    env_prefix, escaped_sid, mode_flag,
+                );
+                (cmd, None)
+            } else {
+                let default_prompt = config
+                    .default_prompt
+                    .as_deref()
+                    .unwrap_or(config::DEFAULT_PROMPT_FALLBACK);
+                let prompt = build_prompt(
+                    &issue.id,
+                    &issue.title,
+                    default_prompt,
+                    issue.prompt.as_deref(),
+                );
+                let escaped_prompt = shell_escape_single_quotes(&prompt);
+                // Yolo is Claude-only; treat as Build for OpenCode
+                let mode_flag = match issue.agent_mode {
+                    AgentMode::Plan => " --agent plan",
+                    AgentMode::Build | AgentMode::Yolo => "",
+                };
+                let cmd = format!(
+                    "{} && opencode --prompt '{}'{}",
+                    env_prefix, escaped_prompt, mode_flag,
+                );
+                (cmd, None)
+            }
+        }
+        AgentKind::Claude => {
+            let session_display_name = format!("{}: {}", issue.id, issue.title);
+            let escaped_name = shell_escape_single_quotes(&session_display_name);
+            let mode_flag = match issue.agent_mode {
+                AgentMode::Plan => " --permission-mode plan",
+                AgentMode::Yolo => " --dangerously-skip-permissions",
+                AgentMode::Build => "",
+            };
+
+            if let Some(ref sid) = issue.session_id {
+                // Resume existing Claude session — skip the prompt, history is preserved
+                let escaped_sid = shell_escape_single_quotes(sid);
+                let cmd = format!(
+                    "{} && claude --name '{}'{} --resume '{}'",
+                    env_prefix, escaped_name, mode_flag, escaped_sid,
+                );
+                (cmd, Some(sid.clone()))
+            } else {
+                // Fresh Claude session: pre-assign a UUID so we can resume later
+                let uuid = generate_uuid().unwrap_or_default();
+                if uuid.is_empty() {
+                    // uuidgen unavailable — launch without session-id
+                    let default_prompt = config
+                        .default_prompt
+                        .as_deref()
+                        .unwrap_or(config::DEFAULT_PROMPT_FALLBACK);
+                    let prompt = build_prompt(
+                        &issue.id,
+                        &issue.title,
+                        default_prompt,
+                        issue.prompt.as_deref(),
+                    );
+                    let escaped_prompt = shell_escape_single_quotes(&prompt);
+                    let cmd = format!(
+                        "{} && claude --name '{}'{} '{}'",
+                        env_prefix, escaped_name, mode_flag, escaped_prompt,
+                    );
+                    (cmd, None)
+                } else {
+                    let escaped_uuid = shell_escape_single_quotes(&uuid);
+                    let default_prompt = config
+                        .default_prompt
+                        .as_deref()
+                        .unwrap_or(config::DEFAULT_PROMPT_FALLBACK);
+                    let prompt = build_prompt(
+                        &issue.id,
+                        &issue.title,
+                        default_prompt,
+                        issue.prompt.as_deref(),
+                    );
+                    let escaped_prompt = shell_escape_single_quotes(&prompt);
+                    let cmd = format!(
+                        "{} && claude --name '{}'{} --session-id '{}' '{}'",
+                        env_prefix, escaped_name, mode_flag, escaped_uuid, escaped_prompt,
+                    );
+                    (cmd, Some(uuid))
+                }
+            }
+        }
+    }
+}
+
+/// Generate a UUID using the system `uuidgen` command.
+fn generate_uuid() -> Option<String> {
+    Command::new("uuidgen")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+}
+
+/// Poll `opencode session list` to detect a newly created session.
+/// Returns the session ID if found within ~5 seconds, otherwise None.
+fn detect_opencode_session_id() -> Option<String> {
+    // Give OpenCode a moment to create its session before polling
+    std::thread::sleep(Duration::from_millis(800));
+
+    for _ in 0..9 {
+        if let Some(sid) = newest_opencode_session() {
+            return Some(sid);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    None
+}
+
+/// Run `opencode session list` and return the first (newest) session ID found.
+/// Session IDs start with "ses_".
+fn newest_opencode_session() -> Option<String> {
+    let output = Command::new("opencode")
+        .args(["session", "list"])
+        .output()
+        .ok()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_newest_session_id(&stdout)
+}
+
+/// Parse the newest session ID from `opencode session list` output.
+/// Expected format: each line starts with the session ID (ses_xxx).
+fn parse_newest_session_id(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let token = line.split_whitespace().next()?;
+        if token.starts_with("ses_") {
+            Some(token.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+/// Snapshot the current set of OpenCode session IDs before launching.
+#[allow(dead_code)]
+fn snapshot_opencode_sessions() -> HashSet<String> {
+    let output = Command::new("opencode")
+        .args(["session", "list"])
+        .output()
+        .ok();
+
+    let Some(output) = output else {
+        return HashSet::new();
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let token = line.split_whitespace().next()?;
+            if token.starts_with("ses_") {
+                Some(token.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Build the full prompt sent to the agent.
@@ -161,7 +326,7 @@ mod tests {
         );
         assert!(result.starts_with("You are working on bork-6: New feature."));
         assert!(result.contains("Check AGENTS.md for project context"));
-        assert!(result.contains("worktree skill"));
+        assert!(result.contains("bork worktree"));
     }
 
     #[test]
@@ -186,5 +351,25 @@ mod tests {
     #[test]
     fn shell_escape_with_single_quotes() {
         assert_eq!(shell_escape_single_quotes("it's a test"), "it'\\''s a test");
+    }
+
+    #[test]
+    fn parse_newest_session_id_finds_first_ses_entry() {
+        let output = "ses_abc123   My session title   2024-01-15\nses_def456   Another session   2024-01-14\n";
+        assert_eq!(
+            parse_newest_session_id(output),
+            Some("ses_abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_newest_session_id_returns_none_for_empty_output() {
+        assert_eq!(parse_newest_session_id(""), None);
+    }
+
+    #[test]
+    fn parse_newest_session_id_ignores_non_ses_lines() {
+        let output = "No sessions found\n";
+        assert_eq!(parse_newest_session_id(output), None);
     }
 }

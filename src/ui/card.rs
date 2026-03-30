@@ -4,10 +4,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-use crate::types::{AgentStatus, Issue, WorktreeStatus};
+use crate::types::{AgentStatus, Issue, PrStatus, WorktreeStatus};
 use crate::ui::styles;
 
-pub const CARD_HEIGHT: u16 = 5;
+pub const CARD_HEIGHT: u16 = 6;
 
 pub struct CardContext<'a> {
     pub issue: &'a Issue,
@@ -17,6 +17,7 @@ pub struct CardContext<'a> {
     pub activity: Option<&'a str>,
     pub branch: Option<&'a str>,
     pub git_status: Option<&'a WorktreeStatus>,
+    pub pr: Option<&'a PrStatus>,
 }
 
 pub fn render_card(frame: &mut Frame, ctx: &CardContext, area: Rect) {
@@ -39,10 +40,41 @@ pub fn render_card(frame: &mut Frame, ctx: &CardContext, area: Rect) {
         return;
     }
 
-    let max_title_len = inner.width as usize;
-    let title_text = truncate(&ctx.issue.title, max_title_len);
+    let max_width = inner.width as usize;
+
+    // Line 1: Title
+    let title_text = truncate(&ctx.issue.title, max_width);
     let title_line = Line::from(Span::styled(title_text, title_style));
 
+    // Line 2: Session indicator + agent status (clean, no branch crammed in)
+    let status_line = format_status_line(ctx);
+
+    // Line 3: Branch + git changes (full width for the branch name)
+    let branch_line = format_branch_line(ctx.branch, ctx.git_status, max_width);
+
+    // Line 4: PR info or Linear metadata
+    let info_line = if ctx.pr.is_some() {
+        format_pr_line(ctx.pr)
+    } else {
+        format_linear_line(ctx.issue)
+    };
+
+    let mut lines = vec![title_line];
+    if inner.height > 1 {
+        lines.push(status_line);
+    }
+    if inner.height > 2 {
+        lines.push(branch_line);
+    }
+    if inner.height > 3 {
+        lines.push(info_line);
+    }
+
+    let paragraph = Paragraph::new(lines);
+    frame.render_widget(paragraph, inner);
+}
+
+fn format_status_line(ctx: &CardContext) -> Line<'static> {
     let status_color = styles::agent_status_color(&ctx.agent_status);
     let session_indicator = if ctx.session_alive { "▶" } else { " " };
     let session_style = if ctx.session_alive {
@@ -56,61 +88,71 @@ pub fn render_card(frame: &mut Frame, ctx: &CardContext, area: Rect) {
         _ => ctx.agent_status.to_string(),
     };
 
-    let mut status_spans = vec![
+    Line::from(vec![
         Span::styled(session_indicator, session_style),
         Span::raw(" "),
         Span::styled(ctx.agent_status.symbol(), Style::default().fg(status_color)),
         Span::styled(format!(" {}", status_label), styles::dim_style()),
+    ])
+}
+
+fn format_branch_line(
+    branch: Option<&str>,
+    git_status: Option<&WorktreeStatus>,
+    max_width: usize,
+) -> Line<'static> {
+    let Some(branch_name) = branch else {
+        return Line::from("");
+    };
+
+    // Strip the "{issue-id}/" prefix since the card border already shows the issue ID
+    let display_branch = branch_name
+        .find('/')
+        .map(|i| &branch_name[i + 1..])
+        .unwrap_or(branch_name);
+
+    let git_spans = format_git_status(git_status);
+    let git_width: usize = git_spans.iter().map(|s| s.width()).sum();
+    let gap = if git_width > 0 { 1 } else { 0 };
+    let available_for_branch = max_width.saturating_sub(2 + gap + git_width);
+
+    let mut spans = vec![
+        Span::raw("  "),
+        Span::styled(
+            truncate(display_branch, available_for_branch),
+            styles::dim_style(),
+        ),
     ];
 
-    let git_spans = format_git_status(ctx.git_status);
-    let git_width: usize = git_spans.iter().map(|s| s.width()).sum();
-    let base_len =
-        session_indicator.len() + 1 + ctx.agent_status.symbol().len() + 1 + status_label.len();
-
-    if let Some(branch_name) = ctx.branch {
-        let reserved = base_len + 2 + git_width + if git_width > 0 { 1 } else { 0 };
-        let available = (inner.width as usize).saturating_sub(reserved);
-        if available > 3 {
-            status_spans.push(Span::raw("  "));
-            status_spans.push(Span::styled(
-                truncate(branch_name, available),
-                styles::dim_style(),
-            ));
-        }
-    }
-
     if !git_spans.is_empty() {
-        status_spans.push(Span::raw(" "));
-        status_spans.extend(git_spans);
+        spans.push(Span::raw(" "));
+        spans.extend(git_spans);
     }
 
-    let status_line = Line::from(status_spans);
+    Line::from(spans)
+}
 
-    let mut lines = vec![title_line];
-    if inner.height > 1 {
-        lines.push(status_line);
+fn format_linear_line(issue: &Issue) -> Line<'static> {
+    let Some(ref identifier) = issue.linear_identifier else {
+        return Line::from("");
+    };
+
+    let mut spans = vec![
+        Span::raw("  "),
+        Span::styled(
+            format!("\u{25c8} {}", identifier),
+            Style::default().fg(Color::Blue),
+        ),
+    ];
+
+    if let Some(ref state) = issue.linear_state {
+        spans.push(Span::styled(
+            format!(" \u{25cf} {}", state),
+            styles::dim_style(),
+        ));
     }
 
-    // Linear metadata line (if this is a Linear-sourced issue)
-    if inner.height > 2 {
-        if let Some(ref identifier) = ctx.issue.linear_identifier {
-            let mut spans = vec![Span::styled(
-                format!("\u{25c8} {}", identifier),
-                Style::default().fg(Color::Blue),
-            )];
-            if let Some(ref state) = ctx.issue.linear_state {
-                spans.push(Span::styled(
-                    format!(" \u{25cf} {}", state),
-                    styles::dim_style(),
-                ));
-            }
-            lines.push(Line::from(spans));
-        }
-    }
-
-    let paragraph = Paragraph::new(lines);
-    frame.render_widget(paragraph, inner);
+    Line::from(spans)
 }
 
 fn format_git_status(status: Option<&WorktreeStatus>) -> Vec<Span<'static>> {
@@ -143,6 +185,44 @@ fn format_git_status(status: Option<&WorktreeStatus>) -> Vec<Span<'static>> {
     }
 
     spans
+}
+
+fn format_pr_line(pr: Option<&PrStatus>) -> Line<'static> {
+    let Some(pr) = pr else {
+        return Line::from("");
+    };
+
+    let (checks_sym, checks_color) = styles::checks_icon(pr.checks);
+    let (review_sym, review_color) = styles::review_icon(pr.review);
+
+    let mut spans = vec![
+        Span::raw("  "),
+        Span::styled(format!("#{}", pr.number), styles::dim_style()),
+        Span::raw(" "),
+        Span::styled(checks_sym, Style::default().fg(checks_color)),
+        Span::raw(" "),
+        Span::styled(review_sym, Style::default().fg(review_color)),
+    ];
+
+    if pr.additions > 0 || pr.deletions > 0 {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!("+{}", pr.additions),
+            Style::default().fg(Color::Green),
+        ));
+        spans.push(Span::styled("/", styles::dim_style()));
+        spans.push(Span::styled(
+            format!("-{}", pr.deletions),
+            Style::default().fg(Color::Red),
+        ));
+    }
+
+    if pr.is_draft {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled("draft", styles::dim_style()));
+    }
+
+    Line::from(spans)
 }
 
 fn truncate(s: &str, max: usize) -> String {
