@@ -20,8 +20,14 @@ pub struct ActionResult {
 
 pub enum PostAction {
     None,
-    OpenTmuxPopup { session_name: String },
-    LaunchAndOpenPopup { issue_index: usize },
+    OpenTmuxPopup {
+        session_name: String,
+        popup_title: String,
+    },
+    LaunchAndOpenPopup {
+        issue_index: usize,
+        popup_title: String,
+    },
 }
 
 pub fn handle_action(
@@ -176,9 +182,13 @@ fn handle_normal(
             };
 
             let session_name = issue.session_name(&app.config.project_name);
+            let popup_title = format!("{}: {}", issue.id, issue.title);
 
             if app.is_session_alive(&session_name) {
-                return PostAction::OpenTmuxPopup { session_name };
+                return PostAction::OpenTmuxPopup {
+                    session_name,
+                    popup_title,
+                };
             }
 
             if let Some(idx) = app.selected_issue_index() {
@@ -194,7 +204,10 @@ fn handle_normal(
                     let _ = tx.send(result);
                 });
 
-                return PostAction::LaunchAndOpenPopup { issue_index: idx };
+                return PostAction::LaunchAndOpenPopup {
+                    issue_index: idx,
+                    popup_title,
+                };
             }
 
             PostAction::None
