@@ -41,6 +41,8 @@ fn map_normal_key(key: KeyEvent) -> Action {
 
         KeyCode::Char('H') => Action::MoveIssueLeft,
         KeyCode::Char('L') => Action::MoveIssueRight,
+        KeyCode::Char('D') => Action::MoveToDone,
+        KeyCode::Char('T') => Action::MoveToTodo,
 
         KeyCode::Char('g') => Action::ScrollToTop,
         KeyCode::Char('G') => Action::ScrollToBottom,
