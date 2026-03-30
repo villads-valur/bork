@@ -9,6 +9,7 @@ use crate::input::Action;
 use crate::types::{AgentStatus, Column, Issue, IssueKind};
 
 pub type PrWakeTx = mpsc::Sender<()>;
+pub type LinearWakeTx = mpsc::Sender<()>;
 
 pub struct ActionResult {
     pub message: String,
@@ -35,6 +36,7 @@ pub fn handle_action(
     action: Action,
     action_tx: &mpsc::Sender<ActionResult>,
     pr_wake_tx: &PrWakeTx,
+    linear_wake_tx: &LinearWakeTx,
 ) -> PostAction {
     match app.input_mode {
         InputMode::Confirm => {
@@ -50,7 +52,7 @@ pub fn handle_action(
             PostAction::None
         }
         InputMode::LinearPicker => {
-            handle_linear_picker(app, action);
+            handle_linear_picker(app, action, linear_wake_tx);
             PostAction::None
         }
         InputMode::Help => {
@@ -443,7 +445,7 @@ fn submit_dialog(app: &mut App) {
     let _ = config::save_state(&app.to_state(), &app.config.project_root);
 }
 
-fn handle_linear_picker(app: &mut App, action: Action) {
+fn handle_linear_picker(app: &mut App, action: Action, linear_wake_tx: &LinearWakeTx) {
     match action {
         Action::LinearPickerClose => {
             app.close_linear_picker();
@@ -477,6 +479,10 @@ fn handle_linear_picker(app: &mut App, action: Action) {
         }
         Action::LinearPickerSelect => {
             import_linear_issue(app);
+        }
+        Action::LinearPickerRefresh => {
+            let _ = linear_wake_tx.send(());
+            app.set_message("Refreshing Linear issues...");
         }
         _ => {}
     }
@@ -644,6 +650,10 @@ mod tests {
         mpsc::channel().0
     }
 
+    fn linear_wake_tx() -> mpsc::Sender<()> {
+        mpsc::channel().0
+    }
+
     fn test_config() -> AppConfig {
         AppConfig {
             project_name: "bork".to_string(),
@@ -674,12 +684,14 @@ mod tests {
             Action::DialogChar('H'),
             &mpsc::channel().0,
             &pr_wake_tx(),
+            &linear_wake_tx(),
         );
         handle_action(
             &mut app,
             Action::DialogChar('i'),
             &mpsc::channel().0,
             &pr_wake_tx(),
+            &linear_wake_tx(),
         );
 
         // Move from title (field 1) to prompt (field 2)
@@ -688,6 +700,7 @@ mod tests {
             Action::DialogNextField,
             &mpsc::channel().0,
             &pr_wake_tx(),
+            &linear_wake_tx(),
         );
 
         let dialog = app.dialog.as_ref().unwrap();
@@ -709,6 +722,7 @@ mod tests {
             Action::DialogNextField,
             &mpsc::channel().0,
             &pr_wake_tx(),
+            &linear_wake_tx(),
         );
 
         // Type something in the prompt
@@ -717,12 +731,14 @@ mod tests {
             Action::DialogChar('g'),
             &mpsc::channel().0,
             &pr_wake_tx(),
+            &linear_wake_tx(),
         );
         handle_action(
             &mut app,
             Action::DialogChar('o'),
             &mpsc::channel().0,
             &pr_wake_tx(),
+            &linear_wake_tx(),
         );
 
         let dialog = app.dialog.as_ref().unwrap();
@@ -741,6 +757,7 @@ mod tests {
             Action::DialogNextField,
             &mpsc::channel().0,
             &pr_wake_tx(),
+            &linear_wake_tx(),
         );
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 2);
 
@@ -749,6 +766,7 @@ mod tests {
             Action::DialogNextField,
             &mpsc::channel().0,
             &pr_wake_tx(),
+            &linear_wake_tx(),
         );
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 3);
         // Field 3 is the last (mode). Next field from here submits the dialog.
@@ -765,6 +783,7 @@ mod tests {
             Action::DialogNextField,
             &mpsc::channel().0,
             &pr_wake_tx(),
+            &linear_wake_tx(),
         );
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 2);
 
@@ -774,6 +793,7 @@ mod tests {
             Action::DialogPrevField,
             &mpsc::channel().0,
             &pr_wake_tx(),
+            &linear_wake_tx(),
         );
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 1);
     }
@@ -788,6 +808,7 @@ mod tests {
             Action::DialogPrevField,
             &mpsc::channel().0,
             &pr_wake_tx(),
+            &linear_wake_tx(),
         );
 
         handle_action(
@@ -795,6 +816,7 @@ mod tests {
             Action::DialogPrevField,
             &mpsc::channel().0,
             &pr_wake_tx(),
+            &linear_wake_tx(),
         );
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 0);
     }
@@ -810,6 +832,7 @@ mod tests {
             Action::DialogNextField,
             &mpsc::channel().0,
             &pr_wake_tx(),
+            &linear_wake_tx(),
         );
 
         handle_action(
@@ -817,18 +840,21 @@ mod tests {
             Action::DialogChar('a'),
             &mpsc::channel().0,
             &pr_wake_tx(),
+            &linear_wake_tx(),
         );
         handle_action(
             &mut app,
             Action::DialogChar(' '),
             &mpsc::channel().0,
             &pr_wake_tx(),
+            &linear_wake_tx(),
         );
         handle_action(
             &mut app,
             Action::DialogChar('b'),
             &mpsc::channel().0,
             &pr_wake_tx(),
+            &linear_wake_tx(),
         );
 
         assert_eq!(app.dialog.as_ref().unwrap().prompt, "a b");
@@ -845,6 +871,7 @@ mod tests {
             Action::DialogCancel,
             &mpsc::channel().0,
             &pr_wake_tx(),
+            &linear_wake_tx(),
         );
         assert!(app.dialog.is_none());
     }
@@ -878,6 +905,7 @@ mod tests {
             Action::OpenSession,
             &mpsc::channel().0,
             &pr_wake_tx(),
+            &linear_wake_tx(),
         );
 
         assert!(matches!(post, PostAction::None));
@@ -923,6 +951,7 @@ mod tests {
             Action::DialogNextField,
             &mpsc::channel().0,
             &pr_wake_tx(),
+            &linear_wake_tx(),
         );
 
         let dialog = app.dialog.as_ref().unwrap();
@@ -967,6 +996,7 @@ mod tests {
             Action::LinearPickerSelect,
             &mpsc::channel().0,
             &pr_wake_tx(),
+            &linear_wake_tx(),
         );
 
         assert_eq!(app.input_mode, crate::app::InputMode::Normal);
@@ -992,15 +1022,26 @@ mod tests {
             Action::LinearPickerSelect,
             &mpsc::channel().0,
             &pr_wake_tx(),
+            &linear_wake_tx(),
         );
         assert_eq!(app.issues.len(), 1);
 
-        // Try to import again (should fail since it's already on the board)
+        // Try to import again (should show issue but reject the import)
         app.open_linear_picker();
 
-        // The picker should show no issues (uuid-1 is filtered out)
+        // The picker should still show the issue (visible but marked as imported)
         let filtered = app.filtered_linear_issues();
-        assert_eq!(filtered.len(), 0);
+        assert_eq!(filtered.len(), 1);
+
+        // Attempting to import should not create a duplicate
+        handle_action(
+            &mut app,
+            Action::LinearPickerSelect,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+            &linear_wake_tx(),
+        );
+        assert_eq!(app.issues.len(), 1);
     }
 
     #[test]
@@ -1020,18 +1061,21 @@ mod tests {
             Action::LinearPickerChar('l'),
             &mpsc::channel().0,
             &pr_wake_tx(),
+            &linear_wake_tx(),
         );
         handle_action(
             &mut app,
             Action::LinearPickerChar('o'),
             &mpsc::channel().0,
             &pr_wake_tx(),
+            &linear_wake_tx(),
         );
         handle_action(
             &mut app,
             Action::LinearPickerChar('g'),
             &mpsc::channel().0,
             &pr_wake_tx(),
+            &linear_wake_tx(),
         );
 
         let filtered = app.filtered_linear_issues();
@@ -1057,6 +1101,7 @@ mod tests {
             Action::LinearPickerDown,
             &mpsc::channel().0,
             &pr_wake_tx(),
+            &linear_wake_tx(),
         );
         assert_eq!(app.linear_picker.as_ref().unwrap().selected, 1);
 
@@ -1065,6 +1110,7 @@ mod tests {
             Action::LinearPickerDown,
             &mpsc::channel().0,
             &pr_wake_tx(),
+            &linear_wake_tx(),
         );
         assert_eq!(app.linear_picker.as_ref().unwrap().selected, 2);
 
@@ -1074,6 +1120,7 @@ mod tests {
             Action::LinearPickerDown,
             &mpsc::channel().0,
             &pr_wake_tx(),
+            &linear_wake_tx(),
         );
         assert_eq!(app.linear_picker.as_ref().unwrap().selected, 2);
 
@@ -1082,6 +1129,7 @@ mod tests {
             Action::LinearPickerUp,
             &mpsc::channel().0,
             &pr_wake_tx(),
+            &linear_wake_tx(),
         );
         assert_eq!(app.linear_picker.as_ref().unwrap().selected, 1);
     }
@@ -1098,6 +1146,7 @@ mod tests {
             Action::LinearPickerClose,
             &mpsc::channel().0,
             &pr_wake_tx(),
+            &linear_wake_tx(),
         );
 
         assert_eq!(app.input_mode, crate::app::InputMode::Normal);
