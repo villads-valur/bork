@@ -61,6 +61,7 @@ Press `n` to create an issue, `Enter` to launch an agent session. You're up and 
 
 - **4-column kanban board** &mdash; To Do, In Progress, Code Review, Done
 - **AI agent sessions** &mdash; Launch OpenCode or Claude Code per issue in tmux popups
+- **Session resumption** &mdash; Closing a tmux popup and reopening it continues the same conversation, not a fresh one
 - **Real-time status monitoring** &mdash; See agent state on each card (Idle, Busy, Waiting, Error)
 - **GitHub PR status** &mdash; Background polling shows checks, review status, and diff stats on cards
 - **Git worktree tracking** &mdash; Live staged/unstaged change counts and branch names
@@ -166,7 +167,7 @@ These are installed automatically by `bork init`. Use `bork install` / `bork uni
 | `Shift+Tab` | Jump to previous column |
 | `g` | Scroll to top |
 | `G` | Scroll to bottom |
-| `Enter` | Open session (launch if none, attach if exists) |
+| `Enter` | Open session (resume or launch if none, attach if running) |
 | `P` | Force-sync PR statuses from GitHub |
 | `o` | Open PR in browser (if issue has a matching PR) |
 | `q` / `Ctrl+c` | Quit |
