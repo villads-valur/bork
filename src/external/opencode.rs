@@ -16,8 +16,11 @@ use crate::types::{AgentKind, AgentMode, Issue};
 /// The agent_session_id is the agent's internal session ID for resuming conversations:
 ///   - Claude: UUID pre-assigned via --session-id
 ///   - OpenCode: ses_xxx detected by polling `opencode session list` after launch
-pub fn launch_session(issue: &Issue, config: &AppConfig) -> Result<(String, Option<String>), AppError> {
-    let session_name = issue.session_name();
+pub fn launch_session(
+    issue: &Issue,
+    config: &AppConfig,
+) -> Result<(String, Option<String>), AppError> {
+    let session_name = issue.session_name(&config.project_name);
     let cwd = &config.project_root;
 
     if tmux::session_exists(&session_name) {
@@ -29,7 +32,8 @@ pub fn launch_session(issue: &Issue, config: &AppConfig) -> Result<(String, Opti
     let status_dir = config::agent_status_dir(&config.project_root);
     let status_dir_str = status_dir.to_str().unwrap_or("");
 
-    let (agent_cmd, pre_assigned_session_id) = build_agent_cmd(issue, config, &session_name, status_dir_str);
+    let (agent_cmd, pre_assigned_session_id) =
+        build_agent_cmd(issue, config, &session_name, status_dir_str);
 
     tmux::send_keys(&session_name, &agent_cmd)?;
 
@@ -201,16 +205,14 @@ fn newest_opencode_session() -> Option<String> {
 /// Parse the newest session ID from `opencode session list` output.
 /// Expected format: each line starts with the session ID (ses_xxx).
 fn parse_newest_session_id(output: &str) -> Option<String> {
-    output
-        .lines()
-        .find_map(|line| {
-            let token = line.split_whitespace().next()?;
-            if token.starts_with("ses_") {
-                Some(token.to_string())
-            } else {
-                None
-            }
-        })
+    output.lines().find_map(|line| {
+        let token = line.split_whitespace().next()?;
+        if token.starts_with("ses_") {
+            Some(token.to_string())
+        } else {
+            None
+        }
+    })
 }
 
 /// Snapshot the current set of OpenCode session IDs before launching.

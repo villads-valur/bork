@@ -215,8 +215,12 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run_tui() -> anyhow::Result<()> {
-    // --- Tmux auto-wrap ---
-    match external::tmux::ensure_bork_session()? {
+    // --- Load config + state (before tmux wrap so we have project_name) ---
+    let config = config::load_config();
+    let state = config::load_state(&config.project_root);
+
+    // --- Tmux auto-wrap (scoped to project name) ---
+    match external::tmux::ensure_bork_session(&config.project_name)? {
         external::tmux::EnsureResult::AlreadyInside => {}
         external::tmux::EnsureResult::Wrapped { exit_code } => {
             std::process::exit(exit_code);
@@ -238,9 +242,6 @@ fn run_tui() -> anyhow::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // --- Load config + state ---
-    let config = config::load_config();
-    let state = config::load_state(&config.project_root);
     let mut app = App::new(config, state);
 
     // --- Ensure agent-status dir ---
@@ -334,7 +335,7 @@ fn run_tui() -> anyhow::Result<()> {
             .as_secs();
         let cleanup_indices = app.issues_needing_session_cleanup(now);
         for idx in cleanup_indices {
-            let session_name = app.issues[idx].session_name();
+            let session_name = app.issues[idx].session_name(&app.config.project_name);
             let status_file = config::agent_status_dir(&app.config.project_root)
                 .join(format!("{}.json", session_name));
             let sn = session_name.clone();

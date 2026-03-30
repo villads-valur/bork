@@ -109,7 +109,7 @@ fn handle_normal(
                 return PostAction::None;
             };
 
-            let session_name = issue.session_name();
+            let session_name = issue.session_name(&app.config.project_name);
             if !app.is_session_alive(&session_name) {
                 app.set_message("No active session to kill");
                 return PostAction::None;
@@ -156,7 +156,7 @@ fn handle_normal(
                 return PostAction::None;
             };
 
-            let session_name = issue.session_name();
+            let session_name = issue.session_name(&app.config.project_name);
 
             if app.is_session_alive(&session_name) {
                 return PostAction::OpenTmuxPopup { session_name };
@@ -376,7 +376,7 @@ fn handle_confirm(app: &mut App, action: Action, action_tx: &mpsc::Sender<Action
                     ConfirmAction::DeleteIssue { issue_index } => {
                         if issue_index < app.issues.len() {
                             let issue = &app.issues[issue_index];
-                            let session_name = issue.session_name();
+                            let session_name = issue.session_name(&app.config.project_name);
                             let id = issue.id.clone();
                             let status_file =
                                 agent_status_file(&app.config.project_root, &session_name);

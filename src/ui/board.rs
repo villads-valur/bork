@@ -102,7 +102,7 @@ fn render_column(frame: &mut Frame, app: &App, column: Column, area: Rect, is_se
         let ctx = card::CardContext {
             issue,
             selected: is_selected,
-            session_alive: app.is_session_alive(&issue.session_name()),
+            session_alive: app.is_session_alive(&issue.session_name(&app.config.project_name)),
             agent_status: app.resolved_agent_status(issue),
             activity: app.resolved_activity(issue),
             branch: app.branch_for(issue),

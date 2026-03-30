@@ -13,9 +13,9 @@ pub enum EnsureResult {
     Wrapped { exit_code: i32 },
 }
 
-/// If we're not inside tmux, create/attach a "bork" session that runs bork.
+/// If we're not inside tmux, create/attach a project-scoped session that runs bork.
 /// Returns Wrapped when the outer process should exit (the real bork is running inside tmux).
-pub fn ensure_bork_session() -> Result<EnsureResult, AppError> {
+pub fn ensure_bork_session(project_name: &str) -> Result<EnsureResult, AppError> {
     if is_inside_tmux() {
         return Ok(EnsureResult::AlreadyInside);
     }
@@ -26,7 +26,7 @@ pub fn ensure_bork_session() -> Result<EnsureResult, AppError> {
         .output()
         .map_err(|_| AppError::Tmux("tmux is not installed".to_string()))?;
 
-    let session_name = "bork";
+    let session_name = project_name;
 
     if !session_exists(session_name) {
         // Get the path to ourselves
@@ -44,10 +44,14 @@ pub fn ensure_bork_session() -> Result<EnsureResult, AppError> {
                 exe.to_str().unwrap_or("bork"),
             ])
             .status()
-            .map_err(|e| AppError::Tmux(format!("failed to create bork session: {e}")))?;
+            .map_err(|e| {
+                AppError::Tmux(format!("failed to create session '{session_name}': {e}"))
+            })?;
 
         if !status.success() {
-            return Err(AppError::Tmux("failed to create bork session".to_string()));
+            return Err(AppError::Tmux(format!(
+                "failed to create session '{session_name}'"
+            )));
         }
 
         // Hide the tmux status bar so our ratatui footer is the only chrome
@@ -65,7 +69,9 @@ pub fn ensure_bork_session() -> Result<EnsureResult, AppError> {
     let status = Command::new("tmux")
         .args(["attach", "-t", session_name])
         .status()
-        .map_err(|e| AppError::Tmux(format!("failed to attach to bork session: {e}")))?;
+        .map_err(|e| {
+            AppError::Tmux(format!("failed to attach to session '{session_name}': {e}"))
+        })?;
 
     Ok(EnsureResult::Wrapped {
         exit_code: status.code().unwrap_or(0),

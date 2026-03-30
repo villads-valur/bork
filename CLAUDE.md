@@ -85,5 +85,6 @@ The binary is symlinked to `/opt/homebrew/bin/bork`.
 - State: {project_root}/.bork/state.json (atomic writes)
 - Config: {project_root}/.bork/config.toml
 - Issue IDs: {project_name}-{number} (e.g. bork-1, bork-2)
-- Tmux sessions named: bork-{issue-id}
+- Tmux sessions named: {project_name}-{issue-id}
+- Wrapper tmux session named: {project_name}
 - Opencode launched at project root with --prompt for issue context

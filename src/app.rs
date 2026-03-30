@@ -342,7 +342,7 @@ impl App {
     }
 
     pub fn resolved_agent_status(&self, issue: &Issue) -> AgentStatus {
-        let session_name = issue.session_name();
+        let session_name = issue.session_name(&self.config.project_name);
 
         if let Some(info) = self.agent_statuses.get(&session_name) {
             // Cross-reference with session liveness: if session is dead but
@@ -361,7 +361,7 @@ impl App {
     }
 
     pub fn resolved_activity(&self, issue: &Issue) -> Option<&str> {
-        let session_name = issue.session_name();
+        let session_name = issue.session_name(&self.config.project_name);
         self.agent_statuses
             .get(&session_name)
             .and_then(|info| info.activity.as_deref())
@@ -508,7 +508,7 @@ impl App {
                 if now.saturating_sub(done_at) < self.config.done_session_ttl {
                     return false;
                 }
-                let session_name = issue.session_name();
+                let session_name = issue.session_name(&self.config.project_name);
                 self.is_session_alive(&session_name)
             })
             .map(|(idx, _)| idx)
