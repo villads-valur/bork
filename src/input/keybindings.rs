@@ -36,6 +36,7 @@ fn map_normal_key(key: KeyEvent) -> Action {
         KeyCode::Char('x') => Action::KillSession,
 
         KeyCode::Char('n') => Action::CreateIssue,
+        KeyCode::Char('a') => Action::AddIssue,
         KeyCode::Char('e') => Action::EditIssue,
         KeyCode::Char('d') => Action::DeleteIssue,
 
