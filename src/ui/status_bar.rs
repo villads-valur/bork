@@ -102,6 +102,7 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         ("j/k", "up/down"),
         ("Tab", "column"),
         ("Enter", "open"),
+        ("a", "add"),
         ("n", "new"),
         ("e", "edit"),
         ("d", "delete"),

@@ -42,6 +42,7 @@ pub struct DialogState {
     pub agent_kind: AgentKind,
     pub focused_field: usize, // 0=title, 1=prompt, 2=mode
     pub editing_index: Option<usize>,
+    pub target_column: Option<Column>,
 }
 
 impl DialogState {
@@ -53,6 +54,7 @@ impl DialogState {
             agent_kind,
             focused_field: 0,
             editing_index: None,
+            target_column: None,
         }
     }
 
@@ -64,6 +66,7 @@ impl DialogState {
             agent_kind: issue.agent_kind,
             focused_field: 0,
             editing_index: Some(index),
+            target_column: None,
         }
     }
 
@@ -557,7 +560,13 @@ impl App {
     // --- Dialog ---
 
     pub fn open_dialog(&mut self) {
-        self.dialog = Some(DialogState::new(self.config.agent_kind));
+        self.open_dialog_in_column(Column::Todo);
+    }
+
+    pub fn open_dialog_in_column(&mut self, column: Column) {
+        let mut state = DialogState::new(self.config.agent_kind);
+        state.target_column = Some(column);
+        self.dialog = Some(state);
         self.input_mode = InputMode::Dialog;
     }
 
