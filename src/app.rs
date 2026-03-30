@@ -37,6 +37,12 @@ pub enum ConfirmAction {
     DeleteIssue { issue_index: usize },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinearPickerContext {
+    Import,
+    Attach,
+}
+
 pub struct DialogState {
     pub kind: IssueKind,
     pub title: String,
@@ -45,13 +51,16 @@ pub struct DialogState {
     pub prompt_cursor: usize,
     pub agent_mode: AgentMode,
     pub agent_kind: AgentKind,
-    pub focused_field: usize, // 0=kind, 1=title, 2=prompt, 3=mode
+    pub focused_field: usize, // 0=kind, 1=title, 2=prompt, 3=mode, 4=linear
     pub editing_index: Option<usize>,
     pub target_column: Option<Column>,
+    pub linear_issue: Option<LinearIssue>,
+    pub linear_detached: bool,
+    pub linear_available: bool,
 }
 
 impl DialogState {
-    pub fn new(agent_kind: AgentKind) -> Self {
+    pub fn new(agent_kind: AgentKind, linear_available: bool) -> Self {
         DialogState {
             kind: IssueKind::Agentic,
             title: String::new(),
@@ -63,11 +72,29 @@ impl DialogState {
             focused_field: 1,
             editing_index: None,
             target_column: None,
+            linear_issue: None,
+            linear_detached: false,
+            linear_available,
         }
     }
 
-    pub fn from_issue(issue: &Issue, index: usize) -> Self {
+    pub fn from_issue(issue: &Issue, index: usize, linear_available: bool) -> Self {
         let prompt = issue.prompt.clone().unwrap_or_default();
+        let linear_issue = if let Some(ref lid) = issue.linear_id {
+            Some(LinearIssue {
+                id: lid.clone(),
+                identifier: issue.linear_identifier.clone().unwrap_or_default(),
+                title: issue.title.clone(),
+                url: issue.linear_url.clone().unwrap_or_default(),
+                branch_name: issue.linear_branch.clone().unwrap_or_default(),
+                priority: 0,
+                state_name: issue.linear_state.clone().unwrap_or_default(),
+                team_key: String::new(),
+            })
+        } else {
+            None
+        };
+
         DialogState {
             kind: issue.kind,
             title: issue.title.clone(),
@@ -79,14 +106,36 @@ impl DialogState {
             focused_field: 1,
             editing_index: Some(index),
             target_column: None,
+            linear_issue,
+            linear_detached: false,
+            linear_available,
         }
     }
 
     pub fn active_field_count(&self) -> usize {
-        match self.kind {
+        let base = match self.kind {
+            IssueKind::Agentic => 4,    // kind, title, prompt, mode
+            IssueKind::NonAgentic => 3, // kind, title, prompt
+        };
+        if self.linear_available {
+            base + 1
+        } else {
+            base
+        }
+    }
+
+    pub fn linear_field_index(&self) -> Option<usize> {
+        if !self.linear_available {
+            return None;
+        }
+        Some(match self.kind {
             IssueKind::Agentic => 4,
             IssueKind::NonAgentic => 3,
-        }
+        })
+    }
+
+    pub fn is_on_linear_field(&self) -> bool {
+        self.linear_field_index() == Some(self.focused_field)
     }
 
     pub fn next_field(&mut self) -> bool {
@@ -105,6 +154,11 @@ impl DialogState {
     }
 
     pub fn push_char(&mut self, c: char) {
+        // Linear field is handled by the handler, not here
+        if self.is_on_linear_field() {
+            return;
+        }
+
         match self.focused_field {
             0 => {
                 if c == ' ' {
@@ -281,6 +335,7 @@ pub struct App {
     pub linear_available: bool,
     pub linear_issues: Vec<LinearIssue>,
     pub linear_picker: Option<LinearPickerState>,
+    pub linear_picker_context: LinearPickerContext,
     pub github_user: Option<String>,
     pub user_prs: Vec<PrStatus>,
 }
@@ -320,6 +375,7 @@ impl App {
             linear_available: false,
             linear_issues: Vec::new(),
             linear_picker: None,
+            linear_picker_context: LinearPickerContext::Import,
             github_user: None,
             user_prs: Vec::new(),
         }
@@ -763,6 +819,7 @@ impl App {
                 linear_url: None,
                 linear_state: None,
                 linear_branch: None,
+                linear_imported: false,
                 pr_number: Some(pr.number),
             });
         }
@@ -833,14 +890,14 @@ impl App {
     }
 
     pub fn open_dialog_in_column(&mut self, column: Column) {
-        let mut state = DialogState::new(self.config.agent_kind);
+        let mut state = DialogState::new(self.config.agent_kind, self.linear_available);
         state.target_column = Some(column);
         self.dialog = Some(state);
         self.input_mode = InputMode::Dialog;
     }
 
     pub fn open_edit_dialog(&mut self, issue: &Issue, index: usize) {
-        self.dialog = Some(DialogState::from_issue(issue, index));
+        self.dialog = Some(DialogState::from_issue(issue, index, self.linear_available));
         self.input_mode = InputMode::Dialog;
     }
 
@@ -852,12 +909,17 @@ impl App {
     // --- Linear Picker ---
 
     pub fn open_linear_picker(&mut self) {
+        self.open_linear_picker_with_context(LinearPickerContext::Import);
+    }
+
+    pub fn open_linear_picker_with_context(&mut self, context: LinearPickerContext) {
         if self.linear_issues.is_empty() {
             if self.linear_available {
                 self.set_message("No Linear issues loaded yet");
             }
             return;
         }
+        self.linear_picker_context = context;
         self.linear_picker = Some(LinearPickerState {
             search: String::new(),
             selected: 0,
@@ -867,13 +929,28 @@ impl App {
 
     pub fn close_linear_picker(&mut self) {
         self.linear_picker = None;
-        self.input_mode = InputMode::Normal;
+        if self.linear_picker_context == LinearPickerContext::Attach && self.dialog.is_some() {
+            self.input_mode = InputMode::Dialog;
+        } else {
+            self.input_mode = InputMode::Normal;
+        }
+        self.linear_picker_context = LinearPickerContext::Import;
     }
 
     pub fn filtered_linear_issues(&self) -> Vec<&LinearIssue> {
         let picker = match &self.linear_picker {
             Some(p) => p,
             None => return Vec::new(),
+        };
+
+        // In attach context, allow the currently-attached issue through the filter
+        let current_linear_id = if self.linear_picker_context == LinearPickerContext::Attach {
+            self.dialog
+                .as_ref()
+                .and_then(|d| d.linear_issue.as_ref())
+                .map(|li| li.id.as_str())
+        } else {
+            None
         };
 
         let existing_linear_ids: HashSet<&str> = self
@@ -885,7 +962,15 @@ impl App {
         let query = picker.search.to_lowercase();
         self.linear_issues
             .iter()
-            .filter(|i| !existing_linear_ids.contains(i.id.as_str()))
+            .filter(|i| {
+                let dominated = existing_linear_ids.contains(i.id.as_str());
+                if dominated {
+                    // Allow through if this is the issue currently being edited
+                    current_linear_id == Some(i.id.as_str())
+                } else {
+                    true
+                }
+            })
             .filter(|i| {
                 if query.is_empty() {
                     return true;
@@ -1085,6 +1170,7 @@ mod tests {
             linear_url: None,
             linear_state: None,
             linear_branch: None,
+            linear_imported: false,
             pr_number: None,
         }
     }
@@ -1658,11 +1744,11 @@ mod tests {
     // ================================================================
 
     fn claude_dialog() -> DialogState {
-        DialogState::new(crate::types::AgentKind::Claude)
+        DialogState::new(crate::types::AgentKind::Claude, false)
     }
 
     fn opencode_dialog() -> DialogState {
-        DialogState::new(crate::types::AgentKind::OpenCode)
+        DialogState::new(crate::types::AgentKind::OpenCode, false)
     }
 
     #[test]
@@ -1703,7 +1789,7 @@ mod tests {
     #[test]
     fn dialog_new_uses_config_agent_kind() {
         let config = test_config();
-        let d = DialogState::new(config.agent_kind);
+        let d = DialogState::new(config.agent_kind, false);
         assert_eq!(d.agent_kind, crate::types::AgentKind::OpenCode);
     }
 
@@ -1712,21 +1798,21 @@ mod tests {
         let mut issue = test_issue("bork-1", Column::Todo);
         issue.agent_kind = crate::types::AgentKind::Claude;
         issue.agent_mode = crate::types::AgentMode::Yolo;
-        let d = DialogState::from_issue(&issue, 0);
+        let d = DialogState::from_issue(&issue, 0, false);
         assert_eq!(d.agent_kind, crate::types::AgentKind::Claude);
         assert_eq!(d.agent_mode, crate::types::AgentMode::Yolo);
     }
 
     #[test]
     fn dialog_new_defaults_to_agentic_with_title_focused() {
-        let d = DialogState::new(crate::types::AgentKind::OpenCode);
+        let d = DialogState::new(crate::types::AgentKind::OpenCode, false);
         assert_eq!(d.kind, IssueKind::Agentic);
         assert_eq!(d.focused_field, 1);
     }
 
     #[test]
     fn dialog_prompt_supports_normal_edit_commands() {
-        let mut d = DialogState::new(crate::types::AgentKind::OpenCode);
+        let mut d = DialogState::new(crate::types::AgentKind::OpenCode, false);
         d.focused_field = 2;
 
         for c in "todo note".chars() {

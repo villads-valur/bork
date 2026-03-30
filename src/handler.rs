@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 
-use crate::app::{App, ConfirmAction, InputMode};
+use crate::app::{App, ConfirmAction, InputMode, LinearPickerContext};
 use crate::config::{self, AppConfig};
 use crate::external::{github, opencode, tmux};
 use crate::input::Action;
@@ -304,6 +304,33 @@ fn handle_help(app: &mut App, action: Action) {
 }
 
 fn handle_dialog(app: &mut App, action: Action) {
+    // Intercept actions on the Linear field
+    let on_linear = app.dialog.as_ref().is_some_and(|d| d.is_on_linear_field());
+
+    if on_linear {
+        match action {
+            Action::DialogChar(' ') => {
+                // Space on Linear field opens the picker
+                app.open_linear_picker_with_context(LinearPickerContext::Attach);
+                return;
+            }
+            Action::DialogNextField => {
+                // Enter/Tab on Linear field (last field) submits
+                submit_dialog(app);
+                return;
+            }
+            Action::DialogBackspace | Action::DialogDelete => {
+                if let Some(ref mut dialog) = app.dialog {
+                    dialog.linear_issue = None;
+                    dialog.linear_detached = true;
+                }
+                return;
+            }
+            Action::DialogChar(_) => return,
+            _ => {}
+        }
+    }
+
     match action {
         Action::DialogChar(c) => {
             if let Some(ref mut dialog) = app.dialog {
@@ -400,6 +427,9 @@ fn submit_dialog(app: &mut App) {
             app.issues[idx].prompt = prompt;
             app.issues[idx].agent_mode = dialog.agent_mode;
             app.issues[idx].kind = dialog.kind;
+
+            apply_linear_fields(&mut app.issues[idx], &dialog);
+
             app.set_message(format!("Updated {}", app.issues[idx].id));
             let _ = config::save_state(&app.to_state(), &app.config.project_root);
         }
@@ -410,7 +440,7 @@ fn submit_dialog(app: &mut App) {
     let column = dialog.target_column.unwrap_or(Column::Todo);
     let column_index = column.index();
 
-    let issue = Issue {
+    let mut issue = Issue {
         id: id.clone(),
         title,
         kind: dialog.kind,
@@ -428,8 +458,11 @@ fn submit_dialog(app: &mut App) {
         linear_url: None,
         linear_state: None,
         linear_branch: None,
+        linear_imported: false,
         pr_number: None,
     };
+
+    apply_linear_fields(&mut issue, &dialog);
 
     app.issues.push(issue);
     app.set_message(format!("Created {}", id));
@@ -441,6 +474,29 @@ fn submit_dialog(app: &mut App) {
     }
 
     let _ = config::save_state(&app.to_state(), &app.config.project_root);
+}
+
+fn apply_linear_fields(issue: &mut Issue, dialog: &crate::app::DialogState) {
+    if dialog.linear_detached {
+        issue.linear_id = None;
+        issue.linear_identifier = None;
+        issue.linear_url = None;
+        issue.linear_state = None;
+        issue.linear_branch = None;
+        issue.linear_imported = false;
+    } else if let Some(ref li) = dialog.linear_issue {
+        issue.linear_id = Some(li.id.clone());
+        issue.linear_identifier = Some(li.identifier.clone());
+        issue.linear_url = Some(li.url.clone());
+        issue.linear_state = Some(li.state_name.clone());
+        issue.linear_branch = if li.branch_name.is_empty() {
+            None
+        } else {
+            Some(li.branch_name.clone())
+        };
+        // Attached via dialog, not imported — don't sync title
+        issue.linear_imported = false;
+    }
 }
 
 fn handle_linear_picker(app: &mut App, action: Action) {
@@ -476,9 +532,33 @@ fn handle_linear_picker(app: &mut App, action: Action) {
             }
         }
         Action::LinearPickerSelect => {
-            import_linear_issue(app);
+            if app.linear_picker_context == LinearPickerContext::Attach {
+                attach_linear_to_dialog(app);
+            } else {
+                import_linear_issue(app);
+            }
         }
         _ => {}
+    }
+}
+
+fn attach_linear_to_dialog(app: &mut App) {
+    let filtered = app.filtered_linear_issues();
+    let selected_idx = app.linear_picker.as_ref().map(|p| p.selected).unwrap_or(0);
+
+    let linear_issue = match filtered.get(selected_idx) {
+        Some(i) => (*i).clone(),
+        None => return,
+    };
+
+    // Close picker first (resets context, restores InputMode::Dialog)
+    app.linear_picker = None;
+    app.input_mode = InputMode::Dialog;
+    app.linear_picker_context = LinearPickerContext::Import;
+
+    if let Some(ref mut dialog) = app.dialog {
+        dialog.linear_issue = Some(linear_issue);
+        dialog.linear_detached = false;
     }
 }
 
@@ -526,6 +606,7 @@ fn import_linear_issue(app: &mut App) {
         } else {
             Some(linear_issue.branch_name.clone())
         },
+        linear_imported: true,
         pr_number: None,
     };
 
@@ -870,6 +951,7 @@ mod tests {
             linear_url: None,
             linear_state: None,
             linear_branch: None,
+            linear_imported: false,
             pr_number: None,
         });
 
@@ -910,6 +992,7 @@ mod tests {
             linear_url: None,
             linear_state: None,
             linear_branch: None,
+            linear_imported: false,
             pr_number: None,
         });
 
@@ -1103,5 +1186,212 @@ mod tests {
         assert_eq!(app.input_mode, crate::app::InputMode::Normal);
         assert!(app.linear_picker.is_none());
         assert_eq!(app.issues.len(), 0);
+    }
+
+    // ================================================================
+    // Dialog with Linear field: tab-through and submit
+    // ================================================================
+
+    #[test]
+    fn edit_dialog_with_linear_tabs_through_and_submits() {
+        let mut app = test_app();
+        app.linear_available = true;
+
+        app.issues.push(crate::types::Issue {
+            id: "bork-1".to_string(),
+            title: "Test issue".to_string(),
+            kind: crate::types::IssueKind::Agentic,
+            column: Column::Todo,
+            worktree: None,
+            tmux_session: None,
+            agent_kind: crate::types::AgentKind::OpenCode,
+            agent_mode: crate::types::AgentMode::Plan,
+            agent_status: crate::types::AgentStatus::Stopped,
+            prompt: None,
+            done_at: None,
+            session_id: None,
+            linear_id: None,
+            linear_identifier: None,
+            linear_url: None,
+            linear_state: None,
+            linear_branch: None,
+            linear_imported: false,
+            pr_number: None,
+        });
+
+        let issue = app.issues[0].clone();
+        app.open_edit_dialog(&issue, 0);
+
+        // Should start on title (field 1)
+        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 1);
+        // Agentic + linear_available = 5 fields (0..4)
+        assert_eq!(app.dialog.as_ref().unwrap().active_field_count(), 5);
+
+        // Tab: title(1) -> prompt(2)
+        handle_action(
+            &mut app,
+            Action::DialogNextField,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 2);
+
+        // Tab: prompt(2) -> mode(3)
+        handle_action(
+            &mut app,
+            Action::DialogNextField,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 3);
+
+        // Tab: mode(3) -> linear(4)
+        handle_action(
+            &mut app,
+            Action::DialogNextField,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 4);
+        assert!(app.dialog.as_ref().unwrap().is_on_linear_field());
+
+        // Tab on linear field should submit
+        handle_action(
+            &mut app,
+            Action::DialogNextField,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+        assert_eq!(app.input_mode, crate::app::InputMode::Normal);
+        assert!(app.dialog.is_none(), "dialog should be closed after submit");
+    }
+
+    #[test]
+    fn edit_dialog_with_linear_tab_submits_even_without_issues_loaded() {
+        let mut app = test_app();
+        app.linear_available = true;
+        // No linear issues loaded
+        app.linear_issues = vec![];
+
+        app.issues.push(crate::types::Issue {
+            id: "bork-1".to_string(),
+            title: "Test issue".to_string(),
+            kind: crate::types::IssueKind::Agentic,
+            column: Column::Todo,
+            worktree: None,
+            tmux_session: None,
+            agent_kind: crate::types::AgentKind::OpenCode,
+            agent_mode: crate::types::AgentMode::Plan,
+            agent_status: crate::types::AgentStatus::Stopped,
+            prompt: None,
+            done_at: None,
+            session_id: None,
+            linear_id: None,
+            linear_identifier: None,
+            linear_url: None,
+            linear_state: None,
+            linear_branch: None,
+            linear_imported: false,
+            pr_number: None,
+        });
+
+        let issue = app.issues[0].clone();
+        app.open_edit_dialog(&issue, 0);
+
+        // Tab through to linear field
+        handle_action(
+            &mut app,
+            Action::DialogNextField,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+        handle_action(
+            &mut app,
+            Action::DialogNextField,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+        handle_action(
+            &mut app,
+            Action::DialogNextField,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+        assert!(app.dialog.as_ref().unwrap().is_on_linear_field());
+
+        // Tab on linear field should submit even without issues loaded
+        handle_action(
+            &mut app,
+            Action::DialogNextField,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+        assert_eq!(app.input_mode, crate::app::InputMode::Normal);
+        assert!(
+            app.dialog.is_none(),
+            "dialog should close on tab from linear field"
+        );
+    }
+
+    #[test]
+    fn edit_dialog_with_linear_shift_enter_submits_from_any_field() {
+        let mut app = test_app();
+        app.linear_available = true;
+
+        app.issues.push(crate::types::Issue {
+            id: "bork-1".to_string(),
+            title: "Test issue".to_string(),
+            kind: crate::types::IssueKind::Agentic,
+            column: Column::Todo,
+            worktree: None,
+            tmux_session: None,
+            agent_kind: crate::types::AgentKind::OpenCode,
+            agent_mode: crate::types::AgentMode::Plan,
+            agent_status: crate::types::AgentStatus::Stopped,
+            prompt: None,
+            done_at: None,
+            session_id: None,
+            linear_id: None,
+            linear_identifier: None,
+            linear_url: None,
+            linear_state: None,
+            linear_branch: None,
+            linear_imported: false,
+            pr_number: None,
+        });
+
+        let issue = app.issues[0].clone();
+        app.open_edit_dialog(&issue, 0);
+
+        // Tab to linear field
+        handle_action(
+            &mut app,
+            Action::DialogNextField,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+        handle_action(
+            &mut app,
+            Action::DialogNextField,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+        handle_action(
+            &mut app,
+            Action::DialogNextField,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+        assert!(app.dialog.as_ref().unwrap().is_on_linear_field());
+
+        // Shift+Enter should submit from linear field
+        handle_action(
+            &mut app,
+            Action::DialogSubmit,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+        assert_eq!(app.input_mode, crate::app::InputMode::Normal);
+        assert!(app.dialog.is_none());
     }
 }

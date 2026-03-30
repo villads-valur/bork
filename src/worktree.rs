@@ -77,6 +77,7 @@ fn run_worktree_in(
             linear_url: None,
             linear_state: None,
             linear_branch: None,
+            linear_imported: false,
             pr_number: None,
         };
         state.issues.push(issue);

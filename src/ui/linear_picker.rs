@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::app::App;
+use crate::app::{App, LinearPickerContext};
 use crate::ui::styles;
 
 const PICKER_MIN_WIDTH: u16 = 50;
@@ -29,11 +29,17 @@ pub fn render_linear_picker(frame: &mut Frame, app: &App) {
     let picker_area = Rect::new(x, y, width, height);
     frame.render_widget(Clear, picker_area);
 
+    let picker_title = if app.linear_picker_context == LinearPickerContext::Attach {
+        " Attach Linear Issue "
+    } else {
+        " Import Linear Issue "
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(styles::ACCENT))
         .title(Span::styled(
-            " Import Linear Issue ",
+            picker_title,
             Style::default()
                 .fg(styles::ACCENT)
                 .add_modifier(Modifier::BOLD),
@@ -157,9 +163,14 @@ pub fn render_linear_picker(frame: &mut Frame, app: &App) {
     // Footer
     let footer_y = inner.y + inner.height - 1;
     let footer_area = Rect::new(inner.x + 1, footer_y, inner.width - 2, 1);
+    let select_hint = if app.linear_picker_context == LinearPickerContext::Attach {
+        ":attach  "
+    } else {
+        ":import  "
+    };
     let footer = Line::from(vec![
         Span::styled("Enter", styles::statusbar_key_style()),
-        Span::styled(":import  ", styles::statusbar_desc_style()),
+        Span::styled(select_hint, styles::statusbar_desc_style()),
         Span::styled("\u{2191}\u{2193}", styles::statusbar_key_style()),
         Span::styled(":navigate  ", styles::statusbar_desc_style()),
         Span::styled("Esc", styles::statusbar_key_style()),
