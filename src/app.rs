@@ -293,32 +293,57 @@ impl App {
     }
 
     pub fn move_issue_right(&mut self) {
-        if let Some(idx) = self.selected_issue_index() {
-            if let Some(next) = self.issues[idx].column.next() {
-                let wt = self.issues[idx].worktree.clone();
-                self.issues[idx].column = next;
-                if next == Column::Done {
-                    self.issues[idx].done_at = Some(unix_now());
-                    if let Some(w) = wt {
-                        self.freeze_worktree_status(&w);
-                    }
-                }
-            }
-        }
+        let Some(idx) = self.selected_issue_index() else {
+            return;
+        };
+        let Some(next) = self.issues[idx].column.next() else {
+            return;
+        };
+        self.move_issue_to_column(idx, next);
     }
 
     pub fn move_issue_left(&mut self) {
-        if let Some(idx) = self.selected_issue_index() {
-            let was_done = self.issues[idx].column == Column::Done;
-            if let Some(prev) = self.issues[idx].column.prev() {
-                let wt = self.issues[idx].worktree.clone();
-                self.issues[idx].column = prev;
-                if was_done {
-                    self.issues[idx].done_at = None;
-                    if let Some(w) = wt {
-                        self.unfreeze_worktree_status(&w);
-                    }
-                }
+        let Some(idx) = self.selected_issue_index() else {
+            return;
+        };
+        let Some(prev) = self.issues[idx].column.prev() else {
+            return;
+        };
+        self.move_issue_to_column(idx, prev);
+    }
+
+    pub fn move_to_done(&mut self) {
+        let Some(idx) = self.selected_issue_index() else {
+            return;
+        };
+        self.move_issue_to_column(idx, Column::Done);
+    }
+
+    pub fn move_to_todo(&mut self) {
+        let Some(idx) = self.selected_issue_index() else {
+            return;
+        };
+        self.move_issue_to_column(idx, Column::Todo);
+    }
+
+    fn move_issue_to_column(&mut self, idx: usize, target: Column) {
+        let issue = &mut self.issues[idx];
+        if issue.column == target {
+            return;
+        }
+        let was_done = issue.column == Column::Done;
+        let wt = issue.worktree.clone();
+        issue.column = target;
+
+        if target == Column::Done {
+            issue.done_at = Some(unix_now());
+            if let Some(w) = wt {
+                self.freeze_worktree_status(&w);
+            }
+        } else if was_done {
+            issue.done_at = None;
+            if let Some(w) = wt {
+                self.unfreeze_worktree_status(&w);
             }
         }
     }
