@@ -2,11 +2,11 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 
-use crate::app::{App, ConfirmAction, InputMode, DIALOG_FIELD_COUNT};
+use crate::app::{App, ConfirmAction, InputMode};
 use crate::config::{self, AppConfig};
 use crate::external::{github, opencode, tmux};
 use crate::input::Action;
-use crate::types::{AgentStatus, Column, Issue};
+use crate::types::{AgentStatus, Column, Issue, IssueKind};
 
 pub type PrWakeTx = mpsc::Sender<()>;
 
@@ -192,9 +192,15 @@ fn handle_normal(
         }
 
         Action::OpenSession => {
-            let Some(issue) = app.selected_issue() else {
+            let Some(idx) = app.selected_issue_index() else {
                 return PostAction::None;
             };
+            let issue = app.issues[idx].clone();
+
+            if issue.kind == IssueKind::NonAgentic {
+                app.open_edit_dialog(&issue, idx);
+                return PostAction::None;
+            }
 
             let session_name = issue.session_name(&app.config.project_name);
             let popup_title = format!("{}: {}", issue.id, issue.title);
@@ -206,26 +212,21 @@ fn handle_normal(
                 };
             }
 
-            if let Some(idx) = app.selected_issue_index() {
-                app.busy_count += 1;
-                app.set_message("Launching session...");
+            app.busy_count += 1;
+            app.set_message("Launching session...");
 
-                let issue = app.issues[idx].clone();
-                let config = app.config.clone();
-                let tx = action_tx.clone();
+            let config = app.config.clone();
+            let tx = action_tx.clone();
 
-                thread::spawn(move || {
-                    let result = launch_and_report(issue, config);
-                    let _ = tx.send(result);
-                });
+            thread::spawn(move || {
+                let result = launch_and_report(issue, config);
+                let _ = tx.send(result);
+            });
 
-                return PostAction::LaunchAndOpenPopup {
-                    issue_index: idx,
-                    popup_title,
-                };
+            PostAction::LaunchAndOpenPopup {
+                issue_index: idx,
+                popup_title,
             }
-
-            PostAction::None
         }
 
         Action::SyncPRs => {
@@ -314,25 +315,53 @@ fn handle_dialog(app: &mut App, action: Action) {
                 dialog.delete_char();
             }
         }
+        Action::DialogDelete => {
+            if let Some(ref mut dialog) = app.dialog {
+                dialog.delete_char_forward();
+            }
+        }
+        Action::DialogMoveLeft => {
+            if let Some(ref mut dialog) = app.dialog {
+                dialog.move_cursor_left();
+            }
+        }
+        Action::DialogMoveRight => {
+            if let Some(ref mut dialog) = app.dialog {
+                dialog.move_cursor_right();
+            }
+        }
+        Action::DialogMoveStart => {
+            if let Some(ref mut dialog) = app.dialog {
+                dialog.move_cursor_start();
+            }
+        }
+        Action::DialogMoveEnd => {
+            if let Some(ref mut dialog) = app.dialog {
+                dialog.move_cursor_end();
+            }
+        }
+        Action::DialogDeleteWord => {
+            if let Some(ref mut dialog) = app.dialog {
+                dialog.delete_word_backward();
+            }
+        }
+        Action::DialogClearToStart => {
+            if let Some(ref mut dialog) = app.dialog {
+                dialog.clear_to_start();
+            }
+        }
 
         Action::DialogNextField => {
             if let Some(ref mut dialog) = app.dialog {
-                let next = dialog.focused_field + 1;
-
-                if next >= DIALOG_FIELD_COUNT {
-                    let _ = dialog;
+                if dialog.next_field() {
                     submit_dialog(app);
                     return;
                 }
-
-                dialog.focused_field = next;
             }
         }
         Action::DialogPrevField => {
             if let Some(ref mut dialog) = app.dialog {
-                if dialog.focused_field > 0 {
-                    dialog.focused_field -= 1;
-                }
+                dialog.prev_field();
             }
         }
         Action::DialogSubmit => {
@@ -362,7 +391,7 @@ fn submit_dialog(app: &mut App) {
     let prompt = if dialog.prompt.trim().is_empty() {
         None
     } else {
-        Some(dialog.prompt.trim().to_string())
+        Some(dialog.prompt.clone())
     };
 
     if let Some(idx) = dialog.editing_index {
@@ -370,6 +399,7 @@ fn submit_dialog(app: &mut App) {
             app.issues[idx].title = title;
             app.issues[idx].prompt = prompt;
             app.issues[idx].agent_mode = dialog.agent_mode;
+            app.issues[idx].kind = dialog.kind;
             app.set_message(format!("Updated {}", app.issues[idx].id));
             let _ = config::save_state(&app.to_state(), &app.config.project_root);
         }
@@ -383,6 +413,7 @@ fn submit_dialog(app: &mut App) {
     let issue = Issue {
         id: id.clone(),
         title,
+        kind: dialog.kind,
         column,
         tmux_session: None,
         agent_kind: app.config.agent_kind,
@@ -476,6 +507,7 @@ fn import_linear_issue(app: &mut App) {
     let issue = Issue {
         id,
         title: linear_issue.title.clone(),
+        kind: IssueKind::Agentic,
         column: Column::Todo,
         worktree: None,
         tmux_session: None,
@@ -603,7 +635,7 @@ mod tests {
     use std::sync::mpsc;
 
     use super::*;
-    use crate::app::{App, DialogState};
+    use crate::app::App;
     use crate::config::DEFAULT_DONE_SESSION_TTL;
     use crate::input::Action;
     use crate::types::Column;
@@ -650,7 +682,7 @@ mod tests {
             &pr_wake_tx(),
         );
 
-        // Move from title (field 0) to prompt (field 1)
+        // Move from title (field 1) to prompt (field 2)
         handle_action(
             &mut app,
             Action::DialogNextField,
@@ -659,7 +691,7 @@ mod tests {
         );
 
         let dialog = app.dialog.as_ref().unwrap();
-        assert_eq!(dialog.focused_field, 1);
+        assert_eq!(dialog.focused_field, 2);
         assert_eq!(
             dialog.prompt, "",
             "prompt should remain empty after navigating from title"
@@ -702,14 +734,6 @@ mod tests {
         let mut app = test_app();
         app.open_dialog();
 
-        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 0);
-
-        handle_action(
-            &mut app,
-            Action::DialogNextField,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-        );
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 1);
 
         handle_action(
@@ -719,7 +743,15 @@ mod tests {
             &pr_wake_tx(),
         );
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 2);
-        // Field 2 is the last (mode). Next field from here submits the dialog.
+
+        handle_action(
+            &mut app,
+            Action::DialogNextField,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 3);
+        // Field 3 is the last (mode). Next field from here submits the dialog.
     }
 
     #[test]
@@ -734,7 +766,7 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
         );
-        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 1);
+        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 2);
 
         // Go back to title
         handle_action(
@@ -743,13 +775,20 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
         );
-        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 0);
+        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 1);
     }
 
     #[test]
     fn dialog_prev_field_does_not_go_below_zero() {
         let mut app = test_app();
         app.open_dialog();
+
+        handle_action(
+            &mut app,
+            Action::DialogPrevField,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
 
         handle_action(
             &mut app,
@@ -811,6 +850,44 @@ mod tests {
     }
 
     #[test]
+    fn open_session_on_non_agentic_opens_edit_dialog() {
+        let mut app = test_app();
+        app.issues.push(crate::types::Issue {
+            id: "bork-1".to_string(),
+            title: "Manual task".to_string(),
+            kind: crate::types::IssueKind::NonAgentic,
+            column: Column::Todo,
+            worktree: None,
+            tmux_session: None,
+            agent_kind: crate::types::AgentKind::OpenCode,
+            agent_mode: crate::types::AgentMode::Plan,
+            agent_status: crate::types::AgentStatus::Stopped,
+            prompt: Some("scratch".to_string()),
+            done_at: None,
+            session_id: None,
+            linear_id: None,
+            linear_identifier: None,
+            linear_url: None,
+            linear_state: None,
+            linear_branch: None,
+            pr_number: None,
+        });
+
+        let post = handle_action(
+            &mut app,
+            Action::OpenSession,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+
+        assert!(matches!(post, PostAction::None));
+        assert_eq!(app.input_mode, InputMode::Dialog);
+        let dialog = app.dialog.as_ref().expect("dialog should be open");
+        assert_eq!(dialog.title, "Manual task");
+        assert_eq!(dialog.focused_field, 1);
+    }
+
+    #[test]
     fn edit_dialog_does_not_inject_default_prompt() {
         let mut app = test_app();
 
@@ -818,6 +895,7 @@ mod tests {
         app.issues.push(crate::types::Issue {
             id: "bork-1".to_string(),
             title: "Test".to_string(),
+            kind: crate::types::IssueKind::Agentic,
             column: Column::Todo,
             worktree: Some("main".to_string()),
             tmux_session: None,

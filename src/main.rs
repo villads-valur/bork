@@ -254,16 +254,18 @@ fn run_tui() -> anyhow::Result<()> {
     let config = config::load_config();
     let state = config::load_state(&config.project_root);
 
-    // --- Single-instance lock ---
-    lock::acquire_lock(&config.project_root)?;
-
     // --- Tmux auto-wrap (scoped to project name) ---
+    // Must happen before the lock: the outer process creates a tmux session
+    // running bork, then attaches. Only the inner process runs the TUI.
     match external::tmux::ensure_bork_session(&config.project_name)? {
         external::tmux::EnsureResult::AlreadyInside => {}
         external::tmux::EnsureResult::Wrapped { exit_code } => {
             std::process::exit(exit_code);
         }
     }
+
+    // --- Single-instance lock (only the inner/TUI process holds the lock) ---
+    lock::acquire_lock(&config.project_root)?;
 
     // --- Panic hook ---
     let panic_project_root = config.project_root.clone();

@@ -125,6 +125,10 @@ fn map_dialog_key(key: KeyEvent) -> Action {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
             KeyCode::Char('c') => Action::DialogCancel,
+            KeyCode::Char('w') => Action::DialogDeleteWord,
+            KeyCode::Char('u') => Action::DialogClearToStart,
+            KeyCode::Char('a') => Action::DialogMoveStart,
+            KeyCode::Char('e') => Action::DialogMoveEnd,
             _ => Action::Noop,
         };
     }
@@ -135,6 +139,11 @@ fn map_dialog_key(key: KeyEvent) -> Action {
         KeyCode::Tab => Action::DialogNextField,
         KeyCode::BackTab => Action::DialogPrevField,
         KeyCode::Backspace => Action::DialogBackspace,
+        KeyCode::Delete => Action::DialogDelete,
+        KeyCode::Left => Action::DialogMoveLeft,
+        KeyCode::Right => Action::DialogMoveRight,
+        KeyCode::Home => Action::DialogMoveStart,
+        KeyCode::End => Action::DialogMoveEnd,
         KeyCode::Char(c) => Action::DialogChar(c),
         _ => Action::Noop,
     }

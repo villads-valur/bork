@@ -5,10 +5,10 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::App;
-use crate::types::{AgentKind, AgentMode};
+use crate::types::{AgentKind, AgentMode, IssueKind};
 use crate::ui::styles;
 
-const DIALOG_HEIGHT: u16 = 19;
+const DIALOG_HEIGHT: u16 = 20;
 const DIALOG_MIN_WIDTH: u16 = 44;
 const DIALOG_MAX_WIDTH: u16 = 80;
 const PROMPT_VISIBLE_LINES: usize = 3;
@@ -57,50 +57,69 @@ pub fn render_dialog(frame: &mut Frame, app: &App) {
     let field_width = inner.width.saturating_sub(2) as usize;
     let label_width = 10;
 
-    // --- Title field (row 1) ---
-    let title_area = Rect::new(inner.x + 1, inner.y + 1, inner.width - 2, 1);
+    // --- Kind field (row 1) ---
+    let kind_area = Rect::new(inner.x + 1, inner.y + 1, inner.width - 2, 1);
+    render_kind_field(
+        frame,
+        dialog.kind,
+        kind_area,
+        dialog.focused_field == 0,
+        label_width,
+    );
+
+    // --- Title field (row 3) ---
+    let title_area = Rect::new(inner.x + 1, inner.y + 3, inner.width - 2, 1);
     render_single_line_field(
         frame,
         "Title:",
         &dialog.title,
+        dialog.title_cursor,
         title_area,
-        dialog.focused_field == 0,
-        label_width,
-        field_width,
-    );
-
-    // --- Prompt field (rows 3-5, 3 visible lines) ---
-    let prompt_area = Rect::new(
-        inner.x + 1,
-        inner.y + 3,
-        inner.width - 2,
-        PROMPT_VISIBLE_LINES as u16,
-    );
-    render_multiline_field(
-        frame,
-        "Prompt:",
-        &dialog.prompt,
-        prompt_area,
         dialog.focused_field == 1,
         label_width,
         field_width,
     );
 
-    // --- Mode field (after the 3-line prompt) ---
-    let mode_row = 3 + PROMPT_VISIBLE_LINES as u16 + 1;
-    let mode_area = Rect::new(inner.x + 1, inner.y + mode_row, inner.width - 2, 1);
-    render_mode_field(
+    // --- Prompt/notes field (rows 5-7, 3 visible lines) ---
+    let prompt_label = if dialog.kind == IssueKind::NonAgentic {
+        "Notes:"
+    } else {
+        "Prompt:"
+    };
+    let prompt_area = Rect::new(
+        inner.x + 1,
+        inner.y + 5,
+        inner.width - 2,
+        PROMPT_VISIBLE_LINES as u16,
+    );
+    render_multiline_field(
         frame,
-        &dialog.agent_mode,
-        dialog.agent_kind,
-        mode_area,
+        prompt_label,
+        &dialog.prompt,
+        dialog.prompt_cursor,
+        prompt_area,
         dialog.focused_field == 2,
         label_width,
+        field_width,
     );
+
+    if dialog.kind == IssueKind::Agentic {
+        // --- Mode field (after the 3-line prompt) ---
+        let mode_row = 5 + PROMPT_VISIBLE_LINES as u16 + 1;
+        let mode_area = Rect::new(inner.x + 1, inner.y + mode_row, inner.width - 2, 1);
+        render_mode_field(
+            frame,
+            &dialog.agent_mode,
+            dialog.agent_kind,
+            mode_area,
+            dialog.focused_field == 3,
+            label_width,
+        );
+    }
 
     // --- Footer hints ---
     let footer_y = inner.y + inner.height - 2;
-    let submit_hint = if dialog.editing_index.is_some() {
+    let submit_hint = if dialog.editing_index.is_some() || dialog.kind == IssueKind::NonAgentic {
         ":save  "
     } else {
         ":start  "
@@ -121,6 +140,7 @@ fn render_single_line_field(
     frame: &mut Frame,
     label: &str,
     value: &str,
+    cursor: usize,
     area: Rect,
     focused: bool,
     label_width: usize,
@@ -131,13 +151,9 @@ fn render_single_line_field(
 
     let max_value_len = field_width.saturating_sub(label_width + 1);
     let char_count = value.chars().count();
-    let display_value = if char_count > max_value_len && max_value_len > 3 {
-        let skip = char_count - (max_value_len - 3);
-        let tail: String = value.chars().skip(skip).collect();
-        format!("...{}", tail)
-    } else {
-        value.to_string()
-    };
+    let safe_cursor = cursor.min(char_count);
+    let start = safe_cursor.saturating_sub(max_value_len);
+    let display_value: String = value.chars().skip(start).take(max_value_len).collect();
 
     let mut spans = vec![
         Span::styled(
@@ -162,6 +178,7 @@ fn render_multiline_field(
     frame: &mut Frame,
     label: &str,
     value: &str,
+    cursor: usize,
     area: Rect,
     focused: bool,
     label_width: usize,
@@ -179,13 +196,18 @@ fn render_multiline_field(
     let wrapped = wrap_text(value, chars_per_line);
     let visible_lines = area.height as usize;
 
-    // Show the last N lines so the cursor is always visible
-    let start = if wrapped.len() > visible_lines {
-        wrapped.len() - visible_lines
+    let line_count = wrapped.len().max(1);
+    let cursor_line = cursor_line_index(&wrapped, cursor.min(value.chars().count()));
+    let mut start = 0usize;
+    if line_count > visible_lines && cursor_line + 1 > visible_lines {
+        start = cursor_line + 1 - visible_lines;
+    }
+    let end = (start + visible_lines).min(line_count);
+    let visible = if wrapped.is_empty() {
+        Vec::new()
     } else {
-        0
+        wrapped[start..end].to_vec()
     };
-    let visible = &wrapped[start..];
 
     for (i, line_text) in visible.iter().enumerate() {
         let y = area.y + i as u16;
@@ -201,14 +223,14 @@ fn render_multiline_field(
 
         let prefix_style = if i == 0 { label_style } else { label_style };
 
-        let is_last_line = i == visible.len() - 1;
+        let is_cursor_line = start + i == cursor_line;
 
         let mut spans = vec![
             Span::styled(prefix, prefix_style),
             Span::styled(line_text.clone(), value_style),
         ];
 
-        if focused && is_last_line {
+        if focused && is_cursor_line {
             spans.push(Span::styled(
                 "\u{2588}",
                 Style::default().fg(styles::ACCENT),
@@ -235,6 +257,67 @@ fn render_multiline_field(
         let line = Line::from(spans);
         frame.render_widget(Paragraph::new(line), area);
     }
+}
+
+fn render_kind_field(
+    frame: &mut Frame,
+    kind: IssueKind,
+    area: Rect,
+    focused: bool,
+    label_width: usize,
+) {
+    let label_style = field_label_style(focused);
+    let selected_style = Style::default()
+        .fg(styles::ACCENT)
+        .add_modifier(Modifier::BOLD);
+    let unselected_style = styles::dim_style();
+    let indicator = |selected: bool| if selected { "\u{25cf}" } else { "\u{25cb}" };
+
+    let is_agentic = kind == IssueKind::Agentic;
+    let is_todo = kind == IssueKind::NonAgentic;
+
+    let line = Line::from(vec![
+        Span::styled(
+            format!("{:<width$}", "Kind:", width = label_width),
+            label_style,
+        ),
+        Span::styled(
+            format!("[{} Agentic]", indicator(is_agentic)),
+            if is_agentic {
+                selected_style
+            } else {
+                unselected_style
+            },
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("[{} Todo]", indicator(is_todo)),
+            if is_todo {
+                selected_style
+            } else {
+                unselected_style
+            },
+        ),
+    ]);
+
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+fn cursor_line_index(lines: &[String], cursor: usize) -> usize {
+    if lines.is_empty() {
+        return 0;
+    }
+
+    let mut seen = 0usize;
+    for (i, line) in lines.iter().enumerate() {
+        let line_len = line.chars().count();
+        if cursor <= seen + line_len {
+            return i;
+        }
+        seen += line_len;
+    }
+
+    lines.len() - 1
 }
 
 /// Simple word-wrap: break text into lines of at most `max_width` characters.

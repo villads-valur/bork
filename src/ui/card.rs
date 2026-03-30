@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-use crate::types::{AgentStatus, Issue, PrState, PrStatus, WorktreeStatus};
+use crate::types::{AgentStatus, Issue, IssueKind, PrState, PrStatus, WorktreeStatus};
 use crate::ui::styles;
 
 pub const CARD_HEIGHT: u16 = 6;
@@ -75,6 +75,13 @@ pub fn render_card(frame: &mut Frame, ctx: &CardContext, area: Rect) {
 }
 
 fn format_status_line(ctx: &CardContext) -> Line<'static> {
+    if ctx.issue.kind == IssueKind::NonAgentic {
+        return Line::from(vec![
+            Span::raw("  "),
+            Span::styled("Todo", styles::dim_style()),
+        ]);
+    }
+
     let status_color = styles::agent_status_color(&ctx.agent_status);
     let session_indicator = if ctx.session_alive { "▶" } else { " " };
     let session_style = if ctx.session_alive {

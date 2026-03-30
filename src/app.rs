@@ -4,8 +4,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use crate::config::{AppConfig, AppState};
 use crate::external::linear::LinearIssue;
 use crate::types::{
-    AgentKind, AgentMode, AgentStatus, AgentStatusInfo, Column, Issue, PrState, PrStatus,
-    WorktreeStatus,
+    AgentKind, AgentMode, AgentStatus, AgentStatusInfo, Column, Issue, IssueKind, PrState,
+    PrStatus, WorktreeStatus,
 };
 
 fn unix_now() -> u64 {
@@ -38,11 +38,14 @@ pub enum ConfirmAction {
 }
 
 pub struct DialogState {
+    pub kind: IssueKind,
     pub title: String,
+    pub title_cursor: usize,
     pub prompt: String,
+    pub prompt_cursor: usize,
     pub agent_mode: AgentMode,
     pub agent_kind: AgentKind,
-    pub focused_field: usize, // 0=title, 1=prompt, 2=mode
+    pub focused_field: usize, // 0=kind, 1=title, 2=prompt, 3=mode
     pub editing_index: Option<usize>,
     pub target_column: Option<Column>,
 }
@@ -50,33 +53,74 @@ pub struct DialogState {
 impl DialogState {
     pub fn new(agent_kind: AgentKind) -> Self {
         DialogState {
+            kind: IssueKind::Agentic,
             title: String::new(),
+            title_cursor: 0,
             prompt: String::new(),
+            prompt_cursor: 0,
             agent_mode: AgentMode::Plan,
             agent_kind,
-            focused_field: 0,
+            focused_field: 1,
             editing_index: None,
             target_column: None,
         }
     }
 
     pub fn from_issue(issue: &Issue, index: usize) -> Self {
+        let prompt = issue.prompt.clone().unwrap_or_default();
         DialogState {
+            kind: issue.kind,
             title: issue.title.clone(),
-            prompt: issue.prompt.clone().unwrap_or_default(),
+            title_cursor: issue.title.chars().count(),
+            prompt_cursor: prompt.chars().count(),
+            prompt,
             agent_mode: issue.agent_mode,
             agent_kind: issue.agent_kind,
-            focused_field: 0,
+            focused_field: 1,
             editing_index: Some(index),
             target_column: None,
         }
     }
 
+    pub fn active_field_count(&self) -> usize {
+        match self.kind {
+            IssueKind::Agentic => 4,
+            IssueKind::NonAgentic => 3,
+        }
+    }
+
+    pub fn next_field(&mut self) -> bool {
+        let next = self.focused_field + 1;
+        if next >= self.active_field_count() {
+            return true;
+        }
+        self.focused_field = next;
+        false
+    }
+
+    pub fn prev_field(&mut self) {
+        if self.focused_field > 0 {
+            self.focused_field -= 1;
+        }
+    }
+
     pub fn push_char(&mut self, c: char) {
         match self.focused_field {
-            0 => self.title.push(c),
-            1 => self.prompt.push(c),
-            2 => {
+            0 => {
+                if c == ' ' {
+                    self.kind = match self.kind {
+                        IssueKind::Agentic => IssueKind::NonAgentic,
+                        IssueKind::NonAgentic => IssueKind::Agentic,
+                    };
+                } else if c == 'h' {
+                    self.kind = IssueKind::Agentic;
+                } else if c == 'l' {
+                    self.kind = IssueKind::NonAgentic;
+                }
+            }
+            1 => insert_char(&mut self.title, &mut self.title_cursor, c),
+            2 => insert_char(&mut self.prompt, &mut self.prompt_cursor, c),
+            3 => {
                 if c == ' ' || c == 'h' || c == 'l' {
                     self.agent_mode = match self.agent_kind {
                         AgentKind::Claude => self.agent_mode.next_for_claude(),
@@ -90,18 +134,127 @@ impl DialogState {
 
     pub fn delete_char(&mut self) {
         match self.focused_field {
-            0 => {
-                self.title.pop();
-            }
-            1 => {
-                self.prompt.pop();
-            }
+            1 => delete_char_before_cursor(&mut self.title, &mut self.title_cursor),
+            2 => delete_char_before_cursor(&mut self.prompt, &mut self.prompt_cursor),
+            _ => {}
+        }
+    }
+
+    pub fn delete_char_forward(&mut self) {
+        match self.focused_field {
+            1 => delete_char_at_cursor(&mut self.title, self.title_cursor),
+            2 => delete_char_at_cursor(&mut self.prompt, self.prompt_cursor),
+            _ => {}
+        }
+    }
+
+    pub fn move_cursor_left(&mut self) {
+        match self.focused_field {
+            1 => self.title_cursor = self.title_cursor.saturating_sub(1),
+            2 => self.prompt_cursor = self.prompt_cursor.saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    pub fn move_cursor_right(&mut self) {
+        match self.focused_field {
+            1 => self.title_cursor = (self.title_cursor + 1).min(self.title.chars().count()),
+            2 => self.prompt_cursor = (self.prompt_cursor + 1).min(self.prompt.chars().count()),
+            _ => {}
+        }
+    }
+
+    pub fn move_cursor_start(&mut self) {
+        match self.focused_field {
+            1 => self.title_cursor = 0,
+            2 => self.prompt_cursor = 0,
+            _ => {}
+        }
+    }
+
+    pub fn move_cursor_end(&mut self) {
+        match self.focused_field {
+            1 => self.title_cursor = self.title.chars().count(),
+            2 => self.prompt_cursor = self.prompt.chars().count(),
+            _ => {}
+        }
+    }
+
+    pub fn delete_word_backward(&mut self) {
+        match self.focused_field {
+            1 => delete_word_backward(&mut self.title, &mut self.title_cursor),
+            2 => delete_word_backward(&mut self.prompt, &mut self.prompt_cursor),
+            _ => {}
+        }
+    }
+
+    pub fn clear_to_start(&mut self) {
+        match self.focused_field {
+            1 => clear_to_start(&mut self.title, &mut self.title_cursor),
+            2 => clear_to_start(&mut self.prompt, &mut self.prompt_cursor),
             _ => {}
         }
     }
 }
 
-pub const DIALOG_FIELD_COUNT: usize = 3;
+fn char_to_byte_index(s: &str, char_index: usize) -> usize {
+    s.char_indices()
+        .nth(char_index)
+        .map(|(idx, _)| idx)
+        .unwrap_or_else(|| s.len())
+}
+
+fn insert_char(text: &mut String, cursor: &mut usize, c: char) {
+    let byte_index = char_to_byte_index(text, *cursor);
+    text.insert(byte_index, c);
+    *cursor += 1;
+}
+
+fn delete_char_before_cursor(text: &mut String, cursor: &mut usize) {
+    if *cursor == 0 {
+        return;
+    }
+    let end = char_to_byte_index(text, *cursor);
+    let start = char_to_byte_index(text, *cursor - 1);
+    text.drain(start..end);
+    *cursor -= 1;
+}
+
+fn delete_char_at_cursor(text: &mut String, cursor: usize) {
+    if cursor >= text.chars().count() {
+        return;
+    }
+    let start = char_to_byte_index(text, cursor);
+    let end = char_to_byte_index(text, cursor + 1);
+    text.drain(start..end);
+}
+
+fn delete_word_backward(text: &mut String, cursor: &mut usize) {
+    if *cursor == 0 {
+        return;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut start = *cursor;
+    while start > 0 && chars[start - 1].is_whitespace() {
+        start -= 1;
+    }
+    while start > 0 && !chars[start - 1].is_whitespace() {
+        start -= 1;
+    }
+    let start_byte = char_to_byte_index(text, start);
+    let end_byte = char_to_byte_index(text, *cursor);
+    text.drain(start_byte..end_byte);
+    *cursor = start;
+}
+
+fn clear_to_start(text: &mut String, cursor: &mut usize) {
+    if *cursor == 0 {
+        return;
+    }
+    let end_byte = char_to_byte_index(text, *cursor);
+    text.drain(0..end_byte);
+    *cursor = 0;
+}
 
 pub struct App {
     pub issues: Vec<Issue>,
@@ -501,13 +654,25 @@ impl App {
     }
 
     pub fn branch_for(&self, issue: &Issue) -> Option<&str> {
-        let wt = self.worktree_for(issue)?;
-        if issue.column == Column::Done {
-            if let Some(frozen) = self.frozen_worktree_branches.get(wt) {
-                return Some(frozen.as_str());
+        if let Some(wt) = self.worktree_for(issue) {
+            if issue.column == Column::Done {
+                if let Some(frozen) = self.frozen_worktree_branches.get(wt) {
+                    return Some(frozen.as_str());
+                }
+            }
+            if let Some(branch) = self.worktree_branches.get(wt) {
+                return Some(branch.as_str());
             }
         }
-        self.worktree_branches.get(wt).map(|s| s.as_str())
+
+        // Fallback: resolve branch from pr_number via user_prs
+        if let Some(pr_num) = issue.pr_number {
+            if let Some(pr) = self.user_prs.iter().find(|p| p.number == pr_num) {
+                return Some(pr.head_branch.as_str());
+            }
+        }
+
+        None
     }
 
     pub fn pr_for(&self, issue: &Issue) -> Option<&PrStatus> {
@@ -583,6 +748,7 @@ impl App {
             new_issues.push(Issue {
                 id,
                 title: pr.title.clone(),
+                kind: IssueKind::Agentic,
                 column: Column::CodeReview,
                 worktree: None,
                 tmux_session: None,
@@ -888,7 +1054,7 @@ mod tests {
 
     use super::*;
     use crate::config::DEFAULT_DONE_SESSION_TTL;
-    use crate::types::{AgentKind, AgentMode, PrState, PrStatus};
+    use crate::types::{AgentKind, AgentMode, IssueKind, PrState, PrStatus};
 
     fn test_config() -> AppConfig {
         AppConfig {
@@ -904,6 +1070,7 @@ mod tests {
         Issue {
             id: id.to_string(),
             title: format!("Test issue {}", id),
+            kind: IssueKind::Agentic,
             column,
             tmux_session: None,
             agent_kind: AgentKind::OpenCode,
@@ -1487,9 +1654,7 @@ mod tests {
     }
 
     // ================================================================
-    // DialogState: mode cycling (field 2 = mode in our 3-field dialog)
-    // ================================================================
-    // DialogState: mode cycling (field 2 = mode in our 3-field dialog)
+    // DialogState: mode cycling (field 3 = mode)
     // ================================================================
 
     fn claude_dialog() -> DialogState {
@@ -1504,7 +1669,7 @@ mod tests {
     fn dialog_claude_mode_cycles_plan_build_yolo() {
         let mut d = claude_dialog();
         assert_eq!(d.agent_mode, crate::types::AgentMode::Plan);
-        d.focused_field = 2;
+        d.focused_field = 3;
         d.push_char(' ');
         assert_eq!(d.agent_mode, crate::types::AgentMode::Build);
         d.push_char(' ');
@@ -1516,7 +1681,7 @@ mod tests {
     #[test]
     fn dialog_opencode_mode_cycles_plan_build_only() {
         let mut d = opencode_dialog();
-        d.focused_field = 2;
+        d.focused_field = 3;
         d.push_char(' ');
         assert_eq!(d.agent_mode, crate::types::AgentMode::Build);
         d.push_char(' ');
@@ -1528,7 +1693,7 @@ mod tests {
     #[test]
     fn dialog_mode_toggle_with_h_and_l_keys() {
         let mut d = claude_dialog();
-        d.focused_field = 2;
+        d.focused_field = 3;
         d.push_char('l');
         assert_eq!(d.agent_mode, crate::types::AgentMode::Build);
         d.push_char('h');
@@ -1550,6 +1715,41 @@ mod tests {
         let d = DialogState::from_issue(&issue, 0);
         assert_eq!(d.agent_kind, crate::types::AgentKind::Claude);
         assert_eq!(d.agent_mode, crate::types::AgentMode::Yolo);
+    }
+
+    #[test]
+    fn dialog_new_defaults_to_agentic_with_title_focused() {
+        let d = DialogState::new(crate::types::AgentKind::OpenCode);
+        assert_eq!(d.kind, IssueKind::Agentic);
+        assert_eq!(d.focused_field, 1);
+    }
+
+    #[test]
+    fn dialog_prompt_supports_normal_edit_commands() {
+        let mut d = DialogState::new(crate::types::AgentKind::OpenCode);
+        d.focused_field = 2;
+
+        for c in "todo note".chars() {
+            d.push_char(c);
+        }
+        assert_eq!(d.prompt, "todo note");
+
+        d.move_cursor_left();
+        d.move_cursor_left();
+        d.delete_char();
+        assert_eq!(d.prompt, "todo nte");
+
+        d.move_cursor_start();
+        d.delete_char_forward();
+        assert_eq!(d.prompt, "odo nte");
+
+        d.move_cursor_end();
+        d.delete_word_backward();
+        assert_eq!(d.prompt, "odo ");
+
+        d.clear_to_start();
+        assert_eq!(d.prompt, "");
+        assert_eq!(d.prompt_cursor, 0);
     }
 
     // ================================================================

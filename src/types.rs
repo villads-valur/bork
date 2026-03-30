@@ -115,6 +115,27 @@ impl fmt::Display for AgentMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IssueKind {
+    Agentic,
+    NonAgentic,
+}
+
+impl Default for IssueKind {
+    fn default() -> Self {
+        Self::Agentic
+    }
+}
+
+impl fmt::Display for IssueKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Agentic => write!(f, "Agentic"),
+            Self::NonAgentic => write!(f, "Todo"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentStatus {
     Stopped,
     Idle,
@@ -182,6 +203,8 @@ impl WorktreeStatus {
 pub struct Issue {
     pub id: String,
     pub title: String,
+    #[serde(default)]
+    pub kind: IssueKind,
     pub column: Column,
     pub tmux_session: Option<String>,
     pub agent_kind: AgentKind,
@@ -274,6 +297,7 @@ mod tests {
         Issue {
             id: id.to_string(),
             title: format!("Test issue {}", id),
+            kind: IssueKind::Agentic,
             column,
             tmux_session: None,
             agent_kind: AgentKind::OpenCode,
