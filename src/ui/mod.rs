@@ -1,6 +1,7 @@
 pub mod board;
 pub mod card;
 pub mod dialog;
+pub mod help;
 pub mod linear_picker;
 pub mod status_bar;
 pub mod styles;
@@ -27,4 +28,5 @@ pub fn render(frame: &mut Frame, app: &App) {
     // Render overlays on top of the board
     dialog::render_dialog(frame, app);
     linear_picker::render_linear_picker(frame, app);
+    help::render_help(frame, app);
 }

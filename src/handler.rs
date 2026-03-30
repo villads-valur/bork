@@ -53,6 +53,10 @@ pub fn handle_action(
             handle_linear_picker(app, action);
             PostAction::None
         }
+        InputMode::Help => {
+            handle_help(app, action);
+            PostAction::None
+        }
         InputMode::Normal => handle_normal(app, action, action_tx, pr_wake_tx),
     }
 }
@@ -182,6 +186,11 @@ fn handle_normal(
             PostAction::None
         }
 
+        Action::ShowHelp => {
+            app.open_help();
+            PostAction::None
+        }
+
         Action::OpenSession => {
             let Some(issue) = app.selected_issue() else {
                 return PostAction::None;
@@ -279,6 +288,16 @@ fn handle_search(app: &mut App, action: Action) {
         Action::SearchBackspace => app.search_delete_char(),
         Action::SearchConfirm => app.confirm_search(),
         Action::SearchCancel => app.cancel_search(),
+        _ => {}
+    }
+}
+
+fn handle_help(app: &mut App, action: Action) {
+    match action {
+        Action::CloseHelp => app.close_help(),
+        Action::Quit => {
+            app.should_quit = true;
+        }
         _ => {}
     }
 }

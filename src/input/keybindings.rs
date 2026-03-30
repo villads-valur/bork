@@ -10,6 +10,7 @@ pub fn map_key_to_action(key: KeyEvent, mode: InputMode) -> Action {
         InputMode::Dialog => map_dialog_key(key),
         InputMode::Search => map_search_key(key),
         InputMode::LinearPicker => map_linear_picker_key(key),
+        InputMode::Help => map_help_key(key),
     }
 }
 
@@ -53,6 +54,7 @@ fn map_normal_key(key: KeyEvent) -> Action {
         KeyCode::Char('W') => Action::AssignWorktree,
 
         KeyCode::Char('/') => Action::SearchStart,
+        KeyCode::Char('?') => Action::ShowHelp,
         KeyCode::Esc => Action::ClearSearch,
         KeyCode::Char('I') => Action::OpenLinearPicker,
 
@@ -108,8 +110,14 @@ fn map_linear_picker_key(key: KeyEvent) -> Action {
     }
 }
 
+fn map_help_key(key: KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Esc => Action::CloseHelp,
+        _ => Action::Noop,
+    }
+}
+
 fn map_dialog_key(key: KeyEvent) -> Action {
-    // Shift+Enter = submit from any field
     if key.modifiers.contains(KeyModifiers::SHIFT) && key.code == KeyCode::Enter {
         return Action::DialogSubmit;
     }

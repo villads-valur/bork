@@ -21,6 +21,7 @@ pub enum InputMode {
     Dialog,
     Search,
     LinearPicker,
+    Help,
 }
 
 #[derive(Debug)]
@@ -626,6 +627,16 @@ impl App {
                     || i.team_key.to_lowercase().contains(&query)
             })
             .collect()
+    }
+
+    // --- Help ---
+
+    pub fn open_help(&mut self) {
+        self.input_mode = InputMode::Help;
+    }
+
+    pub fn close_help(&mut self) {
+        self.input_mode = InputMode::Normal;
     }
 
     // --- Issue ID generation ---
