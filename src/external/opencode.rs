@@ -10,7 +10,7 @@ use crate::types::{AgentKind, AgentMode, Issue};
 /// Exports BORK_SESSION and BORK_STATUS_DIR so hooks/plugins can write status files.
 /// Returns the tmux session name.
 pub fn launch_session(issue: &Issue, config: &AppConfig) -> Result<String, AppError> {
-    let session_name = issue.session_name();
+    let session_name = issue.session_name(&config.project_name);
     let cwd = &config.project_root;
 
     if tmux::session_exists(&session_name) {

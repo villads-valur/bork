@@ -365,12 +365,20 @@ fn render_mode_field(
         ),
         Span::styled(
             format!("[{} plan]", indicator(plan_selected)),
-            if plan_selected { selected_style } else { unselected_style },
+            if plan_selected {
+                selected_style
+            } else {
+                unselected_style
+            },
         ),
         Span::raw("  "),
         Span::styled(
             format!("[{} build]", indicator(build_selected)),
-            if build_selected { selected_style } else { unselected_style },
+            if build_selected {
+                selected_style
+            } else {
+                unselected_style
+            },
         ),
     ];
 
@@ -378,7 +386,11 @@ fn render_mode_field(
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
             format!("[{} yolo]", indicator(yolo_selected)),
-            if yolo_selected { selected_style } else { unselected_style },
+            if yolo_selected {
+                selected_style
+            } else {
+                unselected_style
+            },
         ));
     }
 

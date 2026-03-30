@@ -195,8 +195,8 @@ pub struct Issue {
 }
 
 impl Issue {
-    pub fn session_name(&self) -> String {
-        format!("bork-{}", self.id.to_lowercase())
+    pub fn session_name(&self, project_name: &str) -> String {
+        format!("{}-{}", project_name, self.id.to_lowercase())
     }
 }
 
@@ -373,9 +373,10 @@ mod tests {
     // --- Issue session_name ---
 
     #[test]
-    fn session_name_lowercases_id() {
+    fn session_name_uses_project_name_and_lowercases_id() {
         let issue = test_issue("BORK-3", Column::Todo);
-        assert_eq!(issue.session_name(), "bork-bork-3");
+        assert_eq!(issue.session_name("bork"), "bork-bork-3");
+        assert_eq!(issue.session_name("myapp"), "myapp-bork-3");
     }
 
     // --- Issue serialization with done_at ---
