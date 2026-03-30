@@ -107,6 +107,8 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         ("d", "delete"),
         ("x", "kill"),
         ("H/L", "move"),
+        ("D", "done"),
+        ("T", "todo"),
         ("P", "sync prs"),
         ("/", "search"),
     ];

@@ -107,6 +107,16 @@ fn handle_normal(
             let _ = config::save_state(&app.to_state(), &app.config.project_root);
             PostAction::None
         }
+        Action::MoveToDone => {
+            app.move_to_done();
+            let _ = config::save_state(&app.to_state(), &app.config.project_root);
+            PostAction::None
+        }
+        Action::MoveToTodo => {
+            app.move_to_todo();
+            let _ = config::save_state(&app.to_state(), &app.config.project_root);
+            PostAction::None
+        }
 
         Action::KillSession => {
             let Some(issue) = app.selected_issue() else {
