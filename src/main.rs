@@ -112,7 +112,7 @@ fn spawn_git_status_worker(
     rx
 }
 
-fn spawn_linear_worker() -> mpsc::Receiver<LinearPollResult> {
+fn spawn_linear_worker(wake_rx: mpsc::Receiver<()>) -> mpsc::Receiver<LinearPollResult> {
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || loop {
@@ -123,7 +123,18 @@ fn spawn_linear_worker() -> mpsc::Receiver<LinearPollResult> {
         if tx.send(LinearPollResult { issues }).is_err() {
             break;
         }
-        thread::sleep(LINEAR_POLL_INTERVAL);
+
+        let deadline = Instant::now() + LINEAR_POLL_INTERVAL;
+        loop {
+            if Instant::now() >= deadline {
+                break;
+            }
+            match wake_rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(()) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        }
     });
 
     rx
@@ -307,6 +318,8 @@ fn run_tui() -> anyhow::Result<()> {
         let _ = linear_check_tx.send(available);
     });
     let mut linear_rx: Option<mpsc::Receiver<LinearPollResult>> = None;
+    let (linear_wake_tx, linear_wake_rx) = mpsc::channel::<()>();
+    let mut linear_wake_rx = Some(linear_wake_rx);
 
     let mut pending_popup_session: Option<(String, String)> = None;
     let mut pending_popup_for_launch: Option<(usize, String)> = None;
@@ -322,8 +335,13 @@ fn run_tui() -> anyhow::Result<()> {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
                         let action = map_key_to_action(key, app.input_mode);
-                        let post_action =
-                            handler::handle_action(&mut app, action, &action_tx, &pr_wake_tx);
+                        let post_action = handler::handle_action(
+                            &mut app,
+                            action,
+                            &action_tx,
+                            &pr_wake_tx,
+                            &linear_wake_tx,
+                        );
 
                         match post_action {
                             PostAction::None => {}
@@ -438,7 +456,9 @@ fn run_tui() -> anyhow::Result<()> {
         // --- Linear: check availability then consume poll results ---
         if let Ok(true) = linear_check_rx.try_recv() {
             app.linear_available = true;
-            linear_rx = Some(spawn_linear_worker());
+            if let Some(wake_rx) = linear_wake_rx.take() {
+                linear_rx = Some(spawn_linear_worker(wake_rx));
+            }
         }
         if let Some(ref rx) = linear_rx {
             while let Ok(result) = rx.try_recv() {

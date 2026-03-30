@@ -710,21 +710,12 @@ impl App {
             None => return Vec::new(),
         };
 
-        let existing_linear_ids: HashSet<&str> = self
-            .issues
-            .iter()
-            .filter_map(|i| i.linear_id.as_deref())
-            .collect();
-
         let query = picker.search.to_lowercase();
         self.linear_issues
             .iter()
-            .filter(|i| !existing_linear_ids.contains(i.id.as_str()))
             .filter(|i| {
-                if query.is_empty() {
-                    return true;
-                }
-                i.title.to_lowercase().contains(&query)
+                query.is_empty()
+                    || i.title.to_lowercase().contains(&query)
                     || i.identifier.to_lowercase().contains(&query)
                     || i.team_key.to_lowercase().contains(&query)
             })
@@ -2574,7 +2565,7 @@ mod tests {
     }
 
     #[test]
-    fn filtered_linear_issues_excludes_already_imported() {
+    fn filtered_linear_issues_includes_already_imported() {
         let mut issue = test_issue("test-1", Column::Todo);
         issue.linear_id = Some("uuid-1".to_string());
         let mut app = test_app(vec![issue]);
@@ -2586,8 +2577,7 @@ mod tests {
         app.open_linear_picker();
 
         let filtered = app.filtered_linear_issues();
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].identifier, "TEST-2");
+        assert_eq!(filtered.len(), 2);
     }
 
     #[test]
