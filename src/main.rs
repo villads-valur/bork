@@ -5,6 +5,7 @@ mod external;
 mod handler;
 mod init;
 mod input;
+mod lock;
 mod types;
 mod ui;
 mod worktree;
@@ -238,6 +239,9 @@ fn run_tui() -> anyhow::Result<()> {
     let config = config::load_config();
     let state = config::load_state(&config.project_root);
 
+    // --- Single-instance lock ---
+    lock::acquire_lock(&config.project_root)?;
+
     // --- Tmux auto-wrap (scoped to project name) ---
     match external::tmux::ensure_bork_session(&config.project_name)? {
         external::tmux::EnsureResult::AlreadyInside => {}
@@ -247,12 +251,17 @@ fn run_tui() -> anyhow::Result<()> {
     }
 
     // --- Panic hook ---
+    let panic_project_root = config.project_root.clone();
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
+        lock::release_lock(&panic_project_root);
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
         original_hook(panic_info);
     }));
+
+    // --- Signal handlers (SIGTERM, SIGHUP) ---
+    lock::install_signal_handlers();
 
     // --- Terminal setup ---
     enable_raw_mode()?;
@@ -325,7 +334,7 @@ fn run_tui() -> anyhow::Result<()> {
             }
         }
 
-        if app.should_quit {
+        if app.should_quit || lock::signal_received() {
             break;
         }
 
@@ -430,6 +439,7 @@ fn run_tui() -> anyhow::Result<()> {
     }
 
     let _ = config::save_state(&app.to_state(), &app.config.project_root);
+    lock::release_lock(&app.config.project_root);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
