@@ -284,8 +284,8 @@ fn run_tui() -> anyhow::Result<()> {
     });
     let mut linear_rx: Option<mpsc::Receiver<LinearPollResult>> = None;
 
-    let mut pending_popup_session: Option<String> = None;
-    let mut pending_popup_for_launch: Option<usize> = None;
+    let mut pending_popup_session: Option<(String, String)> = None;
+    let mut pending_popup_for_launch: Option<(usize, String)> = None;
 
     // --- Main event loop ---
     loop {
@@ -303,12 +303,18 @@ fn run_tui() -> anyhow::Result<()> {
 
                         match post_action {
                             PostAction::None => {}
-                            PostAction::OpenTmuxPopup { session_name } => {
-                                open_tmux_popup(&mut terminal, &session_name)?;
+                            PostAction::OpenTmuxPopup {
+                                session_name,
+                                popup_title,
+                            } => {
+                                open_tmux_popup(&mut terminal, &session_name, &popup_title)?;
                                 app.message = None;
                             }
-                            PostAction::LaunchAndOpenPopup { issue_index } => {
-                                pending_popup_for_launch = Some(issue_index);
+                            PostAction::LaunchAndOpenPopup {
+                                issue_index,
+                                popup_title,
+                            } => {
+                                pending_popup_for_launch = Some((issue_index, popup_title));
                             }
                         }
                     }
@@ -334,19 +340,19 @@ fn run_tui() -> anyhow::Result<()> {
             }
 
             if let Some(session_name) = result.session_to_open {
-                if let Some(launch_idx) = pending_popup_for_launch.take() {
+                if let Some((launch_idx, popup_title)) = pending_popup_for_launch.take() {
                     app.issues[launch_idx].tmux_session = Some(session_name.clone());
                     if app.issues[launch_idx].column == types::Column::Todo {
                         app.issues[launch_idx].column = types::Column::InProgress;
                     }
-                    pending_popup_session = Some(session_name);
+                    pending_popup_session = Some((session_name, popup_title));
                 }
             }
         }
 
-        if let Some(session_name) = pending_popup_session.take() {
+        if let Some((session_name, popup_title)) = pending_popup_session.take() {
             let _ = config::save_state(&app.to_state(), &app.config.project_root);
-            open_tmux_popup(&mut terminal, &session_name)?;
+            open_tmux_popup(&mut terminal, &session_name, &popup_title)?;
             app.message = None;
         }
 
@@ -434,11 +440,12 @@ fn run_tui() -> anyhow::Result<()> {
 fn open_tmux_popup(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     session_name: &str,
+    title: &str,
 ) -> anyhow::Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
-    let _ = external::tmux::open_popup(session_name);
+    let _ = external::tmux::open_popup(session_name, title);
 
     enable_raw_mode()?;
     execute!(terminal.backend_mut(), EnterAlternateScreen)?;

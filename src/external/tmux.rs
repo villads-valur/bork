@@ -217,7 +217,7 @@ pub fn create_window(session: &str, window_name: &str, cwd: &Path) -> Result<(),
 
 /// Open a session as a tmux popup overlay (90% of the screen).
 /// This blocks until the user detaches or the popup closes.
-pub fn open_popup(session: &str) -> Result<(), AppError> {
+pub fn open_popup(session: &str, title: &str) -> Result<(), AppError> {
     if !is_inside_tmux() {
         // Fallback: just attach directly
         let _ = Command::new("tmux")
@@ -227,9 +227,20 @@ pub fn open_popup(session: &str) -> Result<(), AppError> {
     }
 
     let attach_cmd = format!("tmux attach -t {}", shell_escape(session));
+    let popup_title = format!(" {} ", title);
 
     let status = Command::new("tmux")
-        .args(["display-popup", "-E", "-w", "90%", "-h", "90%", &attach_cmd])
+        .args([
+            "display-popup",
+            "-E",
+            "-w",
+            "90%",
+            "-h",
+            "90%",
+            "-T",
+            &popup_title,
+            &attach_cmd,
+        ])
         .status()
         .map_err(|e| AppError::Tmux(format!("failed to open popup for '{session}': {e}")))?;
 
