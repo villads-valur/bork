@@ -12,13 +12,13 @@
 
 ---
 
-<!-- TODO: Add demo GIF here -->
-<!-- Record with: vhs, asciinema, or ttygif -->
-<!-- Recommended size: 80x24 terminal, 15-30s loop showing: -->
-<!--   1. Board overview with issues in different columns -->
-<!--   2. Creating a new issue -->
-<!--   3. Launching an agent session (tmux popup) -->
-<!--   4. Returning to the board with live status updates -->
+<p align="center">
+  <img src="assets/board-dark.png" alt="bork – dark theme" width="720">
+  <br>
+  <img src="assets/board-light.png" alt="bork – light theme" width="720">
+  <br>
+  <sub>Adapts to your terminal theme (ANSI 16 colors)</sub>
+</p>
 
 ## Overview
 
