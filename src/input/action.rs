@@ -33,5 +33,12 @@ pub enum Action {
     SearchConfirm,
     SearchCancel,
     ClearSearch,
+    OpenLinearPicker,
+    LinearPickerDown,
+    LinearPickerUp,
+    LinearPickerSelect,
+    LinearPickerClose,
+    LinearPickerChar(char),
+    LinearPickerBackspace,
     Noop,
 }

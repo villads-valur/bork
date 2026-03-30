@@ -71,6 +71,11 @@ fn run_worktree_in(
             worktree: Some(worktree_dir.to_string()),
             done_at: None,
             session_id: None,
+            linear_id: None,
+            linear_identifier: None,
+            linear_url: None,
+            linear_state: None,
+            linear_branch: None,
         };
         state.issues.push(issue);
     } else {

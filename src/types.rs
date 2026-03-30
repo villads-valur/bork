@@ -196,6 +196,16 @@ pub struct Issue {
     /// OpenCode: "ses_xxx..." format. Claude: UUID format.
     #[serde(default)]
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub linear_id: Option<String>,
+    #[serde(default)]
+    pub linear_identifier: Option<String>,
+    #[serde(default)]
+    pub linear_url: Option<String>,
+    #[serde(default)]
+    pub linear_state: Option<String>,
+    #[serde(default)]
+    pub linear_branch: Option<String>,
 }
 
 impl Issue {
@@ -267,6 +277,11 @@ mod tests {
             worktree: None,
             done_at: None,
             session_id: None,
+            linear_id: None,
+            linear_identifier: None,
+            linear_url: None,
+            linear_state: None,
+            linear_branch: None,
         }
     }
 

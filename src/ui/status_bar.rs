@@ -64,8 +64,8 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    // Dialog mode: footer is handled by the dialog overlay itself
-    if app.input_mode == InputMode::Dialog {
+    // Dialog/picker mode: footer is handled by the overlay itself
+    if app.input_mode == InputMode::Dialog || app.input_mode == InputMode::LinearPicker {
         return;
     }
 
@@ -110,6 +110,10 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         ("P", "sync prs"),
         ("/", "search"),
     ];
+    if app.linear_available {
+        bindings.push(("I", "linear"));
+    }
+    bindings.push(("q", "quit"));
 
     if has_pr {
         bindings.push(("o", "open pr"));

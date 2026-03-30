@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::{AppConfig, AppState};
+use crate::external::linear::LinearIssue;
 use crate::types::{
     AgentKind, AgentMode, AgentStatus, AgentStatusInfo, Column, Issue, PrStatus, WorktreeStatus,
 };
@@ -19,6 +20,13 @@ pub enum InputMode {
     Confirm,
     Dialog,
     Search,
+    LinearPicker,
+}
+
+#[derive(Debug)]
+pub struct LinearPickerState {
+    pub search: String,
+    pub selected: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +120,9 @@ pub struct App {
     pub spinner_tick: usize,
     pub search_query: String,
     pub config: AppConfig,
+    pub linear_available: bool,
+    pub linear_issues: Vec<LinearIssue>,
+    pub linear_picker: Option<LinearPickerState>,
 }
 
 impl App {
@@ -146,6 +157,9 @@ impl App {
             spinner_tick: 0,
             search_query: String::new(),
             config,
+            linear_available: false,
+            linear_issues: Vec::new(),
+            linear_picker: None,
         }
     }
 
@@ -532,6 +546,54 @@ impl App {
         self.input_mode = InputMode::Normal;
     }
 
+    // --- Linear Picker ---
+
+    pub fn open_linear_picker(&mut self) {
+        if self.linear_issues.is_empty() {
+            if self.linear_available {
+                self.set_message("No Linear issues loaded yet");
+            }
+            return;
+        }
+        self.linear_picker = Some(LinearPickerState {
+            search: String::new(),
+            selected: 0,
+        });
+        self.input_mode = InputMode::LinearPicker;
+    }
+
+    pub fn close_linear_picker(&mut self) {
+        self.linear_picker = None;
+        self.input_mode = InputMode::Normal;
+    }
+
+    pub fn filtered_linear_issues(&self) -> Vec<&LinearIssue> {
+        let picker = match &self.linear_picker {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+
+        let existing_linear_ids: HashSet<&str> = self
+            .issues
+            .iter()
+            .filter_map(|i| i.linear_id.as_deref())
+            .collect();
+
+        let query = picker.search.to_lowercase();
+        self.linear_issues
+            .iter()
+            .filter(|i| !existing_linear_ids.contains(i.id.as_str()))
+            .filter(|i| {
+                if query.is_empty() {
+                    return true;
+                }
+                i.title.to_lowercase().contains(&query)
+                    || i.identifier.to_lowercase().contains(&query)
+                    || i.team_key.to_lowercase().contains(&query)
+            })
+            .collect()
+    }
+
     // --- Issue ID generation ---
 
     pub fn next_issue_id(&self) -> String {
@@ -683,6 +745,11 @@ mod tests {
             worktree: None,
             done_at: None,
             session_id: None,
+            linear_id: None,
+            linear_identifier: None,
+            linear_url: None,
+            linear_state: None,
+            linear_branch: None,
         }
     }
 
@@ -2061,5 +2128,111 @@ mod tests {
 
         let idx = app.selected_issue_index().expect("should have index");
         assert_eq!(idx, 1, "global index of 'Fix bug' is 1, not 0");
+    }
+
+    // ================================================================
+    // Linear picker
+    // ================================================================
+
+    fn test_linear_issue(id: &str, identifier: &str, title: &str) -> LinearIssue {
+        LinearIssue {
+            id: id.to_string(),
+            identifier: identifier.to_string(),
+            title: title.to_string(),
+            url: format!("https://linear.app/test/issue/{}", identifier),
+            branch_name: format!("{}-slug", identifier.to_lowercase()),
+            priority: 2,
+            state_name: "In Progress".to_string(),
+            team_key: "TEST".to_string(),
+        }
+    }
+
+    #[test]
+    fn open_linear_picker_requires_issues() {
+        let mut app = test_app(vec![]);
+        app.linear_available = true;
+        app.linear_issues = vec![];
+
+        app.open_linear_picker();
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert!(app.linear_picker.is_none());
+    }
+
+    #[test]
+    fn open_linear_picker_with_issues() {
+        let mut app = test_app(vec![]);
+        app.linear_available = true;
+        app.linear_issues = vec![test_linear_issue("uuid-1", "TEST-1", "First issue")];
+
+        app.open_linear_picker();
+        assert_eq!(app.input_mode, InputMode::LinearPicker);
+        assert!(app.linear_picker.is_some());
+    }
+
+    #[test]
+    fn close_linear_picker_restores_normal_mode() {
+        let mut app = test_app(vec![]);
+        app.linear_available = true;
+        app.linear_issues = vec![test_linear_issue("uuid-1", "TEST-1", "First issue")];
+
+        app.open_linear_picker();
+        app.close_linear_picker();
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert!(app.linear_picker.is_none());
+    }
+
+    #[test]
+    fn filtered_linear_issues_excludes_already_imported() {
+        let mut issue = test_issue("test-1", Column::Todo);
+        issue.linear_id = Some("uuid-1".to_string());
+        let mut app = test_app(vec![issue]);
+
+        app.linear_issues = vec![
+            test_linear_issue("uuid-1", "TEST-1", "Already imported"),
+            test_linear_issue("uuid-2", "TEST-2", "Not imported"),
+        ];
+        app.open_linear_picker();
+
+        let filtered = app.filtered_linear_issues();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].identifier, "TEST-2");
+    }
+
+    #[test]
+    fn filtered_linear_issues_filters_by_search() {
+        let mut app = test_app(vec![]);
+        app.linear_issues = vec![
+            test_linear_issue("uuid-1", "TEST-1", "Add login page"),
+            test_linear_issue("uuid-2", "TEST-2", "Fix dashboard bug"),
+            test_linear_issue("uuid-3", "TEST-3", "Add logout button"),
+        ];
+        app.open_linear_picker();
+
+        if let Some(ref mut picker) = app.linear_picker {
+            picker.search = "add".to_string();
+        }
+
+        let filtered = app.filtered_linear_issues();
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0].identifier, "TEST-1");
+        assert_eq!(filtered[1].identifier, "TEST-3");
+    }
+
+    #[test]
+    fn filtered_linear_issues_matches_identifier() {
+        let mut app = test_app(vec![]);
+        app.linear_issues = vec![
+            test_linear_issue("uuid-1", "TEST-1", "First"),
+            test_linear_issue("uuid-2", "DOC-99", "Second"),
+        ];
+        app.open_linear_picker();
+
+        if let Some(ref mut picker) = app.linear_picker {
+            picker.search = "doc".to_string();
+        }
+
+        let filtered = app.filtered_linear_issues();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].identifier, "DOC-99");
     }
 }
