@@ -417,13 +417,10 @@ impl App {
         issue.worktree.as_deref()
     }
 
-    /// Auto-detect a worktree directory for an issue by matching its ID
-    /// against known directory names from both live and frozen worktree maps.
-    ///
-    /// Matching rules:
-    /// 1. Exact match (case-insensitive): dir name == issue ID
-    /// 2. Prefix match: dir starts with "{issue_id}-"
-    /// 3. Among prefix matches, shortest directory name wins
+    /// Auto-detect a worktree directory for an issue by finding a
+    /// dash-bounded substring match of the issue ID (case-insensitive).
+    /// Matches `doc-1929`, `doc-1929-slug`, and `legora-doc-1929-slug`.
+    /// Shortest directory name wins among multiple matches.
     fn detect_worktree(&self, issue: &Issue) -> Option<String> {
         let issue_id_lower = issue.id.to_lowercase();
 
@@ -435,14 +432,14 @@ impl App {
 
         for dir_name in all_keys {
             let dir_lower = dir_name.to_lowercase();
-            if dir_lower == issue_id_lower {
-                return Some(dir_name.clone());
-            }
-            if let Some(rest) = dir_lower.strip_prefix(issue_id_lower.as_str()) {
-                if rest.starts_with('-') && (best.is_none() || dir_name.len() < best.unwrap().len())
-                {
-                    best = Some(dir_name.as_str());
-                }
+            let Some(pos) = dir_lower.find(&issue_id_lower) else {
+                continue;
+            };
+            let before_ok = pos == 0 || dir_lower.as_bytes()[pos - 1] == b'-';
+            let end = pos + issue_id_lower.len();
+            let after_ok = end == dir_lower.len() || dir_lower.as_bytes()[end] == b'-';
+            if before_ok && after_ok && (best.is_none() || dir_name.len() < best.unwrap().len()) {
+                best = Some(dir_name.as_str());
             }
         }
         best.map(|s| s.to_string())
@@ -912,10 +909,53 @@ mod tests {
     #[test]
     fn test_detect_worktree_searches_frozen_keys() {
         let mut app = test_app(vec![test_issue("bork-1", Column::Done)]);
-        // Not in worktree_branches (git worker skipped it)
-        // But in frozen_worktree_branches
         app.frozen_worktree_branches
             .insert("bork-1".into(), "bork-1/feature".into());
+        assert_eq!(
+            app.detect_worktree(&app.issues[0].clone()),
+            Some("bork-1".into())
+        );
+    }
+
+    #[test]
+    fn test_detect_worktree_project_prefixed_dir() {
+        let mut app = test_app(vec![test_issue("doc-1929", Column::InProgress)]);
+        app.worktree_branches.insert(
+            "legora-doc-1929-show-hidden-data".into(),
+            "doc-1929/show-hidden-data".into(),
+        );
+        assert_eq!(
+            app.detect_worktree(&app.issues[0].clone()),
+            Some("legora-doc-1929-show-hidden-data".into())
+        );
+    }
+
+    #[test]
+    fn test_detect_worktree_project_prefixed_no_slug() {
+        let mut app = test_app(vec![test_issue("doc-1929", Column::InProgress)]);
+        app.worktree_branches
+            .insert("legora-doc-1929".into(), "doc-1929/feature".into());
+        assert_eq!(
+            app.detect_worktree(&app.issues[0].clone()),
+            Some("legora-doc-1929".into())
+        );
+    }
+
+    #[test]
+    fn test_detect_worktree_no_false_substring_match() {
+        let mut app = test_app(vec![test_issue("doc-1", Column::InProgress)]);
+        app.worktree_branches
+            .insert("legora-doc-12-something".into(), "doc-12/something".into());
+        assert_eq!(app.detect_worktree(&app.issues[0].clone()), None);
+    }
+
+    #[test]
+    fn test_detect_worktree_exact_preferred_over_substring() {
+        let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
+        app.worktree_branches
+            .insert("bork-1".into(), "bork-1/feature".into());
+        app.worktree_branches
+            .insert("legora-bork-1-extended".into(), "bork-1/extended".into());
         assert_eq!(
             app.detect_worktree(&app.issues[0].clone()),
             Some("bork-1".into())
