@@ -1,6 +1,6 @@
 use ratatui::style::{Color, Modifier, Style};
 
-use crate::types::{AgentStatus, ChecksStatus, ReviewDecision};
+use crate::types::{AgentStatus, ChecksStatus, PrState, ReviewDecision};
 
 // All colors use ANSI 16 palette so they adapt to the user's terminal theme.
 // Never use Color::Rgb or Color::Indexed(16+) here.
@@ -65,6 +65,14 @@ pub fn statusbar_key_style() -> Style {
 
 pub fn statusbar_desc_style() -> Style {
     Style::default().fg(DIM)
+}
+
+pub fn pr_state_style(state: &PrState) -> (&'static str, Color) {
+    match state {
+        PrState::Open => ("open", Color::Green),
+        PrState::Merged => ("merged", Color::Magenta),
+        PrState::Closed => ("closed", Color::Red),
+    }
 }
 
 pub fn checks_icon(status: Option<ChecksStatus>) -> (&'static str, Color) {

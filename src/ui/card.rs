@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-use crate::types::{AgentStatus, Issue, PrStatus, WorktreeStatus};
+use crate::types::{AgentStatus, Issue, PrState, PrStatus, WorktreeStatus};
 use crate::ui::styles;
 
 pub const CARD_HEIGHT: u16 = 6;
@@ -192,37 +192,52 @@ fn format_pr_line(pr: Option<&PrStatus>) -> Line<'static> {
         return Line::from("");
     };
 
-    let (checks_sym, checks_color) = styles::checks_icon(pr.checks);
-    let (review_sym, review_color) = styles::review_icon(pr.review);
+    let pr_number = Span::styled(format!("#{}", pr.number), styles::dim_style());
 
-    let mut spans = vec![
-        Span::raw("  "),
-        Span::styled(format!("#{}", pr.number), styles::dim_style()),
-        Span::raw(" "),
-        Span::styled(checks_sym, Style::default().fg(checks_color)),
-        Span::raw(" "),
-        Span::styled(review_sym, Style::default().fg(review_color)),
-    ];
+    match &pr.state {
+        PrState::Merged | PrState::Closed => {
+            let (label, color) = styles::pr_state_style(&pr.state);
+            Line::from(vec![
+                Span::raw("  "),
+                pr_number,
+                Span::raw(" "),
+                Span::styled(label, Style::default().fg(color)),
+            ])
+        }
+        PrState::Open => {
+            let (checks_sym, checks_color) = styles::checks_icon(pr.checks);
+            let (review_sym, review_color) = styles::review_icon(pr.review);
 
-    if pr.additions > 0 || pr.deletions > 0 {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            format!("+{}", pr.additions),
-            Style::default().fg(Color::Green),
-        ));
-        spans.push(Span::styled("/", styles::dim_style()));
-        spans.push(Span::styled(
-            format!("-{}", pr.deletions),
-            Style::default().fg(Color::Red),
-        ));
+            let mut spans = vec![
+                Span::raw("  "),
+                pr_number,
+                Span::raw(" "),
+                Span::styled(checks_sym, Style::default().fg(checks_color)),
+                Span::raw(" "),
+                Span::styled(review_sym, Style::default().fg(review_color)),
+            ];
+
+            if pr.additions > 0 || pr.deletions > 0 {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(
+                    format!("+{}", pr.additions),
+                    Style::default().fg(Color::Green),
+                ));
+                spans.push(Span::styled("/", styles::dim_style()));
+                spans.push(Span::styled(
+                    format!("-{}", pr.deletions),
+                    Style::default().fg(Color::Red),
+                ));
+            }
+
+            if pr.is_draft {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled("draft", styles::dim_style()));
+            }
+
+            Line::from(spans)
+        }
     }
-
-    if pr.is_draft {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled("draft", styles::dim_style()));
-    }
-
-    Line::from(spans)
 }
 
 fn truncate(s: &str, max: usize) -> String {
