@@ -33,6 +33,12 @@ use external::git::GitPollResult;
 use external::linear::LinearPollResult;
 use types::PrStatus;
 
+struct PrPollResult {
+    prs: HashMap<String, PrStatus>,
+    user_prs: Vec<PrStatus>,
+    github_user: Option<String>,
+}
+
 const TICK_RATE: Duration = Duration::from_millis(50);
 const TMUX_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const GIT_POLL_INTERVAL: Duration = Duration::from_secs(3);
@@ -126,13 +132,22 @@ fn spawn_linear_worker() -> mpsc::Receiver<LinearPollResult> {
 fn spawn_pr_poll_worker(
     main_worktree: PathBuf,
     wake_rx: mpsc::Receiver<()>,
-) -> mpsc::Receiver<HashMap<String, PrStatus>> {
+) -> mpsc::Receiver<PrPollResult> {
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || loop {
         let prs = external::github::fetch_prs(&main_worktree);
         let indexed = external::github::index_by_branch(prs);
-        if tx.send(indexed).is_err() {
+        let user_prs = external::github::fetch_user_prs(&main_worktree);
+        let github_user = external::github::fetch_current_user(&main_worktree);
+        if tx
+            .send(PrPollResult {
+                prs: indexed,
+                user_prs,
+                github_user,
+            })
+            .is_err()
+        {
             break;
         }
 
@@ -387,7 +402,16 @@ fn run_tui() -> anyhow::Result<()> {
         }
 
         while let Ok(pr_result) = pr_rx.try_recv() {
-            app.pr_statuses = pr_result;
+            app.pr_statuses = pr_result.prs;
+            app.user_prs = pr_result.user_prs;
+            if pr_result.github_user.is_some() {
+                app.github_user = pr_result.github_user;
+            }
+        }
+
+        // --- Auto-import open PRs as issues ---
+        if app.sync_prs_as_issues() {
+            let _ = config::save_state(&app.to_state(), &app.config.project_root);
         }
 
         // --- Auto-assign worktrees for issues that don't have one ---
