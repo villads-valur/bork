@@ -50,9 +50,12 @@ pub fn render_linear_picker(frame: &mut Frame, app: &App) {
 
     // Search field
     let search_area = Rect::new(inner.x + 1, inner.y + 1, inner.width - 2, 1);
-    let search_display = if picker.search.len() > field_width.saturating_sub(10) {
-        let skip = picker.search.len() - (field_width.saturating_sub(13));
-        format!("...{}", &picker.search[skip..])
+    let max_search_chars = field_width.saturating_sub(10);
+    let char_count = picker.search.chars().count();
+    let search_display = if char_count > max_search_chars && max_search_chars > 3 {
+        let skip = char_count - (max_search_chars - 3);
+        let tail: String = picker.search.chars().skip(skip).collect();
+        format!("...{}", tail)
     } else {
         picker.search.clone()
     };
@@ -82,15 +85,10 @@ pub fn render_linear_picker(frame: &mut Frame, app: &App) {
     let available_rows = (inner.height.saturating_sub(5)) as usize;
     let visible_count = available_rows.min(VISIBLE_ITEMS);
 
-    // Scroll to keep selection visible
-    let scroll = if count == 0 {
+    let scroll = if visible_count == 0 || picker.selected < visible_count {
         0
-    } else if picker.selected < picker.scroll_offset {
-        picker.selected
-    } else if picker.selected >= picker.scroll_offset + visible_count {
-        picker.selected - visible_count + 1
     } else {
-        picker.scroll_offset
+        picker.selected - visible_count + 1
     };
 
     if count == 0 {

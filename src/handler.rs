@@ -385,14 +385,12 @@ fn handle_linear_picker(app: &mut App, action: Action) {
             if let Some(ref mut picker) = app.linear_picker {
                 picker.search.push(c);
                 picker.selected = 0;
-                picker.scroll_offset = 0;
             }
         }
         Action::LinearPickerBackspace => {
             if let Some(ref mut picker) = app.linear_picker {
                 picker.search.pop();
                 picker.selected = 0;
-                picker.scroll_offset = 0;
             }
         }
         Action::LinearPickerSelect => {
@@ -801,5 +799,178 @@ mod tests {
             dialog.prompt, "",
             "edit dialog prompt should stay empty when issue had no prompt"
         );
+    }
+
+    // ================================================================
+    // Linear picker: import and navigation
+    // ================================================================
+
+    fn test_linear_issue(
+        id: &str,
+        identifier: &str,
+        title: &str,
+    ) -> crate::external::linear::LinearIssue {
+        crate::external::linear::LinearIssue {
+            id: id.to_string(),
+            identifier: identifier.to_string(),
+            title: title.to_string(),
+            url: format!("https://linear.app/test/issue/{}", identifier),
+            branch_name: format!("{}-slug", identifier.to_lowercase()),
+            priority: 2,
+            state_name: "In Progress".to_string(),
+            team_key: "TEST".to_string(),
+        }
+    }
+
+    #[test]
+    fn linear_picker_import_creates_issue_in_todo() {
+        let mut app = test_app();
+        app.linear_available = true;
+        app.linear_issues = vec![test_linear_issue("uuid-1", "TEST-1", "First issue")];
+
+        app.open_linear_picker();
+        assert_eq!(app.input_mode, crate::app::InputMode::LinearPicker);
+
+        handle_action(
+            &mut app,
+            Action::LinearPickerSelect,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+
+        assert_eq!(app.input_mode, crate::app::InputMode::Normal);
+        assert_eq!(app.issues.len(), 1);
+        assert_eq!(app.issues[0].id, "test-1");
+        assert_eq!(app.issues[0].title, "First issue");
+        assert_eq!(app.issues[0].column, Column::Todo);
+        assert_eq!(app.issues[0].linear_id, Some("uuid-1".to_string()));
+        assert_eq!(app.issues[0].linear_identifier, Some("TEST-1".to_string()));
+        assert_eq!(app.issues[0].linear_branch, Some("test-1-slug".to_string()));
+    }
+
+    #[test]
+    fn linear_picker_import_rejects_duplicate() {
+        let mut app = test_app();
+        app.linear_available = true;
+        app.linear_issues = vec![test_linear_issue("uuid-1", "TEST-1", "First issue")];
+
+        // Import once
+        app.open_linear_picker();
+        handle_action(
+            &mut app,
+            Action::LinearPickerSelect,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+        assert_eq!(app.issues.len(), 1);
+
+        // Try to import again (should fail since it's already on the board)
+        app.open_linear_picker();
+
+        // The picker should show no issues (uuid-1 is filtered out)
+        let filtered = app.filtered_linear_issues();
+        assert_eq!(filtered.len(), 0);
+    }
+
+    #[test]
+    fn linear_picker_search_filters_issues() {
+        let mut app = test_app();
+        app.linear_available = true;
+        app.linear_issues = vec![
+            test_linear_issue("uuid-1", "TEST-1", "Login page"),
+            test_linear_issue("uuid-2", "TEST-2", "Dashboard bug"),
+        ];
+
+        app.open_linear_picker();
+
+        // Type search
+        handle_action(
+            &mut app,
+            Action::LinearPickerChar('l'),
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+        handle_action(
+            &mut app,
+            Action::LinearPickerChar('o'),
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+        handle_action(
+            &mut app,
+            Action::LinearPickerChar('g'),
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+
+        let filtered = app.filtered_linear_issues();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].identifier, "TEST-1");
+    }
+
+    #[test]
+    fn linear_picker_navigation() {
+        let mut app = test_app();
+        app.linear_available = true;
+        app.linear_issues = vec![
+            test_linear_issue("uuid-1", "TEST-1", "First"),
+            test_linear_issue("uuid-2", "TEST-2", "Second"),
+            test_linear_issue("uuid-3", "TEST-3", "Third"),
+        ];
+
+        app.open_linear_picker();
+        assert_eq!(app.linear_picker.as_ref().unwrap().selected, 0);
+
+        handle_action(
+            &mut app,
+            Action::LinearPickerDown,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+        assert_eq!(app.linear_picker.as_ref().unwrap().selected, 1);
+
+        handle_action(
+            &mut app,
+            Action::LinearPickerDown,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+        assert_eq!(app.linear_picker.as_ref().unwrap().selected, 2);
+
+        // Should not go past the last item
+        handle_action(
+            &mut app,
+            Action::LinearPickerDown,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+        assert_eq!(app.linear_picker.as_ref().unwrap().selected, 2);
+
+        handle_action(
+            &mut app,
+            Action::LinearPickerUp,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+        assert_eq!(app.linear_picker.as_ref().unwrap().selected, 1);
+    }
+
+    #[test]
+    fn linear_picker_close_restores_normal() {
+        let mut app = test_app();
+        app.linear_available = true;
+        app.linear_issues = vec![test_linear_issue("uuid-1", "TEST-1", "First")];
+
+        app.open_linear_picker();
+        handle_action(
+            &mut app,
+            Action::LinearPickerClose,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+        );
+
+        assert_eq!(app.input_mode, crate::app::InputMode::Normal);
+        assert!(app.linear_picker.is_none());
+        assert_eq!(app.issues.len(), 0);
     }
 }

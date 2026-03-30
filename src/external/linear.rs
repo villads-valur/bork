@@ -16,6 +16,7 @@ pub struct LinearIssue {
     pub team_key: String,
 }
 
+#[derive(Debug)]
 pub struct LinearPollResult {
     pub issues: Vec<LinearIssue>,
 }
@@ -29,7 +30,14 @@ pub fn check_available() -> bool {
         .is_ok_and(|s| s.success())
 }
 
-const QUERY: &str = r#"{ viewer { assignedIssues(filter: { state: { type: { nin: ["completed", "canceled"] } } }, first: 50, orderBy: updatedAt) { nodes { id identifier title url branchName priority state { name type } team { key } updatedAt } } } }"#;
+const QUERY: &str = concat!(
+    "{ viewer { assignedIssues(",
+    "filter: { state: { type: { nin: [\"completed\", \"canceled\"] } } }, ",
+    "first: 50, ",
+    "orderBy: updatedAt",
+    ") { nodes { id identifier title url branchName priority ",
+    "state { name } team { key } } } } }",
+);
 
 pub fn fetch_assigned_issues() -> Result<Vec<LinearIssue>, AppError> {
     let output = Command::new("linear")
@@ -105,15 +113,11 @@ struct IssueNode {
     priority: u8,
     state: IssueState,
     team: IssueTeam,
-    #[serde(rename = "updatedAt")]
-    _updated_at: String,
 }
 
 #[derive(Deserialize)]
 struct IssueState {
     name: String,
-    #[serde(rename = "type")]
-    _type: String,
 }
 
 #[derive(Deserialize)]
