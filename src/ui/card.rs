@@ -52,8 +52,12 @@ pub fn render_card(frame: &mut Frame, ctx: &CardContext, area: Rect) {
     // Line 3: Branch + git changes (full width for the branch name)
     let branch_line = format_branch_line(ctx.branch, ctx.git_status, max_width);
 
-    // Line 4: PR info
-    let pr_line = format_pr_line(ctx.pr);
+    // Line 4: PR info or Linear metadata
+    let info_line = if ctx.pr.is_some() {
+        format_pr_line(ctx.pr)
+    } else {
+        format_linear_line(ctx.issue)
+    };
 
     let mut lines = vec![title_line];
     if inner.height > 1 {
@@ -63,7 +67,7 @@ pub fn render_card(frame: &mut Frame, ctx: &CardContext, area: Rect) {
         lines.push(branch_line);
     }
     if inner.height > 3 {
-        lines.push(pr_line);
+        lines.push(info_line);
     }
 
     let paragraph = Paragraph::new(lines);
@@ -123,6 +127,29 @@ fn format_branch_line(
     if !git_spans.is_empty() {
         spans.push(Span::raw(" "));
         spans.extend(git_spans);
+    }
+
+    Line::from(spans)
+}
+
+fn format_linear_line(issue: &Issue) -> Line<'static> {
+    let Some(ref identifier) = issue.linear_identifier else {
+        return Line::from("");
+    };
+
+    let mut spans = vec![
+        Span::raw("  "),
+        Span::styled(
+            format!("\u{25c8} {}", identifier),
+            Style::default().fg(Color::Blue),
+        ),
+    ];
+
+    if let Some(ref state) = issue.linear_state {
+        spans.push(Span::styled(
+            format!(" \u{25cf} {}", state),
+            styles::dim_style(),
+        ));
     }
 
     Line::from(spans)

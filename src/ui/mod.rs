@@ -1,6 +1,7 @@
 pub mod board;
 pub mod card;
 pub mod dialog;
+pub mod linear_picker;
 pub mod status_bar;
 pub mod styles;
 
@@ -23,6 +24,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     board::render_board(frame, app, vertical[1]);
     status_bar::render_footer(frame, app, vertical[2]);
 
-    // Render dialog on top of everything if open
+    // Render overlays on top of the board
     dialog::render_dialog(frame, app);
+    linear_picker::render_linear_picker(frame, app);
 }
