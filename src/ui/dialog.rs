@@ -5,10 +5,11 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::App;
+use crate::external::linear::LinearIssue;
 use crate::types::{AgentKind, AgentMode, IssueKind};
 use crate::ui::styles;
 
-const DIALOG_HEIGHT: u16 = 20;
+const DIALOG_HEIGHT: u16 = 22;
 const DIALOG_MIN_WIDTH: u16 = 44;
 const DIALOG_MAX_WIDTH: u16 = 80;
 const PROMPT_VISIBLE_LINES: usize = 3;
@@ -103,10 +104,11 @@ pub fn render_dialog(frame: &mut Frame, app: &App) {
         field_width,
     );
 
+    let mut next_row = 5 + PROMPT_VISIBLE_LINES as u16 + 1;
+
     if dialog.kind == IssueKind::Agentic {
         // --- Mode field (after the 3-line prompt) ---
-        let mode_row = 5 + PROMPT_VISIBLE_LINES as u16 + 1;
-        let mode_area = Rect::new(inner.x + 1, inner.y + mode_row, inner.width - 2, 1);
+        let mode_area = Rect::new(inner.x + 1, inner.y + next_row, inner.width - 2, 1);
         render_mode_field(
             frame,
             &dialog.agent_mode,
@@ -115,23 +117,52 @@ pub fn render_dialog(frame: &mut Frame, app: &App) {
             dialog.focused_field == 3,
             label_width,
         );
+        next_row += 2;
+    }
+
+    // --- Linear field (after mode for Agentic, after prompt for NonAgentic) ---
+    if dialog.linear_available {
+        let linear_field_idx = dialog.linear_field_index().unwrap_or(99);
+        let linear_area = Rect::new(inner.x + 1, inner.y + next_row, inner.width - 2, 1);
+        render_linear_field(
+            frame,
+            &dialog.linear_issue,
+            linear_area,
+            dialog.focused_field == linear_field_idx,
+            label_width,
+        );
     }
 
     // --- Footer hints ---
     let footer_y = inner.y + inner.height - 2;
+    let on_linear = dialog.is_on_linear_field();
     let submit_hint = if dialog.editing_index.is_some() || dialog.kind == IssueKind::NonAgentic {
         ":save  "
     } else {
         ":start  "
     };
-    let footer = Line::from(vec![
-        Span::styled("Enter", styles::statusbar_key_style()),
-        Span::styled(":next  ", styles::statusbar_desc_style()),
-        Span::styled("Shift+Enter", styles::statusbar_key_style()),
-        Span::styled(submit_hint, styles::statusbar_desc_style()),
-        Span::styled("Esc", styles::statusbar_key_style()),
-        Span::styled(":cancel", styles::statusbar_desc_style()),
-    ]);
+
+    let footer = if on_linear {
+        Line::from(vec![
+            Span::styled("Enter", styles::statusbar_key_style()),
+            Span::styled(":attach  ", styles::statusbar_desc_style()),
+            Span::styled("Bksp", styles::statusbar_key_style()),
+            Span::styled(":detach  ", styles::statusbar_desc_style()),
+            Span::styled("Shift+Enter", styles::statusbar_key_style()),
+            Span::styled(submit_hint, styles::statusbar_desc_style()),
+            Span::styled("Esc", styles::statusbar_key_style()),
+            Span::styled(":cancel", styles::statusbar_desc_style()),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("Enter", styles::statusbar_key_style()),
+            Span::styled(":next  ", styles::statusbar_desc_style()),
+            Span::styled("Shift+Enter", styles::statusbar_key_style()),
+            Span::styled(submit_hint, styles::statusbar_desc_style()),
+            Span::styled("Esc", styles::statusbar_key_style()),
+            Span::styled(":cancel", styles::statusbar_desc_style()),
+        ])
+    };
     let footer_area = Rect::new(inner.x + 1, footer_y, inner.width - 2, 1);
     frame.render_widget(Paragraph::new(footer), footer_area);
 }
@@ -418,6 +449,43 @@ fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
     }
 
     lines
+}
+
+fn render_linear_field(
+    frame: &mut Frame,
+    linear_issue: &Option<LinearIssue>,
+    area: Rect,
+    focused: bool,
+    label_width: usize,
+) {
+    let label_style = field_label_style(focused);
+
+    let mut spans = vec![Span::styled(
+        format!("{:<width$}", "Linear:", width = label_width),
+        label_style,
+    )];
+
+    match linear_issue {
+        Some(li) => {
+            spans.push(Span::styled(
+                &li.identifier,
+                Style::default()
+                    .fg(styles::ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            let remaining = area.width as usize - label_width - li.identifier.len() - 3;
+            if remaining > 4 {
+                let title_display: String = li.title.chars().take(remaining).collect();
+                spans.push(Span::styled(" \u{2022} ", styles::dim_style()));
+                spans.push(Span::styled(title_display, styles::dim_style()));
+            }
+        }
+        None => {
+            spans.push(Span::styled("\u{2014}", styles::dim_style()));
+        }
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_mode_field(

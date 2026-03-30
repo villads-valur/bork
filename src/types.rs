@@ -229,6 +229,10 @@ pub struct Issue {
     pub linear_state: Option<String>,
     #[serde(default)]
     pub linear_branch: Option<String>,
+    /// True when the issue was imported from Linear (title syncs with Linear).
+    /// False when a Linear issue was attached to an existing bork issue.
+    #[serde(default)]
+    pub linear_imported: bool,
     /// PR number if this issue was auto-imported from a GitHub PR.
     #[serde(default)]
     pub pr_number: Option<u32>,
@@ -312,6 +316,7 @@ mod tests {
             linear_url: None,
             linear_state: None,
             linear_branch: None,
+            linear_imported: false,
             pr_number: None,
         }
     }

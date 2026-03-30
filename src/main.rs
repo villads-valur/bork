@@ -470,7 +470,10 @@ fn run_tui() -> anyhow::Result<()> {
                     if let Some(ref lid) = issue.linear_id {
                         if let Some(fresh) = app.linear_issues.iter().find(|i| i.id == *lid) {
                             issue.linear_state = Some(fresh.state_name.clone());
-                            issue.title = fresh.title.clone();
+                            // Only sync title for imported issues (not manually attached)
+                            if issue.linear_imported {
+                                issue.title = fresh.title.clone();
+                            }
                         }
                     }
                 }
