@@ -93,6 +93,7 @@ fn map_linear_picker_key(key: KeyEvent) -> Action {
             KeyCode::Char('c') => Action::LinearPickerClose,
             KeyCode::Char('n') => Action::LinearPickerDown,
             KeyCode::Char('p') => Action::LinearPickerUp,
+            KeyCode::Char('r') => Action::LinearPickerRefresh,
             _ => Action::Noop,
         };
     }
