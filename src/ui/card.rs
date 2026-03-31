@@ -7,7 +7,7 @@ use ratatui::Frame;
 use crate::types::{AgentStatus, Issue, IssueKind, PrState, PrStatus, WorktreeStatus};
 use crate::ui::styles;
 
-pub const CARD_HEIGHT: u16 = 6;
+pub const CARD_HEIGHT: u16 = 7;
 
 pub struct CardContext<'a> {
     pub issue: &'a Issue,
@@ -52,12 +52,11 @@ pub fn render_card(frame: &mut Frame, ctx: &CardContext, area: Rect) {
     // Line 3: Branch + git changes (full width for the branch name)
     let branch_line = format_branch_line(ctx.branch, ctx.git_status, max_width);
 
-    // Line 4: PR info or Linear metadata
-    let info_line = if ctx.pr.is_some() {
-        format_pr_line(ctx.pr)
-    } else {
-        format_linear_line(ctx.issue)
-    };
+    // Line 4: Linear metadata
+    let linear_line = format_linear_line(ctx.issue);
+
+    // Line 5: PR info
+    let pr_line = format_pr_line(ctx.pr);
 
     let mut lines = vec![title_line];
     if inner.height > 1 {
@@ -67,7 +66,10 @@ pub fn render_card(frame: &mut Frame, ctx: &CardContext, area: Rect) {
         lines.push(branch_line);
     }
     if inner.height > 3 {
-        lines.push(info_line);
+        lines.push(linear_line);
+    }
+    if inner.height > 4 {
+        lines.push(pr_line);
     }
 
     let paragraph = Paragraph::new(lines);
