@@ -56,6 +56,7 @@ const SECTIONS: &[Section] = &[
             ("/", "Search"),
             ("P", "Sync PRs"),
             ("o", "Open PR in browser"),
+            ("O", "Open in Linear"),
             ("I", "Import from Linear"),
             ("W", "Assign worktree"),
             ("q", "Quit"),
