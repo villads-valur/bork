@@ -36,7 +36,11 @@ const SECTIONS: &[Section] = &[
     },
     Section {
         title: "Sessions",
-        bindings: &[("Enter", "Open session"), ("x", "Kill session")],
+        bindings: &[
+            ("Enter", "Open session"),
+            ("t", "Terminal"),
+            ("x", "Kill session"),
+        ],
     },
     Section {
         title: "Move Issues",

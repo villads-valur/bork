@@ -101,6 +101,7 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         ("h/l", "focus"),
         ("j/k", "nav"),
         ("Enter", "open"),
+        ("t", "term"),
         ("a", "add"),
         ("n", "new"),
         ("?", "help"),

@@ -8,6 +8,7 @@ pub enum Action {
     JumpColumnLeft,
     JumpColumnRight,
     OpenSession,
+    OpenTerminal,
     KillSession,
     MoveIssueLeft,
     MoveIssueRight,

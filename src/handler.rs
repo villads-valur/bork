@@ -193,6 +193,28 @@ fn handle_normal(
             PostAction::None
         }
 
+        Action::OpenTerminal => {
+            let session_name = format!("{}-terminal", app.config.project_name);
+            let popup_title = "Terminal".to_string();
+
+            if app.is_session_alive(&session_name) {
+                return PostAction::OpenTmuxPopup {
+                    session_name,
+                    popup_title,
+                };
+            }
+
+            if let Err(e) = tmux::create_session(&session_name, &app.config.project_root) {
+                app.set_message(format!("Failed to open terminal: {e}"));
+                return PostAction::None;
+            }
+
+            PostAction::OpenTmuxPopup {
+                session_name,
+                popup_title,
+            }
+        }
+
         Action::OpenSession => {
             let Some(idx) = app.selected_issue_index() else {
                 return PostAction::None;

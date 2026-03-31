@@ -34,6 +34,7 @@ fn map_normal_key(key: KeyEvent) -> Action {
         KeyCode::BackTab => Action::JumpColumnLeft,
 
         KeyCode::Enter => Action::OpenSession,
+        KeyCode::Char('t') => Action::OpenTerminal,
         KeyCode::Char('x') => Action::KillSession,
 
         KeyCode::Char('n') => Action::CreateIssue,
