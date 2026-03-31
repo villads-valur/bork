@@ -380,6 +380,16 @@ fn handle_dialog(app: &mut App, action: Action) {
             }
         }
 
+        Action::DialogScrollUp => {
+            if let Some(ref mut dialog) = app.dialog {
+                dialog.scroll_prompt_up();
+            }
+        }
+        Action::DialogScrollDown => {
+            if let Some(ref mut dialog) = app.dialog {
+                dialog.scroll_prompt_down();
+            }
+        }
         Action::DialogNextField => {
             if let Some(ref mut dialog) = app.dialog {
                 if dialog.next_field() {
@@ -759,7 +769,7 @@ mod tests {
         let mut app = test_app();
         app.open_dialog();
 
-        // Type a title
+        // Type a title (starts on Title field = 2 for Agentic, no linear)
         handle_action(
             &mut app,
             Action::DialogChar('H'),
@@ -775,7 +785,7 @@ mod tests {
             &linear_wake_tx(),
         );
 
-        // Move from title (field 1) to prompt (field 2)
+        // Move from title (field 2) to prompt (field 3)
         handle_action(
             &mut app,
             Action::DialogNextField,
@@ -785,7 +795,7 @@ mod tests {
         );
 
         let dialog = app.dialog.as_ref().unwrap();
-        assert_eq!(dialog.focused_field, 2);
+        assert_eq!(dialog.focused_field, 3);
         assert_eq!(
             dialog.prompt, "",
             "prompt should remain empty after navigating from title"
@@ -831,17 +841,11 @@ mod tests {
         let mut app = test_app();
         app.open_dialog();
 
-        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 1);
-
-        handle_action(
-            &mut app,
-            Action::DialogNextField,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-        );
+        // Agentic, no linear: Kind(0), Mode(1), Title(2), Prompt(3)
+        // Starts on Title (field 2)
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 2);
 
+        // Tab: Title(2) -> Prompt(3)
         handle_action(
             &mut app,
             Action::DialogNextField,
@@ -850,7 +854,7 @@ mod tests {
             &linear_wake_tx(),
         );
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 3);
-        // Field 3 is the last (mode). Next field from here submits the dialog.
+        // Field 3 is the last (prompt). Next field from here submits the dialog.
     }
 
     #[test]
@@ -858,7 +862,7 @@ mod tests {
         let mut app = test_app();
         app.open_dialog();
 
-        // Advance to prompt
+        // Starts on Title (field 2). Advance to Prompt (field 3)
         handle_action(
             &mut app,
             Action::DialogNextField,
@@ -866,9 +870,9 @@ mod tests {
             &pr_wake_tx(),
             &linear_wake_tx(),
         );
-        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 2);
+        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 3);
 
-        // Go back to title
+        // Go back to Title (field 2)
         handle_action(
             &mut app,
             Action::DialogPrevField,
@@ -876,7 +880,7 @@ mod tests {
             &pr_wake_tx(),
             &linear_wake_tx(),
         );
-        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 1);
+        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 2);
     }
 
     #[test]
@@ -1271,32 +1275,12 @@ mod tests {
         let issue = app.issues[0].clone();
         app.open_edit_dialog(&issue, 0);
 
-        // Should start on title (field 1)
-        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 1);
-        // Agentic + linear_available = 5 fields (0..4)
+        // Agentic + linear: Kind(0), Mode(1), Linear(2), Title(3), Prompt(4)
+        // Should start on Title (field 3)
+        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 3);
         assert_eq!(app.dialog.as_ref().unwrap().active_field_count(), 5);
 
-        // Tab: title(1) -> prompt(2)
-        handle_action(
-            &mut app,
-            Action::DialogNextField,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-        );
-        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 2);
-
-        // Tab: prompt(2) -> mode(3)
-        handle_action(
-            &mut app,
-            Action::DialogNextField,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-        );
-        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 3);
-
-        // Tab: mode(3) -> linear(4)
+        // Tab: Title(3) -> Prompt(4)
         handle_action(
             &mut app,
             Action::DialogNextField,
@@ -1305,9 +1289,8 @@ mod tests {
             &linear_wake_tx(),
         );
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 4);
-        assert!(app.dialog.as_ref().unwrap().is_on_linear_field());
 
-        // Tab on linear field should submit
+        // Tab on Prompt (last field) should submit
         handle_action(
             &mut app,
             Action::DialogNextField,
@@ -1351,7 +1334,8 @@ mod tests {
         let issue = app.issues[0].clone();
         app.open_edit_dialog(&issue, 0);
 
-        // Tab through to linear field
+        // Agentic + linear: Kind(0), Mode(1), Linear(2), Title(3), Prompt(4)
+        // Starts on Title(3). Tab to Prompt(4), then tab submits.
         handle_action(
             &mut app,
             Action::DialogNextField,
@@ -1359,23 +1343,9 @@ mod tests {
             &pr_wake_tx(),
             &linear_wake_tx(),
         );
-        handle_action(
-            &mut app,
-            Action::DialogNextField,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-        );
-        handle_action(
-            &mut app,
-            Action::DialogNextField,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-        );
-        assert!(app.dialog.as_ref().unwrap().is_on_linear_field());
+        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 4);
 
-        // Tab on linear field should submit even without issues loaded
+        // Tab on Prompt (last field) should submit even without linear issues loaded
         handle_action(
             &mut app,
             Action::DialogNextField,
@@ -1386,7 +1356,7 @@ mod tests {
         assert_eq!(app.input_mode, crate::app::InputMode::Normal);
         assert!(
             app.dialog.is_none(),
-            "dialog should close on tab from linear field"
+            "dialog should close on tab from last field"
         );
     }
 
@@ -1420,31 +1390,9 @@ mod tests {
         let issue = app.issues[0].clone();
         app.open_edit_dialog(&issue, 0);
 
-        // Tab to linear field
-        handle_action(
-            &mut app,
-            Action::DialogNextField,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-        );
-        handle_action(
-            &mut app,
-            Action::DialogNextField,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-        );
-        handle_action(
-            &mut app,
-            Action::DialogNextField,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-        );
-        assert!(app.dialog.as_ref().unwrap().is_on_linear_field());
+        // Starts on Title(3). Shift+Enter should submit from any field.
+        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 3);
 
-        // Shift+Enter should submit from linear field
         handle_action(
             &mut app,
             Action::DialogSubmit,

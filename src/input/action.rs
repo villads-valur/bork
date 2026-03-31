@@ -35,6 +35,8 @@ pub enum Action {
     DialogClearToStart,
     DialogNextField,
     DialogPrevField,
+    DialogScrollUp,
+    DialogScrollDown,
     DialogSubmit,
     DialogCancel,
     SearchStart,
