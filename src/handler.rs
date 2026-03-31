@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
 
@@ -271,6 +272,20 @@ fn handle_normal(
             let main_worktree = app.config.project_root.join("main");
             thread::spawn(move || {
                 github::open_pr_in_browser(pr_number, &main_worktree);
+            });
+            PostAction::None
+        }
+
+        Action::OpenLinear => {
+            let Some(issue) = app.selected_issue() else {
+                return PostAction::None;
+            };
+            let Some(url) = issue.linear_url.clone() else {
+                app.set_message("No Linear issue linked");
+                return PostAction::None;
+            };
+            thread::spawn(move || {
+                let _ = Command::new("open").arg(&url).output();
             });
             PostAction::None
         }
