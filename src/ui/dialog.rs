@@ -1,18 +1,20 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{
+    Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 use ratatui::Frame;
 
-use crate::app::App;
+use crate::app::{App, DialogField};
 use crate::external::linear::LinearIssue;
 use crate::types::{AgentKind, AgentMode, IssueKind};
 use crate::ui::styles;
 
-const DIALOG_HEIGHT: u16 = 22;
+const DIALOG_HEIGHT: u16 = 34;
 const DIALOG_MIN_WIDTH: u16 = 44;
 const DIALOG_MAX_WIDTH: u16 = 80;
-const PROMPT_VISIBLE_LINES: usize = 3;
+const PROMPT_VISIBLE_LINES: usize = 12;
 
 pub fn render_dialog(frame: &mut Frame, app: &App) {
     let dialog = match &app.dialog {
@@ -58,82 +60,84 @@ pub fn render_dialog(frame: &mut Frame, app: &App) {
     let field_width = inner.width.saturating_sub(2) as usize;
     let label_width = 10;
 
-    // --- Kind field (row 1) ---
-    let kind_area = Rect::new(inner.x + 1, inner.y + 1, inner.width - 2, 1);
+    let mut next_row: u16 = 1;
+
+    let kind_area = Rect::new(inner.x + 1, inner.y + next_row, inner.width - 2, 1);
     render_kind_field(
         frame,
         dialog.kind,
         kind_area,
-        dialog.focused_field == 0,
+        dialog.current_field() == DialogField::Kind,
         label_width,
     );
-
-    // --- Title field (row 3) ---
-    let title_area = Rect::new(inner.x + 1, inner.y + 3, inner.width - 2, 1);
-    render_single_line_field(
-        frame,
-        "Title:",
-        &dialog.title,
-        dialog.title_cursor,
-        title_area,
-        dialog.focused_field == 1,
-        label_width,
-        field_width,
-    );
-
-    // --- Prompt/notes field (rows 5-7, 3 visible lines) ---
-    let prompt_label = if dialog.kind == IssueKind::NonAgentic {
-        "Notes:"
-    } else {
-        "Prompt:"
-    };
-    let prompt_area = Rect::new(
-        inner.x + 1,
-        inner.y + 5,
-        inner.width - 2,
-        PROMPT_VISIBLE_LINES as u16,
-    );
-    render_multiline_field(
-        frame,
-        prompt_label,
-        &dialog.prompt,
-        dialog.prompt_cursor,
-        prompt_area,
-        dialog.focused_field == 2,
-        label_width,
-        field_width,
-    );
-
-    let mut next_row = 5 + PROMPT_VISIBLE_LINES as u16 + 1;
+    next_row += 2;
 
     if dialog.kind == IssueKind::Agentic {
-        // --- Mode field (after the 3-line prompt) ---
         let mode_area = Rect::new(inner.x + 1, inner.y + next_row, inner.width - 2, 1);
         render_mode_field(
             frame,
             &dialog.agent_mode,
             dialog.agent_kind,
             mode_area,
-            dialog.focused_field == 3,
+            dialog.current_field() == DialogField::Mode,
             label_width,
         );
         next_row += 2;
     }
 
-    // --- Linear field (after mode for Agentic, after prompt for NonAgentic) ---
     if dialog.linear_available {
-        let linear_field_idx = dialog.linear_field_index().unwrap_or(99);
         let linear_area = Rect::new(inner.x + 1, inner.y + next_row, inner.width - 2, 1);
         render_linear_field(
             frame,
             &dialog.linear_issue,
             linear_area,
-            dialog.focused_field == linear_field_idx,
+            dialog.current_field() == DialogField::Linear,
             label_width,
         );
+        next_row += 2;
     }
 
-    // --- Footer hints ---
+    let title_area = Rect::new(inner.x + 1, inner.y + next_row, inner.width - 2, 1);
+    render_single_line_field(
+        frame,
+        "Title:",
+        &dialog.title,
+        dialog.title_cursor,
+        title_area,
+        dialog.current_field() == DialogField::Title,
+        label_width,
+        field_width,
+    );
+    next_row += 2;
+
+    let prompt_label = if dialog.kind == IssueKind::NonAgentic {
+        "Notes:"
+    } else {
+        "Prompt:"
+    };
+
+    let available_for_prompt = inner.height.saturating_sub(next_row + 2) as usize;
+    let visible_lines = available_for_prompt.min(PROMPT_VISIBLE_LINES).max(3);
+
+    let prompt_area = Rect::new(
+        inner.x + 1,
+        inner.y + next_row,
+        inner.width - 2,
+        visible_lines as u16,
+    );
+    let is_prompt_focused = dialog.current_field() == DialogField::Prompt;
+    render_multiline_field(
+        frame,
+        prompt_label,
+        &dialog.prompt,
+        dialog.prompt_cursor,
+        dialog.prompt_scroll_offset,
+        prompt_area,
+        is_prompt_focused,
+        label_width,
+        field_width,
+    );
+
     let footer_y = inner.y + inner.height - 2;
     let on_linear = dialog.is_on_linear_field();
     let submit_hint = if dialog.editing_index.is_some() || dialog.kind == IssueKind::NonAgentic {
@@ -210,6 +214,7 @@ fn render_multiline_field(
     label: &str,
     value: &str,
     cursor: usize,
+    scroll_offset: usize,
     area: Rect,
     focused: bool,
     label_width: usize,
@@ -218,21 +223,26 @@ fn render_multiline_field(
     let label_style = field_label_style(focused);
     let value_style = field_value_style(focused);
 
-    let chars_per_line = field_width.saturating_sub(label_width + 1);
-    if chars_per_line == 0 {
+    let content_width = field_width.saturating_sub(label_width + 2); // reserve scrollbar column
+    if content_width == 0 {
         return;
     }
 
-    // Word-wrap the value into visual lines
-    let wrapped = wrap_text(value, chars_per_line);
+    let wrapped = wrap_text(value, content_width);
     let visible_lines = area.height as usize;
 
     let line_count = wrapped.len().max(1);
     let cursor_line = cursor_line_index(&wrapped, cursor.min(value.chars().count()));
-    let mut start = 0usize;
-    if line_count > visible_lines && cursor_line + 1 > visible_lines {
+
+    // Start from scroll offset, but ensure cursor stays visible
+    let mut start = scroll_offset;
+    if cursor_line < start {
+        start = cursor_line;
+    } else if cursor_line >= start + visible_lines {
         start = cursor_line + 1 - visible_lines;
     }
+    start = start.min(line_count.saturating_sub(visible_lines));
+
     let end = (start + visible_lines).min(line_count);
     let visible = if wrapped.is_empty() {
         Vec::new()
@@ -246,18 +256,16 @@ fn render_multiline_field(
             break;
         }
 
-        let prefix = if i == 0 {
+        let prefix = if i == 0 && start == 0 {
             format!("{:<width$}", label, width = label_width)
         } else {
             " ".repeat(label_width)
         };
 
-        let prefix_style = if i == 0 { label_style } else { label_style };
-
         let is_cursor_line = start + i == cursor_line;
 
         let mut spans = vec![
-            Span::styled(prefix, prefix_style),
+            Span::styled(prefix, label_style),
             Span::styled(line_text.clone(), value_style),
         ];
 
@@ -269,11 +277,10 @@ fn render_multiline_field(
         }
 
         let line = Line::from(spans);
-        let line_area = Rect::new(area.x, y, area.width, 1);
+        let line_area = Rect::new(area.x, y, area.width.saturating_sub(1), 1);
         frame.render_widget(Paragraph::new(line), line_area);
     }
 
-    // If value is empty and we have space, show cursor on first line
     if wrapped.is_empty() {
         let mut spans = vec![Span::styled(
             format!("{:<width$}", label, width = label_width),
@@ -286,7 +293,20 @@ fn render_multiline_field(
             ));
         }
         let line = Line::from(spans);
-        frame.render_widget(Paragraph::new(line), area);
+        let empty_area = Rect::new(area.x, area.y, area.width.saturating_sub(1), 1);
+        frame.render_widget(Paragraph::new(line), empty_area);
+    }
+
+    if line_count > visible_lines {
+        let scrollbar_area = Rect::new(area.x + area.width - 1, area.y, 1, area.height);
+        let mut scrollbar_state =
+            ScrollbarState::new(line_count.saturating_sub(visible_lines)).position(start);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(Some("\u{2502}"))
+            .thumb_symbol("\u{2588}");
+        frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
     }
 }
 

@@ -43,15 +43,25 @@ pub enum LinearPickerContext {
     Attach,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogField {
+    Kind,
+    Mode,
+    Linear,
+    Title,
+    Prompt,
+}
+
 pub struct DialogState {
     pub kind: IssueKind,
     pub title: String,
     pub title_cursor: usize,
     pub prompt: String,
     pub prompt_cursor: usize,
+    pub prompt_scroll_offset: usize,
     pub agent_mode: AgentMode,
     pub agent_kind: AgentKind,
-    pub focused_field: usize, // 0=kind, 1=title, 2=prompt, 3=mode, 4=linear
+    pub focused_field: usize, // index into ordered field list (see current_field())
     pub editing_index: Option<usize>,
     pub target_column: Option<Column>,
     pub linear_issue: Option<LinearIssue>,
@@ -61,15 +71,18 @@ pub struct DialogState {
 
 impl DialogState {
     pub fn new(agent_kind: AgentKind, linear_available: bool) -> Self {
+        let kind = IssueKind::Agentic;
+        let title_idx = Self::compute_title_index(kind, linear_available);
         DialogState {
-            kind: IssueKind::Agentic,
+            kind,
             title: String::new(),
             title_cursor: 0,
             prompt: String::new(),
             prompt_cursor: 0,
+            prompt_scroll_offset: 0,
             agent_mode: AgentMode::Plan,
             agent_kind,
-            focused_field: 1,
+            focused_field: title_idx,
             editing_index: None,
             target_column: None,
             linear_issue: None,
@@ -95,15 +108,17 @@ impl DialogState {
             None
         };
 
+        let title_idx = Self::compute_title_index(issue.kind, linear_available);
         DialogState {
             kind: issue.kind,
             title: issue.title.clone(),
             title_cursor: issue.title.chars().count(),
             prompt_cursor: prompt.chars().count(),
             prompt,
+            prompt_scroll_offset: 0,
             agent_mode: issue.agent_mode,
             agent_kind: issue.agent_kind,
-            focused_field: 1,
+            focused_field: title_idx,
             editing_index: Some(index),
             target_column: None,
             linear_issue,
@@ -112,30 +127,58 @@ impl DialogState {
         }
     }
 
-    pub fn active_field_count(&self) -> usize {
-        let base = match self.kind {
-            IssueKind::Agentic => 4,    // kind, title, prompt, mode
-            IssueKind::NonAgentic => 3, // kind, title, prompt
+    /// Field order: Kind, [Mode if Agentic], [Linear if available], Title, Prompt
+    pub fn current_field(&self) -> DialogField {
+        let fields: &[DialogField] = match (self.kind == IssueKind::Agentic, self.linear_available)
+        {
+            (true, true) => &[
+                DialogField::Kind,
+                DialogField::Mode,
+                DialogField::Linear,
+                DialogField::Title,
+                DialogField::Prompt,
+            ],
+            (true, false) => &[
+                DialogField::Kind,
+                DialogField::Mode,
+                DialogField::Title,
+                DialogField::Prompt,
+            ],
+            (false, true) => &[
+                DialogField::Kind,
+                DialogField::Linear,
+                DialogField::Title,
+                DialogField::Prompt,
+            ],
+            (false, false) => &[DialogField::Kind, DialogField::Title, DialogField::Prompt],
         };
-        if self.linear_available {
-            base + 1
-        } else {
-            base
-        }
+        fields[self.focused_field.min(fields.len() - 1)]
     }
 
-    pub fn linear_field_index(&self) -> Option<usize> {
-        if !self.linear_available {
-            return None;
+    pub fn active_field_count(&self) -> usize {
+        let mut count = 3; // kind + title + prompt
+        if self.kind == IssueKind::Agentic {
+            count += 1;
         }
-        Some(match self.kind {
-            IssueKind::Agentic => 4,
-            IssueKind::NonAgentic => 3,
-        })
+        if self.linear_available {
+            count += 1;
+        }
+        count
+    }
+
+    fn compute_title_index(kind: IssueKind, linear_available: bool) -> usize {
+        let mut idx = 1; // after kind
+        if kind == IssueKind::Agentic {
+            idx += 1;
+        }
+        if linear_available {
+            idx += 1;
+        }
+        idx
     }
 
     pub fn is_on_linear_field(&self) -> bool {
-        self.linear_field_index() == Some(self.focused_field)
+        self.current_field() == DialogField::Linear
     }
 
     pub fn next_field(&mut self) -> bool {
@@ -153,28 +196,30 @@ impl DialogState {
         }
     }
 
-    pub fn push_char(&mut self, c: char) {
-        // Linear field is handled by the handler, not here
-        if self.is_on_linear_field() {
-            return;
+    fn clamp_focused_field(&mut self) {
+        let max = self.active_field_count() - 1;
+        if self.focused_field > max {
+            self.focused_field = max;
         }
+    }
 
-        match self.focused_field {
-            0 => {
-                if c == ' ' {
-                    self.kind = match self.kind {
-                        IssueKind::Agentic => IssueKind::NonAgentic,
-                        IssueKind::NonAgentic => IssueKind::Agentic,
-                    };
-                } else if c == 'h' {
-                    self.kind = IssueKind::Agentic;
-                } else if c == 'l' {
-                    self.kind = IssueKind::NonAgentic;
+    pub fn push_char(&mut self, c: char) {
+        match self.current_field() {
+            DialogField::Kind => {
+                match c {
+                    ' ' => {
+                        self.kind = match self.kind {
+                            IssueKind::Agentic => IssueKind::NonAgentic,
+                            IssueKind::NonAgentic => IssueKind::Agentic,
+                        };
+                    }
+                    'h' => self.kind = IssueKind::Agentic,
+                    'l' => self.kind = IssueKind::NonAgentic,
+                    _ => {}
                 }
+                self.clamp_focused_field();
             }
-            1 => insert_char(&mut self.title, &mut self.title_cursor, c),
-            2 => insert_char(&mut self.prompt, &mut self.prompt_cursor, c),
-            3 => {
+            DialogField::Mode => {
                 if c == ' ' || c == 'h' || c == 'l' {
                     self.agent_mode = match self.agent_kind {
                         AgentKind::Claude => self.agent_mode.next_for_claude(),
@@ -182,72 +227,91 @@ impl DialogState {
                     };
                 }
             }
-            _ => {}
+            DialogField::Linear => {}
+            DialogField::Title => insert_char(&mut self.title, &mut self.title_cursor, c),
+            DialogField::Prompt => insert_char(&mut self.prompt, &mut self.prompt_cursor, c),
         }
     }
 
     pub fn delete_char(&mut self) {
-        match self.focused_field {
-            1 => delete_char_before_cursor(&mut self.title, &mut self.title_cursor),
-            2 => delete_char_before_cursor(&mut self.prompt, &mut self.prompt_cursor),
+        match self.current_field() {
+            DialogField::Title => {
+                delete_char_before_cursor(&mut self.title, &mut self.title_cursor)
+            }
+            DialogField::Prompt => {
+                delete_char_before_cursor(&mut self.prompt, &mut self.prompt_cursor)
+            }
             _ => {}
         }
     }
 
     pub fn delete_char_forward(&mut self) {
-        match self.focused_field {
-            1 => delete_char_at_cursor(&mut self.title, self.title_cursor),
-            2 => delete_char_at_cursor(&mut self.prompt, self.prompt_cursor),
+        match self.current_field() {
+            DialogField::Title => delete_char_at_cursor(&mut self.title, self.title_cursor),
+            DialogField::Prompt => delete_char_at_cursor(&mut self.prompt, self.prompt_cursor),
             _ => {}
         }
     }
 
     pub fn move_cursor_left(&mut self) {
-        match self.focused_field {
-            1 => self.title_cursor = self.title_cursor.saturating_sub(1),
-            2 => self.prompt_cursor = self.prompt_cursor.saturating_sub(1),
+        match self.current_field() {
+            DialogField::Title => self.title_cursor = self.title_cursor.saturating_sub(1),
+            DialogField::Prompt => self.prompt_cursor = self.prompt_cursor.saturating_sub(1),
             _ => {}
         }
     }
 
     pub fn move_cursor_right(&mut self) {
-        match self.focused_field {
-            1 => self.title_cursor = (self.title_cursor + 1).min(self.title.chars().count()),
-            2 => self.prompt_cursor = (self.prompt_cursor + 1).min(self.prompt.chars().count()),
+        match self.current_field() {
+            DialogField::Title => {
+                self.title_cursor = (self.title_cursor + 1).min(self.title.chars().count())
+            }
+            DialogField::Prompt => {
+                self.prompt_cursor = (self.prompt_cursor + 1).min(self.prompt.chars().count())
+            }
             _ => {}
         }
     }
 
     pub fn move_cursor_start(&mut self) {
-        match self.focused_field {
-            1 => self.title_cursor = 0,
-            2 => self.prompt_cursor = 0,
+        match self.current_field() {
+            DialogField::Title => self.title_cursor = 0,
+            DialogField::Prompt => self.prompt_cursor = 0,
             _ => {}
         }
     }
 
     pub fn move_cursor_end(&mut self) {
-        match self.focused_field {
-            1 => self.title_cursor = self.title.chars().count(),
-            2 => self.prompt_cursor = self.prompt.chars().count(),
+        match self.current_field() {
+            DialogField::Title => self.title_cursor = self.title.chars().count(),
+            DialogField::Prompt => self.prompt_cursor = self.prompt.chars().count(),
             _ => {}
         }
     }
 
     pub fn delete_word_backward(&mut self) {
-        match self.focused_field {
-            1 => delete_word_backward(&mut self.title, &mut self.title_cursor),
-            2 => delete_word_backward(&mut self.prompt, &mut self.prompt_cursor),
+        match self.current_field() {
+            DialogField::Title => delete_word_backward(&mut self.title, &mut self.title_cursor),
+            DialogField::Prompt => delete_word_backward(&mut self.prompt, &mut self.prompt_cursor),
             _ => {}
         }
     }
 
     pub fn clear_to_start(&mut self) {
-        match self.focused_field {
-            1 => clear_to_start(&mut self.title, &mut self.title_cursor),
-            2 => clear_to_start(&mut self.prompt, &mut self.prompt_cursor),
+        match self.current_field() {
+            DialogField::Title => clear_to_start(&mut self.title, &mut self.title_cursor),
+            DialogField::Prompt => clear_to_start(&mut self.prompt, &mut self.prompt_cursor),
             _ => {}
         }
+    }
+
+    pub fn scroll_prompt_up(&mut self) {
+        self.prompt_scroll_offset = self.prompt_scroll_offset.saturating_sub(1);
+    }
+
+    pub fn scroll_prompt_down(&mut self) {
+        // Increment freely; the rendering code clamps to valid range
+        self.prompt_scroll_offset += 1;
     }
 }
 
@@ -1728,7 +1792,7 @@ mod tests {
     fn dialog_claude_mode_cycles_plan_build_yolo() {
         let mut d = claude_dialog();
         assert_eq!(d.agent_mode, crate::types::AgentMode::Plan);
-        d.focused_field = 3;
+        d.focused_field = 1; // Mode field (Agentic, no linear)
         d.push_char(' ');
         assert_eq!(d.agent_mode, crate::types::AgentMode::Build);
         d.push_char(' ');
@@ -1740,7 +1804,7 @@ mod tests {
     #[test]
     fn dialog_opencode_mode_cycles_plan_build_only() {
         let mut d = opencode_dialog();
-        d.focused_field = 3;
+        d.focused_field = 1; // Mode field (Agentic, no linear)
         d.push_char(' ');
         assert_eq!(d.agent_mode, crate::types::AgentMode::Build);
         d.push_char(' ');
@@ -1752,7 +1816,7 @@ mod tests {
     #[test]
     fn dialog_mode_toggle_with_h_and_l_keys() {
         let mut d = claude_dialog();
-        d.focused_field = 3;
+        d.focused_field = 1; // Mode field (Agentic, no linear)
         d.push_char('l');
         assert_eq!(d.agent_mode, crate::types::AgentMode::Build);
         d.push_char('h');
@@ -1780,13 +1844,15 @@ mod tests {
     fn dialog_new_defaults_to_agentic_with_title_focused() {
         let d = DialogState::new(crate::types::AgentKind::OpenCode, false);
         assert_eq!(d.kind, IssueKind::Agentic);
-        assert_eq!(d.focused_field, 1);
+        // Agentic, no linear: Kind(0), Mode(1), Title(2)
+        assert_eq!(d.focused_field, 2);
     }
 
     #[test]
     fn dialog_prompt_supports_normal_edit_commands() {
         let mut d = DialogState::new(crate::types::AgentKind::OpenCode, false);
-        d.focused_field = 2;
+        // Agentic, no linear: Kind(0), Mode(1), Title(2), Prompt(3)
+        d.focused_field = 3;
 
         for c in "todo note".chars() {
             d.push_char(c);

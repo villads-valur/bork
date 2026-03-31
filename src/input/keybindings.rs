@@ -130,6 +130,8 @@ fn map_dialog_key(key: KeyEvent) -> Action {
             KeyCode::Char('u') => Action::DialogClearToStart,
             KeyCode::Char('a') => Action::DialogMoveStart,
             KeyCode::Char('e') => Action::DialogMoveEnd,
+            KeyCode::Up => Action::DialogScrollUp,
+            KeyCode::Down => Action::DialogScrollDown,
             _ => Action::Noop,
         };
     }
