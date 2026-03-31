@@ -13,9 +13,7 @@
 ---
 
 <p align="center">
-  <img src="assets/board-dark.png" alt="bork – dark theme" width="720">
-  <br>
-  <img src="assets/board-light.png" alt="bork – light theme" width="720">
+  <img src="assets/board-light.png" alt="bork kanban board" width="720">
   <br>
   <sub>Adapts to your terminal theme (ANSI 16 colors)</sub>
 </p>
@@ -69,6 +67,10 @@ Press `n` to create an issue, `Enter` to launch an agent session. You're up and 
 - **Plan, Build, and Yolo modes** &mdash; Toggle between modes per issue; Claude also supports Yolo (skips all permission prompts)
 - **Vim-style navigation** &mdash; h/j/k/l, g/G, and familiar modal keybindings
 - **ANSI 16 colors** &mdash; Adapts to any terminal theme, no hardcoded RGB
+- **Linear integration** &mdash; Import and attach Linear issues, sync state bidirectionally, open in Linear with a keypress
+- **Auto-import PRs** &mdash; Open PRs authored by you are automatically added to the Code Review column
+- **Search and filter** &mdash; Type `/` to fuzzy-filter the board by title or issue ID
+- **Issue kinds** &mdash; Agentic issues launch AI sessions; non-agentic "todo" items skip the agent entirely
 - **Zero-dependency state** &mdash; JSON file persistence with atomic writes, no database
 
 ## Requirements
@@ -78,8 +80,8 @@ Press `n` to create an issue, `Enter` to launch an agent session. You're up and 
 | [tmux](https://github.com/tmux/tmux) | Session management and popup overlays |
 | [git](https://git-scm.com/) | Worktree status and branch detection |
 | [gh](https://cli.github.com/) | GitHub PR status polling (optional) |
+| [linear](https://linear.app/docs/cli) | Linear issue import and sync (optional) |
 | [OpenCode](https://opencode.ai) or [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | AI coding agent (at least one) |
-| [gh](https://cli.github.com/) | GitHub PR status (optional) |
 | [Rust toolchain](https://rustup.rs/) | Building from source |
 
 ## Installation
@@ -115,6 +117,7 @@ bork --help
 | `bork` | Launch the TUI kanban board |
 | `bork init <repo>` | Set up a new bork project from a git repo |
 | `bork install` | Install agent status hooks |
+| `bork worktree <id> [slug]` | Create a git worktree for an issue |
 | `bork uninstall` | Remove agent status hooks |
 
 ### `bork init`
@@ -170,6 +173,11 @@ These are installed automatically by `bork init`. Use `bork install` / `bork uni
 | `Enter` | Open session (resume or launch if none, attach if running) |
 | `P` | Force-sync PR statuses from GitHub |
 | `o` | Open PR in browser (if issue has a matching PR) |
+| `t` | Open project-root terminal in tmux |
+| `/` | Search / filter board |
+| `?` | Show keybinding help overlay |
+| `I` | Import issue from Linear |
+| `O` | Open linked Linear issue in browser |
 | `q` / `Ctrl+c` | Quit |
 
 ### Issue Management
@@ -180,8 +188,12 @@ These are installed automatically by `bork init`. Use `bork install` / `bork uni
 | `e` | Edit selected issue |
 | `d` | Delete issue (with confirmation) |
 | `x` | Kill session (with confirmation) |
+| `a` | Add issue in current column |
 | `H` | Move issue to previous column |
 | `L` | Move issue to next column |
+| `D` | Move issue directly to Done |
+| `T` | Move issue directly to To Do |
+| `W` | Reassign worktree |
 
 ### Dialog Mode
 
@@ -191,7 +203,7 @@ These are installed automatically by `bork init`. Use `bork install` / `bork uni
 | `Shift+Tab` | Previous field |
 | `Shift+Enter` | Submit from any field |
 | `Esc` / `Ctrl+c` | Cancel |
-| `Space` / `h` / `l` | Cycle mode: Plan → Build (→ Yolo for Claude) |
+| `Space` / `h` / `l` | Cycle mode (on Mode field); open Linear picker (on Linear field) |
 
 ### Confirm Mode
 
@@ -230,7 +242,7 @@ Each issue card shows the current agent status:
 
 ## GitHub PR Integration
 
-Bork polls GitHub for open PRs every 60 seconds using a single GraphQL query via the `gh` CLI. PRs are matched to issues by comparing the PR's head branch name against each issue's worktree branch.
+Bork polls GitHub for open PRs every 60 seconds using a single GraphQL query via the `gh` CLI. PRs are matched to issues by comparing the PR's head branch name against each issue's worktree branch. Open, non-draft PRs authored by the current GitHub user are also auto-imported as issues in the Code Review column, so you can track CI and review status without manual setup.
 
 Each card shows PR status when a matching PR is found:
 
@@ -246,6 +258,17 @@ Each card shows PR status when a matching PR is found:
 | `+12/-3` | Lines added/removed |
 
 The `gh` CLI must be installed and authenticated. If `gh` is not available or the repo is not on GitHub, PR polling is silently skipped.
+
+## Linear Integration
+
+When the [Linear CLI](https://linear.app/docs/cli) is installed and authenticated, bork polls your assigned issues every 45 seconds and enables these features:
+
+- **Import issues** &mdash; Press `I` to open a fuzzy-search picker of your assigned Linear issues. Imported issues use the Linear identifier as the bork issue ID (e.g. `BORK-14` becomes `bork-14`).
+- **Attach issues** &mdash; In the issue dialog, the Linear field lets you link a Linear issue to an existing bork issue without overwriting the title.
+- **Open in Linear** &mdash; Press `O` to open the linked Linear issue in your browser.
+- **State sync** &mdash; Linear issue state is refreshed on each poll cycle. Imported issues also sync their title from Linear.
+
+If the `linear` CLI is not found at startup, all Linear features are silently disabled.
 
 ## Project Layout
 
@@ -271,6 +294,7 @@ Each issue gets its own git worktree. Tmux sessions are named `bork-{issue-id}` 
 
 - [ratatui](https://ratatui.rs/) &mdash; TUI framework
 - [crossterm](https://github.com/crossterm-rs/crossterm) &mdash; Terminal backend
+- [clap](https://github.com/clap-rs/clap) &mdash; CLI argument parsing
 - [serde](https://serde.rs/) &mdash; Serialization
 - [anyhow](https://github.com/dtolnay/anyhow) + [thiserror](https://github.com/dtolnay/thiserror) &mdash; Error handling
 
