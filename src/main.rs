@@ -21,7 +21,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use crossterm::{
     event::{self, Event, KeyEventKind},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
+    },
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
@@ -284,7 +286,7 @@ fn run_tui() -> anyhow::Result<()> {
     std::panic::set_hook(Box::new(move |panic_info| {
         lock::release_lock(&panic_project_root);
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, SetTitle(""));
         original_hook(panic_info);
     }));
 
@@ -294,7 +296,11 @@ fn run_tui() -> anyhow::Result<()> {
     // --- Terminal setup ---
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        SetTitle(format!("bork: {}", config.project_name))
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -351,7 +357,12 @@ fn run_tui() -> anyhow::Result<()> {
                                 session_name,
                                 popup_title,
                             } => {
-                                open_tmux_popup(&mut terminal, &session_name, &popup_title)?;
+                                open_tmux_popup(
+                                    &mut terminal,
+                                    &session_name,
+                                    &popup_title,
+                                    &app.config.project_name,
+                                )?;
                                 app.message = None;
                             }
                             PostAction::LaunchAndOpenPopup {
@@ -396,7 +407,12 @@ fn run_tui() -> anyhow::Result<()> {
 
         if let Some((session_name, popup_title)) = pending_popup_session.take() {
             let _ = config::save_state(&app.to_state(), &app.config.project_root);
-            open_tmux_popup(&mut terminal, &session_name, &popup_title)?;
+            open_tmux_popup(
+                &mut terminal,
+                &session_name,
+                &popup_title,
+                &app.config.project_name,
+            )?;
             app.message = None;
         }
 
@@ -491,7 +507,7 @@ fn run_tui() -> anyhow::Result<()> {
     lock::release_lock(&app.config.project_root);
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, SetTitle(""))?;
 
     Ok(())
 }
@@ -500,6 +516,7 @@ fn open_tmux_popup(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     session_name: &str,
     title: &str,
+    project_name: &str,
 ) -> anyhow::Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -507,7 +524,11 @@ fn open_tmux_popup(
     let _ = external::tmux::open_popup(session_name, title);
 
     enable_raw_mode()?;
-    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        SetTitle(format!("bork: {}", project_name))
+    )?;
     terminal.clear()?;
 
     Ok(())
