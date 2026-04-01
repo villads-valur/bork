@@ -12,6 +12,7 @@ pub struct AppConfig {
     pub agent_kind: AgentKind,
     pub default_prompt: Option<String>,
     pub done_session_ttl: u64,
+    pub debug: bool,
 }
 
 pub const DEFAULT_DONE_SESSION_TTL: u64 = 300;
@@ -27,6 +28,7 @@ impl Default for AppConfig {
             agent_kind: AgentKind::OpenCode,
             default_prompt: None,
             done_session_ttl: DEFAULT_DONE_SESSION_TTL,
+            debug: false,
         }
     }
 }
@@ -133,6 +135,7 @@ pub(crate) fn toml_parse(contents: &str) -> Result<AppConfig, String> {
     let mut agent_kind = None;
     let mut default_prompt = None;
     let mut done_session_ttl = None;
+    let mut debug = None;
 
     for line in contents.lines() {
         let line = line.trim();
@@ -154,6 +157,9 @@ pub(crate) fn toml_parse(contents: &str) -> Result<AppConfig, String> {
                 "done_session_ttl" => {
                     done_session_ttl = value.parse::<u64>().ok();
                 }
+                "debug" => {
+                    debug = Some(value == "true");
+                }
                 _ => {}
             }
         }
@@ -165,6 +171,7 @@ pub(crate) fn toml_parse(contents: &str) -> Result<AppConfig, String> {
         agent_kind: agent_kind.unwrap_or(AgentKind::OpenCode),
         default_prompt,
         done_session_ttl: done_session_ttl.unwrap_or(DEFAULT_DONE_SESSION_TTL),
+        debug: debug.unwrap_or(false),
     })
 }
 
@@ -236,5 +243,30 @@ done_session_ttl = "notanumber"
 "#;
         let config = toml_parse(contents).unwrap();
         assert_eq!(config.done_session_ttl, DEFAULT_DONE_SESSION_TTL);
+    }
+
+    #[test]
+    fn toml_parse_debug_true() {
+        let contents = r#"
+project_name = "bork"
+debug = "true"
+"#;
+        let config = toml_parse(contents).unwrap();
+        assert!(config.debug);
+    }
+
+    #[test]
+    fn toml_parse_debug_false_by_default() {
+        let config = toml_parse("").unwrap();
+        assert!(!config.debug);
+    }
+
+    #[test]
+    fn toml_parse_debug_non_true_is_false() {
+        let contents = r#"
+debug = "yes"
+"#;
+        let config = toml_parse(contents).unwrap();
+        assert!(!config.debug);
     }
 }

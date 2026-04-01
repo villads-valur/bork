@@ -1,5 +1,6 @@
 pub mod board;
 pub mod card;
+pub mod debug_inspector;
 pub mod dialog;
 pub mod help;
 pub mod linear_picker;
@@ -29,4 +30,5 @@ pub fn render(frame: &mut Frame, app: &App) {
     dialog::render_dialog(frame, app);
     linear_picker::render_import_picker(frame, app);
     help::render_help(frame, app);
+    debug_inspector::render_debug_inspector(frame, app);
 }
