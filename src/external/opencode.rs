@@ -89,6 +89,7 @@ fn build_agent_cmd(
                     &issue.title,
                     default_prompt,
                     issue.prompt.as_deref(),
+                    issue.linear_url.as_deref(),
                 );
                 let escaped_prompt = shell_escape_single_quotes(&prompt);
                 // Yolo is Claude-only; treat as Build for OpenCode
@@ -121,21 +122,22 @@ fn build_agent_cmd(
                 );
                 (cmd, Some(sid.clone()))
             } else {
-                // Fresh Claude session: pre-assign a UUID so we can resume later
+                // Fresh Claude session: build prompt and optionally pre-assign a UUID
+                let default_prompt = config
+                    .default_prompt
+                    .as_deref()
+                    .unwrap_or(config::DEFAULT_PROMPT_FALLBACK);
+                let prompt = build_prompt(
+                    &issue.id,
+                    &issue.title,
+                    default_prompt,
+                    issue.prompt.as_deref(),
+                    issue.linear_url.as_deref(),
+                );
+                let escaped_prompt = shell_escape_single_quotes(&prompt);
+
                 let uuid = generate_uuid().unwrap_or_default();
                 if uuid.is_empty() {
-                    // uuidgen unavailable — launch without session-id
-                    let default_prompt = config
-                        .default_prompt
-                        .as_deref()
-                        .unwrap_or(config::DEFAULT_PROMPT_FALLBACK);
-                    let prompt = build_prompt(
-                        &issue.id,
-                        &issue.title,
-                        default_prompt,
-                        issue.prompt.as_deref(),
-                    );
-                    let escaped_prompt = shell_escape_single_quotes(&prompt);
                     let cmd = format!(
                         "{} && claude --name '{}'{} '{}'",
                         env_prefix, escaped_name, mode_flag, escaped_prompt,
@@ -143,17 +145,6 @@ fn build_agent_cmd(
                     (cmd, None)
                 } else {
                     let escaped_uuid = shell_escape_single_quotes(&uuid);
-                    let default_prompt = config
-                        .default_prompt
-                        .as_deref()
-                        .unwrap_or(config::DEFAULT_PROMPT_FALLBACK);
-                    let prompt = build_prompt(
-                        &issue.id,
-                        &issue.title,
-                        default_prompt,
-                        issue.prompt.as_deref(),
-                    );
-                    let escaped_prompt = shell_escape_single_quotes(&prompt);
                     let cmd = format!(
                         "{} && claude --name '{}'{} --session-id '{}' '{}'",
                         env_prefix, escaped_name, mode_flag, escaped_uuid, escaped_prompt,
@@ -242,10 +233,22 @@ fn snapshot_opencode_sessions() -> HashSet<String> {
 }
 
 /// Build the full prompt sent to the agent.
-/// Always starts with issue context and the default prompt, then appends the
-/// user's custom prompt (if any) after a blank line.
-fn build_prompt(id: &str, title: &str, default_prompt: &str, user_prompt: Option<&str>) -> String {
+/// Always starts with issue context and the default prompt, then optionally
+/// includes a Linear ticket URL, then appends the user's custom prompt (if
+/// any) after a blank line.
+fn build_prompt(
+    id: &str,
+    title: &str,
+    default_prompt: &str,
+    user_prompt: Option<&str>,
+    linear_url: Option<&str>,
+) -> String {
     let mut prompt = format!("You are working on {}: {}. {}", id, title, default_prompt);
+
+    if let Some(url) = linear_url {
+        prompt.push_str("\n\nThis issue has a Linear ticket: ");
+        prompt.push_str(url);
+    }
 
     if let Some(user_text) = user_prompt {
         let trimmed = user_text.trim();
@@ -267,14 +270,14 @@ fn shell_escape_single_quotes(s: &str) -> String {
 mod tests {
     use super::*;
 
-    const TEST_DEFAULT: &str = "Check AGENTS.md for project context.";
+    const TEST_DEFAULT: &str = "The source code is in main/.";
 
     #[test]
     fn build_prompt_without_user_prompt() {
-        let result = build_prompt("bork-1", "Fix auth", TEST_DEFAULT, None);
+        let result = build_prompt("bork-1", "Fix auth", TEST_DEFAULT, None, None);
         assert_eq!(
             result,
-            "You are working on bork-1: Fix auth. Check AGENTS.md for project context."
+            "You are working on bork-1: Fix auth. The source code is in main/."
         );
     }
 
@@ -285,34 +288,41 @@ mod tests {
             "Add tests",
             TEST_DEFAULT,
             Some("Focus on unit tests"),
+            None,
         );
         assert_eq!(
             result,
-            "You are working on bork-2: Add tests. Check AGENTS.md for project context.\n\nFocus on unit tests"
+            "You are working on bork-2: Add tests. The source code is in main/.\n\nFocus on unit tests"
         );
     }
 
     #[test]
     fn build_prompt_with_empty_user_prompt() {
-        let result = build_prompt("bork-3", "Refactor", TEST_DEFAULT, Some(""));
+        let result = build_prompt("bork-3", "Refactor", TEST_DEFAULT, Some(""), None);
         assert_eq!(
             result,
-            "You are working on bork-3: Refactor. Check AGENTS.md for project context."
+            "You are working on bork-3: Refactor. The source code is in main/."
         );
     }
 
     #[test]
     fn build_prompt_with_whitespace_only_user_prompt() {
-        let result = build_prompt("bork-4", "Cleanup", TEST_DEFAULT, Some("   \n  "));
+        let result = build_prompt("bork-4", "Cleanup", TEST_DEFAULT, Some("   \n  "), None);
         assert_eq!(
             result,
-            "You are working on bork-4: Cleanup. Check AGENTS.md for project context."
+            "You are working on bork-4: Cleanup. The source code is in main/."
         );
     }
 
     #[test]
     fn build_prompt_user_prompt_is_trimmed() {
-        let result = build_prompt("bork-5", "Feature", TEST_DEFAULT, Some("  do the thing  "));
+        let result = build_prompt(
+            "bork-5",
+            "Feature",
+            TEST_DEFAULT,
+            Some("  do the thing  "),
+            None,
+        );
         assert!(result.ends_with("\n\ndo the thing"));
     }
 
@@ -323,9 +333,10 @@ mod tests {
             "New feature",
             config::DEFAULT_PROMPT_FALLBACK,
             None,
+            None,
         );
         assert!(result.starts_with("You are working on bork-6: New feature."));
-        assert!(result.contains("Check AGENTS.md for project context"));
+        assert!(result.contains("source code is in main/"));
         assert!(result.contains("bork worktree"));
     }
 
@@ -336,11 +347,48 @@ mod tests {
             "Setup",
             "Read README.md first.",
             Some("Install deps"),
+            None,
         );
         assert_eq!(
             result,
             "You are working on proj-1: Setup. Read README.md first.\n\nInstall deps"
         );
+    }
+
+    #[test]
+    fn build_prompt_with_linear_url() {
+        let result = build_prompt(
+            "vil-123",
+            "Fix auth flow",
+            TEST_DEFAULT,
+            None,
+            Some("https://linear.app/team/issue/VIL-123"),
+        );
+        assert_eq!(
+            result,
+            "You are working on vil-123: Fix auth flow. The source code is in main/.\n\nThis issue has a Linear ticket: https://linear.app/team/issue/VIL-123"
+        );
+    }
+
+    #[test]
+    fn build_prompt_with_linear_url_and_user_prompt() {
+        let result = build_prompt(
+            "vil-123",
+            "Fix auth flow",
+            TEST_DEFAULT,
+            Some("Focus on OAuth"),
+            Some("https://linear.app/team/issue/VIL-123"),
+        );
+        assert!(result.contains("The source code is in main/."));
+        assert!(result
+            .contains("\n\nThis issue has a Linear ticket: https://linear.app/team/issue/VIL-123"));
+        assert!(result.ends_with("\n\nFocus on OAuth"));
+    }
+
+    #[test]
+    fn build_prompt_without_linear_url_no_linear_line() {
+        let result = build_prompt("bork-7", "Add feature", TEST_DEFAULT, None, None);
+        assert!(!result.contains("Linear"));
     }
 
     #[test]

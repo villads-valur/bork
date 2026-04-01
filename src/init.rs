@@ -22,7 +22,7 @@ This is a bork project. The directory layout is:
 ```
 project/                    # container root (this is where you are)
 ├── main/                   # main branch worktree (owns .git/)
-├── {issue-id}/             # issue worktrees (siblings of main/)
+├── {issue-id}-{slug}/      # issue worktrees (siblings of main/)
 ├── .bork/                  # bork state (do not modify directly)
 ├── AGENTS.md               # project instructions
 └── opencode.jsonc           # opencode config
@@ -44,7 +44,7 @@ bork worktree bork-14 add-worktree-support
 ```
 
 This creates:
-- Directory: `bork-14/` (sibling of `main/`)
+- Directory: `bork-14-add-worktree-support/` (sibling of `main/`)
 - Branch: `bork-14/add-worktree-support` (branched from current HEAD of main)
 - Updates `.bork/state.json` to link the issue to the worktree
 
@@ -55,17 +55,31 @@ bork worktree bork-14 add-worktree-support --title "Add worktree support"
 
 ## Naming conventions
 
-- **Worktree directory**: Use the issue ID exactly (e.g. `bork-14`, `bork-7`)
+- **Worktree directory**: `{issue-id}-{slug}` when a slug is provided (e.g. `bork-14-add-worktree-support`), or just `{issue-id}` without a slug
 - **Branch name**: `{issue-id}/{kebab-case-slug}` (e.g. `bork-14/add-worktree-support`)
 - Issue IDs follow the pattern `{project-name}-{number}` (e.g. `bork-1`, `bork-14`)
+
+## Linear issues
+
+When an issue was imported from Linear, the bork issue ID is the Linear identifier in lowercase (e.g. `vil-123` for Linear issue `VIL-123`). The worktree follows the same naming pattern:
+
+```bash
+bork worktree vil-123 fix-auth-flow
+```
+
+This creates:
+- Directory: `vil-123-fix-auth-flow/`
+- Branch: `vil-123/fix-auth-flow`
+
+When Linear is not used, issue IDs are regular bork IDs (e.g. `bork-14`).
 
 ## After creating a worktree
 
 1. Create a planning file:
    ```bash
-   mkdir -p {issue-id}/.claude
+   mkdir -p {worktree-dir}/.claude
    ```
-   Then create `{issue-id}/.claude/planning.md` with the task plan.
+   Then create `{worktree-dir}/.claude/planning.md` with the task plan.
 
 2. Do all work for the issue inside the worktree directory, not in `main/`.
 
@@ -80,13 +94,13 @@ git -C main worktree list
 When work is done and merged:
 
 ```bash
-git -C main worktree remove ../{issue-id}
+git -C main worktree remove ../{worktree-dir}
 ```
 
 Or forcefully if there are uncommitted changes:
 
 ```bash
-git -C main worktree remove --force ../{issue-id}
+git -C main worktree remove --force ../{worktree-dir}
 ```
 
 ## Important
@@ -95,6 +109,47 @@ git -C main worktree remove --force ../{issue-id}
 - The `main/` worktree should stay on the `main` branch.
 - Multiple worktrees can exist simultaneously for parallel work streams.
 - Each worktree is a full checkout sharing the same git objects (disk efficient).
+"#;
+
+const AGENTS_MD_TEMPLATE: &str = r#"# {project_name}
+
+Managed with bork across git worktrees and tmux.
+
+## Project Layout
+
+```
+{project_name}/                     # Container directory (NOT a git repo)
+├── .bork/                          # Bork state (config.toml, state.json)
+├── AGENTS.md
+├── opencode.jsonc
+├── main/                           # Main branch worktree (git repo)
+│   └── CLAUDE.md                   # Project instructions
+└── {issue-id}-{slug}/              # Issue worktrees
+```
+
+## Worktree Conventions
+
+- Use `bork worktree <issue-id> <slug>` to create worktrees
+- Worktree directory: `{issue-id}-{slug}` (e.g. `{project_name}-1-fix-bug`)
+- Branch: `{issue-id}/{slug}` (e.g. `{project_name}-1/fix-bug`)
+- Issue IDs: `{project_name}-{number}`
+- Linear-imported issue IDs: lowercase Linear identifier (e.g. `abc-123` for `ABC-123`)
+- Tmux sessions: `{project_name}-{issue-id}`
+"#;
+
+const CLAUDE_MD_TEMPLATE: &str = r#"# {project_name}
+
+## Build & Run
+
+```bash
+# TODO: Add build commands
+```
+
+## Testing
+
+```bash
+# TODO: Add test commands
+```
 "#;
 
 const OPENCODE_JSONC: &str = r#"{
@@ -224,6 +279,20 @@ pub fn run_init(
     // Scaffold opencode.jsonc
     fs::write(container.join("opencode.jsonc"), OPENCODE_JSONC)
         .context("Failed to write opencode.jsonc")?;
+
+    // Scaffold AGENTS.md at container root (unless one already exists)
+    let agents_path = container.join("AGENTS.md");
+    if !agents_path.exists() {
+        let agents_content = AGENTS_MD_TEMPLATE.replace("{project_name}", dir_name);
+        fs::write(&agents_path, agents_content).context("Failed to write AGENTS.md")?;
+    }
+
+    // Scaffold CLAUDE.md inside the git repo (unless one already exists)
+    let claude_path = main_dir.join("CLAUDE.md");
+    if !claude_path.exists() {
+        let claude_content = CLAUDE_MD_TEMPLATE.replace("{project_name}", dir_name);
+        fs::write(&claude_path, claude_content).context("Failed to write CLAUDE.md")?;
+    }
 
     // Scaffold worktree skill for Claude Code
     let skill_dir = container.join(".claude/skills/worktree");
@@ -450,6 +519,32 @@ mod tests {
         );
         let skill = fs::read_to_string(container.join(".claude/skills/worktree/SKILL.md")).unwrap();
         assert!(skill.contains("git worktree"));
+
+        // Verify AGENTS.md at container root
+        assert!(
+            container.join("AGENTS.md").exists(),
+            "AGENTS.md should exist"
+        );
+        let agents = fs::read_to_string(container.join("AGENTS.md")).unwrap();
+        assert!(
+            agents.contains("my-project"),
+            "AGENTS.md should contain project name"
+        );
+        assert!(
+            agents.contains("bork worktree"),
+            "AGENTS.md should mention bork worktree"
+        );
+
+        // Verify CLAUDE.md inside git repo
+        assert!(
+            container.join("main/CLAUDE.md").exists(),
+            "CLAUDE.md should exist in main/"
+        );
+        let claude = fs::read_to_string(container.join("main/CLAUDE.md")).unwrap();
+        assert!(
+            claude.contains("my-project"),
+            "CLAUDE.md should contain project name"
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }

@@ -1395,6 +1395,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_detect_worktree_id_with_slug_suffix() {
+        let mut app = test_app(vec![test_issue("bork-14", Column::InProgress)]);
+        app.worktree_branches
+            .insert("bork-14-fix-auth".into(), "bork-14/fix-auth".into());
+        assert_eq!(
+            app.detect_worktree(&app.issues[0].clone()),
+            Some("bork-14-fix-auth".into())
+        );
+    }
+
+    #[test]
+    fn test_detect_worktree_linear_id_with_slug_suffix() {
+        let mut app = test_app(vec![test_issue("vil-123", Column::InProgress)]);
+        app.worktree_branches.insert(
+            "vil-123-fix-auth-flow".into(),
+            "vil-123/fix-auth-flow".into(),
+        );
+        assert_eq!(
+            app.detect_worktree(&app.issues[0].clone()),
+            Some("vil-123-fix-auth-flow".into())
+        );
+    }
+
+    #[test]
+    fn test_detect_worktree_slug_suffix_no_false_positive() {
+        let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
+        app.worktree_branches
+            .insert("bork-14-fix-auth".into(), "bork-14/fix-auth".into());
+        assert_eq!(app.detect_worktree(&app.issues[0].clone()), None);
+    }
+
     // ================================================================
     // auto_assign_worktrees / clear_stale_worktrees
     // ================================================================
