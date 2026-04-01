@@ -1,9 +1,7 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
-};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{App, DialogField};
@@ -119,24 +117,25 @@ pub fn render_dialog(frame: &mut Frame, app: &App) {
     let available_for_prompt = inner.height.saturating_sub(next_row + 2) as usize;
     let visible_lines = available_for_prompt.min(PROMPT_VISIBLE_LINES).max(3);
 
+    let is_prompt_focused = dialog.current_field() == DialogField::Prompt;
+
+    let label_area = Rect::new(inner.x + 1, inner.y + next_row, label_width as u16, 1);
+    let label_style = field_label_style(is_prompt_focused);
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            format!("{:<width$}", prompt_label, width = label_width),
+            label_style,
+        )),
+        label_area,
+    );
+
     let prompt_area = Rect::new(
-        inner.x + 1,
+        inner.x + 1 + label_width as u16,
         inner.y + next_row,
-        inner.width - 2,
+        inner.width.saturating_sub(2 + label_width as u16),
         visible_lines as u16,
     );
-    let is_prompt_focused = dialog.current_field() == DialogField::Prompt;
-    render_multiline_field(
-        frame,
-        prompt_label,
-        &dialog.prompt,
-        dialog.prompt_cursor,
-        dialog.prompt_scroll_offset,
-        prompt_area,
-        is_prompt_focused,
-        label_width,
-        field_width,
-    );
+    frame.render_widget(&dialog.prompt, prompt_area);
 
     let footer_y = inner.y + inner.height - 2;
     let on_linear = dialog.is_on_linear_field();
@@ -158,8 +157,9 @@ pub fn render_dialog(frame: &mut Frame, app: &App) {
             Span::styled(":cancel", styles::statusbar_desc_style()),
         ])
     } else {
+        let next_key = if is_prompt_focused { "Tab" } else { "Enter" };
         Line::from(vec![
-            Span::styled("Enter", styles::statusbar_key_style()),
+            Span::styled(next_key, styles::statusbar_key_style()),
             Span::styled(":next  ", styles::statusbar_desc_style()),
             Span::styled("Shift+Enter", styles::statusbar_key_style()),
             Span::styled(submit_hint, styles::statusbar_desc_style()),
@@ -209,107 +209,6 @@ fn render_single_line_field(
     frame.render_widget(Paragraph::new(line), area);
 }
 
-fn render_multiline_field(
-    frame: &mut Frame,
-    label: &str,
-    value: &str,
-    cursor: usize,
-    scroll_offset: usize,
-    area: Rect,
-    focused: bool,
-    label_width: usize,
-    field_width: usize,
-) {
-    let label_style = field_label_style(focused);
-    let value_style = field_value_style(focused);
-
-    let content_width = field_width.saturating_sub(label_width + 2); // reserve scrollbar column
-    if content_width == 0 {
-        return;
-    }
-
-    let wrapped = wrap_text(value, content_width);
-    let visible_lines = area.height as usize;
-
-    let line_count = wrapped.len().max(1);
-    let cursor_line = cursor_line_index(&wrapped, cursor.min(value.chars().count()));
-
-    // Start from scroll offset, but ensure cursor stays visible
-    let mut start = scroll_offset;
-    if cursor_line < start {
-        start = cursor_line;
-    } else if cursor_line >= start + visible_lines {
-        start = cursor_line + 1 - visible_lines;
-    }
-    start = start.min(line_count.saturating_sub(visible_lines));
-
-    let end = (start + visible_lines).min(line_count);
-    let visible = if wrapped.is_empty() {
-        Vec::new()
-    } else {
-        wrapped[start..end].to_vec()
-    };
-
-    for (i, line_text) in visible.iter().enumerate() {
-        let y = area.y + i as u16;
-        if y >= area.y + area.height {
-            break;
-        }
-
-        let prefix = if i == 0 && start == 0 {
-            format!("{:<width$}", label, width = label_width)
-        } else {
-            " ".repeat(label_width)
-        };
-
-        let is_cursor_line = start + i == cursor_line;
-
-        let mut spans = vec![
-            Span::styled(prefix, label_style),
-            Span::styled(line_text.clone(), value_style),
-        ];
-
-        if focused && is_cursor_line {
-            spans.push(Span::styled(
-                "\u{2588}",
-                Style::default().fg(styles::ACCENT),
-            ));
-        }
-
-        let line = Line::from(spans);
-        let line_area = Rect::new(area.x, y, area.width.saturating_sub(1), 1);
-        frame.render_widget(Paragraph::new(line), line_area);
-    }
-
-    if wrapped.is_empty() {
-        let mut spans = vec![Span::styled(
-            format!("{:<width$}", label, width = label_width),
-            label_style,
-        )];
-        if focused {
-            spans.push(Span::styled(
-                "\u{2588}",
-                Style::default().fg(styles::ACCENT),
-            ));
-        }
-        let line = Line::from(spans);
-        let empty_area = Rect::new(area.x, area.y, area.width.saturating_sub(1), 1);
-        frame.render_widget(Paragraph::new(line), empty_area);
-    }
-
-    if line_count > visible_lines {
-        let scrollbar_area = Rect::new(area.x + area.width - 1, area.y, 1, area.height);
-        let mut scrollbar_state =
-            ScrollbarState::new(line_count.saturating_sub(visible_lines)).position(start);
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(None)
-            .end_symbol(None)
-            .track_symbol(Some("\u{2502}"))
-            .thumb_symbol("\u{2588}");
-        frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
-    }
-}
-
 fn render_kind_field(
     frame: &mut Frame,
     kind: IssueKind,
@@ -352,123 +251,6 @@ fn render_kind_field(
     ]);
 
     frame.render_widget(Paragraph::new(line), area);
-}
-
-fn cursor_line_index(lines: &[String], cursor: usize) -> usize {
-    if lines.is_empty() {
-        return 0;
-    }
-
-    let mut seen = 0usize;
-    for (i, line) in lines.iter().enumerate() {
-        let line_len = line.chars().count();
-        if cursor <= seen + line_len {
-            return i;
-        }
-        seen += line_len;
-    }
-
-    lines.len() - 1
-}
-
-/// Simple word-wrap: break text into lines of at most `max_width` characters.
-/// Breaks on word boundaries when possible, otherwise hard-wraps.
-/// Preserves trailing spaces so the cursor position stays accurate.
-fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
-    if text.is_empty() {
-        return Vec::new();
-    }
-
-    let mut lines = Vec::new();
-    let mut current_line = String::new();
-    let mut line_len: usize = 0;
-
-    // Split into segments of (whitespace, word) pairs to preserve spaces
-    let mut chars = text.char_indices().peekable();
-    while chars.peek().is_some() {
-        // Collect a word (non-space characters)
-        let mut word = String::new();
-        while let Some(&(_, c)) = chars.peek() {
-            if c == ' ' {
-                break;
-            }
-            word.push(c);
-            chars.next();
-        }
-
-        if !word.is_empty() {
-            let word_len = word.chars().count();
-
-            if line_len == 0 {
-                if word_len > max_width {
-                    let mut wchars = word.chars();
-                    while wchars.clone().count() > 0 {
-                        let chunk: String = wchars.by_ref().take(max_width).collect();
-                        if chunk.is_empty() {
-                            break;
-                        }
-                        let chunk_len = chunk.chars().count();
-                        if wchars.clone().count() > 0 {
-                            lines.push(chunk);
-                        } else {
-                            current_line = chunk;
-                            line_len = chunk_len;
-                        }
-                    }
-                } else {
-                    current_line.push_str(&word);
-                    line_len += word_len;
-                }
-            } else if line_len + word_len <= max_width {
-                current_line.push_str(&word);
-                line_len += word_len;
-            } else {
-                lines.push(current_line);
-                if word_len > max_width {
-                    let mut wchars = word.chars();
-                    current_line = String::new();
-                    line_len = 0;
-                    while wchars.clone().count() > 0 {
-                        let chunk: String = wchars.by_ref().take(max_width).collect();
-                        if chunk.is_empty() {
-                            break;
-                        }
-                        let chunk_len = chunk.chars().count();
-                        if wchars.clone().count() > 0 {
-                            lines.push(chunk);
-                        } else {
-                            current_line = chunk;
-                            line_len = chunk_len;
-                        }
-                    }
-                } else {
-                    current_line = word;
-                    line_len = word_len;
-                }
-            }
-        }
-
-        // Collect spaces after the word
-        while let Some(&(_, c)) = chars.peek() {
-            if c != ' ' {
-                break;
-            }
-            if line_len >= max_width {
-                lines.push(current_line);
-                current_line = String::new();
-                line_len = 0;
-            }
-            current_line.push(' ');
-            line_len += 1;
-            chars.next();
-        }
-    }
-
-    if !current_line.is_empty() {
-        lines.push(current_line);
-    }
-
-    lines
 }
 
 fn render_linear_field(
@@ -566,98 +348,6 @@ fn render_mode_field(
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn wrap_text_empty_string() {
-        assert_eq!(wrap_text("", 20), Vec::<String>::new());
-    }
-
-    #[test]
-    fn wrap_text_single_word_fits() {
-        assert_eq!(wrap_text("hello", 20), vec!["hello"]);
-    }
-
-    #[test]
-    fn wrap_text_multiple_words_fit_one_line() {
-        assert_eq!(wrap_text("hello world", 20), vec!["hello world"]);
-    }
-
-    #[test]
-    fn wrap_text_wraps_at_word_boundary() {
-        assert_eq!(
-            wrap_text("hello world foo", 11),
-            vec!["hello world", " foo"]
-        );
-    }
-
-    #[test]
-    fn wrap_text_hard_wraps_long_word() {
-        assert_eq!(wrap_text("abcdefghij", 5), vec!["abcde", "fghij"]);
-    }
-
-    #[test]
-    fn wrap_text_preserves_trailing_space() {
-        let result = wrap_text("hello ", 20);
-        assert_eq!(result, vec!["hello "]);
-    }
-
-    #[test]
-    fn wrap_text_preserves_space_between_words() {
-        let result = wrap_text("a b", 20);
-        assert_eq!(result, vec!["a b"]);
-    }
-
-    #[test]
-    fn wrap_text_trailing_space_after_wrap() {
-        let result = wrap_text("hello world ", 20);
-        assert_eq!(result, vec!["hello world "]);
-    }
-
-    #[test]
-    fn wrap_text_multiple_trailing_spaces() {
-        let result = wrap_text("hi   ", 20);
-        assert_eq!(result, vec!["hi   "]);
-    }
-
-    #[test]
-    fn wrap_text_space_causes_line_wrap() {
-        // Line is exactly at max_width, then space pushes to next line
-        let result = wrap_text("12345 ", 5);
-        assert_eq!(result, vec!["12345", " "]);
-    }
-
-    #[test]
-    fn wrap_text_multiple_lines_with_trailing_space() {
-        let result = wrap_text("aaa bbb ccc ", 7);
-        assert_eq!(result, vec!["aaa bbb", " ccc "]);
-    }
-
-    #[test]
-    fn wrap_text_just_spaces() {
-        let result = wrap_text("   ", 10);
-        assert_eq!(result, vec!["   "]);
-    }
-
-    #[test]
-    fn wrap_text_word_exactly_max_width() {
-        assert_eq!(wrap_text("hello", 5), vec!["hello"]);
-    }
-
-    #[test]
-    fn wrap_text_two_words_exactly_max_width() {
-        assert_eq!(wrap_text("ab cd", 5), vec!["ab cd"]);
-    }
-
-    #[test]
-    fn wrap_text_long_sentence_wraps_correctly() {
-        let result = wrap_text("the quick brown fox", 10);
-        assert_eq!(result, vec!["the quick ", "brown fox"]);
-    }
 }
 
 fn field_label_style(focused: bool) -> Style {

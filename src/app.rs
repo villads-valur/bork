@@ -1,12 +1,16 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use ratatui::style::{Modifier, Style};
+use ratatui_textarea::{CursorMove, TextArea};
+
 use crate::config::{AppConfig, AppState};
 use crate::external::linear::LinearIssue;
 use crate::types::{
     AgentKind, AgentMode, AgentStatus, AgentStatusInfo, Column, Issue, IssueKind, PrState,
     PrStatus, WorktreeStatus,
 };
+use crate::ui::styles;
 
 fn unix_now() -> u64 {
     SystemTime::now()
@@ -56,9 +60,7 @@ pub struct DialogState {
     pub kind: IssueKind,
     pub title: String,
     pub title_cursor: usize,
-    pub prompt: String,
-    pub prompt_cursor: usize,
-    pub prompt_scroll_offset: usize,
+    pub prompt: TextArea<'static>,
     pub agent_mode: AgentMode,
     pub agent_kind: AgentKind,
     pub focused_field: usize, // index into ordered field list (see current_field())
@@ -69,6 +71,18 @@ pub struct DialogState {
     pub linear_available: bool,
 }
 
+fn make_prompt_textarea(text: &str) -> TextArea<'static> {
+    let mut ta = TextArea::from(text.lines());
+    ta.set_cursor_line_style(Style::default());
+    ta.set_cursor_style(
+        Style::default()
+            .fg(styles::ACCENT)
+            .add_modifier(Modifier::REVERSED),
+    );
+    ta.set_block(ratatui::widgets::Block::default());
+    ta
+}
+
 impl DialogState {
     pub fn new(agent_kind: AgentKind, linear_available: bool) -> Self {
         let kind = IssueKind::Agentic;
@@ -77,9 +91,7 @@ impl DialogState {
             kind,
             title: String::new(),
             title_cursor: 0,
-            prompt: String::new(),
-            prompt_cursor: 0,
-            prompt_scroll_offset: 0,
+            prompt: make_prompt_textarea(""),
             agent_mode: AgentMode::Plan,
             agent_kind,
             focused_field: title_idx,
@@ -92,7 +104,7 @@ impl DialogState {
     }
 
     pub fn from_issue(issue: &Issue, index: usize, linear_available: bool) -> Self {
-        let prompt = issue.prompt.clone().unwrap_or_default();
+        let prompt_text = issue.prompt.as_deref().unwrap_or("");
         let linear_issue = if let Some(ref lid) = issue.linear_id {
             Some(LinearIssue {
                 id: lid.clone(),
@@ -108,14 +120,16 @@ impl DialogState {
             None
         };
 
+        let mut prompt = make_prompt_textarea(prompt_text);
+        prompt.move_cursor(CursorMove::Bottom);
+        prompt.move_cursor(CursorMove::End);
+
         let title_idx = Self::compute_title_index(issue.kind, linear_available);
         DialogState {
             kind: issue.kind,
             title: issue.title.clone(),
             title_cursor: issue.title.chars().count(),
-            prompt_cursor: prompt.chars().count(),
             prompt,
-            prompt_scroll_offset: 0,
             agent_mode: issue.agent_mode,
             agent_kind: issue.agent_kind,
             focused_field: title_idx,
@@ -125,6 +139,10 @@ impl DialogState {
             linear_detached: false,
             linear_available,
         }
+    }
+
+    pub fn prompt_text(&self) -> String {
+        self.prompt.lines().join("\n")
     }
 
     /// Field order: Kind, [Mode if Agentic], [Linear if available], Title, Prompt
@@ -229,7 +247,7 @@ impl DialogState {
             }
             DialogField::Linear => {}
             DialogField::Title => insert_char(&mut self.title, &mut self.title_cursor, c),
-            DialogField::Prompt => insert_char(&mut self.prompt, &mut self.prompt_cursor, c),
+            DialogField::Prompt => self.prompt.insert_char(c),
         }
     }
 
@@ -239,7 +257,7 @@ impl DialogState {
                 delete_char_before_cursor(&mut self.title, &mut self.title_cursor)
             }
             DialogField::Prompt => {
-                delete_char_before_cursor(&mut self.prompt, &mut self.prompt_cursor)
+                self.prompt.delete_char();
             }
             _ => {}
         }
@@ -248,7 +266,9 @@ impl DialogState {
     pub fn delete_char_forward(&mut self) {
         match self.current_field() {
             DialogField::Title => delete_char_at_cursor(&mut self.title, self.title_cursor),
-            DialogField::Prompt => delete_char_at_cursor(&mut self.prompt, self.prompt_cursor),
+            DialogField::Prompt => {
+                self.prompt.delete_next_char();
+            }
             _ => {}
         }
     }
@@ -256,7 +276,7 @@ impl DialogState {
     pub fn move_cursor_left(&mut self) {
         match self.current_field() {
             DialogField::Title => self.title_cursor = self.title_cursor.saturating_sub(1),
-            DialogField::Prompt => self.prompt_cursor = self.prompt_cursor.saturating_sub(1),
+            DialogField::Prompt => self.prompt.move_cursor(CursorMove::Back),
             _ => {}
         }
     }
@@ -266,9 +286,7 @@ impl DialogState {
             DialogField::Title => {
                 self.title_cursor = (self.title_cursor + 1).min(self.title.chars().count())
             }
-            DialogField::Prompt => {
-                self.prompt_cursor = (self.prompt_cursor + 1).min(self.prompt.chars().count())
-            }
+            DialogField::Prompt => self.prompt.move_cursor(CursorMove::Forward),
             _ => {}
         }
     }
@@ -276,7 +294,7 @@ impl DialogState {
     pub fn move_cursor_start(&mut self) {
         match self.current_field() {
             DialogField::Title => self.title_cursor = 0,
-            DialogField::Prompt => self.prompt_cursor = 0,
+            DialogField::Prompt => self.prompt.move_cursor(CursorMove::Head),
             _ => {}
         }
     }
@@ -284,7 +302,7 @@ impl DialogState {
     pub fn move_cursor_end(&mut self) {
         match self.current_field() {
             DialogField::Title => self.title_cursor = self.title.chars().count(),
-            DialogField::Prompt => self.prompt_cursor = self.prompt.chars().count(),
+            DialogField::Prompt => self.prompt.move_cursor(CursorMove::End),
             _ => {}
         }
     }
@@ -292,7 +310,9 @@ impl DialogState {
     pub fn delete_word_backward(&mut self) {
         match self.current_field() {
             DialogField::Title => delete_word_backward(&mut self.title, &mut self.title_cursor),
-            DialogField::Prompt => delete_word_backward(&mut self.prompt, &mut self.prompt_cursor),
+            DialogField::Prompt => {
+                self.prompt.delete_word();
+            }
             _ => {}
         }
     }
@@ -300,18 +320,11 @@ impl DialogState {
     pub fn clear_to_start(&mut self) {
         match self.current_field() {
             DialogField::Title => clear_to_start(&mut self.title, &mut self.title_cursor),
-            DialogField::Prompt => clear_to_start(&mut self.prompt, &mut self.prompt_cursor),
+            DialogField::Prompt => {
+                self.prompt.delete_line_by_head();
+            }
             _ => {}
         }
-    }
-
-    pub fn scroll_prompt_up(&mut self) {
-        self.prompt_scroll_offset = self.prompt_scroll_offset.saturating_sub(1);
-    }
-
-    pub fn scroll_prompt_down(&mut self) {
-        // Increment freely; the rendering code clamps to valid range
-        self.prompt_scroll_offset += 1;
     }
 }
 
@@ -1857,24 +1870,23 @@ mod tests {
         for c in "todo note".chars() {
             d.push_char(c);
         }
-        assert_eq!(d.prompt, "todo note");
+        assert_eq!(d.prompt_text(), "todo note");
 
         d.move_cursor_left();
         d.move_cursor_left();
         d.delete_char();
-        assert_eq!(d.prompt, "todo nte");
+        assert_eq!(d.prompt_text(), "todo nte");
 
         d.move_cursor_start();
         d.delete_char_forward();
-        assert_eq!(d.prompt, "odo nte");
+        assert_eq!(d.prompt_text(), "odo nte");
 
         d.move_cursor_end();
         d.delete_word_backward();
-        assert_eq!(d.prompt, "odo ");
+        assert_eq!(d.prompt_text(), "odo ");
 
         d.clear_to_start();
-        assert_eq!(d.prompt, "");
-        assert_eq!(d.prompt_cursor, 0);
+        assert_eq!(d.prompt_text(), "");
     }
 
     // ================================================================

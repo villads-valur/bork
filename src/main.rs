@@ -342,7 +342,8 @@ fn run_tui() -> anyhow::Result<()> {
             loop {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
-                        let action = map_key_to_action(key, app.input_mode);
+                        let dialog_field = app.dialog.as_ref().map(|d| d.current_field());
+                        let action = map_key_to_action(key, app.input_mode, dialog_field);
                         let post_action = handler::handle_action(
                             &mut app,
                             action,
