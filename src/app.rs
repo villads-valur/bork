@@ -440,6 +440,7 @@ pub struct App {
     pub picker_tab: ImportSource,
     pub github_user: Option<String>,
     pub user_prs: Vec<PrStatus>,
+    pub git_poll_done: bool,
 }
 
 impl App {
@@ -481,6 +482,7 @@ impl App {
             picker_tab: ImportSource::Linear,
             github_user: None,
             user_prs: Vec::new(),
+            git_poll_done: false,
         }
     }
 

@@ -25,7 +25,7 @@ pub fn render_import_picker(frame: &mut Frame, app: &App) {
 
     let area = frame.area();
     let width = (area.width * 70 / 100).clamp(PICKER_MIN_WIDTH, PICKER_MAX_WIDTH);
-    let height = (VISIBLE_ITEMS as u16 + if show_tabs { 9 } else { 7 }).min(area.height);
+    let height = (VISIBLE_ITEMS as u16 + if show_tabs { 10 } else { 7 }).min(area.height);
     let x = area.width.saturating_sub(width) / 2;
     let y = area.height.saturating_sub(height) / 2;
 
@@ -62,7 +62,7 @@ pub fn render_import_picker(frame: &mut Frame, app: &App) {
     if show_tabs {
         let tab_area = Rect::new(inner.x + 1, row_y, inner.width - 2, 1);
         render_tab_bar(frame, app.picker_tab, tab_area);
-        row_y += 1;
+        row_y += 2;
     }
 
     let search_area = Rect::new(inner.x + 1, row_y, inner.width - 2, 1);

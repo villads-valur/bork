@@ -436,6 +436,7 @@ fn run_tui() -> anyhow::Result<()> {
         while let Ok(git_result) = git_rx.try_recv() {
             app.worktree_statuses = git_result.statuses;
             app.worktree_branches = git_result.branches;
+            app.git_poll_done = true;
         }
 
         while let Ok(pr_result) = pr_rx.try_recv() {
