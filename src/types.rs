@@ -215,8 +215,6 @@ pub struct Issue {
     pub worktree: Option<String>,
     #[serde(default)]
     pub done_at: Option<u64>,
-    /// The agent's internal session ID — used to resume conversations.
-    /// OpenCode: "ses_xxx..." format. Claude: UUID format.
     #[serde(default)]
     pub session_id: Option<String>,
     #[serde(default)]
@@ -229,13 +227,19 @@ pub struct Issue {
     pub linear_state: Option<String>,
     #[serde(default)]
     pub linear_branch: Option<String>,
-    /// True when the issue was imported from Linear (title syncs with Linear).
-    /// False when a Linear issue was attached to an existing bork issue.
     #[serde(default)]
     pub linear_imported: bool,
-    /// PR number if this issue was auto-imported from a GitHub PR.
     #[serde(default)]
     pub pr_number: Option<u32>,
+    #[serde(default)]
+    pub github_pr_number: Option<u32>,
+    #[serde(default)]
+    pub github_pr_url: Option<String>,
+    #[serde(default)]
+    pub github_pr_title: Option<String>,
+    /// When true, issue was imported from a GitHub PR and title syncs from PR data.
+    #[serde(default)]
+    pub github_imported: bool,
 }
 
 impl Issue {
@@ -318,6 +322,10 @@ mod tests {
             linear_branch: None,
             linear_imported: false,
             pr_number: None,
+            github_pr_number: None,
+            github_pr_url: None,
+            github_pr_title: None,
+            github_imported: false,
         }
     }
 

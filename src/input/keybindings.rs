@@ -106,6 +106,8 @@ fn map_linear_picker_key(key: KeyEvent) -> Action {
             KeyCode::Char('n') => Action::LinearPickerDown,
             KeyCode::Char('p') => Action::LinearPickerUp,
             KeyCode::Char('r') => Action::LinearPickerRefresh,
+            KeyCode::Char('l') => Action::PickerSwitchTab,
+            KeyCode::Char('h') => Action::PickerSwitchTab,
             _ => Action::Noop,
         };
     }
@@ -115,8 +117,10 @@ fn map_linear_picker_key(key: KeyEvent) -> Action {
         KeyCode::Enter => Action::LinearPickerSelect,
         KeyCode::Down => Action::LinearPickerDown,
         KeyCode::Up => Action::LinearPickerUp,
-        KeyCode::Tab => Action::LinearPickerDown,
-        KeyCode::BackTab => Action::LinearPickerUp,
+        KeyCode::Tab => Action::PickerSwitchTab,
+        KeyCode::BackTab => Action::PickerSwitchTab,
+        KeyCode::Left => Action::PickerSwitchTab,
+        KeyCode::Right => Action::PickerSwitchTab,
         KeyCode::Backspace => Action::LinearPickerBackspace,
         KeyCode::Char(c) => Action::LinearPickerChar(c),
         _ => Action::Noop,
