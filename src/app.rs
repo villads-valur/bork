@@ -48,10 +48,17 @@ pub enum LinearPickerContext {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportSource {
+    Linear,
+    GitHub,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DialogField {
     Kind,
     Mode,
     Linear,
+    GithubPr,
     Title,
     Prompt,
 }
@@ -63,12 +70,15 @@ pub struct DialogState {
     pub prompt: TextArea<'static>,
     pub agent_mode: AgentMode,
     pub agent_kind: AgentKind,
-    pub focused_field: usize, // index into ordered field list (see current_field())
+    pub focused_field: usize,
     pub editing_index: Option<usize>,
     pub target_column: Option<Column>,
     pub linear_issue: Option<LinearIssue>,
     pub linear_detached: bool,
     pub linear_available: bool,
+    pub github_pr: Option<PrStatus>,
+    pub github_pr_detached: bool,
+    pub github_available: bool,
 }
 
 fn make_prompt_textarea(text: &str) -> TextArea<'static> {
@@ -84,9 +94,9 @@ fn make_prompt_textarea(text: &str) -> TextArea<'static> {
 }
 
 impl DialogState {
-    pub fn new(agent_kind: AgentKind, linear_available: bool) -> Self {
+    pub fn new(agent_kind: AgentKind, linear_available: bool, github_available: bool) -> Self {
         let kind = IssueKind::Agentic;
-        let title_idx = Self::compute_title_index(kind, linear_available);
+        let title_idx = Self::compute_title_index(kind, linear_available, github_available);
         DialogState {
             kind,
             title: String::new(),
@@ -100,31 +110,45 @@ impl DialogState {
             linear_issue: None,
             linear_detached: false,
             linear_available,
+            github_pr: None,
+            github_pr_detached: false,
+            github_available,
         }
     }
 
-    pub fn from_issue(issue: &Issue, index: usize, linear_available: bool) -> Self {
+    pub fn from_issue(
+        issue: &Issue,
+        index: usize,
+        linear_available: bool,
+        github_available: bool,
+        all_prs: &HashMap<String, PrStatus>,
+        user_prs: &[PrStatus],
+    ) -> Self {
         let prompt_text = issue.prompt.as_deref().unwrap_or("");
-        let linear_issue = if let Some(ref lid) = issue.linear_id {
-            Some(LinearIssue {
-                id: lid.clone(),
-                identifier: issue.linear_identifier.clone().unwrap_or_default(),
-                title: issue.title.clone(),
-                url: issue.linear_url.clone().unwrap_or_default(),
-                branch_name: issue.linear_branch.clone().unwrap_or_default(),
-                priority: 0,
-                state_name: issue.linear_state.clone().unwrap_or_default(),
-                team_key: String::new(),
-            })
-        } else {
-            None
-        };
+        let linear_issue = issue.linear_id.as_ref().map(|lid| LinearIssue {
+            id: lid.clone(),
+            identifier: issue.linear_identifier.clone().unwrap_or_default(),
+            title: issue.title.clone(),
+            url: issue.linear_url.clone().unwrap_or_default(),
+            branch_name: issue.linear_branch.clone().unwrap_or_default(),
+            priority: 0,
+            state_name: issue.linear_state.clone().unwrap_or_default(),
+            team_key: String::new(),
+        });
+
+        let github_pr = issue.github_pr_number.and_then(|num| {
+            all_prs
+                .values()
+                .chain(user_prs.iter())
+                .find(|pr| pr.number == num)
+                .cloned()
+        });
 
         let mut prompt = make_prompt_textarea(prompt_text);
         prompt.move_cursor(CursorMove::Bottom);
         prompt.move_cursor(CursorMove::End);
 
-        let title_idx = Self::compute_title_index(issue.kind, linear_available);
+        let title_idx = Self::compute_title_index(issue.kind, linear_available, github_available);
         DialogState {
             kind: issue.kind,
             title: issue.title.clone(),
@@ -138,6 +162,9 @@ impl DialogState {
             linear_issue,
             linear_detached: false,
             linear_available,
+            github_pr,
+            github_pr_detached: false,
+            github_available,
         }
     }
 
@@ -145,46 +172,36 @@ impl DialogState {
         self.prompt.lines().join("\n")
     }
 
-    /// Field order: Kind, [Mode if Agentic], [Linear if available], Title, Prompt
     pub fn current_field(&self) -> DialogField {
-        let fields: &[DialogField] = match (self.kind == IssueKind::Agentic, self.linear_available)
-        {
-            (true, true) => &[
-                DialogField::Kind,
-                DialogField::Mode,
-                DialogField::Linear,
-                DialogField::Title,
-                DialogField::Prompt,
-            ],
-            (true, false) => &[
-                DialogField::Kind,
-                DialogField::Mode,
-                DialogField::Title,
-                DialogField::Prompt,
-            ],
-            (false, true) => &[
-                DialogField::Kind,
-                DialogField::Linear,
-                DialogField::Title,
-                DialogField::Prompt,
-            ],
-            (false, false) => &[DialogField::Kind, DialogField::Title, DialogField::Prompt],
-        };
+        let fields = self.ordered_fields();
         fields[self.focused_field.min(fields.len() - 1)]
     }
 
-    pub fn active_field_count(&self) -> usize {
-        let mut count = 3; // kind + title + prompt
+    fn ordered_fields(&self) -> Vec<DialogField> {
+        let mut fields = vec![DialogField::Kind];
         if self.kind == IssueKind::Agentic {
-            count += 1;
+            fields.push(DialogField::Mode);
         }
         if self.linear_available {
-            count += 1;
+            fields.push(DialogField::Linear);
         }
-        count
+        if self.github_available {
+            fields.push(DialogField::GithubPr);
+        }
+        fields.push(DialogField::Title);
+        fields.push(DialogField::Prompt);
+        fields
     }
 
-    fn compute_title_index(kind: IssueKind, linear_available: bool) -> usize {
+    pub fn active_field_count(&self) -> usize {
+        self.ordered_fields().len()
+    }
+
+    fn compute_title_index(
+        kind: IssueKind,
+        linear_available: bool,
+        github_available: bool,
+    ) -> usize {
         let mut idx = 1; // after kind
         if kind == IssueKind::Agentic {
             idx += 1;
@@ -192,11 +209,18 @@ impl DialogState {
         if linear_available {
             idx += 1;
         }
+        if github_available {
+            idx += 1;
+        }
         idx
     }
 
     pub fn is_on_linear_field(&self) -> bool {
         self.current_field() == DialogField::Linear
+    }
+
+    pub fn is_on_github_field(&self) -> bool {
+        self.current_field() == DialogField::GithubPr
     }
 
     pub fn next_field(&mut self) -> bool {
@@ -245,7 +269,7 @@ impl DialogState {
                     };
                 }
             }
-            DialogField::Linear => {}
+            DialogField::Linear | DialogField::GithubPr => {}
             DialogField::Title => insert_char(&mut self.title, &mut self.title_cursor, c),
             DialogField::Prompt => self.prompt.insert_char(c),
         }
@@ -413,8 +437,10 @@ pub struct App {
     pub linear_issues: Vec<LinearIssue>,
     pub linear_picker: Option<LinearPickerState>,
     pub linear_picker_context: LinearPickerContext,
+    pub picker_tab: ImportSource,
     pub github_user: Option<String>,
     pub user_prs: Vec<PrStatus>,
+    pub git_poll_done: bool,
 }
 
 impl App {
@@ -453,8 +479,10 @@ impl App {
             linear_issues: Vec::new(),
             linear_picker: None,
             linear_picker_context: LinearPickerContext::Import,
+            picker_tab: ImportSource::Linear,
             github_user: None,
             user_prs: Vec::new(),
+            git_poll_done: false,
         }
     }
 
@@ -679,8 +707,6 @@ impl App {
         let session_name = issue.session_name(&self.config.project_name);
 
         if let Some(info) = self.agent_statuses.get(&session_name) {
-            // Cross-reference with session liveness: if session is dead but
-            // status file says Busy/Idle, override to Stopped (stale file)
             if !self.is_session_alive(&session_name) {
                 return AgentStatus::Stopped;
             }
@@ -701,17 +727,12 @@ impl App {
             .and_then(|info| info.activity.as_deref())
     }
 
-    // --- Worktree resolution ---
-
-    /// Return the persisted worktree directory for an issue.
     pub fn worktree_for<'a>(&self, issue: &'a Issue) -> Option<&'a str> {
         issue.worktree.as_deref()
     }
 
-    /// Auto-detect a worktree directory for an issue by finding a
-    /// dash-bounded substring match of the issue ID (case-insensitive).
-    /// Matches `doc-1929`, `doc-1929-slug`, and `legora-doc-1929-slug`.
-    /// Shortest directory name wins among multiple matches.
+    /// Finds a worktree directory by dash-bounded substring match of the issue ID.
+    /// Shortest match wins (e.g. `bork-1` preferred over `bork-1-extended`).
     fn detect_worktree(&self, issue: &Issue) -> Option<String> {
         let issue_id_lower = issue.id.to_lowercase();
 
@@ -736,10 +757,7 @@ impl App {
         best.map(|s| s.to_string())
     }
 
-    /// Auto-assign worktree directories for issues that don't have one.
-    /// Returns true if any assignments were made (signals a state save).
     pub fn auto_assign_worktrees(&mut self) -> bool {
-        // Collect assignments first to avoid borrow conflict with detect_worktree
         let assignments: Vec<(usize, String)> = (0..self.issues.len())
             .filter(|&i| self.issues[i].worktree.is_none())
             .filter_map(|i| self.detect_worktree(&self.issues[i]).map(|wt| (i, wt)))
@@ -758,8 +776,6 @@ impl App {
         true
     }
 
-    /// Clear worktree assignments that point to directories that no longer exist.
-    /// Returns true if any were cleared (signals a state save).
     pub fn clear_stale_worktrees(&mut self) -> bool {
         let mut changed = false;
         for issue in &mut self.issues {
@@ -798,7 +814,6 @@ impl App {
             }
         }
 
-        // Fallback: resolve branch from pr_number via user_prs
         if let Some(pr_num) = issue.pr_number {
             if let Some(pr) = self.user_prs.iter().find(|p| p.number == pr_num) {
                 return Some(pr.head_branch.as_str());
@@ -809,36 +824,35 @@ impl App {
     }
 
     pub fn pr_for(&self, issue: &Issue) -> Option<&PrStatus> {
-        let branch = self.branch_for(issue)?;
-        self.pr_statuses.get(branch)
+        if let Some(branch) = self.branch_for(issue) {
+            if let Some(pr) = self.pr_statuses.get(branch) {
+                return Some(pr);
+            }
+        }
+        let pr_num = issue.github_pr_number.or(issue.pr_number)?;
+        self.pr_statuses
+            .values()
+            .chain(self.user_prs.iter())
+            .find(|p| p.number == pr_num)
     }
 
-    /// Auto-import open, non-draft PRs authored by the current GitHub user as
-    /// issues in the Code Review column. Uses 3-layer deduplication:
-    ///   1. Issue ID prefix match on branch (catches follow-up PRs)
-    ///   2. Exact branch match via branch_for() (catches normal PR-per-issue)
-    ///   3. PR number match (catches reimport edge cases)
-    /// Returns true if any issues were created (signals a state save).
     pub fn sync_prs_as_issues(&mut self) -> bool {
         if self.user_prs.is_empty() {
             return false;
         }
 
-        // Layer 2: collect all branches claimed by existing issues
         let claimed_branches: HashSet<String> = self
             .issues
             .iter()
             .filter_map(|issue| self.branch_for(issue).map(|b| b.to_string()))
             .collect();
 
-        // Layer 3: collect all PR numbers already tracked by issues
         let claimed_pr_numbers: HashSet<u32> = self
             .issues
             .iter()
             .filter_map(|issue| issue.pr_number)
             .collect();
 
-        // Collect issue IDs (lowercased) for layer 1 prefix matching
         let issue_ids: Vec<String> = self.issues.iter().map(|i| i.id.to_lowercase()).collect();
 
         let mut new_issues: Vec<Issue> = Vec::new();
@@ -856,13 +870,10 @@ impl App {
                 continue;
             }
 
-            // Layer 2: exact branch match
             if claimed_branches.contains(branch) {
                 continue;
             }
 
-            // Layer 1: issue ID prefix match on branch
-            // Matches both "issue-id/slug" and "issue-id-slug" patterns
             let branch_lower = branch.to_lowercase();
             let has_prefix_match = issue_ids.iter().any(|id| {
                 branch_lower.starts_with(&format!("{}/", id))
@@ -872,7 +883,6 @@ impl App {
                 continue;
             }
 
-            // Layer 3: PR number match
             if claimed_pr_numbers.contains(&pr.number) {
                 continue;
             }
@@ -898,6 +908,10 @@ impl App {
                 linear_branch: None,
                 linear_imported: false,
                 pr_number: Some(pr.number),
+                github_pr_number: None,
+                github_pr_url: None,
+                github_pr_title: None,
+                github_imported: false,
             });
         }
 
@@ -960,21 +974,32 @@ impl App {
             .collect()
     }
 
-    // --- Dialog ---
-
     pub fn open_dialog(&mut self) {
         self.open_dialog_in_column(Column::Todo);
     }
 
     pub fn open_dialog_in_column(&mut self, column: Column) {
-        let mut state = DialogState::new(self.config.agent_kind, self.linear_available);
+        let github_available = self.has_github_prs();
+        let mut state = DialogState::new(
+            self.config.agent_kind,
+            self.linear_available,
+            github_available,
+        );
         state.target_column = Some(column);
         self.dialog = Some(state);
         self.input_mode = InputMode::Dialog;
     }
 
     pub fn open_edit_dialog(&mut self, issue: &Issue, index: usize) {
-        self.dialog = Some(DialogState::from_issue(issue, index, self.linear_available));
+        let github_available = self.has_github_prs();
+        self.dialog = Some(DialogState::from_issue(
+            issue,
+            index,
+            self.linear_available,
+            github_available,
+            &self.pr_statuses,
+            &self.user_prs,
+        ));
         self.input_mode = InputMode::Dialog;
     }
 
@@ -983,25 +1008,44 @@ impl App {
         self.input_mode = InputMode::Normal;
     }
 
-    // --- Linear Picker ---
-
-    pub fn open_linear_picker(&mut self) {
-        self.open_linear_picker_with_context(LinearPickerContext::Import);
+    pub fn open_import_picker(&mut self) {
+        self.open_import_picker_with_context(LinearPickerContext::Import);
     }
 
-    pub fn open_linear_picker_with_context(&mut self, context: LinearPickerContext) {
-        if self.linear_issues.is_empty() {
+    pub fn open_import_picker_with_context(&mut self, context: LinearPickerContext) {
+        let has_linear = !self.linear_issues.is_empty();
+        let has_github = self.has_github_prs();
+
+        if !has_linear && !has_github {
             if self.linear_available {
-                self.set_message("No Linear issues loaded yet");
+                self.set_message("No issues loaded yet");
+            } else {
+                self.set_message("No import sources available");
             }
             return;
         }
+
+        // Default to whichever tab has data; prefer the current tab if it has data
+        if self.picker_tab == ImportSource::Linear && !has_linear {
+            self.picker_tab = ImportSource::GitHub;
+        } else if self.picker_tab == ImportSource::GitHub && !has_github {
+            self.picker_tab = ImportSource::Linear;
+        }
+
         self.linear_picker_context = context;
         self.linear_picker = Some(LinearPickerState {
             search: String::new(),
             selected: 0,
         });
         self.input_mode = InputMode::LinearPicker;
+    }
+
+    pub fn open_linear_picker(&mut self) {
+        self.open_import_picker_with_context(LinearPickerContext::Import);
+    }
+
+    pub fn open_linear_picker_with_context(&mut self, context: LinearPickerContext) {
+        self.open_import_picker_with_context(context);
     }
 
     pub fn close_linear_picker(&mut self) {
@@ -1012,6 +1056,10 @@ impl App {
             self.input_mode = InputMode::Normal;
         }
         self.linear_picker_context = LinearPickerContext::Import;
+    }
+
+    pub fn has_github_prs(&self) -> bool {
+        !self.pr_statuses.is_empty() || !self.user_prs.is_empty()
     }
 
     pub fn filtered_linear_issues(&self) -> Vec<&LinearIssue> {
@@ -1032,7 +1080,47 @@ impl App {
             .collect()
     }
 
-    // --- Help ---
+    pub fn filtered_github_prs(&self) -> Vec<&PrStatus> {
+        let picker = match &self.linear_picker {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+
+        let query = picker.search.to_lowercase();
+
+        // Merge pr_statuses and user_prs, dedup by PR number
+        let mut seen: HashSet<u32> = HashSet::new();
+        let mut prs: Vec<&PrStatus> = Vec::new();
+
+        // pr_statuses first (richer data from repo query)
+        for pr in self.pr_statuses.values() {
+            if seen.insert(pr.number) {
+                prs.push(pr);
+            }
+        }
+        // user_prs that weren't already in pr_statuses
+        for pr in &self.user_prs {
+            if seen.insert(pr.number) {
+                prs.push(pr);
+            }
+        }
+
+        prs.retain(|pr| {
+            query.is_empty()
+                || pr.title.to_lowercase().contains(&query)
+                || pr.number.to_string().contains(&query)
+                || pr.author.to_lowercase().contains(&query)
+                || pr.head_branch.to_lowercase().contains(&query)
+        });
+
+        // Open PRs first, then by number descending
+        prs.sort_by(|a, b| {
+            let a_open = a.state == PrState::Open;
+            let b_open = b.state == PrState::Open;
+            b_open.cmp(&a_open).then(b.number.cmp(&a.number))
+        });
+        prs
+    }
 
     pub fn open_help(&mut self) {
         self.input_mode = InputMode::Help;
@@ -1042,49 +1130,27 @@ impl App {
         self.input_mode = InputMode::Normal;
     }
 
-    // --- Issue ID generation ---
-
     pub fn next_issue_id(&self) -> String {
-        let prefix = &self.config.project_name;
-        let max_num = self
-            .issues
-            .iter()
-            .filter_map(|issue| {
-                let id = &issue.id;
-                if let Some(suffix) = id.strip_prefix(&format!("{}-", prefix)) {
-                    suffix.parse::<u32>().ok()
-                } else {
-                    None
-                }
-            })
-            .max()
-            .unwrap_or(0);
-
-        format!("{}-{}", prefix, max_num + 1)
+        self.next_issue_id_after(0)
     }
 
-    /// Like `next_issue_id` but accounts for `offset` additional issues that
-    /// will be created in the same batch (so each gets a unique ID).
+    /// Accounts for `offset` additional issues being created in the same batch.
     fn next_issue_id_after(&self, offset: u32) -> String {
         let prefix = &self.config.project_name;
         let max_num = self
             .issues
             .iter()
             .filter_map(|issue| {
-                let id = &issue.id;
-                if let Some(suffix) = id.strip_prefix(&format!("{}-", prefix)) {
-                    suffix.parse::<u32>().ok()
-                } else {
-                    None
-                }
+                issue
+                    .id
+                    .strip_prefix(&format!("{}-", prefix))
+                    .and_then(|s| s.parse::<u32>().ok())
             })
             .max()
             .unwrap_or(0);
 
         format!("{}-{}", prefix, max_num + 1 + offset)
     }
-
-    // --- Confirm ---
 
     pub fn start_confirm(&mut self, message: String, action: ConfirmAction) {
         self.input_mode = InputMode::Confirm;
@@ -1103,8 +1169,6 @@ impl App {
         self.confirm_message = None;
         self.pending_confirm.take()
     }
-
-    // --- Search ---
 
     pub fn start_search(&mut self) {
         self.input_mode = InputMode::Search;
@@ -1222,6 +1286,10 @@ mod tests {
             linear_branch: None,
             linear_imported: false,
             pr_number: None,
+            github_pr_number: None,
+            github_pr_url: None,
+            github_pr_title: None,
+            github_imported: false,
         }
     }
 
@@ -1826,11 +1894,11 @@ mod tests {
     // ================================================================
 
     fn claude_dialog() -> DialogState {
-        DialogState::new(crate::types::AgentKind::Claude, false)
+        DialogState::new(crate::types::AgentKind::Claude, false, false)
     }
 
     fn opencode_dialog() -> DialogState {
-        DialogState::new(crate::types::AgentKind::OpenCode, false)
+        DialogState::new(crate::types::AgentKind::OpenCode, false, false)
     }
 
     #[test]
@@ -1871,7 +1939,7 @@ mod tests {
     #[test]
     fn dialog_new_uses_config_agent_kind() {
         let config = test_config();
-        let d = DialogState::new(config.agent_kind, false);
+        let d = DialogState::new(config.agent_kind, false, false);
         assert_eq!(d.agent_kind, crate::types::AgentKind::OpenCode);
     }
 
@@ -1880,14 +1948,21 @@ mod tests {
         let mut issue = test_issue("bork-1", Column::Todo);
         issue.agent_kind = crate::types::AgentKind::Claude;
         issue.agent_mode = crate::types::AgentMode::Yolo;
-        let d = DialogState::from_issue(&issue, 0, false);
+        let d = DialogState::from_issue(
+            &issue,
+            0,
+            false,
+            false,
+            &std::collections::HashMap::new(),
+            &[],
+        );
         assert_eq!(d.agent_kind, crate::types::AgentKind::Claude);
         assert_eq!(d.agent_mode, crate::types::AgentMode::Yolo);
     }
 
     #[test]
     fn dialog_new_defaults_to_agentic_with_title_focused() {
-        let d = DialogState::new(crate::types::AgentKind::OpenCode, false);
+        let d = DialogState::new(crate::types::AgentKind::OpenCode, false, false);
         assert_eq!(d.kind, IssueKind::Agentic);
         // Agentic, no linear: Kind(0), Mode(1), Title(2)
         assert_eq!(d.focused_field, 2);
@@ -1895,7 +1970,7 @@ mod tests {
 
     #[test]
     fn dialog_prompt_supports_normal_edit_commands() {
-        let mut d = DialogState::new(crate::types::AgentKind::OpenCode, false);
+        let mut d = DialogState::new(crate::types::AgentKind::OpenCode, false, false);
         // Agentic, no linear: Kind(0), Mode(1), Title(2), Prompt(3)
         d.focused_field = 3;
 

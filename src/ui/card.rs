@@ -18,6 +18,7 @@ pub struct CardContext<'a> {
     pub branch: Option<&'a str>,
     pub git_status: Option<&'a WorktreeStatus>,
     pub pr: Option<&'a PrStatus>,
+    pub git_poll_done: bool,
 }
 
 pub fn render_card(frame: &mut Frame, ctx: &CardContext, area: Rect) {
@@ -42,38 +43,27 @@ pub fn render_card(frame: &mut Frame, ctx: &CardContext, area: Rect) {
 
     let max_width = inner.width as usize;
 
-    // Line 1: Title
     let title_text = truncate(&ctx.issue.title, max_width);
     let title_line = Line::from(Span::styled(title_text, title_style));
-
-    // Line 2: Session indicator + agent status (clean, no branch crammed in)
     let status_line = format_status_line(ctx);
-
-    // Line 3: Branch + git changes (full width for the branch name)
-    let branch_line = format_branch_line(ctx.branch, ctx.git_status, max_width);
-
-    // Line 4: Linear metadata
-    let linear_line = format_linear_line(ctx.issue);
-
-    // Line 5: PR info
     let pr_line = format_pr_line(ctx.pr);
+    let bottom_line = format_bottom_line(ctx.issue, ctx.branch, ctx.git_poll_done);
 
     let mut lines = vec![title_line];
     if inner.height > 1 {
         lines.push(status_line);
     }
     if inner.height > 2 {
-        lines.push(branch_line);
-    }
-    if inner.height > 3 {
-        lines.push(linear_line);
-    }
-    if inner.height > 4 {
         lines.push(pr_line);
     }
 
     let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, inner);
+
+    if inner.height > 3 {
+        let bottom_area = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
+        frame.render_widget(Paragraph::new(bottom_line), bottom_area);
+    }
 }
 
 fn format_status_line(ctx: &CardContext) -> Line<'static> {
@@ -97,42 +87,14 @@ fn format_status_line(ctx: &CardContext) -> Line<'static> {
         _ => ctx.agent_status.to_string(),
     };
 
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled(session_indicator, session_style),
         Span::raw(" "),
         Span::styled(ctx.agent_status.symbol(), Style::default().fg(status_color)),
         Span::styled(format!(" {}", status_label), styles::dim_style()),
-    ])
-}
-
-fn format_branch_line(
-    branch: Option<&str>,
-    git_status: Option<&WorktreeStatus>,
-    max_width: usize,
-) -> Line<'static> {
-    let Some(branch_name) = branch else {
-        return Line::from("");
-    };
-
-    // Strip the "{issue-id}/" prefix since the card border already shows the issue ID
-    let display_branch = branch_name
-        .find('/')
-        .map(|i| &branch_name[i + 1..])
-        .unwrap_or(branch_name);
-
-    let git_spans = format_git_status(git_status);
-    let git_width: usize = git_spans.iter().map(|s| s.width()).sum();
-    let gap = if git_width > 0 { 1 } else { 0 };
-    let available_for_branch = max_width.saturating_sub(2 + gap + git_width);
-
-    let mut spans = vec![
-        Span::raw("  "),
-        Span::styled(
-            truncate(display_branch, available_for_branch),
-            styles::dim_style(),
-        ),
     ];
 
+    let git_spans = format_git_status(ctx.git_status);
     if !git_spans.is_empty() {
         spans.push(Span::raw(" "));
         spans.extend(git_spans);
@@ -141,23 +103,30 @@ fn format_branch_line(
     Line::from(spans)
 }
 
-fn format_linear_line(issue: &Issue) -> Line<'static> {
-    let Some(ref identifier) = issue.linear_identifier else {
-        return Line::from("");
-    };
+fn format_bottom_line(issue: &Issue, branch: Option<&str>, git_poll_done: bool) -> Line<'static> {
+    let has_linear = issue.linear_identifier.is_some();
+    let show_warning = branch.is_none() && git_poll_done;
 
-    let mut spans = vec![
-        Span::raw("  "),
-        Span::styled(
+    if !has_linear && !show_warning {
+        return Line::from("");
+    }
+
+    let mut spans = vec![Span::raw("  ")];
+
+    if let Some(ref identifier) = issue.linear_identifier {
+        spans.push(Span::styled(
             format!("\u{25c8} {}", identifier),
             Style::default().fg(Color::Blue),
-        ),
-    ];
+        ));
+    }
 
-    if let Some(ref state) = issue.linear_state {
+    if show_warning {
+        if has_linear {
+            spans.push(Span::raw(" "));
+        }
         spans.push(Span::styled(
-            format!(" \u{25cf} {}", state),
-            styles::dim_style(),
+            "\u{26a0} no branch",
+            Style::default().fg(Color::Yellow),
         ));
     }
 

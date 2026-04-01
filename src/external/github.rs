@@ -174,9 +174,6 @@ fn parse_pr_node(node: &serde_json::Value) -> Option<PrStatus> {
     })
 }
 
-/// Fetch the current user's open PRs using GitHub's search API.
-/// This avoids the pagination limit of the pullRequests query and
-/// guarantees we find all open PRs authored by the current user.
 pub fn fetch_user_prs(main_worktree: &Path) -> Vec<PrStatus> {
     let Some(repo) = get_repo_identity(main_worktree) else {
         return Vec::new();

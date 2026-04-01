@@ -82,6 +82,10 @@ fn run_worktree_in(
             linear_branch: None,
             linear_imported: false,
             pr_number: None,
+            github_pr_number: None,
+            github_pr_url: None,
+            github_pr_title: None,
+            github_imported: false,
         };
         state.issues.push(issue);
     } else {

@@ -114,35 +114,38 @@ fn spawn_git_status_worker(
     rx
 }
 
+/// Sleep until `interval` elapses or `wake_rx` signals.
+/// Returns `false` if the wake channel disconnected (caller should exit).
+fn sleep_with_wake(wake_rx: &mpsc::Receiver<()>, interval: Duration) -> bool {
+    let deadline = Instant::now() + interval;
+    loop {
+        if Instant::now() >= deadline {
+            return true;
+        }
+        match wake_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(()) => return true,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return false,
+        }
+    }
+}
+
 fn spawn_linear_worker(wake_rx: mpsc::Receiver<()>) -> mpsc::Receiver<LinearPollResult> {
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || loop {
-        let issues = match external::linear::fetch_assigned_issues() {
-            Ok(issues) => issues,
-            Err(_) => Vec::new(),
-        };
+        let issues = external::linear::fetch_assigned_issues().unwrap_or_default();
         if tx.send(LinearPollResult { issues }).is_err() {
             break;
         }
-
-        let deadline = Instant::now() + LINEAR_POLL_INTERVAL;
-        loop {
-            if Instant::now() >= deadline {
-                break;
-            }
-            match wake_rx.recv_timeout(Duration::from_millis(500)) {
-                Ok(()) => break,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
-            }
+        if !sleep_with_wake(&wake_rx, LINEAR_POLL_INTERVAL) {
+            break;
         }
     });
 
     rx
 }
 
-/// PR poll worker with wake-up support for force-sync.
 fn spawn_pr_poll_worker(
     main_worktree: PathBuf,
     wake_rx: mpsc::Receiver<()>,
@@ -164,17 +167,8 @@ fn spawn_pr_poll_worker(
         {
             break;
         }
-
-        let deadline = Instant::now() + PR_POLL_INTERVAL;
-        loop {
-            if Instant::now() >= deadline {
-                break;
-            }
-            match wake_rx.recv_timeout(Duration::from_millis(500)) {
-                Ok(()) => break,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
-            }
+        if !sleep_with_wake(&wake_rx, PR_POLL_INTERVAL) {
+            break;
         }
     });
 
@@ -267,9 +261,7 @@ fn run_tui() -> anyhow::Result<()> {
     let config = config::load_config();
     let state = config::load_state(&config.project_root);
 
-    // --- Tmux auto-wrap (scoped to project name) ---
-    // Must happen before the lock: the outer process creates a tmux session
-    // running bork, then attaches. Only the inner process runs the TUI.
+    // Tmux auto-wrap: outer process creates session + attaches, inner runs TUI
     match external::tmux::ensure_bork_session(&config.project_name)? {
         external::tmux::EnsureResult::AlreadyInside => {}
         external::tmux::EnsureResult::Wrapped { exit_code } => {
@@ -319,7 +311,6 @@ fn run_tui() -> anyhow::Result<()> {
     let main_worktree = app.config.project_root.join("main");
     let pr_rx = spawn_pr_poll_worker(main_worktree, pr_wake_rx);
 
-    // Linear: non-blocking availability check, poll worker starts only if CLI is found
     let (linear_check_tx, linear_check_rx) = mpsc::channel::<bool>();
     thread::spawn(move || {
         let available = external::linear::check_available();
@@ -445,6 +436,7 @@ fn run_tui() -> anyhow::Result<()> {
         while let Ok(git_result) = git_rx.try_recv() {
             app.worktree_statuses = git_result.statuses;
             app.worktree_branches = git_result.branches;
+            app.git_poll_done = true;
         }
 
         while let Ok(pr_result) = pr_rx.try_recv() {
@@ -452,6 +444,17 @@ fn run_tui() -> anyhow::Result<()> {
             app.user_prs = pr_result.user_prs;
             if pr_result.github_user.is_some() {
                 app.github_user = pr_result.github_user;
+            }
+
+            for issue in &mut app.issues {
+                if let Some(pr_num) = issue.github_pr_number {
+                    if let Some(pr) = app.pr_statuses.values().find(|p| p.number == pr_num) {
+                        issue.github_pr_title = Some(pr.title.clone());
+                        if issue.github_imported {
+                            issue.title = pr.title.clone();
+                        }
+                    }
+                }
             }
         }
 
@@ -482,12 +485,10 @@ fn run_tui() -> anyhow::Result<()> {
         if let Some(ref rx) = linear_rx {
             while let Ok(result) = rx.try_recv() {
                 app.linear_issues = result.issues;
-                // Refresh metadata for issues already on the board
                 for issue in &mut app.issues {
                     if let Some(ref lid) = issue.linear_id {
                         if let Some(fresh) = app.linear_issues.iter().find(|i| i.id == *lid) {
                             issue.linear_state = Some(fresh.state_name.clone());
-                            // Only sync title for imported issues (not manually attached)
                             if issue.linear_imported {
                                 issue.title = fresh.title.clone();
                             }

@@ -3,11 +3,11 @@ use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
 
-use crate::app::{App, ConfirmAction, InputMode, LinearPickerContext};
+use crate::app::{App, ConfirmAction, ImportSource, InputMode, LinearPickerContext};
 use crate::config::{self, AppConfig};
 use crate::external::{github, opencode, tmux};
 use crate::input::Action;
-use crate::types::{AgentStatus, Column, Issue, IssueKind};
+use crate::types::{AgentMode, AgentStatus, Column, Issue, IssueKind};
 
 pub type PrWakeTx = mpsc::Sender<()>;
 pub type LinearWakeTx = mpsc::Sender<()>;
@@ -15,8 +15,6 @@ pub type LinearWakeTx = mpsc::Sender<()>;
 pub struct ActionResult {
     pub message: String,
     pub session_to_open: Option<String>,
-    /// If the launch detected an agent session ID, carries (issue_id, agent_session_id)
-    /// so main.rs can persist it on the issue.
     pub session_id: Option<(String, String)>,
 }
 
@@ -53,7 +51,7 @@ pub fn handle_action(
             PostAction::None
         }
         InputMode::LinearPicker => {
-            handle_linear_picker(app, action, linear_wake_tx);
+            handle_linear_picker(app, action, linear_wake_tx, pr_wake_tx);
             PostAction::None
         }
         InputMode::Help => {
@@ -185,7 +183,7 @@ fn handle_normal(
         }
 
         Action::OpenLinearPicker => {
-            app.open_linear_picker();
+            app.open_import_picker();
             PostAction::None
         }
 
@@ -343,23 +341,22 @@ fn handle_help(app: &mut App, action: Action) {
 }
 
 fn handle_dialog(app: &mut App, action: Action) {
-    // Intercept actions on the Linear field
     let on_linear = app.dialog.as_ref().is_some_and(|d| d.is_on_linear_field());
+    let on_github = app.dialog.as_ref().is_some_and(|d| d.is_on_github_field());
 
     if on_linear {
         match action {
             Action::DialogChar(' ') => {
-                // Space on Linear field opens the picker
+                app.picker_tab = ImportSource::Linear;
                 app.open_linear_picker_with_context(LinearPickerContext::Attach);
                 return;
             }
             Action::DialogNextField => {
-                // Enter/Tab on Linear field (last field) submits
                 submit_dialog(app);
                 return;
             }
             Action::DialogBackspace | Action::DialogDelete => {
-                if let Some(ref mut dialog) = app.dialog {
+                if let Some(dialog) = app.dialog.as_mut() {
                     dialog.linear_issue = None;
                     dialog.linear_detached = true;
                 }
@@ -370,77 +367,67 @@ fn handle_dialog(app: &mut App, action: Action) {
         }
     }
 
-    match action {
-        Action::DialogChar(c) => {
-            if let Some(ref mut dialog) = app.dialog {
-                dialog.push_char(c);
+    if on_github {
+        match action {
+            Action::DialogChar(' ') => {
+                app.picker_tab = ImportSource::GitHub;
+                app.open_import_picker_with_context(LinearPickerContext::Attach);
+                return;
             }
-        }
-        Action::DialogBackspace => {
-            if let Some(ref mut dialog) = app.dialog {
-                dialog.delete_char();
+            Action::DialogNextField => {
+                submit_dialog(app);
+                return;
             }
-        }
-        Action::DialogDelete => {
-            if let Some(ref mut dialog) = app.dialog {
-                dialog.delete_char_forward();
-            }
-        }
-        Action::DialogMoveLeft => {
-            if let Some(ref mut dialog) = app.dialog {
-                dialog.move_cursor_left();
-            }
-        }
-        Action::DialogMoveRight => {
-            if let Some(ref mut dialog) = app.dialog {
-                dialog.move_cursor_right();
-            }
-        }
-        Action::DialogMoveStart => {
-            if let Some(ref mut dialog) = app.dialog {
-                dialog.move_cursor_start();
-            }
-        }
-        Action::DialogMoveEnd => {
-            if let Some(ref mut dialog) = app.dialog {
-                dialog.move_cursor_end();
-            }
-        }
-        Action::DialogDeleteWord => {
-            if let Some(ref mut dialog) = app.dialog {
-                dialog.delete_word_backward();
-            }
-        }
-        Action::DialogClearToStart => {
-            if let Some(ref mut dialog) = app.dialog {
-                dialog.clear_to_start();
-            }
-        }
-
-        Action::DialogPromptKey(key_event) => {
-            if let Some(ref mut dialog) = app.dialog {
-                dialog.prompt.input(key_event);
-            }
-        }
-        Action::DialogNextField => {
-            if let Some(ref mut dialog) = app.dialog {
-                if dialog.next_field() {
-                    submit_dialog(app);
-                    return;
+            Action::DialogBackspace | Action::DialogDelete => {
+                if let Some(dialog) = app.dialog.as_mut() {
+                    dialog.github_pr = None;
+                    dialog.github_pr_detached = true;
                 }
+                return;
             }
+            Action::DialogChar(_) => return,
+            _ => {}
         }
-        Action::DialogPrevField => {
-            if let Some(ref mut dialog) = app.dialog {
-                dialog.prev_field();
-            }
-        }
+    }
+
+    match action {
         Action::DialogSubmit => {
             submit_dialog(app);
+            return;
         }
         Action::DialogCancel => {
             app.close_dialog();
+            return;
         }
+        Action::DialogNextField => {
+            if let Some(dialog) = app.dialog.as_mut() {
+                if dialog.next_field() {
+                    submit_dialog(app);
+                }
+            }
+            return;
+        }
+        _ => {}
+    }
+
+    let Some(dialog) = app.dialog.as_mut() else {
+        return;
+    };
+
+    match action {
+        Action::DialogChar(c) => dialog.push_char(c),
+        Action::DialogBackspace => dialog.delete_char(),
+        Action::DialogDelete => dialog.delete_char_forward(),
+        Action::DialogMoveLeft => dialog.move_cursor_left(),
+        Action::DialogMoveRight => dialog.move_cursor_right(),
+        Action::DialogMoveStart => dialog.move_cursor_start(),
+        Action::DialogMoveEnd => dialog.move_cursor_end(),
+        Action::DialogDeleteWord => dialog.delete_word_backward(),
+        Action::DialogClearToStart => dialog.clear_to_start(),
+        Action::DialogPromptKey(key_event) => {
+            dialog.prompt.input(key_event);
+        }
+        Action::DialogPrevField => dialog.prev_field(),
         _ => {}
     }
 }
@@ -474,6 +461,7 @@ fn submit_dialog(app: &mut App) {
             app.issues[idx].kind = dialog.kind;
 
             apply_linear_fields(&mut app.issues[idx], &dialog);
+            apply_github_fields(&mut app.issues[idx], &dialog);
 
             app.set_message(format!("Updated {}", app.issues[idx].id));
             let _ = config::save_state(&app.to_state(), &app.config.project_root);
@@ -505,9 +493,14 @@ fn submit_dialog(app: &mut App) {
         linear_branch: None,
         linear_imported: false,
         pr_number: None,
+        github_pr_number: None,
+        github_pr_url: None,
+        github_pr_title: None,
+        github_imported: false,
     };
 
     apply_linear_fields(&mut issue, &dialog);
+    apply_github_fields(&mut issue, &dialog);
 
     app.issues.push(issue);
     app.set_message(format!("Created {}", id));
@@ -544,13 +537,53 @@ fn apply_linear_fields(issue: &mut Issue, dialog: &crate::app::DialogState) {
     }
 }
 
-fn handle_linear_picker(app: &mut App, action: Action, linear_wake_tx: &LinearWakeTx) {
+fn apply_github_fields(issue: &mut Issue, dialog: &crate::app::DialogState) {
+    if dialog.github_pr_detached {
+        issue.github_pr_number = None;
+        issue.github_pr_url = None;
+        issue.github_pr_title = None;
+        issue.github_imported = false;
+        if issue.pr_number == issue.github_pr_number {
+            issue.pr_number = None;
+        }
+    } else if let Some(ref pr) = dialog.github_pr {
+        issue.github_pr_number = Some(pr.number);
+        issue.github_pr_url = Some(pr.url.clone());
+        issue.github_pr_title = Some(pr.title.clone());
+        issue.pr_number = Some(pr.number);
+        // Attached via dialog, not imported — don't sync title
+        issue.github_imported = false;
+    }
+}
+
+fn handle_linear_picker(
+    app: &mut App,
+    action: Action,
+    linear_wake_tx: &LinearWakeTx,
+    pr_wake_tx: &PrWakeTx,
+) {
     match action {
         Action::LinearPickerClose => {
             app.close_linear_picker();
         }
+        Action::PickerSwitchTab => {
+            let has_linear = !app.linear_issues.is_empty();
+            let has_github = app.has_github_prs();
+            if has_linear && has_github {
+                app.picker_tab = match app.picker_tab {
+                    ImportSource::Linear => ImportSource::GitHub,
+                    ImportSource::GitHub => ImportSource::Linear,
+                };
+                if let Some(ref mut picker) = app.linear_picker {
+                    picker.selected = 0;
+                }
+            }
+        }
         Action::LinearPickerDown => {
-            let count = app.filtered_linear_issues().len();
+            let count = match app.picker_tab {
+                ImportSource::Linear => app.filtered_linear_issues().len(),
+                ImportSource::GitHub => app.filtered_github_prs().len(),
+            };
             if let Some(ref mut picker) = app.linear_picker {
                 if count > 0 && picker.selected < count - 1 {
                     picker.selected += 1;
@@ -576,17 +609,22 @@ fn handle_linear_picker(app: &mut App, action: Action, linear_wake_tx: &LinearWa
                 picker.selected = 0;
             }
         }
-        Action::LinearPickerSelect => {
-            if app.linear_picker_context == LinearPickerContext::Attach {
-                attach_linear_to_dialog(app);
-            } else {
-                import_linear_issue(app);
+        Action::LinearPickerSelect => match (app.linear_picker_context, app.picker_tab) {
+            (LinearPickerContext::Attach, ImportSource::Linear) => attach_linear_to_dialog(app),
+            (LinearPickerContext::Attach, ImportSource::GitHub) => attach_github_to_dialog(app),
+            (_, ImportSource::Linear) => import_linear_issue(app),
+            (_, ImportSource::GitHub) => import_github_pr(app),
+        },
+        Action::LinearPickerRefresh => match app.picker_tab {
+            ImportSource::Linear => {
+                let _ = linear_wake_tx.send(());
+                app.set_message("Refreshing Linear issues...");
             }
-        }
-        Action::LinearPickerRefresh => {
-            let _ = linear_wake_tx.send(());
-            app.set_message("Refreshing Linear issues...");
-        }
+            ImportSource::GitHub => {
+                let _ = pr_wake_tx.send(());
+                app.set_message("Refreshing GitHub PRs...");
+            }
+        },
         _ => {}
     }
 }
@@ -600,7 +638,6 @@ fn attach_linear_to_dialog(app: &mut App) {
         None => return,
     };
 
-    // Close picker first (resets context, restores InputMode::Dialog)
     app.linear_picker = None;
     app.input_mode = InputMode::Dialog;
     app.linear_picker_context = LinearPickerContext::Import;
@@ -620,10 +657,8 @@ fn import_linear_issue(app: &mut App) {
         None => return,
     };
 
-    // Use the Linear identifier as the bork issue ID (e.g. "BORK-14")
     let id = linear_issue.identifier.to_lowercase();
 
-    // Check for collision
     if app.issues.iter().any(|i| i.id == id) {
         app.set_message(format!(
             "{} is already on the board",
@@ -657,13 +692,16 @@ fn import_linear_issue(app: &mut App) {
         },
         linear_imported: true,
         pr_number: None,
+        github_pr_number: None,
+        github_pr_url: None,
+        github_pr_title: None,
+        github_imported: false,
     };
 
     app.issues.push(issue);
     app.set_message(format!("Imported {}", linear_issue.identifier));
     app.close_linear_picker();
 
-    // Select the new issue in the Todo column
     let count = app.issues_in_column(Column::Todo).len();
     if count > 0 {
         app.selected_column = 0;
@@ -671,6 +709,84 @@ fn import_linear_issue(app: &mut App) {
     }
 
     let _ = config::save_state(&app.to_state(), &app.config.project_root);
+}
+
+fn import_github_pr(app: &mut App) {
+    let filtered = app.filtered_github_prs();
+    let selected_idx = app.linear_picker.as_ref().map(|p| p.selected).unwrap_or(0);
+
+    let pr = match filtered.get(selected_idx) {
+        Some(pr) => (*pr).clone(),
+        None => return,
+    };
+
+    if app
+        .issues
+        .iter()
+        .any(|i| i.github_pr_number == Some(pr.number) || i.pr_number == Some(pr.number))
+    {
+        app.set_message(format!("PR #{} is already on the board", pr.number));
+        app.close_linear_picker();
+        return;
+    }
+
+    let id = app.next_issue_id();
+    let issue = Issue {
+        id,
+        title: pr.title.clone(),
+        kind: IssueKind::Agentic,
+        column: Column::CodeReview,
+        worktree: None,
+        tmux_session: None,
+        agent_kind: app.config.agent_kind,
+        agent_mode: AgentMode::Plan,
+        agent_status: AgentStatus::Stopped,
+        prompt: None,
+        done_at: None,
+        session_id: None,
+        linear_id: None,
+        linear_identifier: None,
+        linear_url: None,
+        linear_state: None,
+        linear_branch: None,
+        linear_imported: false,
+        pr_number: Some(pr.number),
+        github_pr_number: Some(pr.number),
+        github_pr_url: Some(pr.url.clone()),
+        github_pr_title: Some(pr.title.clone()),
+        github_imported: true,
+    };
+
+    app.issues.push(issue);
+    app.set_message(format!("Imported PR #{}", pr.number));
+    app.close_linear_picker();
+
+    let count = app.issues_in_column(Column::CodeReview).len();
+    if count > 0 {
+        app.selected_column = Column::CodeReview.index();
+        app.selected_row[Column::CodeReview.index()] = count - 1;
+    }
+
+    let _ = config::save_state(&app.to_state(), &app.config.project_root);
+}
+
+fn attach_github_to_dialog(app: &mut App) {
+    let filtered = app.filtered_github_prs();
+    let selected_idx = app.linear_picker.as_ref().map(|p| p.selected).unwrap_or(0);
+
+    let pr = match filtered.get(selected_idx) {
+        Some(pr) => (*pr).clone(),
+        None => return,
+    };
+
+    app.linear_picker = None;
+    app.input_mode = InputMode::Dialog;
+    app.linear_picker_context = LinearPickerContext::Import;
+
+    if let Some(ref mut dialog) = app.dialog {
+        dialog.github_pr = Some(pr);
+        dialog.github_pr_detached = false;
+    }
 }
 
 fn handle_confirm(app: &mut App, action: Action, action_tx: &mpsc::Sender<ActionResult>) {
@@ -1018,6 +1134,10 @@ mod tests {
             linear_branch: None,
             linear_imported: false,
             pr_number: None,
+            github_pr_number: None,
+            github_pr_url: None,
+            github_pr_title: None,
+            github_imported: false,
         });
 
         let post = handle_action(
@@ -1060,6 +1180,10 @@ mod tests {
             linear_branch: None,
             linear_imported: false,
             pr_number: None,
+            github_pr_number: None,
+            github_pr_url: None,
+            github_pr_title: None,
+            github_imported: false,
         });
 
         // Open edit dialog
@@ -1305,6 +1429,10 @@ mod tests {
             linear_branch: None,
             linear_imported: false,
             pr_number: None,
+            github_pr_number: None,
+            github_pr_url: None,
+            github_pr_title: None,
+            github_imported: false,
         });
 
         let issue = app.issues[0].clone();
@@ -1364,6 +1492,10 @@ mod tests {
             linear_branch: None,
             linear_imported: false,
             pr_number: None,
+            github_pr_number: None,
+            github_pr_url: None,
+            github_pr_title: None,
+            github_imported: false,
         });
 
         let issue = app.issues[0].clone();
@@ -1420,6 +1552,10 @@ mod tests {
             linear_branch: None,
             linear_imported: false,
             pr_number: None,
+            github_pr_number: None,
+            github_pr_url: None,
+            github_pr_title: None,
+            github_imported: false,
         });
 
         let issue = app.issues[0].clone();

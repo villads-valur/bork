@@ -27,6 +27,6 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     // Render overlays on top of the board
     dialog::render_dialog(frame, app);
-    linear_picker::render_linear_picker(frame, app);
+    linear_picker::render_import_picker(frame, app);
     help::render_help(frame, app);
 }

@@ -6,7 +6,7 @@ use ratatui::Frame;
 
 use crate::app::{App, DialogField};
 use crate::external::linear::LinearIssue;
-use crate::types::{AgentKind, AgentMode, IssueKind};
+use crate::types::{AgentKind, AgentMode, IssueKind, PrStatus};
 use crate::ui::styles;
 
 const DIALOG_HEIGHT: u16 = 34;
@@ -95,6 +95,18 @@ pub fn render_dialog(frame: &mut Frame, app: &App) {
         next_row += 2;
     }
 
+    if dialog.github_available {
+        let github_area = Rect::new(inner.x + 1, inner.y + next_row, inner.width - 2, 1);
+        render_github_pr_field(
+            frame,
+            &dialog.github_pr,
+            github_area,
+            dialog.current_field() == DialogField::GithubPr,
+            label_width,
+        );
+        next_row += 2;
+    }
+
     let title_area = Rect::new(inner.x + 1, inner.y + next_row, inner.width - 2, 1);
     render_single_line_field(
         frame,
@@ -138,16 +150,16 @@ pub fn render_dialog(frame: &mut Frame, app: &App) {
     frame.render_widget(&dialog.prompt, prompt_area);
 
     let footer_y = inner.y + inner.height - 2;
-    let on_linear = dialog.is_on_linear_field();
+    let on_external_field = dialog.is_on_linear_field() || dialog.is_on_github_field();
     let submit_hint = if dialog.editing_index.is_some() || dialog.kind == IssueKind::NonAgentic {
         ":save  "
     } else {
         ":start  "
     };
 
-    let footer = if on_linear {
+    let footer = if on_external_field {
         Line::from(vec![
-            Span::styled("Enter", styles::statusbar_key_style()),
+            Span::styled("Space", styles::statusbar_key_style()),
             Span::styled(":attach  ", styles::statusbar_desc_style()),
             Span::styled("Bksp", styles::statusbar_key_style()),
             Span::styled(":detach  ", styles::statusbar_desc_style()),
@@ -278,6 +290,45 @@ fn render_linear_field(
             let remaining = area.width as usize - label_width - li.identifier.len() - 3;
             if remaining > 4 {
                 let title_display: String = li.title.chars().take(remaining).collect();
+                spans.push(Span::styled(" \u{2022} ", styles::dim_style()));
+                spans.push(Span::styled(title_display, styles::dim_style()));
+            }
+        }
+        None => {
+            spans.push(Span::styled("\u{2014}", styles::dim_style()));
+        }
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn render_github_pr_field(
+    frame: &mut Frame,
+    github_pr: &Option<PrStatus>,
+    area: Rect,
+    focused: bool,
+    label_width: usize,
+) {
+    let label_style = field_label_style(focused);
+
+    let mut spans = vec![Span::styled(
+        format!("{:<width$}", "GitHub:", width = label_width),
+        label_style,
+    )];
+
+    match github_pr {
+        Some(pr) => {
+            let number_str = format!("#{}", pr.number);
+            let num_len = number_str.len();
+            spans.push(Span::styled(
+                number_str,
+                Style::default()
+                    .fg(styles::ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            let remaining = area.width as usize - label_width - num_len - 3;
+            if remaining > 4 {
+                let title_display: String = pr.title.chars().take(remaining).collect();
                 spans.push(Span::styled(" \u{2022} ", styles::dim_style()));
                 spans.push(Span::styled(title_display, styles::dim_style()));
             }

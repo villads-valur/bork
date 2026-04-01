@@ -56,6 +56,7 @@ pub enum Action {
     LinearPickerChar(char),
     LinearPickerBackspace,
     LinearPickerRefresh,
+    PickerSwitchTab,
     ShowHelp,
     CloseHelp,
     Noop,
