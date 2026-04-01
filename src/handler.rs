@@ -417,14 +417,9 @@ fn handle_dialog(app: &mut App, action: Action) {
             }
         }
 
-        Action::DialogScrollUp => {
+        Action::DialogPromptKey(key_event) => {
             if let Some(ref mut dialog) = app.dialog {
-                dialog.scroll_prompt_up();
-            }
-        }
-        Action::DialogScrollDown => {
-            if let Some(ref mut dialog) = app.dialog {
-                dialog.scroll_prompt_down();
+                dialog.prompt.input(key_event);
             }
         }
         Action::DialogNextField => {
@@ -464,10 +459,11 @@ fn submit_dialog(app: &mut App) {
         return;
     }
 
-    let prompt = if dialog.prompt.trim().is_empty() {
+    let prompt_text = dialog.prompt_text();
+    let prompt = if prompt_text.trim().is_empty() {
         None
     } else {
-        Some(dialog.prompt.clone())
+        Some(prompt_text)
     };
 
     if let Some(idx) = dialog.editing_index {
@@ -834,7 +830,8 @@ mod tests {
         let dialog = app.dialog.as_ref().unwrap();
         assert_eq!(dialog.focused_field, 3);
         assert_eq!(
-            dialog.prompt, "",
+            dialog.prompt_text(),
+            "",
             "prompt should remain empty after navigating from title"
         );
     }
@@ -870,7 +867,7 @@ mod tests {
         );
 
         let dialog = app.dialog.as_ref().unwrap();
-        assert_eq!(dialog.prompt, "go");
+        assert_eq!(dialog.prompt_text(), "go");
     }
 
     #[test]
@@ -979,7 +976,7 @@ mod tests {
             &linear_wake_tx(),
         );
 
-        assert_eq!(app.dialog.as_ref().unwrap().prompt, "a b");
+        assert_eq!(app.dialog.as_ref().unwrap().prompt_text(), "a b");
     }
 
     #[test]
@@ -1080,7 +1077,8 @@ mod tests {
 
         let dialog = app.dialog.as_ref().unwrap();
         assert_eq!(
-            dialog.prompt, "",
+            dialog.prompt_text(),
+            "",
             "edit dialog prompt should stay empty when issue had no prompt"
         );
     }

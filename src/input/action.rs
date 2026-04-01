@@ -1,3 +1,5 @@
+use crossterm::event::KeyEvent;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Quit,
@@ -37,10 +39,9 @@ pub enum Action {
     DialogClearToStart,
     DialogNextField,
     DialogPrevField,
-    DialogScrollUp,
-    DialogScrollDown,
     DialogSubmit,
     DialogCancel,
+    DialogPromptKey(KeyEvent),
     SearchStart,
     SearchChar(char),
     SearchBackspace,
