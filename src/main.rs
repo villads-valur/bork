@@ -34,6 +34,7 @@ use types::{AgentKind, AgentStatusInfo};
 
 use external::git::GitPollResult;
 use external::linear::LinearPollResult;
+use external::ports::PortPollResult;
 use types::PrStatus;
 
 struct PrPollResult {
@@ -45,6 +46,7 @@ struct PrPollResult {
 const TICK_RATE: Duration = Duration::from_millis(50);
 const TMUX_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const GIT_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const PORT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const LINEAR_POLL_INTERVAL: Duration = Duration::from_secs(45);
 const PR_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -67,6 +69,21 @@ fn spawn_session_status_worker(status_dir: PathBuf) -> mpsc::Receiver<SessionPol
             break;
         }
         thread::sleep(TMUX_POLL_INTERVAL);
+    });
+
+    rx
+}
+
+fn spawn_port_poll_worker(sessions: Arc<Mutex<HashSet<String>>>) -> mpsc::Receiver<PortPollResult> {
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || loop {
+        let sessions = sessions.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let ports = external::ports::poll_listening_ports(&sessions);
+        if tx.send(PortPollResult { ports }).is_err() {
+            break;
+        }
+        thread::sleep(PORT_POLL_INTERVAL);
     });
 
     rx
@@ -312,6 +329,8 @@ fn run_tui() -> anyhow::Result<()> {
     let (action_tx, action_rx) = mpsc::channel::<ActionResult>();
     let status_dir = config::agent_status_dir(&app.config.project_root);
     let session_rx = spawn_session_status_worker(status_dir);
+    let port_sessions = Arc::new(Mutex::new(HashSet::<String>::new()));
+    let port_rx = spawn_port_poll_worker(port_sessions.clone());
     let git_skip_set = Arc::new(Mutex::new(app.done_worktree_names()));
     let (git_wake_tx, git_wake_rx) = mpsc::channel::<()>();
     let git_rx = spawn_git_status_worker(
@@ -444,6 +463,14 @@ fn run_tui() -> anyhow::Result<()> {
             needs_redraw = true;
             app.active_sessions = poll.sessions;
             app.agent_statuses = poll.agent_statuses;
+            // Update shared sessions set for the port poll worker
+            if let Ok(mut shared) = port_sessions.lock() {
+                *shared = app.active_sessions.clone();
+            }
+        }
+
+        while let Ok(port_result) = port_rx.try_recv() {
+            app.listening_ports = port_result.ports;
         }
 
         // --- Auto-kill Done sessions past TTL ---

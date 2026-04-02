@@ -18,7 +18,7 @@ pub struct CardContext<'a> {
     pub branch: Option<&'a str>,
     pub git_status: Option<&'a WorktreeStatus>,
     pub pr: Option<&'a PrStatus>,
-    pub git_poll_done: bool,
+    pub ports: Option<&'a Vec<u16>>,
 }
 
 pub fn render_card(frame: &mut Frame, ctx: &CardContext, area: Rect) {
@@ -47,7 +47,7 @@ pub fn render_card(frame: &mut Frame, ctx: &CardContext, area: Rect) {
     let title_line = Line::from(Span::styled(title_text, title_style));
     let status_line = format_status_line(ctx);
     let pr_line = format_pr_line(ctx.pr);
-    let bottom_line = format_bottom_line(ctx.issue, ctx.branch, ctx.git_poll_done);
+    let bottom_line = format_bottom_line(ctx.issue, ctx.branch, ctx.ports, max_width);
 
     let mut lines = vec![title_line];
     if inner.height > 1 {
@@ -103,34 +103,66 @@ fn format_status_line(ctx: &CardContext) -> Line<'static> {
     Line::from(spans)
 }
 
-fn format_bottom_line(issue: &Issue, branch: Option<&str>, git_poll_done: bool) -> Line<'static> {
+fn format_bottom_line(
+    issue: &Issue,
+    branch: Option<&str>,
+    ports: Option<&Vec<u16>>,
+    max_width: usize,
+) -> Line<'static> {
     let has_linear = issue.linear_identifier.is_some();
-    let show_warning = branch.is_none() && git_poll_done;
+    let has_branch = branch.is_some();
+    let has_ports = ports.is_some_and(|p| !p.is_empty());
 
-    if !has_linear && !show_warning {
+    if !has_linear && !has_branch && !has_ports {
         return Line::from("");
     }
 
-    let mut spans = vec![Span::raw("  ")];
+    // Left side: Linear identifier
+    let mut left_spans: Vec<Span<'static>> = vec![Span::raw("  ")];
+    let mut left_width: usize = 2;
 
     if let Some(ref identifier) = issue.linear_identifier {
-        spans.push(Span::styled(
-            format!("\u{25c8} {}", identifier),
-            Style::default().fg(Color::Blue),
-        ));
+        let text = format!("\u{25c8} {}", identifier);
+        left_width += text.len();
+        left_spans.push(Span::styled(text, Style::default().fg(Color::Blue)));
     }
 
-    if show_warning {
-        if has_linear {
-            spans.push(Span::raw(" "));
+    // Right side: branch icon + ports
+    let mut right_spans: Vec<Span<'static>> = Vec::new();
+    let mut right_width: usize = 0;
+
+    if has_ports {
+        // 🔌 is 2 cells wide in most terminals
+        right_spans.push(Span::styled("\u{1f50c}", Style::default()));
+        right_width += 2;
+    }
+
+    if has_branch {
+        if !right_spans.is_empty() {
+            right_spans.insert(0, Span::raw(" "));
+            right_width += 1;
         }
-        spans.push(Span::styled(
-            "\u{26a0} no branch",
-            Style::default().fg(Color::Yellow),
-        ));
+        right_spans.insert(
+            0,
+            Span::styled("\u{1f33f}", Style::default().fg(Color::Green)),
+        );
+        right_width += 2;
     }
 
-    Line::from(spans)
+    if !right_spans.is_empty() {
+        // Reserve 1 cell padding before the right card border
+        let total = left_width + right_width + 1;
+        let gap = if total < max_width {
+            max_width - total
+        } else {
+            1
+        };
+        left_spans.push(Span::raw(" ".repeat(gap)));
+        left_spans.extend(right_spans);
+        left_spans.push(Span::raw(" "));
+    }
+
+    Line::from(left_spans)
 }
 
 fn format_git_status(status: Option<&WorktreeStatus>) -> Vec<Span<'static>> {
