@@ -687,13 +687,15 @@ impl App {
         self.message_set_at = Some(Instant::now());
     }
 
-    pub fn clear_expired_message(&mut self) {
+    pub fn clear_expired_message(&mut self) -> bool {
         if let Some(set_at) = self.message_set_at {
             if set_at.elapsed().as_secs() >= 3 {
                 self.message = None;
                 self.message_set_at = None;
+                return true;
             }
         }
+        false
     }
 
     pub fn to_state(&self) -> AppState {
