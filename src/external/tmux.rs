@@ -65,6 +65,17 @@ pub fn ensure_bork_session(project_name: &str) -> Result<EnsureResult, AppError>
             .status();
     }
 
+    // Give the inner process a moment to start, then verify the session
+    // is still alive. If the inner bork crashed (e.g. lock contention),
+    // the session is already gone and attach would print a confusing
+    // "can't find session" error.
+    if !session_exists(session_name) {
+        return Err(AppError::Tmux(format!(
+            "bork failed to start inside tmux session '{session_name}'. \
+             Check .bork/bork.pid for a stale lock file."
+        )));
+    }
+
     // Attach to the session (blocks until user detaches)
     let status = Command::new("tmux")
         .args(["attach", "-t", session_name])
