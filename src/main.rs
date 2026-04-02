@@ -12,7 +12,7 @@ mod worktree;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -72,7 +72,7 @@ fn spawn_session_status_worker(status_dir: PathBuf) -> mpsc::Receiver<SessionPol
     rx
 }
 
-fn read_agent_statuses(status_dir: &PathBuf) -> HashMap<String, AgentStatusInfo> {
+fn read_agent_statuses(status_dir: &Path) -> HashMap<String, AgentStatusInfo> {
     let mut statuses = HashMap::new();
     let entries = match std::fs::read_dir(status_dir) {
         Ok(e) => e,
@@ -80,7 +80,7 @@ fn read_agent_statuses(status_dir: &PathBuf) -> HashMap<String, AgentStatusInfo>
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.extension().is_some_and(|e| e == "json") {
+        if path.extension().is_none_or(|e| e != "json") {
             continue;
         }
         let Some(session_name) = path.file_stem().and_then(|s| s.to_str()) else {
@@ -99,6 +99,7 @@ fn read_agent_statuses(status_dir: &PathBuf) -> HashMap<String, AgentStatusInfo>
 fn spawn_git_status_worker(
     project_root: PathBuf,
     skip: Arc<Mutex<HashSet<String>>>,
+    wake_rx: mpsc::Receiver<()>,
 ) -> mpsc::Receiver<GitPollResult> {
     let (tx, rx) = mpsc::channel();
 
@@ -108,7 +109,9 @@ fn spawn_git_status_worker(
         if tx.send(result).is_err() {
             break;
         }
-        thread::sleep(GIT_POLL_INTERVAL);
+        if !sleep_with_wake(&wake_rx, GIT_POLL_INTERVAL) {
+            break;
+        }
     });
 
     rx
@@ -153,18 +156,22 @@ fn spawn_pr_poll_worker(
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || loop {
-        let prs = external::github::fetch_prs(&main_worktree);
-        let indexed = external::github::index_by_branch(prs);
-        let user_prs = external::github::fetch_user_prs(&main_worktree);
-        let github_user = external::github::fetch_current_user(&main_worktree);
-        if tx
-            .send(PrPollResult {
-                prs: indexed,
-                user_prs,
-                github_user,
-            })
-            .is_err()
-        {
+        // Run the 3 independent gh api calls in parallel
+        let result = thread::scope(|s| {
+            let prs_handle = s.spawn(|| {
+                let prs = external::github::fetch_prs(&main_worktree);
+                external::github::index_by_branch(prs)
+            });
+            let user_prs_handle = s.spawn(|| external::github::fetch_user_prs(&main_worktree));
+            let user_handle = s.spawn(|| external::github::fetch_current_user(&main_worktree));
+
+            PrPollResult {
+                prs: prs_handle.join().unwrap_or_default(),
+                user_prs: user_prs_handle.join().unwrap_or_default(),
+                github_user: user_handle.join().ok().flatten(),
+            }
+        });
+        if tx.send(result).is_err() {
             break;
         }
         if !sleep_with_wake(&wake_rx, PR_POLL_INTERVAL) {
@@ -306,7 +313,12 @@ fn run_tui() -> anyhow::Result<()> {
     let status_dir = config::agent_status_dir(&app.config.project_root);
     let session_rx = spawn_session_status_worker(status_dir);
     let git_skip_set = Arc::new(Mutex::new(app.done_worktree_names()));
-    let git_rx = spawn_git_status_worker(app.config.project_root.clone(), git_skip_set.clone());
+    let (git_wake_tx, git_wake_rx) = mpsc::channel::<()>();
+    let git_rx = spawn_git_status_worker(
+        app.config.project_root.clone(),
+        git_skip_set.clone(),
+        git_wake_rx,
+    );
     let (pr_wake_tx, pr_wake_rx) = mpsc::channel::<()>();
     let main_worktree = app.config.project_root.join("main");
     let pr_rx = spawn_pr_poll_worker(main_worktree, pr_wake_rx);
@@ -341,6 +353,7 @@ fn run_tui() -> anyhow::Result<()> {
                             &action_tx,
                             &pr_wake_tx,
                             &linear_wake_tx,
+                            &git_wake_tx,
                         );
 
                         match post_action {
@@ -349,6 +362,13 @@ fn run_tui() -> anyhow::Result<()> {
                                 session_name,
                                 popup_title,
                             } => {
+                                if app.state_dirty {
+                                    let _ = config::save_state(
+                                        &app.to_state(),
+                                        &app.config.project_root,
+                                    );
+                                    app.state_dirty = false;
+                                }
                                 open_tmux_popup(
                                     &mut terminal,
                                     &session_name,
@@ -387,8 +407,11 @@ fn run_tui() -> anyhow::Result<()> {
             }
 
             if let Some(session_name) = result.session_to_open {
-                if let Some((launch_idx, popup_title)) = pending_popup_for_launch.take() {
-                    app.issues[launch_idx].tmux_session = Some(session_name.clone());
+                if let Some(popup_title) = result.popup_title {
+                    // Direct popup (e.g. OpenTerminal)
+                    pending_popup_session = Some((session_name, popup_title));
+                } else if let Some((launch_idx, popup_title)) = pending_popup_for_launch.take() {
+                    // Agent session launch
                     if app.issues[launch_idx].column == types::Column::Todo {
                         app.issues[launch_idx].column = types::Column::InProgress;
                     }
@@ -398,7 +421,9 @@ fn run_tui() -> anyhow::Result<()> {
         }
 
         if let Some((session_name, popup_title)) = pending_popup_session.take() {
+            // Flush state before yielding terminal to tmux popup (could last a long time)
             let _ = config::save_state(&app.to_state(), &app.config.project_root);
+            app.state_dirty = false;
             open_tmux_popup(
                 &mut terminal,
                 &session_name,
@@ -447,10 +472,9 @@ fn run_tui() -> anyhow::Result<()> {
             }
 
             for issue in &mut app.issues {
-                if let Some(pr_num) = issue.github_pr_number {
-                    if let Some(pr) = app.pr_statuses.values().find(|p| p.number == pr_num) {
-                        issue.github_pr_title = Some(pr.title.clone());
-                        if issue.github_imported {
+                if let Some(pr_num) = issue.pr_number {
+                    if issue.pr_imported {
+                        if let Some(pr) = app.pr_statuses.values().find(|p| p.number == pr_num) {
                             issue.title = pr.title.clone();
                         }
                     }
@@ -460,14 +484,15 @@ fn run_tui() -> anyhow::Result<()> {
 
         // --- Auto-import open PRs as issues ---
         if app.sync_prs_as_issues() {
-            let _ = config::save_state(&app.to_state(), &app.config.project_root);
+            app.mark_dirty();
         }
 
         // --- Auto-assign worktrees for issues that don't have one ---
         let mut worktree_changed = app.auto_assign_worktrees();
         worktree_changed = app.clear_stale_worktrees() || worktree_changed;
         if worktree_changed {
-            let _ = config::save_state(&app.to_state(), &app.config.project_root);
+            let _ = git_wake_tx.send(());
+            app.mark_dirty();
         }
 
         // --- Update git skip set for Done worktrees ---
@@ -487,9 +512,8 @@ fn run_tui() -> anyhow::Result<()> {
                 app.linear_issues = result.issues;
                 for issue in &mut app.issues {
                     if let Some(ref lid) = issue.linear_id {
-                        if let Some(fresh) = app.linear_issues.iter().find(|i| i.id == *lid) {
-                            issue.linear_state = Some(fresh.state_name.clone());
-                            if issue.linear_imported {
+                        if issue.linear_imported {
+                            if let Some(fresh) = app.linear_issues.iter().find(|i| i.id == *lid) {
                                 issue.title = fresh.title.clone();
                             }
                         }
@@ -500,6 +524,12 @@ fn run_tui() -> anyhow::Result<()> {
 
         if app.busy_count > 0 {
             app.spinner_tick = app.spinner_tick.wrapping_add(1);
+        }
+
+        // --- Flush dirty state to disk (once per tick, not per action) ---
+        if app.state_dirty {
+            let _ = config::save_state(&app.to_state(), &app.config.project_root);
+            app.state_dirty = false;
         }
 
         app.clear_expired_message();

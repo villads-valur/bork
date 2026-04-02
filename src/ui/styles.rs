@@ -2,6 +2,17 @@ use ratatui::style::{Color, Modifier, Style};
 
 use crate::types::{AgentStatus, ChecksStatus, PrState, ReviewDecision};
 
+pub fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else if max > 3 {
+        let end: String = s.chars().take(max - 3).collect();
+        format!("{}...", end)
+    } else {
+        s.chars().take(max).collect()
+    }
+}
+
 // All colors use ANSI 16 palette so they adapt to the user's terminal theme.
 // Never use Color::Rgb or Color::Indexed(16+) here.
 pub const ACCENT: Color = Color::Cyan;
@@ -158,5 +169,58 @@ mod tests {
         let (icon, color) = review_icon(None);
         assert_eq!(icon, "–");
         assert_eq!(color, Color::Gray);
+    }
+
+    // --- truncate ---
+
+    #[test]
+    fn truncate_short_string_unchanged() {
+        assert_eq!(truncate("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_exact_length_unchanged() {
+        assert_eq!(truncate("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_adds_ellipsis() {
+        assert_eq!(truncate("hello world", 8), "hello...");
+    }
+
+    #[test]
+    fn truncate_max_4_single_char_plus_ellipsis() {
+        assert_eq!(truncate("abcdef", 4), "a...");
+    }
+
+    #[test]
+    fn truncate_max_3_no_ellipsis() {
+        assert_eq!(truncate("abcdef", 3), "abc");
+    }
+
+    #[test]
+    fn truncate_max_2() {
+        assert_eq!(truncate("abcdef", 2), "ab");
+    }
+
+    #[test]
+    fn truncate_max_1() {
+        assert_eq!(truncate("abcdef", 1), "a");
+    }
+
+    #[test]
+    fn truncate_max_0() {
+        assert_eq!(truncate("abcdef", 0), "");
+    }
+
+    #[test]
+    fn truncate_empty_string() {
+        assert_eq!(truncate("", 5), "");
+    }
+
+    #[test]
+    fn truncate_unicode() {
+        // Unicode chars count as 1 char each
+        assert_eq!(truncate("héllo wörld", 8), "héllo...");
     }
 }

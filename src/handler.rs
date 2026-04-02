@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
@@ -7,14 +7,16 @@ use crate::app::{App, ConfirmAction, ImportSource, InputMode, LinearPickerContex
 use crate::config::{self, AppConfig};
 use crate::external::{github, opencode, tmux};
 use crate::input::Action;
-use crate::types::{AgentMode, AgentStatus, Column, Issue, IssueKind};
+use crate::types::{AgentMode, Column, Issue, IssueKind};
 
 pub type PrWakeTx = mpsc::Sender<()>;
 pub type LinearWakeTx = mpsc::Sender<()>;
+pub type GitWakeTx = mpsc::Sender<()>;
 
 pub struct ActionResult {
     pub message: String,
     pub session_to_open: Option<String>,
+    pub popup_title: Option<String>,
     pub session_id: Option<(String, String)>,
 }
 
@@ -36,6 +38,7 @@ pub fn handle_action(
     action_tx: &mpsc::Sender<ActionResult>,
     pr_wake_tx: &PrWakeTx,
     linear_wake_tx: &LinearWakeTx,
+    git_wake_tx: &GitWakeTx,
 ) -> PostAction {
     match app.input_mode {
         InputMode::Confirm => {
@@ -58,7 +61,7 @@ pub fn handle_action(
             handle_help(app, action);
             PostAction::None
         }
-        InputMode::Normal => handle_normal(app, action, action_tx, pr_wake_tx),
+        InputMode::Normal => handle_normal(app, action, action_tx, pr_wake_tx, git_wake_tx),
     }
 }
 
@@ -67,6 +70,7 @@ fn handle_normal(
     action: Action,
     action_tx: &mpsc::Sender<ActionResult>,
     pr_wake_tx: &PrWakeTx,
+    git_wake_tx: &GitWakeTx,
 ) -> PostAction {
     match action {
         Action::Quit => {
@@ -110,22 +114,22 @@ fn handle_normal(
 
         Action::MoveIssueRight => {
             app.move_issue_right();
-            let _ = config::save_state(&app.to_state(), &app.config.project_root);
+            app.mark_dirty();
             PostAction::None
         }
         Action::MoveIssueLeft => {
             app.move_issue_left();
-            let _ = config::save_state(&app.to_state(), &app.config.project_root);
+            app.mark_dirty();
             PostAction::None
         }
         Action::MoveToDone => {
             app.move_to_done();
-            let _ = config::save_state(&app.to_state(), &app.config.project_root);
+            app.mark_dirty();
             PostAction::None
         }
         Action::MoveToTodo => {
             app.move_to_todo();
-            let _ = config::save_state(&app.to_state(), &app.config.project_root);
+            app.mark_dirty();
             PostAction::None
         }
 
@@ -203,15 +207,30 @@ fn handle_normal(
                 };
             }
 
-            if let Err(e) = tmux::create_session(&session_name, &app.config.project_root) {
-                app.set_message(format!("Failed to open terminal: {e}"));
-                return PostAction::None;
-            }
+            app.busy_count += 1;
+            app.set_message("Opening terminal...");
+            let tx = action_tx.clone();
+            let project_root = app.config.project_root.clone();
 
-            PostAction::OpenTmuxPopup {
-                session_name,
-                popup_title,
-            }
+            thread::spawn(move || {
+                let result = match tmux::create_session(&session_name, &project_root) {
+                    Ok(()) => ActionResult {
+                        message: format!("Terminal session '{}' ready", session_name),
+                        session_to_open: Some(session_name),
+                        popup_title: Some(popup_title),
+                        session_id: None,
+                    },
+                    Err(e) => ActionResult {
+                        message: format!("Failed to open terminal: {e}"),
+                        session_to_open: None,
+                        popup_title: None,
+                        session_id: None,
+                    },
+                };
+                let _ = tx.send(result);
+            });
+
+            PostAction::None
         }
 
         Action::OpenSession => {
@@ -302,7 +321,8 @@ fn handle_normal(
                     app.set_message(format!("Assigned worktree: {wt}"));
                 }
             }
-            let _ = config::save_state(&app.to_state(), &app.config.project_root);
+            let _ = git_wake_tx.send(());
+            app.mark_dirty();
             PostAction::None
         }
 
@@ -381,7 +401,7 @@ fn handle_dialog(app: &mut App, action: Action) {
             Action::DialogBackspace | Action::DialogDelete => {
                 if let Some(dialog) = app.dialog.as_mut() {
                     dialog.github_pr = None;
-                    dialog.github_pr_detached = true;
+                    dialog.github_pr_cleared = true;
                 }
                 return;
             }
@@ -461,10 +481,10 @@ fn submit_dialog(app: &mut App) {
             app.issues[idx].kind = dialog.kind;
 
             apply_linear_fields(&mut app.issues[idx], &dialog);
-            apply_github_fields(&mut app.issues[idx], &dialog);
+            apply_pr_fields(&mut app.issues[idx], &dialog);
 
             app.set_message(format!("Updated {}", app.issues[idx].id));
-            let _ = config::save_state(&app.to_state(), &app.config.project_root);
+            app.mark_dirty();
         }
         return;
     }
@@ -478,10 +498,8 @@ fn submit_dialog(app: &mut App) {
         title,
         kind: dialog.kind,
         column,
-        tmux_session: None,
         agent_kind: app.config.agent_kind,
         agent_mode: dialog.agent_mode,
-        agent_status: AgentStatus::Stopped,
         prompt,
         worktree: None,
         done_at: None,
@@ -489,18 +507,13 @@ fn submit_dialog(app: &mut App) {
         linear_id: None,
         linear_identifier: None,
         linear_url: None,
-        linear_state: None,
-        linear_branch: None,
         linear_imported: false,
         pr_number: None,
-        github_pr_number: None,
-        github_pr_url: None,
-        github_pr_title: None,
-        github_imported: false,
+        pr_imported: false,
     };
 
     apply_linear_fields(&mut issue, &dialog);
-    apply_github_fields(&mut issue, &dialog);
+    apply_pr_fields(&mut issue, &dialog);
 
     app.issues.push(issue);
     app.set_message(format!("Created {}", id));
@@ -511,7 +524,7 @@ fn submit_dialog(app: &mut App) {
         app.selected_row[column_index] = count - 1;
     }
 
-    let _ = config::save_state(&app.to_state(), &app.config.project_root);
+    app.mark_dirty();
 }
 
 fn apply_linear_fields(issue: &mut Issue, dialog: &crate::app::DialogState) {
@@ -519,40 +532,24 @@ fn apply_linear_fields(issue: &mut Issue, dialog: &crate::app::DialogState) {
         issue.linear_id = None;
         issue.linear_identifier = None;
         issue.linear_url = None;
-        issue.linear_state = None;
-        issue.linear_branch = None;
         issue.linear_imported = false;
     } else if let Some(ref li) = dialog.linear_issue {
         issue.linear_id = Some(li.id.clone());
         issue.linear_identifier = Some(li.identifier.clone());
         issue.linear_url = Some(li.url.clone());
-        issue.linear_state = Some(li.state_name.clone());
-        issue.linear_branch = if li.branch_name.is_empty() {
-            None
-        } else {
-            Some(li.branch_name.clone())
-        };
         // Attached via dialog, not imported — don't sync title
         issue.linear_imported = false;
     }
 }
 
-fn apply_github_fields(issue: &mut Issue, dialog: &crate::app::DialogState) {
-    if dialog.github_pr_detached {
-        issue.github_pr_number = None;
-        issue.github_pr_url = None;
-        issue.github_pr_title = None;
-        issue.github_imported = false;
-        if issue.pr_number == issue.github_pr_number {
-            issue.pr_number = None;
-        }
+fn apply_pr_fields(issue: &mut Issue, dialog: &crate::app::DialogState) {
+    if dialog.github_pr_cleared {
+        issue.pr_number = None;
+        issue.pr_imported = false;
     } else if let Some(ref pr) = dialog.github_pr {
-        issue.github_pr_number = Some(pr.number);
-        issue.github_pr_url = Some(pr.url.clone());
-        issue.github_pr_title = Some(pr.title.clone());
         issue.pr_number = Some(pr.number);
         // Attached via dialog, not imported — don't sync title
-        issue.github_imported = false;
+        issue.pr_imported = false;
     }
 }
 
@@ -673,29 +670,18 @@ fn import_linear_issue(app: &mut App) {
         title: linear_issue.title.clone(),
         kind: IssueKind::Agentic,
         column: Column::Todo,
-        worktree: None,
-        tmux_session: None,
         agent_kind: app.config.agent_kind,
         agent_mode: crate::types::AgentMode::Plan,
-        agent_status: AgentStatus::Stopped,
         prompt: None,
+        worktree: None,
         done_at: None,
         session_id: None,
         linear_id: Some(linear_issue.id.clone()),
         linear_identifier: Some(linear_issue.identifier.clone()),
         linear_url: Some(linear_issue.url.clone()),
-        linear_state: Some(linear_issue.state_name.clone()),
-        linear_branch: if linear_issue.branch_name.is_empty() {
-            None
-        } else {
-            Some(linear_issue.branch_name.clone())
-        },
         linear_imported: true,
         pr_number: None,
-        github_pr_number: None,
-        github_pr_url: None,
-        github_pr_title: None,
-        github_imported: false,
+        pr_imported: false,
     };
 
     app.issues.push(issue);
@@ -708,7 +694,7 @@ fn import_linear_issue(app: &mut App) {
         app.selected_row[0] = count - 1;
     }
 
-    let _ = config::save_state(&app.to_state(), &app.config.project_root);
+    app.mark_dirty();
 }
 
 fn import_github_pr(app: &mut App) {
@@ -720,11 +706,7 @@ fn import_github_pr(app: &mut App) {
         None => return,
     };
 
-    if app
-        .issues
-        .iter()
-        .any(|i| i.github_pr_number == Some(pr.number) || i.pr_number == Some(pr.number))
-    {
+    if app.issues.iter().any(|i| i.pr_number == Some(pr.number)) {
         app.set_message(format!("PR #{} is already on the board", pr.number));
         app.close_linear_picker();
         return;
@@ -736,25 +718,18 @@ fn import_github_pr(app: &mut App) {
         title: pr.title.clone(),
         kind: IssueKind::Agentic,
         column: Column::CodeReview,
-        worktree: None,
-        tmux_session: None,
         agent_kind: app.config.agent_kind,
         agent_mode: AgentMode::Plan,
-        agent_status: AgentStatus::Stopped,
         prompt: None,
+        worktree: None,
         done_at: None,
         session_id: None,
         linear_id: None,
         linear_identifier: None,
         linear_url: None,
-        linear_state: None,
-        linear_branch: None,
         linear_imported: false,
         pr_number: Some(pr.number),
-        github_pr_number: Some(pr.number),
-        github_pr_url: Some(pr.url.clone()),
-        github_pr_title: Some(pr.title.clone()),
-        github_imported: true,
+        pr_imported: true,
     };
 
     app.issues.push(issue);
@@ -767,7 +742,7 @@ fn import_github_pr(app: &mut App) {
         app.selected_row[Column::CodeReview.index()] = count - 1;
     }
 
-    let _ = config::save_state(&app.to_state(), &app.config.project_root);
+    app.mark_dirty();
 }
 
 fn attach_github_to_dialog(app: &mut App) {
@@ -785,7 +760,7 @@ fn attach_github_to_dialog(app: &mut App) {
 
     if let Some(ref mut dialog) = app.dialog {
         dialog.github_pr = Some(pr);
-        dialog.github_pr_detached = false;
+        dialog.github_pr_cleared = false;
     }
 }
 
@@ -811,6 +786,7 @@ fn handle_confirm(app: &mut App, action: Action, action_tx: &mpsc::Sender<Action
                             let _ = tx.send(ActionResult {
                                 message,
                                 session_to_open: None,
+                                popup_title: None,
                                 session_id: None,
                             });
                         });
@@ -832,6 +808,7 @@ fn handle_confirm(app: &mut App, action: Action, action_tx: &mpsc::Sender<Action
                                     let _ = tx.send(ActionResult {
                                         message: format!("Deleted {} and killed session", id),
                                         session_to_open: None,
+                                        popup_title: None,
                                         session_id: None,
                                     });
                                 });
@@ -843,7 +820,7 @@ fn handle_confirm(app: &mut App, action: Action, action_tx: &mpsc::Sender<Action
 
                             app.issues.remove(issue_index);
                             app.clamp_all_rows();
-                            let _ = config::save_state(&app.to_state(), &app.config.project_root);
+                            app.mark_dirty();
                         }
                     }
                 }
@@ -861,23 +838,25 @@ fn launch_and_report(issue: Issue, config: AppConfig) -> ActionResult {
         Ok((session_name, agent_sid)) => ActionResult {
             message: format!("Session '{}' started", session_name),
             session_to_open: Some(session_name),
+            popup_title: None,
             session_id: agent_sid.map(|sid| (issue.id.clone(), sid)),
         },
         Err(e) => ActionResult {
             message: format!("Failed to launch: {e}"),
             session_to_open: None,
+            popup_title: None,
             session_id: None,
         },
     }
 }
 
-fn agent_status_file(project_root: &PathBuf, session_name: &str) -> PathBuf {
+fn agent_status_file(project_root: &Path, session_name: &str) -> PathBuf {
     config::agent_status_dir(project_root).join(format!("{}.json", session_name))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::mpsc;
 
     use super::*;
@@ -891,6 +870,10 @@ mod tests {
     }
 
     fn linear_wake_tx() -> mpsc::Sender<()> {
+        mpsc::channel().0
+    }
+
+    fn git_wake_tx() -> mpsc::Sender<()> {
         mpsc::channel().0
     }
 
@@ -909,6 +892,27 @@ mod tests {
         App::new(test_config(), state)
     }
 
+    fn test_issue(id: &str, column: Column) -> crate::types::Issue {
+        crate::types::Issue {
+            id: id.to_string(),
+            title: format!("Test issue {}", id),
+            kind: crate::types::IssueKind::Agentic,
+            column,
+            agent_kind: crate::types::AgentKind::OpenCode,
+            agent_mode: crate::types::AgentMode::Plan,
+            prompt: None,
+            worktree: None,
+            done_at: None,
+            session_id: None,
+            linear_id: None,
+            linear_identifier: None,
+            linear_url: None,
+            linear_imported: false,
+            pr_number: None,
+            pr_imported: false,
+        }
+    }
+
     // ================================================================
     // Dialog: prompt field stays empty on field navigation
     // ================================================================
@@ -925,6 +929,7 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
+            &git_wake_tx(),
         );
         handle_action(
             &mut app,
@@ -932,6 +937,7 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
+            &git_wake_tx(),
         );
 
         // Move from title (field 2) to prompt (field 3)
@@ -941,6 +947,7 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
+            &git_wake_tx(),
         );
 
         let dialog = app.dialog.as_ref().unwrap();
@@ -964,6 +971,7 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
+            &git_wake_tx(),
         );
 
         // Type something in the prompt
@@ -973,6 +981,7 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
+            &git_wake_tx(),
         );
         handle_action(
             &mut app,
@@ -980,6 +989,7 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
+            &git_wake_tx(),
         );
 
         let dialog = app.dialog.as_ref().unwrap();
@@ -1002,6 +1012,7 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
+            &git_wake_tx(),
         );
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 3);
         // Field 3 is the last (prompt). Next field from here submits the dialog.
@@ -1019,6 +1030,7 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
+            &git_wake_tx(),
         );
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 3);
 
@@ -1029,6 +1041,7 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
+            &git_wake_tx(),
         );
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 2);
     }
@@ -1044,6 +1057,7 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
+            &git_wake_tx(),
         );
 
         handle_action(
@@ -1052,6 +1066,7 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
+            &git_wake_tx(),
         );
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 0);
     }
@@ -1068,6 +1083,7 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
+            &git_wake_tx(),
         );
 
         handle_action(
@@ -1076,6 +1092,7 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
+            &git_wake_tx(),
         );
         handle_action(
             &mut app,
@@ -1083,6 +1100,7 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
+            &git_wake_tx(),
         );
         handle_action(
             &mut app,
@@ -1090,6 +1108,7 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
+            &git_wake_tx(),
         );
 
         assert_eq!(app.dialog.as_ref().unwrap().prompt_text(), "a b");
@@ -1107,6 +1126,7 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
+            &git_wake_tx(),
         );
         assert!(app.dialog.is_none());
     }
@@ -1119,25 +1139,18 @@ mod tests {
             title: "Manual task".to_string(),
             kind: crate::types::IssueKind::NonAgentic,
             column: Column::Todo,
-            worktree: None,
-            tmux_session: None,
             agent_kind: crate::types::AgentKind::OpenCode,
             agent_mode: crate::types::AgentMode::Plan,
-            agent_status: crate::types::AgentStatus::Stopped,
             prompt: Some("scratch".to_string()),
+            worktree: None,
             done_at: None,
             session_id: None,
             linear_id: None,
             linear_identifier: None,
             linear_url: None,
-            linear_state: None,
-            linear_branch: None,
             linear_imported: false,
             pr_number: None,
-            github_pr_number: None,
-            github_pr_url: None,
-            github_pr_title: None,
-            github_imported: false,
+            pr_imported: false,
         });
 
         let post = handle_action(
@@ -1146,6 +1159,7 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
+            &git_wake_tx(),
         );
 
         assert!(matches!(post, PostAction::None));
@@ -1165,25 +1179,18 @@ mod tests {
             title: "Test".to_string(),
             kind: crate::types::IssueKind::Agentic,
             column: Column::Todo,
-            worktree: Some("main".to_string()),
-            tmux_session: None,
             agent_kind: crate::types::AgentKind::OpenCode,
             agent_mode: crate::types::AgentMode::Plan,
-            agent_status: crate::types::AgentStatus::Stopped,
             prompt: None,
+            worktree: Some("main".to_string()),
             done_at: None,
             session_id: None,
             linear_id: None,
             linear_identifier: None,
             linear_url: None,
-            linear_state: None,
-            linear_branch: None,
             linear_imported: false,
             pr_number: None,
-            github_pr_number: None,
-            github_pr_url: None,
-            github_pr_title: None,
-            github_imported: false,
+            pr_imported: false,
         });
 
         // Open edit dialog
@@ -1197,6 +1204,7 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
+            &git_wake_tx(),
         );
 
         let dialog = app.dialog.as_ref().unwrap();
@@ -1243,6 +1251,7 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
+            &git_wake_tx(),
         );
 
         assert_eq!(app.input_mode, crate::app::InputMode::Normal);
@@ -1252,7 +1261,6 @@ mod tests {
         assert_eq!(app.issues[0].column, Column::Todo);
         assert_eq!(app.issues[0].linear_id, Some("uuid-1".to_string()));
         assert_eq!(app.issues[0].linear_identifier, Some("TEST-1".to_string()));
-        assert_eq!(app.issues[0].linear_branch, Some("test-1-slug".to_string()));
     }
 
     #[test]
@@ -1269,6 +1277,7 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
+            &git_wake_tx(),
         );
         assert_eq!(app.issues.len(), 1);
 
@@ -1286,6 +1295,7 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
+            &git_wake_tx(),
         );
         assert_eq!(app.issues.len(), 1);
     }
@@ -1308,6 +1318,7 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
+            &git_wake_tx(),
         );
         handle_action(
             &mut app,
@@ -1315,6 +1326,7 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
+            &git_wake_tx(),
         );
         handle_action(
             &mut app,
@@ -1322,6 +1334,7 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
+            &git_wake_tx(),
         );
 
         let filtered = app.filtered_linear_issues();
@@ -1348,6 +1361,7 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
+            &git_wake_tx(),
         );
         assert_eq!(app.linear_picker.as_ref().unwrap().selected, 1);
 
@@ -1357,6 +1371,7 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
+            &git_wake_tx(),
         );
         assert_eq!(app.linear_picker.as_ref().unwrap().selected, 2);
 
@@ -1367,6 +1382,7 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
+            &git_wake_tx(),
         );
         assert_eq!(app.linear_picker.as_ref().unwrap().selected, 2);
 
@@ -1376,6 +1392,7 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
+            &git_wake_tx(),
         );
         assert_eq!(app.linear_picker.as_ref().unwrap().selected, 1);
     }
@@ -1393,6 +1410,7 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
+            &git_wake_tx(),
         );
 
         assert_eq!(app.input_mode, crate::app::InputMode::Normal);
@@ -1414,25 +1432,18 @@ mod tests {
             title: "Test issue".to_string(),
             kind: crate::types::IssueKind::Agentic,
             column: Column::Todo,
-            worktree: None,
-            tmux_session: None,
             agent_kind: crate::types::AgentKind::OpenCode,
             agent_mode: crate::types::AgentMode::Plan,
-            agent_status: crate::types::AgentStatus::Stopped,
             prompt: None,
+            worktree: None,
             done_at: None,
             session_id: None,
             linear_id: None,
             linear_identifier: None,
             linear_url: None,
-            linear_state: None,
-            linear_branch: None,
             linear_imported: false,
             pr_number: None,
-            github_pr_number: None,
-            github_pr_url: None,
-            github_pr_title: None,
-            github_imported: false,
+            pr_imported: false,
         });
 
         let issue = app.issues[0].clone();
@@ -1450,6 +1461,7 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
+            &git_wake_tx(),
         );
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 4);
 
@@ -1460,6 +1472,7 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
+            &git_wake_tx(),
         );
         assert_eq!(app.input_mode, crate::app::InputMode::Normal);
         assert!(app.dialog.is_none(), "dialog should be closed after submit");
@@ -1477,25 +1490,18 @@ mod tests {
             title: "Test issue".to_string(),
             kind: crate::types::IssueKind::Agentic,
             column: Column::Todo,
-            worktree: None,
-            tmux_session: None,
             agent_kind: crate::types::AgentKind::OpenCode,
             agent_mode: crate::types::AgentMode::Plan,
-            agent_status: crate::types::AgentStatus::Stopped,
             prompt: None,
+            worktree: None,
             done_at: None,
             session_id: None,
             linear_id: None,
             linear_identifier: None,
             linear_url: None,
-            linear_state: None,
-            linear_branch: None,
             linear_imported: false,
             pr_number: None,
-            github_pr_number: None,
-            github_pr_url: None,
-            github_pr_title: None,
-            github_imported: false,
+            pr_imported: false,
         });
 
         let issue = app.issues[0].clone();
@@ -1509,6 +1515,7 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
+            &git_wake_tx(),
         );
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 4);
 
@@ -1519,6 +1526,7 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
+            &git_wake_tx(),
         );
         assert_eq!(app.input_mode, crate::app::InputMode::Normal);
         assert!(
@@ -1537,25 +1545,18 @@ mod tests {
             title: "Test issue".to_string(),
             kind: crate::types::IssueKind::Agentic,
             column: Column::Todo,
-            worktree: None,
-            tmux_session: None,
             agent_kind: crate::types::AgentKind::OpenCode,
             agent_mode: crate::types::AgentMode::Plan,
-            agent_status: crate::types::AgentStatus::Stopped,
             prompt: None,
+            worktree: None,
             done_at: None,
             session_id: None,
             linear_id: None,
             linear_identifier: None,
             linear_url: None,
-            linear_state: None,
-            linear_branch: None,
             linear_imported: false,
             pr_number: None,
-            github_pr_number: None,
-            github_pr_url: None,
-            github_pr_title: None,
-            github_imported: false,
+            pr_imported: false,
         });
 
         let issue = app.issues[0].clone();
@@ -1570,8 +1571,311 @@ mod tests {
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
+            &git_wake_tx(),
         );
         assert_eq!(app.input_mode, crate::app::InputMode::Normal);
         assert!(app.dialog.is_none());
+    }
+
+    // ================================================================
+    // Normal mode: navigation
+    // ================================================================
+
+    fn app_with_issues() -> App {
+        let mut app = test_app();
+        app.issues.push(test_issue("bork-1", Column::Todo));
+        app.issues.push(test_issue("bork-2", Column::Todo));
+        app.issues.push(test_issue("bork-3", Column::InProgress));
+        app
+    }
+
+    fn act(app: &mut App, action: Action) -> PostAction {
+        handle_action(
+            app,
+            action,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+            &linear_wake_tx(),
+            &git_wake_tx(),
+        )
+    }
+
+    #[test]
+    fn move_down_increments_row() {
+        let mut app = app_with_issues();
+        assert_eq!(app.selected_row[0], 0);
+        act(&mut app, Action::MoveDown);
+        assert_eq!(app.selected_row[0], 1);
+    }
+
+    #[test]
+    fn move_up_decrements_row() {
+        let mut app = app_with_issues();
+        app.selected_row[0] = 1;
+        act(&mut app, Action::MoveUp);
+        assert_eq!(app.selected_row[0], 0);
+    }
+
+    #[test]
+    fn focus_right_moves_down_then_next_column() {
+        let mut app = app_with_issues();
+        assert_eq!(app.selected_column, 0);
+        assert_eq!(app.selected_row[0], 0);
+        // 2 issues in Todo: first FocusRight moves to row 1
+        act(&mut app, Action::FocusRight);
+        assert_eq!(app.selected_column, 0);
+        assert_eq!(app.selected_row[0], 1);
+        // At bottom of Todo: next FocusRight jumps to InProgress
+        act(&mut app, Action::FocusRight);
+        assert_eq!(app.selected_column, 1);
+    }
+
+    #[test]
+    fn focus_left_moves_up_then_prev_column() {
+        let mut app = app_with_issues();
+        app.selected_column = 1;
+        // InProgress has 1 issue at row 0, so FocusLeft jumps to Todo
+        act(&mut app, Action::FocusLeft);
+        assert_eq!(app.selected_column, 0);
+    }
+
+    #[test]
+    fn jump_column_right() {
+        let mut app = app_with_issues();
+        assert_eq!(app.selected_column, 0);
+        act(&mut app, Action::JumpColumnRight);
+        // Should jump to InProgress (next column with issues)
+        assert_eq!(app.selected_column, 1);
+    }
+
+    #[test]
+    fn scroll_to_top() {
+        let mut app = app_with_issues();
+        app.selected_row[0] = 1;
+        act(&mut app, Action::ScrollToTop);
+        assert_eq!(app.selected_row[0], 0);
+    }
+
+    #[test]
+    fn scroll_to_bottom() {
+        let mut app = app_with_issues();
+        act(&mut app, Action::ScrollToBottom);
+        assert_eq!(app.selected_row[0], 1); // 2 issues in Todo, last index is 1
+    }
+
+    // ================================================================
+    // Normal mode: issue movement
+    // ================================================================
+
+    #[test]
+    fn move_issue_right_changes_column() {
+        let mut app = app_with_issues();
+        assert_eq!(app.issues[0].column, Column::Todo);
+        act(&mut app, Action::MoveIssueRight);
+        assert_eq!(app.issues[0].column, Column::InProgress);
+        assert!(app.state_dirty);
+    }
+
+    #[test]
+    fn move_issue_left_changes_column() {
+        let mut app = app_with_issues();
+        app.selected_column = 1;
+        assert_eq!(app.issues[2].column, Column::InProgress);
+        act(&mut app, Action::MoveIssueLeft);
+        assert_eq!(app.issues[2].column, Column::Todo);
+        assert!(app.state_dirty);
+    }
+
+    #[test]
+    fn move_to_done() {
+        let mut app = app_with_issues();
+        act(&mut app, Action::MoveToDone);
+        assert_eq!(app.issues[0].column, Column::Done);
+        assert!(app.issues[0].done_at.is_some());
+        assert!(app.state_dirty);
+    }
+
+    #[test]
+    fn move_to_todo() {
+        let mut app = app_with_issues();
+        app.selected_column = 1;
+        act(&mut app, Action::MoveToTodo);
+        assert_eq!(app.issues[2].column, Column::Todo);
+        assert!(app.state_dirty);
+    }
+
+    // ================================================================
+    // Normal mode: CRUD actions
+    // ================================================================
+
+    #[test]
+    fn create_issue_opens_dialog() {
+        let mut app = test_app();
+        act(&mut app, Action::CreateIssue);
+        assert_eq!(app.input_mode, InputMode::Dialog);
+        assert!(app.dialog.is_some());
+    }
+
+    #[test]
+    fn edit_issue_opens_dialog() {
+        let mut app = app_with_issues();
+        act(&mut app, Action::EditIssue);
+        assert_eq!(app.input_mode, InputMode::Dialog);
+        let dialog = app.dialog.as_ref().unwrap();
+        assert!(dialog.editing_index.is_some());
+        assert_eq!(dialog.title, "Test issue bork-1");
+    }
+
+    #[test]
+    fn delete_issue_opens_confirm() {
+        let mut app = app_with_issues();
+        act(&mut app, Action::DeleteIssue);
+        assert_eq!(app.input_mode, InputMode::Confirm);
+        assert!(app.confirm_message.is_some());
+    }
+
+    #[test]
+    fn delete_confirm_removes_issue() {
+        let mut app = app_with_issues();
+        act(&mut app, Action::DeleteIssue);
+        assert_eq!(app.input_mode, InputMode::Confirm);
+        act(&mut app, Action::ConfirmYes);
+        assert_eq!(app.input_mode, InputMode::Normal);
+        // bork-1 was deleted (no active session so synchronous)
+        assert_eq!(app.issues.len(), 2);
+        assert_eq!(app.issues[0].id, "bork-2");
+        assert!(app.state_dirty);
+    }
+
+    #[test]
+    fn delete_confirm_no_cancels() {
+        let mut app = app_with_issues();
+        act(&mut app, Action::DeleteIssue);
+        act(&mut app, Action::ConfirmNo);
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert_eq!(app.issues.len(), 3);
+    }
+
+    // ================================================================
+    // Normal mode: misc actions
+    // ================================================================
+
+    #[test]
+    fn quit_sets_should_quit() {
+        let mut app = test_app();
+        act(&mut app, Action::Quit);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn search_start_enters_search_mode() {
+        let mut app = test_app();
+        act(&mut app, Action::SearchStart);
+        assert_eq!(app.input_mode, InputMode::Search);
+    }
+
+    #[test]
+    fn show_help_enters_help_mode() {
+        let mut app = test_app();
+        act(&mut app, Action::ShowHelp);
+        assert_eq!(app.input_mode, InputMode::Help);
+    }
+
+    #[test]
+    fn close_help_returns_to_normal() {
+        let mut app = test_app();
+        act(&mut app, Action::ShowHelp);
+        assert_eq!(app.input_mode, InputMode::Help);
+        act(&mut app, Action::CloseHelp);
+        assert_eq!(app.input_mode, InputMode::Normal);
+    }
+
+    #[test]
+    fn sync_prs_returns_none() {
+        let mut app = test_app();
+        let post = act(&mut app, Action::SyncPRs);
+        assert!(matches!(post, PostAction::None));
+    }
+
+    #[test]
+    fn add_issue_opens_dialog_for_current_column() {
+        let mut app = app_with_issues();
+        app.selected_column = 1; // InProgress
+        act(&mut app, Action::AddIssue);
+        assert_eq!(app.input_mode, InputMode::Dialog);
+        let dialog = app.dialog.as_ref().unwrap();
+        assert_eq!(dialog.target_column, Some(Column::InProgress));
+    }
+
+    #[test]
+    fn noop_does_nothing() {
+        let mut app = test_app();
+        let post = act(&mut app, Action::Noop);
+        assert!(matches!(post, PostAction::None));
+        assert_eq!(app.input_mode, InputMode::Normal);
+    }
+
+    // ================================================================
+    // Search mode dispatch
+    // ================================================================
+
+    #[test]
+    fn search_char_appends() {
+        let mut app = test_app();
+        act(&mut app, Action::SearchStart);
+        act(&mut app, Action::SearchChar('a'));
+        act(&mut app, Action::SearchChar('b'));
+        assert_eq!(app.search_query, "ab");
+    }
+
+    #[test]
+    fn search_backspace_removes() {
+        let mut app = test_app();
+        act(&mut app, Action::SearchStart);
+        act(&mut app, Action::SearchChar('a'));
+        act(&mut app, Action::SearchChar('b'));
+        act(&mut app, Action::SearchBackspace);
+        assert_eq!(app.search_query, "a");
+    }
+
+    #[test]
+    fn search_confirm_returns_to_normal() {
+        let mut app = test_app();
+        act(&mut app, Action::SearchStart);
+        act(&mut app, Action::SearchChar('x'));
+        act(&mut app, Action::SearchConfirm);
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert_eq!(app.search_query, "x"); // query preserved
+    }
+
+    #[test]
+    fn search_cancel_clears_and_returns() {
+        let mut app = test_app();
+        act(&mut app, Action::SearchStart);
+        act(&mut app, Action::SearchChar('x'));
+        act(&mut app, Action::SearchCancel);
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert_eq!(app.search_query, ""); // query cleared
+    }
+
+    // ================================================================
+    // Kill session (confirm flow, no actual tmux)
+    // ================================================================
+
+    #[test]
+    fn kill_session_no_active_session_shows_message() {
+        let mut app = app_with_issues();
+        act(&mut app, Action::KillSession);
+        // No active session, so it just sets a message
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert!(app.message.as_ref().unwrap().contains("No active session"));
+    }
+
+    #[test]
+    fn kill_session_with_active_session_opens_confirm() {
+        let mut app = app_with_issues();
+        app.active_sessions.insert("bork-bork-1".to_string());
+        act(&mut app, Action::KillSession);
+        assert_eq!(app.input_mode, InputMode::Confirm);
     }
 }

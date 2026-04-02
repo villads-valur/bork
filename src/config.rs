@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -31,15 +31,9 @@ impl Default for AppConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppState {
     pub issues: Vec<Issue>,
-}
-
-impl Default for AppState {
-    fn default() -> Self {
-        Self { issues: Vec::new() }
-    }
 }
 
 /// Walk up from cwd looking for a `.bork/` directory.
@@ -62,24 +56,24 @@ fn find_project_root() -> PathBuf {
     cwd
 }
 
-fn config_dir(project_root: &PathBuf) -> PathBuf {
+fn config_dir(project_root: &Path) -> PathBuf {
     project_root.join(".bork")
 }
 
-pub fn agent_status_dir(project_root: &PathBuf) -> PathBuf {
+pub fn agent_status_dir(project_root: &Path) -> PathBuf {
     config_dir(project_root).join("agent-status")
 }
 
-pub fn ensure_agent_status_dir(project_root: &PathBuf) {
+pub fn ensure_agent_status_dir(project_root: &Path) {
     let dir = agent_status_dir(project_root);
     let _ = fs::create_dir_all(&dir);
 }
 
-fn state_path(project_root: &PathBuf) -> PathBuf {
+fn state_path(project_root: &Path) -> PathBuf {
     config_dir(project_root).join("state.json")
 }
 
-fn config_path(project_root: &PathBuf) -> PathBuf {
+fn config_path(project_root: &Path) -> PathBuf {
     config_dir(project_root).join("config.toml")
 }
 
@@ -102,7 +96,7 @@ pub fn load_config() -> AppConfig {
     }
 }
 
-pub fn load_state(project_root: &PathBuf) -> AppState {
+pub fn load_state(project_root: &Path) -> AppState {
     let path = state_path(project_root);
     if path.exists() {
         if let Ok(contents) = fs::read_to_string(&path) {
@@ -114,7 +108,7 @@ pub fn load_state(project_root: &PathBuf) -> AppState {
     AppState::default()
 }
 
-pub fn save_state(state: &AppState, project_root: &PathBuf) -> anyhow::Result<()> {
+pub fn save_state(state: &AppState, project_root: &Path) -> anyhow::Result<()> {
     let dir = config_dir(project_root);
     fs::create_dir_all(&dir)?;
 

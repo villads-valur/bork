@@ -3,7 +3,7 @@ use std::process::Command;
 use anyhow::{bail, Context};
 
 use crate::config;
-use crate::types::{AgentMode, AgentStatus, Column, Issue, IssueKind};
+use crate::types::{AgentMode, Column, Issue, IssueKind};
 
 /// Create a git worktree and register it with bork's state.json.
 pub fn run_worktree(issue_id: &str, slug: Option<&str>, title: Option<&str>) -> anyhow::Result<()> {
@@ -67,10 +67,8 @@ fn run_worktree_in(
             title: title.to_string(),
             kind: IssueKind::Agentic,
             column: Column::Todo,
-            tmux_session: None,
             agent_kind: config.agent_kind,
             agent_mode: AgentMode::Plan,
-            agent_status: AgentStatus::Stopped,
             prompt: None,
             worktree: Some(worktree_dir.to_string()),
             done_at: None,
@@ -78,14 +76,9 @@ fn run_worktree_in(
             linear_id: None,
             linear_identifier: None,
             linear_url: None,
-            linear_state: None,
-            linear_branch: None,
             linear_imported: false,
             pr_number: None,
-            github_pr_number: None,
-            github_pr_url: None,
-            github_pr_title: None,
-            github_imported: false,
+            pr_imported: false,
         };
         state.issues.push(issue);
     } else {

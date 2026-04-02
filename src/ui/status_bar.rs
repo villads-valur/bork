@@ -19,7 +19,7 @@ pub fn render_header(frame: &mut Frame, app: &App, area: Rect) {
             format!("- {} ", app.config.project_name),
             Style::default().fg(styles::TEXT),
         ),
-        Span::styled("v0.1.0", styles::dim_style()),
+        Span::styled(concat!("v", env!("CARGO_PKG_VERSION")), styles::dim_style()),
     ]);
 
     frame.render_widget(Paragraph::new(title), area);

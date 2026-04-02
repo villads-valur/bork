@@ -77,7 +77,7 @@ pub struct DialogState {
     pub linear_detached: bool,
     pub linear_available: bool,
     pub github_pr: Option<PrStatus>,
-    pub github_pr_detached: bool,
+    pub github_pr_cleared: bool,
     pub github_available: bool,
 }
 
@@ -111,7 +111,7 @@ impl DialogState {
             linear_detached: false,
             linear_available,
             github_pr: None,
-            github_pr_detached: false,
+            github_pr_cleared: false,
             github_available,
         }
     }
@@ -130,13 +130,13 @@ impl DialogState {
             identifier: issue.linear_identifier.clone().unwrap_or_default(),
             title: issue.title.clone(),
             url: issue.linear_url.clone().unwrap_or_default(),
-            branch_name: issue.linear_branch.clone().unwrap_or_default(),
+            branch_name: String::new(),
             priority: 0,
-            state_name: issue.linear_state.clone().unwrap_or_default(),
+            state_name: String::new(),
             team_key: String::new(),
         });
 
-        let github_pr = issue.github_pr_number.and_then(|num| {
+        let github_pr = issue.pr_number.and_then(|num| {
             all_prs
                 .values()
                 .chain(user_prs.iter())
@@ -163,7 +163,7 @@ impl DialogState {
             linear_detached: false,
             linear_available,
             github_pr,
-            github_pr_detached: false,
+            github_pr_cleared: false,
             github_available,
         }
     }
@@ -441,6 +441,7 @@ pub struct App {
     pub github_user: Option<String>,
     pub user_prs: Vec<PrStatus>,
     pub git_poll_done: bool,
+    pub state_dirty: bool,
 }
 
 impl App {
@@ -483,7 +484,12 @@ impl App {
             github_user: None,
             user_prs: Vec::new(),
             git_poll_done: false,
+            state_dirty: false,
         }
+    }
+
+    pub fn mark_dirty(&mut self) {
+        self.state_dirty = true;
     }
 
     pub fn issues_in_column(&self, column: Column) -> Vec<(usize, &Issue)> {
@@ -829,7 +835,7 @@ impl App {
                 return Some(pr);
             }
         }
-        let pr_num = issue.github_pr_number.or(issue.pr_number)?;
+        let pr_num = issue.pr_number?;
         self.pr_statuses
             .values()
             .chain(self.user_prs.iter())
@@ -893,25 +899,18 @@ impl App {
                 title: pr.title.clone(),
                 kind: IssueKind::Agentic,
                 column: Column::CodeReview,
-                worktree: None,
-                tmux_session: None,
                 agent_kind: self.config.agent_kind,
                 agent_mode: AgentMode::Plan,
-                agent_status: AgentStatus::Stopped,
                 prompt: None,
+                worktree: None,
                 done_at: None,
                 session_id: None,
                 linear_id: None,
                 linear_identifier: None,
                 linear_url: None,
-                linear_state: None,
-                linear_branch: None,
                 linear_imported: false,
                 pr_number: Some(pr.number),
-                github_pr_number: None,
-                github_pr_url: None,
-                github_pr_title: None,
-                github_imported: false,
+                pr_imported: true,
             });
         }
 
@@ -1040,6 +1039,7 @@ impl App {
         self.input_mode = InputMode::LinearPicker;
     }
 
+    #[cfg(test)]
     pub fn open_linear_picker(&mut self) {
         self.open_import_picker_with_context(LinearPickerContext::Import);
     }
@@ -1271,10 +1271,8 @@ mod tests {
             title: format!("Test issue {}", id),
             kind: IssueKind::Agentic,
             column,
-            tmux_session: None,
             agent_kind: AgentKind::OpenCode,
             agent_mode: AgentMode::Plan,
-            agent_status: AgentStatus::Stopped,
             prompt: None,
             worktree: None,
             done_at: None,
@@ -1282,14 +1280,9 @@ mod tests {
             linear_id: None,
             linear_identifier: None,
             linear_url: None,
-            linear_state: None,
-            linear_branch: None,
             linear_imported: false,
             pr_number: None,
-            github_pr_number: None,
-            github_pr_url: None,
-            github_pr_title: None,
-            github_imported: false,
+            pr_imported: false,
         }
     }
 
@@ -2125,7 +2118,6 @@ mod tests {
         // Issue in Done with done_at 600 seconds ago, TTL is 300s, session alive
         let mut issue = test_issue("bork-1", Column::Done);
         issue.done_at = Some(1000);
-        issue.tmux_session = Some("bork-bork-1".to_string());
 
         let mut app = test_app(vec![issue]);
         app.config.done_session_ttl = 300;
@@ -2145,7 +2137,6 @@ mod tests {
         // Issue in Done with done_at 100 seconds ago, TTL is 300s
         let mut issue = test_issue("bork-1", Column::Done);
         issue.done_at = Some(1500);
-        issue.tmux_session = Some("bork-bork-1".to_string());
 
         let mut app = test_app(vec![issue]);
         app.config.done_session_ttl = 300;
@@ -2180,8 +2171,7 @@ mod tests {
     #[test]
     fn issues_needing_cleanup_not_in_done() {
         // Issue in InProgress should never be in cleanup list
-        let mut issue = test_issue("bork-1", Column::InProgress);
-        issue.tmux_session = Some("bork-bork-1".to_string());
+        let issue = test_issue("bork-1", Column::InProgress);
 
         let mut app = test_app(vec![issue]);
         app.active_sessions.insert("bork-bork-1".to_string());
@@ -2194,8 +2184,7 @@ mod tests {
     #[test]
     fn issues_needing_cleanup_no_done_at() {
         // Issue in Done but done_at is None (legacy data)
-        let mut issue = test_issue("bork-1", Column::Done);
-        issue.tmux_session = Some("bork-bork-1".to_string());
+        let issue = test_issue("bork-1", Column::Done);
 
         let mut app = test_app(vec![issue]);
         app.active_sessions.insert("bork-bork-1".to_string());
@@ -2212,11 +2201,9 @@ mod tests {
     fn issues_needing_cleanup_multiple_issues() {
         let mut expired = test_issue("bork-1", Column::Done);
         expired.done_at = Some(1000);
-        expired.tmux_session = Some("bork-bork-1".to_string());
 
         let mut not_expired = test_issue("bork-2", Column::Done);
         not_expired.done_at = Some(1500);
-        not_expired.tmux_session = Some("bork-bork-2".to_string());
 
         let in_progress = test_issue("bork-3", Column::InProgress);
 
