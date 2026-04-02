@@ -45,7 +45,7 @@ struct PrPollResult {
 
 const TICK_RATE: Duration = Duration::from_millis(50);
 const TMUX_POLL_INTERVAL: Duration = Duration::from_secs(2);
-const GIT_POLL_INTERVAL: Duration = Duration::from_secs(3);
+const GIT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const PORT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const LINEAR_POLL_INTERVAL: Duration = Duration::from_secs(45);
 const PR_POLL_INTERVAL: Duration = Duration::from_secs(60);
@@ -353,17 +353,22 @@ fn run_tui() -> anyhow::Result<()> {
 
     let mut pending_popup_session: Option<(String, String)> = None;
     let mut pending_popup_for_launch: Option<(usize, String)> = None;
+    let mut needs_redraw = true;
 
     // --- Main event loop ---
     loop {
-        terminal.draw(|frame| {
-            ui::render(frame, &app);
-        })?;
+        if needs_redraw {
+            terminal.draw(|frame| {
+                ui::render(frame, &app);
+            })?;
+            needs_redraw = false;
+        }
 
         if event::poll(TICK_RATE)? {
             loop {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
+                        needs_redraw = true;
                         let dialog_field = app.dialog.as_ref().map(|d| d.current_field());
                         let action = map_key_to_action(key, app.input_mode, dialog_field);
                         let post_action = handler::handle_action(
@@ -416,6 +421,7 @@ fn run_tui() -> anyhow::Result<()> {
         }
 
         while let Ok(result) = action_rx.try_recv() {
+            needs_redraw = true;
             app.busy_count = app.busy_count.saturating_sub(1);
             app.set_message(result.message);
 
@@ -450,9 +456,11 @@ fn run_tui() -> anyhow::Result<()> {
                 &app.config.project_name,
             )?;
             app.message = None;
+            needs_redraw = true;
         }
 
         while let Ok(poll) = session_rx.try_recv() {
+            needs_redraw = true;
             app.active_sessions = poll.sessions;
             app.agent_statuses = poll.agent_statuses;
             // Update shared sessions set for the port poll worker
@@ -472,11 +480,11 @@ fn run_tui() -> anyhow::Result<()> {
             .as_secs();
         let cleanup_indices = app.issues_needing_session_cleanup(now);
         for idx in cleanup_indices {
+            needs_redraw = true;
             let session_name = app.issues[idx].session_name(&app.config.project_name);
             let status_file = config::agent_status_dir(&app.config.project_root)
                 .join(format!("{}.json", session_name));
             let sn = session_name.clone();
-            // Remove from active set immediately so we don't re-fire on next tick
             app.active_sessions.remove(&session_name);
             thread::spawn(move || {
                 let _ = external::tmux::kill_session(&sn);
@@ -485,13 +493,19 @@ fn run_tui() -> anyhow::Result<()> {
             app.set_message(format!("Auto-killed session '{}' (done TTL)", session_name));
         }
 
+        let mut git_data_changed = false;
         while let Ok(git_result) = git_rx.try_recv() {
+            needs_redraw = true;
+            git_data_changed = true;
             app.worktree_statuses = git_result.statuses;
             app.worktree_branches = git_result.branches;
             app.git_poll_done = true;
         }
 
+        let mut pr_data_changed = false;
         while let Ok(pr_result) = pr_rx.try_recv() {
+            needs_redraw = true;
+            pr_data_changed = true;
             app.pr_statuses = pr_result.prs;
             app.user_prs = pr_result.user_prs;
             if pr_result.github_user.is_some() {
@@ -509,26 +523,31 @@ fn run_tui() -> anyhow::Result<()> {
             }
         }
 
-        // --- Auto-import open PRs as issues ---
-        if app.sync_prs_as_issues() {
+        // --- Auto-import open PRs as issues (only when new PR data arrived) ---
+        if pr_data_changed && app.sync_prs_as_issues() {
             app.mark_dirty();
         }
 
-        // --- Auto-assign worktrees for issues that don't have one ---
-        let mut worktree_changed = app.auto_assign_worktrees();
-        worktree_changed = app.clear_stale_worktrees() || worktree_changed;
-        if worktree_changed {
-            let _ = git_wake_tx.send(());
-            app.mark_dirty();
+        // --- Auto-assign worktrees (only when git data changed) ---
+        if git_data_changed {
+            let mut worktree_changed = app.auto_assign_worktrees();
+            worktree_changed = app.clear_stale_worktrees() || worktree_changed;
+            if worktree_changed {
+                let _ = git_wake_tx.send(());
+                app.mark_dirty();
+            }
         }
 
-        // --- Update git skip set for Done worktrees ---
-        if let Ok(mut skip) = git_skip_set.lock() {
-            *skip = app.done_worktree_names();
+        // --- Update git skip set when issues changed columns or git data arrived ---
+        if git_data_changed || app.state_dirty {
+            if let Ok(mut skip) = git_skip_set.lock() {
+                *skip = app.done_worktree_names();
+            }
         }
 
         // --- Linear: check availability then consume poll results ---
         if let Ok(true) = linear_check_rx.try_recv() {
+            needs_redraw = true;
             app.linear_available = true;
             if let Some(wake_rx) = linear_wake_rx.take() {
                 linear_rx = Some(spawn_linear_worker(wake_rx));
@@ -536,6 +555,7 @@ fn run_tui() -> anyhow::Result<()> {
         }
         if let Some(ref rx) = linear_rx {
             while let Ok(result) = rx.try_recv() {
+                needs_redraw = true;
                 app.linear_issues = result.issues;
                 for issue in &mut app.issues {
                     if let Some(ref lid) = issue.linear_id {
@@ -551,6 +571,7 @@ fn run_tui() -> anyhow::Result<()> {
 
         if app.busy_count > 0 {
             app.spinner_tick = app.spinner_tick.wrapping_add(1);
+            needs_redraw = true;
         }
 
         // --- Flush dirty state to disk (once per tick, not per action) ---
@@ -559,7 +580,9 @@ fn run_tui() -> anyhow::Result<()> {
             app.state_dirty = false;
         }
 
-        app.clear_expired_message();
+        if app.clear_expired_message() {
+            needs_redraw = true;
+        }
     }
 
     let _ = config::save_state(&app.to_state(), &app.config.project_root);
