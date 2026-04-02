@@ -132,9 +132,9 @@ fn format_bottom_line(
     let mut right_width: usize = 0;
 
     if has_ports {
-        let port_text = format_port_text(ports.unwrap());
-        right_width += port_text.len();
-        right_spans.push(Span::styled(port_text, Style::default().fg(Color::Cyan)));
+        // 🔌 is 2 cells wide in most terminals
+        right_spans.push(Span::styled("\u{1f50c}", Style::default()));
+        right_width += 2;
     }
 
     if has_branch {
@@ -142,7 +142,6 @@ fn format_bottom_line(
             right_spans.insert(0, Span::raw(" "));
             right_width += 1;
         }
-        // 🌿 is 2 cells wide in most terminals
         right_spans.insert(
             0,
             Span::styled("\u{1f33f}", Style::default().fg(Color::Green)),
@@ -151,28 +150,19 @@ fn format_bottom_line(
     }
 
     if !right_spans.is_empty() {
-        let gap = if left_width + right_width < max_width {
-            max_width - left_width - right_width
+        // Reserve 1 cell padding before the right card border
+        let total = left_width + right_width + 1;
+        let gap = if total < max_width {
+            max_width - total
         } else {
             1
         };
         left_spans.push(Span::raw(" ".repeat(gap)));
         left_spans.extend(right_spans);
+        left_spans.push(Span::raw(" "));
     }
 
     Line::from(left_spans)
-}
-
-fn format_port_text(ports: &[u16]) -> String {
-    if ports.len() <= 2 {
-        ports
-            .iter()
-            .map(|p| format!(":{}", p))
-            .collect::<Vec<_>>()
-            .join(" ")
-    } else {
-        format!(":{} +{}", ports[0], ports.len() - 1)
-    }
 }
 
 fn format_git_status(status: Option<&WorktreeStatus>) -> Vec<Span<'static>> {
