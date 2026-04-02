@@ -264,7 +264,7 @@ fn render_linear_list(
             };
             let overhead = 2 + priority_str.len() + id_width + 1 + state_str.len();
             let title_budget = field_width.saturating_sub(overhead);
-            let title = truncate(&issue.title, title_budget);
+            let title = styles::truncate(&issue.title, title_budget);
 
             let title_style = if is_imported {
                 styles::dim_style()
@@ -304,12 +304,7 @@ fn render_github_list(
     let filtered = app.filtered_github_prs();
     let count = filtered.len();
 
-    let imported_pr_numbers: HashSet<u32> = app
-        .issues
-        .iter()
-        .flat_map(|i| [i.github_pr_number, i.pr_number])
-        .flatten()
-        .collect();
+    let imported_pr_numbers: HashSet<u32> = app.issues.iter().filter_map(|i| i.pr_number).collect();
 
     let scroll = if visible_count == 0 || picker.selected < visible_count {
         0
@@ -380,7 +375,7 @@ fn render_github_list(
                 + diff_str.len()
                 + status_suffix.len();
             let title_budget = field_width.saturating_sub(overhead);
-            let title = truncate(&pr.title, title_budget);
+            let title = styles::truncate(&pr.title, title_budget);
 
             let title_style = if is_imported {
                 styles::dim_style()
@@ -407,16 +402,5 @@ fn render_github_list(
 
             frame.render_widget(Paragraph::new(line), row_area);
         }
-    }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else if max > 3 {
-        let end: String = s.chars().take(max - 3).collect();
-        format!("{}...", end)
-    } else {
-        s.chars().take(max).collect()
     }
 }

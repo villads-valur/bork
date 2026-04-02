@@ -43,7 +43,7 @@ pub fn render_card(frame: &mut Frame, ctx: &CardContext, area: Rect) {
 
     let max_width = inner.width as usize;
 
-    let title_text = truncate(&ctx.issue.title, max_width);
+    let title_text = styles::truncate(&ctx.issue.title, max_width);
     let title_line = Line::from(Span::styled(title_text, title_style));
     let status_line = format_status_line(ctx);
     let pr_line = format_pr_line(ctx.pr);
@@ -215,16 +215,5 @@ fn format_pr_line(pr: Option<&PrStatus>) -> Line<'static> {
 
             Line::from(spans)
         }
-    }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else if max > 3 {
-        let end: String = s.chars().take(max - 3).collect();
-        format!("{}...", end)
-    } else {
-        s.chars().take(max).collect()
     }
 }

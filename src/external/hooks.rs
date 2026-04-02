@@ -207,7 +207,9 @@ fn install_claude_hooks() -> anyhow::Result<()> {
         let bork_entries = bork_entries.as_array().unwrap();
 
         if let Some(existing_entries) = existing_hooks.get_mut(event_name) {
-            let existing_arr = existing_entries.as_array_mut().unwrap();
+            let Some(existing_arr) = existing_entries.as_array_mut() else {
+                continue;
+            };
 
             // Remove any existing bork hooks (identified by BORK_STATUS_DIR in the command)
             existing_arr.retain(|entry| !is_bork_hook(entry));
@@ -279,6 +281,107 @@ fn is_bork_hook(entry: &serde_json::Value) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // --- is_bork_hook ---
+
+    #[test]
+    fn is_bork_hook_with_bork_command() {
+        let entry = json!({
+            "hooks": [{
+                "type": "command",
+                "command": "echo BORK_STATUS_DIR test"
+            }]
+        });
+        assert!(is_bork_hook(&entry));
+    }
+
+    #[test]
+    fn is_bork_hook_without_bork_command() {
+        let entry = json!({
+            "hooks": [{
+                "type": "command",
+                "command": "echo hello"
+            }]
+        });
+        assert!(!is_bork_hook(&entry));
+    }
+
+    #[test]
+    fn is_bork_hook_no_hooks_key() {
+        let entry = json!({"type": "command"});
+        assert!(!is_bork_hook(&entry));
+    }
+
+    #[test]
+    fn is_bork_hook_empty_hooks_array() {
+        let entry = json!({"hooks": []});
+        assert!(!is_bork_hook(&entry));
+    }
+
+    #[test]
+    fn is_bork_hook_hooks_not_array() {
+        let entry = json!({"hooks": "not an array"});
+        assert!(!is_bork_hook(&entry));
+    }
+
+    #[test]
+    fn is_bork_hook_command_not_string() {
+        let entry = json!({"hooks": [{"command": 42}]});
+        assert!(!is_bork_hook(&entry));
+    }
+
+    // --- claude_hooks_already_installed ---
+    // This function reads from a file, but we can test the JSON logic
+    // by writing temp files.
+
+    #[test]
+    fn hooks_installed_detects_full_match() {
+        let tmp = std::env::temp_dir().join("bork-test-hooks-installed.json");
+        let settings = json!({
+            "hooks": serde_json::from_str::<serde_json::Value>(CLAUDE_HOOKS).unwrap()
+        });
+        std::fs::write(&tmp, serde_json::to_string(&settings).unwrap()).unwrap();
+        assert!(claude_hooks_already_installed(&tmp.to_path_buf()));
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn hooks_installed_false_when_no_file() {
+        let tmp = std::env::temp_dir().join("bork-test-hooks-nonexistent.json");
+        assert!(!claude_hooks_already_installed(&tmp.to_path_buf()));
+    }
+
+    #[test]
+    fn hooks_installed_false_when_empty_hooks() {
+        let tmp = std::env::temp_dir().join("bork-test-hooks-empty.json");
+        let settings = json!({"hooks": {}});
+        std::fs::write(&tmp, serde_json::to_string(&settings).unwrap()).unwrap();
+        assert!(!claude_hooks_already_installed(&tmp.to_path_buf()));
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn hooks_installed_false_when_no_hooks_key() {
+        let tmp = std::env::temp_dir().join("bork-test-hooks-nokey.json");
+        let settings = json!({"other": "stuff"});
+        std::fs::write(&tmp, serde_json::to_string(&settings).unwrap()).unwrap();
+        assert!(!claude_hooks_already_installed(&tmp.to_path_buf()));
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn hooks_installed_false_when_invalid_json() {
+        let tmp = std::env::temp_dir().join("bork-test-hooks-invalid.json");
+        std::fs::write(&tmp, "not json").unwrap();
+        assert!(!claude_hooks_already_installed(&tmp.to_path_buf()));
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 fn dirs_global_config() -> PathBuf {
