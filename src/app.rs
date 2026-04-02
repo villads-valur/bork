@@ -418,6 +418,7 @@ pub struct App {
     pub selected_row: [usize; 4],
     pub active_sessions: HashSet<String>,
     pub agent_statuses: HashMap<String, AgentStatusInfo>,
+    pub listening_ports: HashMap<String, Vec<u16>>,
     pub worktree_statuses: HashMap<String, WorktreeStatus>,
     pub worktree_branches: HashMap<String, String>,
     pub pr_statuses: HashMap<String, PrStatus>,
@@ -463,6 +464,7 @@ impl App {
             selected_row: [0; 4],
             active_sessions: HashSet::new(),
             agent_statuses: HashMap::new(),
+            listening_ports: HashMap::new(),
             worktree_statuses: HashMap::new(),
             worktree_branches: HashMap::new(),
             pr_statuses: HashMap::new(),
@@ -736,6 +738,11 @@ impl App {
         self.agent_statuses
             .get(&session_name)
             .and_then(|info| info.activity.as_deref())
+    }
+
+    pub fn listening_ports_for(&self, issue: &Issue) -> Option<&Vec<u16>> {
+        let session_name = issue.session_name(&self.config.project_name);
+        self.listening_ports.get(&session_name)
     }
 
     pub fn worktree_for<'a>(&self, issue: &'a Issue) -> Option<&'a str> {
