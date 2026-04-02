@@ -117,6 +117,7 @@ fn format_bottom_line(
         return Line::from("");
     }
 
+    // Left side: Linear identifier
     let mut left_spans: Vec<Span<'static>> = vec![Span::raw("  ")];
     let mut left_width: usize = 2;
 
@@ -126,34 +127,37 @@ fn format_bottom_line(
         left_spans.push(Span::styled(text, Style::default().fg(Color::Blue)));
     }
 
-    if has_branch {
-        if has_linear {
-            left_spans.push(Span::raw(" "));
-            left_width += 1;
-        }
-        // 🌿 is 2 cells wide in most terminals
-        let text = "\u{1f33f}";
-        left_width += 2;
-        left_spans.push(Span::styled(text, Style::default().fg(Color::Green)));
-    }
+    // Right side: branch icon + ports
+    let mut right_spans: Vec<Span<'static>> = Vec::new();
+    let mut right_width: usize = 0;
 
     if has_ports {
         let port_text = format_port_text(ports.unwrap());
-        let port_width = port_text.len();
+        right_width += port_text.len();
+        right_spans.push(Span::styled(port_text, Style::default().fg(Color::Cyan)));
+    }
 
-        // Right-align: fill gap between left content and port text
-        let gap = if left_width + port_width < max_width {
-            max_width - left_width - port_width
-        } else if left_width < max_width {
-            1 // at least one space separator
-        } else {
-            0
-        };
-
-        if gap > 0 {
-            left_spans.push(Span::raw(" ".repeat(gap)));
+    if has_branch {
+        if !right_spans.is_empty() {
+            right_spans.insert(0, Span::raw(" "));
+            right_width += 1;
         }
-        left_spans.push(Span::styled(port_text, Style::default().fg(Color::Cyan)));
+        // 🌿 is 2 cells wide in most terminals
+        right_spans.insert(
+            0,
+            Span::styled("\u{1f33f}", Style::default().fg(Color::Green)),
+        );
+        right_width += 2;
+    }
+
+    if !right_spans.is_empty() {
+        let gap = if left_width + right_width < max_width {
+            max_width - left_width - right_width
+        } else {
+            1
+        };
+        left_spans.push(Span::raw(" ".repeat(gap)));
+        left_spans.extend(right_spans);
     }
 
     Line::from(left_spans)
