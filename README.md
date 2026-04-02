@@ -62,6 +62,7 @@ Press `n` to create an issue, `Enter` to launch an agent session. You're up and 
 - **Session resumption** &mdash; Closing a tmux popup and reopening it continues the same conversation, not a fresh one
 - **Real-time status monitoring** &mdash; See agent state on each card (Idle, Busy, Waiting, Error)
 - **GitHub PR status** &mdash; Background polling shows checks, review status, and diff stats on cards
+- **Dev server detection** &mdash; Automatically detects listening TCP ports per session and shows a 🔌 indicator on the card
 - **Git worktree tracking** &mdash; Live staged/unstaged change counts and branch names
 - **Tmux integration** &mdash; Auto-wraps in tmux, sessions open as 90% screen popups
 - **Plan, Build, and Yolo modes** &mdash; Toggle between modes per issue; Claude also supports Yolo (skips all permission prompts)
@@ -239,6 +240,8 @@ Each issue card shows the current agent status:
 | `●` | Busy |
 | `◈` | Waiting for input |
 | `✗` | Error |
+| `🌿` | Worktree branch detected |
+| `🔌` | Dev server listening on a TCP port |
 
 ## GitHub PR Integration
 
@@ -269,6 +272,16 @@ When the [Linear CLI](https://linear.app/docs/cli) is installed and authenticate
 - **State sync** &mdash; Linear issue state is refreshed on each poll cycle. Imported issues also sync their title from Linear.
 
 If the `linear` CLI is not found at startup, all Linear features are silently disabled.
+
+## Dev Server Detection
+
+Bork automatically detects dev servers (or any process listening on a TCP port) running inside tmux session terminals. A dedicated background worker polls every 5 seconds by cross-referencing:
+
+1. **tmux pane PIDs** (`tmux list-panes -a`)
+2. **Listening TCP ports** (`lsof -iTCP -sTCP:LISTEN`)
+3. **Process tree** (`ps -eo pid,ppid`)
+
+When a listening port is traced back to a tmux session's process tree, the card shows a 🔌 indicator in the bottom-right corner. This works with any dev server setup (Next.js, Vite, Rails, etc.) with no configuration required.
 
 ## Project Layout
 
