@@ -7,6 +7,7 @@ use crate::app::{App, ConfirmAction, ImportSource, InputMode, LinearPickerContex
 use crate::config::{self, AppConfig};
 use crate::external::{github, opencode, tmux};
 use crate::input::Action;
+use crate::lock;
 use crate::types::{AgentMode, Column, Issue, IssueKind};
 
 pub type PrWakeTx = mpsc::Sender<()>;
@@ -59,6 +60,10 @@ pub fn handle_action(
         }
         InputMode::Help => {
             handle_help(app, action);
+            PostAction::None
+        }
+        InputMode::DebugInspector => {
+            handle_debug_inspector(app, action);
             PostAction::None
         }
         InputMode::Normal => handle_normal(app, action, action_tx, pr_wake_tx, git_wake_tx),
@@ -336,6 +341,30 @@ fn handle_normal(
             PostAction::None
         }
 
+        Action::DebugReset => {
+            if !app.config.debug {
+                return PostAction::None;
+            }
+            lock::release_lock(&app.config.project_root);
+            let session_name = app.config.project_name.clone();
+            let _ = tmux::kill_session(&session_name);
+            app.should_quit = true;
+            PostAction::None
+        }
+
+        Action::DebugInspect => {
+            if !app.config.debug {
+                return PostAction::None;
+            }
+            let Some(issue) = app.selected_issue().cloned() else {
+                app.set_message("No issue selected");
+                return PostAction::None;
+            };
+            let json = serde_json::to_string_pretty(&issue).unwrap_or_else(|e| format!("{e}"));
+            app.open_debug_inspector(json);
+            PostAction::None
+        }
+
         _ => PostAction::None,
     }
 }
@@ -353,6 +382,29 @@ fn handle_search(app: &mut App, action: Action) {
 fn handle_help(app: &mut App, action: Action) {
     match action {
         Action::CloseHelp => app.close_help(),
+        Action::Quit => {
+            app.should_quit = true;
+        }
+        _ => {}
+    }
+}
+
+fn handle_debug_inspector(app: &mut App, action: Action) {
+    match action {
+        Action::DebugInspectorClose => app.close_debug_inspector(),
+        Action::DebugInspectorScrollDown => {
+            app.debug_inspector_scroll = app.debug_inspector_scroll.saturating_add(1);
+        }
+        Action::DebugInspectorScrollUp => {
+            app.debug_inspector_scroll = app.debug_inspector_scroll.saturating_sub(1);
+        }
+        Action::DebugInspectorScrollTop => {
+            app.debug_inspector_scroll = 0;
+        }
+        Action::DebugInspectorScrollBottom => {
+            let lines = app.debug_inspector_line_count();
+            app.debug_inspector_scroll = lines.saturating_sub(1);
+        }
         Action::Quit => {
             app.should_quit = true;
         }
@@ -884,6 +936,7 @@ mod tests {
             agent_kind: crate::types::AgentKind::OpenCode,
             default_prompt: Some("Check AGENTS.md for context.".to_string()),
             done_session_ttl: DEFAULT_DONE_SESSION_TTL,
+            debug: false,
         }
     }
 

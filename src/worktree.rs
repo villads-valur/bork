@@ -175,6 +175,7 @@ mod tests {
             agent_kind: crate::types::AgentKind::OpenCode,
             default_prompt: None,
             done_session_ttl: 300,
+            debug: false,
         };
 
         (tmp, project, cfg)

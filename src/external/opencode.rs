@@ -393,6 +393,7 @@ mod tests {
             agent_kind: AgentKind::OpenCode,
             default_prompt: Some("The source code is in main/.".to_string()),
             done_session_ttl: 300,
+            debug: false,
         }
     }
 

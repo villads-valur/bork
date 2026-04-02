@@ -21,6 +21,7 @@ pub fn map_key_to_action(
         InputMode::Search => map_search_key(key),
         InputMode::LinearPicker => map_linear_picker_key(key),
         InputMode::Help => map_help_key(key),
+        InputMode::DebugInspector => map_debug_inspector_key(key),
     }
 }
 
@@ -28,6 +29,8 @@ fn map_normal_key(key: KeyEvent) -> Action {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
             KeyCode::Char('c') => Action::Quit,
+            KeyCode::Char('r') => Action::DebugReset,
+            KeyCode::Char('e') => Action::DebugInspect,
             _ => Action::Noop,
         };
     }
@@ -130,6 +133,17 @@ fn map_linear_picker_key(key: KeyEvent) -> Action {
 fn map_help_key(key: KeyEvent) -> Action {
     match key.code {
         KeyCode::Esc => Action::CloseHelp,
+        _ => Action::Noop,
+    }
+}
+
+fn map_debug_inspector_key(key: KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => Action::DebugInspectorClose,
+        KeyCode::Char('j') | KeyCode::Down => Action::DebugInspectorScrollDown,
+        KeyCode::Char('k') | KeyCode::Up => Action::DebugInspectorScrollUp,
+        KeyCode::Char('g') => Action::DebugInspectorScrollTop,
+        KeyCode::Char('G') => Action::DebugInspectorScrollBottom,
         _ => Action::Noop,
     }
 }

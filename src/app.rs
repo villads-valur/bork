@@ -27,6 +27,7 @@ pub enum InputMode {
     Search,
     LinearPicker,
     Help,
+    DebugInspector,
 }
 
 #[derive(Debug)]
@@ -442,6 +443,8 @@ pub struct App {
     pub user_prs: Vec<PrStatus>,
     pub git_poll_done: bool,
     pub state_dirty: bool,
+    pub debug_inspector_json: Option<String>,
+    pub debug_inspector_scroll: usize,
 }
 
 impl App {
@@ -485,6 +488,8 @@ impl App {
             user_prs: Vec::new(),
             git_poll_done: false,
             state_dirty: false,
+            debug_inspector_json: None,
+            debug_inspector_scroll: 0,
         }
     }
 
@@ -1130,6 +1135,25 @@ impl App {
         self.input_mode = InputMode::Normal;
     }
 
+    pub fn open_debug_inspector(&mut self, json: String) {
+        self.debug_inspector_json = Some(json);
+        self.debug_inspector_scroll = 0;
+        self.input_mode = InputMode::DebugInspector;
+    }
+
+    pub fn close_debug_inspector(&mut self) {
+        self.debug_inspector_json = None;
+        self.debug_inspector_scroll = 0;
+        self.input_mode = InputMode::Normal;
+    }
+
+    pub fn debug_inspector_line_count(&self) -> usize {
+        self.debug_inspector_json
+            .as_ref()
+            .map(|j| j.lines().count())
+            .unwrap_or(0)
+    }
+
     pub fn next_issue_id(&self) -> String {
         self.next_issue_id_after(0)
     }
@@ -1262,6 +1286,7 @@ mod tests {
             agent_kind: AgentKind::OpenCode,
             default_prompt: None,
             done_session_ttl: DEFAULT_DONE_SESSION_TTL,
+            debug: false,
         }
     }
 

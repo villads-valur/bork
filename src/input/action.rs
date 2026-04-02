@@ -59,5 +59,12 @@ pub enum Action {
     PickerSwitchTab,
     ShowHelp,
     CloseHelp,
+    DebugReset,
+    DebugInspect,
+    DebugInspectorClose,
+    DebugInspectorScrollUp,
+    DebugInspectorScrollDown,
+    DebugInspectorScrollTop,
+    DebugInspectorScrollBottom,
     Noop,
 }

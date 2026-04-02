@@ -8,7 +8,7 @@ use crate::app::{App, InputMode};
 use crate::ui::styles;
 
 pub fn render_header(frame: &mut Frame, app: &App, area: Rect) {
-    let title = Line::from(vec![
+    let mut title_spans = vec![
         Span::styled(
             " BORK ",
             Style::default()
@@ -20,8 +20,18 @@ pub fn render_header(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(styles::TEXT),
         ),
         Span::styled(concat!("v", env!("CARGO_PKG_VERSION")), styles::dim_style()),
-    ]);
+    ];
 
+    if app.config.debug {
+        title_spans.push(Span::styled(
+            " [DEBUG]",
+            Style::default()
+                .fg(ratatui::style::Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    let title = Line::from(title_spans);
     frame.render_widget(Paragraph::new(title), area);
 
     if app.busy_count > 0 {
@@ -67,7 +77,7 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     // Overlay modes: footer is handled by the overlay itself
     if matches!(
         app.input_mode,
-        InputMode::Dialog | InputMode::LinearPicker | InputMode::Help
+        InputMode::Dialog | InputMode::LinearPicker | InputMode::Help | InputMode::DebugInspector
     ) {
         return;
     }
