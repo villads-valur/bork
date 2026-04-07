@@ -15,6 +15,14 @@ struct Section {
     bindings: &'static [(&'static str, &'static str)],
 }
 
+const DEBUG_SECTION: Section = Section {
+    title: "Debug",
+    bindings: &[
+        ("Ctrl+r", "Reset (kill + clear pid)"),
+        ("Ctrl+e", "Inspect issue JSON"),
+    ],
+};
+
 const SECTIONS: &[Section] = &[
     Section {
         title: "Navigation",
@@ -36,7 +44,11 @@ const SECTIONS: &[Section] = &[
     },
     Section {
         title: "Sessions",
-        bindings: &[("Enter", "Open session"), ("x", "Kill session")],
+        bindings: &[
+            ("Enter", "Open session"),
+            ("t", "Terminal"),
+            ("x", "Kill session"),
+        ],
     },
     Section {
         title: "Move Issues",
@@ -52,6 +64,7 @@ const SECTIONS: &[Section] = &[
             ("/", "Search"),
             ("P", "Sync PRs"),
             ("o", "Open PR in browser"),
+            ("O", "Open in Linear"),
             ("I", "Import from Linear"),
             ("W", "Assign worktree"),
             ("q", "Quit"),
@@ -59,9 +72,14 @@ const SECTIONS: &[Section] = &[
     },
 ];
 
-fn content_height() -> u16 {
-    let section_rows: u16 = SECTIONS.iter().map(|s| 1 + s.bindings.len() as u16).sum();
-    let gaps = SECTIONS.len().saturating_sub(1) as u16;
+fn content_height(debug: bool) -> u16 {
+    let mut section_rows: u16 = SECTIONS.iter().map(|s| 1 + s.bindings.len() as u16).sum();
+    let mut count = SECTIONS.len();
+    if debug {
+        section_rows += 1 + DEBUG_SECTION.bindings.len() as u16;
+        count += 1;
+    }
+    let gaps = count.saturating_sub(1) as u16;
     section_rows + gaps + 3 // +3: top padding, bottom padding, footer
 }
 
@@ -71,8 +89,9 @@ pub fn render_help(frame: &mut Frame, app: &App) {
     }
 
     let area = frame.area();
+    let debug = app.config.debug;
     let width = HELP_WIDTH.min(area.width);
-    let height = (content_height() + 2).min(area.height); // +2 for border
+    let height = (content_height(debug) + 2).min(area.height); // +2 for border
     let x = area.width.saturating_sub(width) / 2;
     let y = area.height.saturating_sub(height) / 2;
 
@@ -100,7 +119,16 @@ pub fn render_help(frame: &mut Frame, app: &App) {
     let max_row = inner.height.saturating_sub(1); // reserve last row for footer
     let mut row: u16 = 0;
 
-    for (i, section) in SECTIONS.iter().enumerate() {
+    let all_sections: Vec<&Section> = if debug {
+        SECTIONS
+            .iter()
+            .chain(std::iter::once(&DEBUG_SECTION))
+            .collect()
+    } else {
+        SECTIONS.iter().collect()
+    };
+
+    for (i, section) in all_sections.iter().enumerate() {
         if i > 0 {
             row += 1;
         }

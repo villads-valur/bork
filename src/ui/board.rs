@@ -88,7 +88,7 @@ fn render_column(frame: &mut Frame, app: &App, column: Column, area: Rect, is_se
         y_offset += 1;
     }
 
-    for (visible_idx, &(_global_idx, ref issue)) in
+    for (visible_idx, (_global_idx, issue)) in
         issues[viewport_start..viewport_end].iter().enumerate()
     {
         let card_y = inner.y + y_offset + (visible_idx as u16 * CARD_HEIGHT);
@@ -108,6 +108,7 @@ fn render_column(frame: &mut Frame, app: &App, column: Column, area: Rect, is_se
             branch: app.branch_for(issue),
             git_status: app.worktree_status_for(issue),
             pr: app.pr_for(issue),
+            ports: app.listening_ports_for(issue),
         };
 
         card::render_card(frame, &ctx, card_area);

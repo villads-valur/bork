@@ -28,8 +28,13 @@ pub fn ensure_bork_session(project_name: &str) -> Result<EnsureResult, AppError>
 
     let session_name = project_name;
 
+    // If the session exists but the pane process is dead (e.g. after a crash
+    // or battery death), kill the stale session so we can recreate it cleanly.
+    if session_exists(session_name) && !is_pane_alive(session_name) {
+        let _ = kill_session(session_name);
+    }
+
     if !session_exists(session_name) {
-        // Get the path to ourselves
         let exe = std::env::current_exe()
             .map_err(|e| AppError::Tmux(format!("could not determine executable path: {e}")))?;
 
@@ -79,6 +84,15 @@ pub fn ensure_bork_session(project_name: &str) -> Result<EnsureResult, AppError>
             .status();
     }
 
+    // Verify the session is alive. If the inner bork crashed (e.g. lock
+    // contention), the session may already be gone.
+    if !session_exists(session_name) {
+        return Err(AppError::Tmux(format!(
+            "bork failed to start inside tmux session '{session_name}'. \
+             Check .bork/bork.pid for a stale lock file."
+        )));
+    }
+
     // Attach to the session (blocks until user detaches)
     let status = Command::new("tmux")
         .args(["attach", "-t", session_name])
@@ -98,6 +112,25 @@ pub fn session_exists(name: &str) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Check whether the first pane's process is still alive.
+/// After a crash or battery death, the tmux session may survive but the
+/// process inside it (bork) is dead. tmux marks this with `pane_dead`.
+fn is_pane_alive(session: &str) -> bool {
+    let target = format!("{session}:0.0");
+    let output = Command::new("tmux")
+        .args(["display-message", "-t", &target, "-p", "#{pane_dead}"])
+        .output();
+
+    match output {
+        Ok(o) if o.status.success() => {
+            let val = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            // pane_dead is "1" when the process has exited, "0" when alive
+            val != "1"
+        }
+        _ => false,
+    }
 }
 
 /// List all tmux session names. Used by the background status worker.

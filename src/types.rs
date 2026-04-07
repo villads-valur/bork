@@ -114,16 +114,11 @@ impl fmt::Display for AgentMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IssueKind {
+    #[default]
     Agentic,
     NonAgentic,
-}
-
-impl Default for IssueKind {
-    fn default() -> Self {
-        Self::Agentic
-    }
 }
 
 impl fmt::Display for IssueKind {
@@ -155,13 +150,6 @@ impl AgentStatus {
             Self::WaitingInput | Self::WaitingPermission | Self::WaitingApproval => "◈",
             Self::Error => "✗",
         }
-    }
-
-    pub fn needs_attention(self) -> bool {
-        matches!(
-            self,
-            Self::WaitingInput | Self::WaitingPermission | Self::WaitingApproval
-        )
     }
 }
 
@@ -206,17 +194,13 @@ pub struct Issue {
     #[serde(default)]
     pub kind: IssueKind,
     pub column: Column,
-    pub tmux_session: Option<String>,
     pub agent_kind: AgentKind,
     pub agent_mode: AgentMode,
-    pub agent_status: AgentStatus,
     pub prompt: Option<String>,
     #[serde(default)]
     pub worktree: Option<String>,
     #[serde(default)]
     pub done_at: Option<u64>,
-    /// The agent's internal session ID — used to resume conversations.
-    /// OpenCode: "ses_xxx..." format. Claude: UUID format.
     #[serde(default)]
     pub session_id: Option<String>,
     #[serde(default)]
@@ -226,16 +210,12 @@ pub struct Issue {
     #[serde(default)]
     pub linear_url: Option<String>,
     #[serde(default)]
-    pub linear_state: Option<String>,
-    #[serde(default)]
-    pub linear_branch: Option<String>,
-    /// True when the issue was imported from Linear (title syncs with Linear).
-    /// False when a Linear issue was attached to an existing bork issue.
-    #[serde(default)]
     pub linear_imported: bool,
-    /// PR number if this issue was auto-imported from a GitHub PR.
     #[serde(default)]
     pub pr_number: Option<u32>,
+    /// When true, issue was auto-imported from a GitHub PR and title syncs from PR data.
+    #[serde(default, alias = "github_imported")]
+    pub pr_imported: bool,
 }
 
 impl Issue {
@@ -246,7 +226,7 @@ impl Issue {
 
 // --- PR types (ephemeral, not persisted) ---
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrState {
     Open,
     Closed,
@@ -303,10 +283,8 @@ mod tests {
             title: format!("Test issue {}", id),
             kind: IssueKind::Agentic,
             column,
-            tmux_session: None,
             agent_kind: AgentKind::OpenCode,
             agent_mode: AgentMode::Plan,
-            agent_status: AgentStatus::Stopped,
             prompt: None,
             worktree: None,
             done_at: None,
@@ -314,10 +292,9 @@ mod tests {
             linear_id: None,
             linear_identifier: None,
             linear_url: None,
-            linear_state: None,
-            linear_branch: None,
             linear_imported: false,
             pr_number: None,
+            pr_imported: false,
         }
     }
 
@@ -454,10 +431,8 @@ mod tests {
             "id": "bork-1",
             "title": "Test",
             "column": "Todo",
-            "tmux_session": null,
             "agent_kind": "OpenCode",
             "agent_mode": "Plan",
-            "agent_status": "Stopped",
             "prompt": null
         }"#;
         let issue: Issue = serde_json::from_str(json).unwrap();
@@ -470,10 +445,8 @@ mod tests {
             "id": "bork-1",
             "title": "Test",
             "column": "Done",
-            "tmux_session": null,
             "agent_kind": "OpenCode",
             "agent_mode": "Plan",
-            "agent_status": "Stopped",
             "prompt": null,
             "done_at": 1700000000
         }"#;
@@ -487,10 +460,8 @@ mod tests {
             "id": "bork-1",
             "title": "Test",
             "column": "Planning",
-            "tmux_session": null,
             "agent_kind": "OpenCode",
             "agent_mode": "Plan",
-            "agent_status": "Stopped",
             "prompt": null
         }"#;
         let issue: Issue = serde_json::from_str(json).unwrap();
@@ -509,7 +480,12 @@ mod tests {
             "agent_kind": "OpenCode",
             "agent_mode": "Plan",
             "agent_status": "Stopped",
-            "prompt": null
+            "prompt": null,
+            "github_pr_number": 42,
+            "github_pr_url": "https://example.com",
+            "github_pr_title": "Some PR",
+            "linear_state": "In Progress",
+            "linear_branch": "feature/x"
         }"#;
         let issue: Issue = serde_json::from_str(json).unwrap();
         assert_eq!(issue.id, "bork-1");
@@ -551,12 +527,9 @@ mod tests {
             "id": "bork-1",
             "title": "Test",
             "column": "Todo",
-            "branch": null,
             "worktree": "main",
-            "tmux_session": null,
             "agent_kind": "OpenCode",
             "agent_mode": "Plan",
-            "agent_status": "Stopped",
             "prompt": null
         }"#;
         let issue: Issue = serde_json::from_str(json).unwrap();
@@ -588,5 +561,20 @@ mod tests {
     fn test_agent_mode_toggle() {
         assert_eq!(AgentMode::Plan.toggle(), AgentMode::Build);
         assert_eq!(AgentMode::Build.toggle(), AgentMode::Plan);
+    }
+
+    #[test]
+    fn github_imported_alias_deserializes_as_pr_imported() {
+        let json = r#"{
+            "id": "bork-1",
+            "title": "Test",
+            "column": "Todo",
+            "agent_kind": "OpenCode",
+            "agent_mode": "Plan",
+            "prompt": null,
+            "github_imported": true
+        }"#;
+        let issue: Issue = serde_json::from_str(json).unwrap();
+        assert!(issue.pr_imported);
     }
 }

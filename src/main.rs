@@ -12,7 +12,7 @@ mod worktree;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -34,6 +34,7 @@ use types::{AgentKind, AgentStatusInfo};
 
 use external::git::GitPollResult;
 use external::linear::LinearPollResult;
+use external::ports::PortPollResult;
 use types::PrStatus;
 
 struct PrPollResult {
@@ -44,7 +45,8 @@ struct PrPollResult {
 
 const TICK_RATE: Duration = Duration::from_millis(50);
 const TMUX_POLL_INTERVAL: Duration = Duration::from_secs(2);
-const GIT_POLL_INTERVAL: Duration = Duration::from_secs(3);
+const GIT_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const PORT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const LINEAR_POLL_INTERVAL: Duration = Duration::from_secs(45);
 const PR_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -72,7 +74,22 @@ fn spawn_session_status_worker(status_dir: PathBuf) -> mpsc::Receiver<SessionPol
     rx
 }
 
-fn read_agent_statuses(status_dir: &PathBuf) -> HashMap<String, AgentStatusInfo> {
+fn spawn_port_poll_worker(sessions: Arc<Mutex<HashSet<String>>>) -> mpsc::Receiver<PortPollResult> {
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || loop {
+        let sessions = sessions.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let ports = external::ports::poll_listening_ports(&sessions);
+        if tx.send(PortPollResult { ports }).is_err() {
+            break;
+        }
+        thread::sleep(PORT_POLL_INTERVAL);
+    });
+
+    rx
+}
+
+fn read_agent_statuses(status_dir: &Path) -> HashMap<String, AgentStatusInfo> {
     let mut statuses = HashMap::new();
     let entries = match std::fs::read_dir(status_dir) {
         Ok(e) => e,
@@ -80,7 +97,7 @@ fn read_agent_statuses(status_dir: &PathBuf) -> HashMap<String, AgentStatusInfo>
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.extension().is_some_and(|e| e == "json") {
+        if path.extension().is_none_or(|e| e != "json") {
             continue;
         }
         let Some(session_name) = path.file_stem().and_then(|s| s.to_str()) else {
@@ -99,6 +116,7 @@ fn read_agent_statuses(status_dir: &PathBuf) -> HashMap<String, AgentStatusInfo>
 fn spawn_git_status_worker(
     project_root: PathBuf,
     skip: Arc<Mutex<HashSet<String>>>,
+    wake_rx: mpsc::Receiver<()>,
 ) -> mpsc::Receiver<GitPollResult> {
     let (tx, rx) = mpsc::channel();
 
@@ -108,41 +126,46 @@ fn spawn_git_status_worker(
         if tx.send(result).is_err() {
             break;
         }
-        thread::sleep(GIT_POLL_INTERVAL);
+        if !sleep_with_wake(&wake_rx, GIT_POLL_INTERVAL) {
+            break;
+        }
     });
 
     rx
+}
+
+/// Sleep until `interval` elapses or `wake_rx` signals.
+/// Returns `false` if the wake channel disconnected (caller should exit).
+fn sleep_with_wake(wake_rx: &mpsc::Receiver<()>, interval: Duration) -> bool {
+    let deadline = Instant::now() + interval;
+    loop {
+        if Instant::now() >= deadline {
+            return true;
+        }
+        match wake_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(()) => return true,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return false,
+        }
+    }
 }
 
 fn spawn_linear_worker(wake_rx: mpsc::Receiver<()>) -> mpsc::Receiver<LinearPollResult> {
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || loop {
-        let issues = match external::linear::fetch_assigned_issues() {
-            Ok(issues) => issues,
-            Err(_) => Vec::new(),
-        };
+        let issues = external::linear::fetch_assigned_issues().unwrap_or_default();
         if tx.send(LinearPollResult { issues }).is_err() {
             break;
         }
-
-        let deadline = Instant::now() + LINEAR_POLL_INTERVAL;
-        loop {
-            if Instant::now() >= deadline {
-                break;
-            }
-            match wake_rx.recv_timeout(Duration::from_millis(500)) {
-                Ok(()) => break,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
-            }
+        if !sleep_with_wake(&wake_rx, LINEAR_POLL_INTERVAL) {
+            break;
         }
     });
 
     rx
 }
 
-/// PR poll worker with wake-up support for force-sync.
 fn spawn_pr_poll_worker(
     main_worktree: PathBuf,
     wake_rx: mpsc::Receiver<()>,
@@ -150,31 +173,26 @@ fn spawn_pr_poll_worker(
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || loop {
-        let prs = external::github::fetch_prs(&main_worktree);
-        let indexed = external::github::index_by_branch(prs);
-        let user_prs = external::github::fetch_user_prs(&main_worktree);
-        let github_user = external::github::fetch_current_user(&main_worktree);
-        if tx
-            .send(PrPollResult {
-                prs: indexed,
-                user_prs,
-                github_user,
-            })
-            .is_err()
-        {
+        // Run the 3 independent gh api calls in parallel
+        let result = thread::scope(|s| {
+            let prs_handle = s.spawn(|| {
+                let prs = external::github::fetch_prs(&main_worktree);
+                external::github::index_by_branch(prs)
+            });
+            let user_prs_handle = s.spawn(|| external::github::fetch_user_prs(&main_worktree));
+            let user_handle = s.spawn(|| external::github::fetch_current_user(&main_worktree));
+
+            PrPollResult {
+                prs: prs_handle.join().unwrap_or_default(),
+                user_prs: user_prs_handle.join().unwrap_or_default(),
+                github_user: user_handle.join().ok().flatten(),
+            }
+        });
+        if tx.send(result).is_err() {
             break;
         }
-
-        let deadline = Instant::now() + PR_POLL_INTERVAL;
-        loop {
-            if Instant::now() >= deadline {
-                break;
-            }
-            match wake_rx.recv_timeout(Duration::from_millis(500)) {
-                Ok(()) => break,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
-            }
+        if !sleep_with_wake(&wake_rx, PR_POLL_INTERVAL) {
+            break;
         }
     });
 
@@ -267,9 +285,7 @@ fn run_tui() -> anyhow::Result<()> {
     let config = config::load_config();
     let state = config::load_state(&config.project_root);
 
-    // --- Tmux auto-wrap (scoped to project name) ---
-    // Must happen before the lock: the outer process creates a tmux session
-    // running bork, then attaches. Only the inner process runs the TUI.
+    // Tmux auto-wrap: outer process creates session + attaches, inner runs TUI
     match external::tmux::ensure_bork_session(&config.project_name)? {
         external::tmux::EnsureResult::AlreadyInside => {}
         external::tmux::EnsureResult::Wrapped { exit_code } => {
@@ -313,13 +329,19 @@ fn run_tui() -> anyhow::Result<()> {
     let (action_tx, action_rx) = mpsc::channel::<ActionResult>();
     let status_dir = config::agent_status_dir(&app.config.project_root);
     let session_rx = spawn_session_status_worker(status_dir);
+    let port_sessions = Arc::new(Mutex::new(HashSet::<String>::new()));
+    let port_rx = spawn_port_poll_worker(port_sessions.clone());
     let git_skip_set = Arc::new(Mutex::new(app.done_worktree_names()));
-    let git_rx = spawn_git_status_worker(app.config.project_root.clone(), git_skip_set.clone());
+    let (git_wake_tx, git_wake_rx) = mpsc::channel::<()>();
+    let git_rx = spawn_git_status_worker(
+        app.config.project_root.clone(),
+        git_skip_set.clone(),
+        git_wake_rx,
+    );
     let (pr_wake_tx, pr_wake_rx) = mpsc::channel::<()>();
     let main_worktree = app.config.project_root.join("main");
     let pr_rx = spawn_pr_poll_worker(main_worktree, pr_wake_rx);
 
-    // Linear: non-blocking availability check, poll worker starts only if CLI is found
     let (linear_check_tx, linear_check_rx) = mpsc::channel::<bool>();
     thread::spawn(move || {
         let available = external::linear::check_available();
@@ -331,24 +353,31 @@ fn run_tui() -> anyhow::Result<()> {
 
     let mut pending_popup_session: Option<(String, String)> = None;
     let mut pending_popup_for_launch: Option<(usize, String)> = None;
+    let mut needs_redraw = true;
 
     // --- Main event loop ---
     loop {
-        terminal.draw(|frame| {
-            ui::render(frame, &app);
-        })?;
+        if needs_redraw {
+            terminal.draw(|frame| {
+                ui::render(frame, &app);
+            })?;
+            needs_redraw = false;
+        }
 
         if event::poll(TICK_RATE)? {
             loop {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
-                        let action = map_key_to_action(key, app.input_mode);
+                        needs_redraw = true;
+                        let dialog_field = app.dialog.as_ref().map(|d| d.current_field());
+                        let action = map_key_to_action(key, app.input_mode, dialog_field);
                         let post_action = handler::handle_action(
                             &mut app,
                             action,
                             &action_tx,
                             &pr_wake_tx,
                             &linear_wake_tx,
+                            &git_wake_tx,
                         );
 
                         match post_action {
@@ -357,6 +386,13 @@ fn run_tui() -> anyhow::Result<()> {
                                 session_name,
                                 popup_title,
                             } => {
+                                if app.state_dirty {
+                                    let _ = config::save_state(
+                                        &app.to_state(),
+                                        &app.config.project_root,
+                                    );
+                                    app.state_dirty = false;
+                                }
                                 open_tmux_popup(
                                     &mut terminal,
                                     &session_name,
@@ -385,6 +421,7 @@ fn run_tui() -> anyhow::Result<()> {
         }
 
         while let Ok(result) = action_rx.try_recv() {
+            needs_redraw = true;
             app.busy_count = app.busy_count.saturating_sub(1);
             app.set_message(result.message);
 
@@ -395,8 +432,11 @@ fn run_tui() -> anyhow::Result<()> {
             }
 
             if let Some(session_name) = result.session_to_open {
-                if let Some((launch_idx, popup_title)) = pending_popup_for_launch.take() {
-                    app.issues[launch_idx].tmux_session = Some(session_name.clone());
+                if let Some(popup_title) = result.popup_title {
+                    // Direct popup (e.g. OpenTerminal)
+                    pending_popup_session = Some((session_name, popup_title));
+                } else if let Some((launch_idx, popup_title)) = pending_popup_for_launch.take() {
+                    // Agent session launch
                     if app.issues[launch_idx].column == types::Column::Todo {
                         app.issues[launch_idx].column = types::Column::InProgress;
                     }
@@ -406,7 +446,9 @@ fn run_tui() -> anyhow::Result<()> {
         }
 
         if let Some((session_name, popup_title)) = pending_popup_session.take() {
+            // Flush state before yielding terminal to tmux popup (could last a long time)
             let _ = config::save_state(&app.to_state(), &app.config.project_root);
+            app.state_dirty = false;
             open_tmux_popup(
                 &mut terminal,
                 &session_name,
@@ -414,11 +456,21 @@ fn run_tui() -> anyhow::Result<()> {
                 &app.config.project_name,
             )?;
             app.message = None;
+            needs_redraw = true;
         }
 
         while let Ok(poll) = session_rx.try_recv() {
+            needs_redraw = true;
             app.active_sessions = poll.sessions;
             app.agent_statuses = poll.agent_statuses;
+            // Update shared sessions set for the port poll worker
+            if let Ok(mut shared) = port_sessions.lock() {
+                *shared = app.active_sessions.clone();
+            }
+        }
+
+        while let Ok(port_result) = port_rx.try_recv() {
+            app.listening_ports = port_result.ports;
         }
 
         // --- Auto-kill Done sessions past TTL ---
@@ -428,11 +480,11 @@ fn run_tui() -> anyhow::Result<()> {
             .as_secs();
         let cleanup_indices = app.issues_needing_session_cleanup(now);
         for idx in cleanup_indices {
+            needs_redraw = true;
             let session_name = app.issues[idx].session_name(&app.config.project_name);
             let status_file = config::agent_status_dir(&app.config.project_root)
                 .join(format!("{}.json", session_name));
             let sn = session_name.clone();
-            // Remove from active set immediately so we don't re-fire on next tick
             app.active_sessions.remove(&session_name);
             thread::spawn(move || {
                 let _ = external::tmux::kill_session(&sn);
@@ -441,38 +493,61 @@ fn run_tui() -> anyhow::Result<()> {
             app.set_message(format!("Auto-killed session '{}' (done TTL)", session_name));
         }
 
+        let mut git_data_changed = false;
         while let Ok(git_result) = git_rx.try_recv() {
+            needs_redraw = true;
+            git_data_changed = true;
             app.worktree_statuses = git_result.statuses;
             app.worktree_branches = git_result.branches;
+            app.git_poll_done = true;
         }
 
+        let mut pr_data_changed = false;
         while let Ok(pr_result) = pr_rx.try_recv() {
+            needs_redraw = true;
+            pr_data_changed = true;
             app.pr_statuses = pr_result.prs;
             app.user_prs = pr_result.user_prs;
             if pr_result.github_user.is_some() {
                 app.github_user = pr_result.github_user;
             }
+
+            for issue in &mut app.issues {
+                if let Some(pr_num) = issue.pr_number {
+                    if issue.pr_imported {
+                        if let Some(pr) = app.pr_statuses.values().find(|p| p.number == pr_num) {
+                            issue.title = pr.title.clone();
+                        }
+                    }
+                }
+            }
         }
 
-        // --- Auto-import open PRs as issues ---
-        if app.sync_prs_as_issues() {
-            let _ = config::save_state(&app.to_state(), &app.config.project_root);
+        // --- Auto-import open PRs as issues (only when new PR data arrived) ---
+        if pr_data_changed && app.sync_prs_as_issues() {
+            app.mark_dirty();
         }
 
-        // --- Auto-assign worktrees for issues that don't have one ---
-        let mut worktree_changed = app.auto_assign_worktrees();
-        worktree_changed = app.clear_stale_worktrees() || worktree_changed;
-        if worktree_changed {
-            let _ = config::save_state(&app.to_state(), &app.config.project_root);
+        // --- Auto-assign worktrees (only when git data changed) ---
+        if git_data_changed {
+            let mut worktree_changed = app.auto_assign_worktrees();
+            worktree_changed = app.clear_stale_worktrees() || worktree_changed;
+            if worktree_changed {
+                let _ = git_wake_tx.send(());
+                app.mark_dirty();
+            }
         }
 
-        // --- Update git skip set for Done worktrees ---
-        if let Ok(mut skip) = git_skip_set.lock() {
-            *skip = app.done_worktree_names();
+        // --- Update git skip set when issues changed columns or git data arrived ---
+        if git_data_changed || app.state_dirty {
+            if let Ok(mut skip) = git_skip_set.lock() {
+                *skip = app.done_worktree_names();
+            }
         }
 
         // --- Linear: check availability then consume poll results ---
         if let Ok(true) = linear_check_rx.try_recv() {
+            needs_redraw = true;
             app.linear_available = true;
             if let Some(wake_rx) = linear_wake_rx.take() {
                 linear_rx = Some(spawn_linear_worker(wake_rx));
@@ -480,14 +555,12 @@ fn run_tui() -> anyhow::Result<()> {
         }
         if let Some(ref rx) = linear_rx {
             while let Ok(result) = rx.try_recv() {
+                needs_redraw = true;
                 app.linear_issues = result.issues;
-                // Refresh metadata for issues already on the board
                 for issue in &mut app.issues {
                     if let Some(ref lid) = issue.linear_id {
-                        if let Some(fresh) = app.linear_issues.iter().find(|i| i.id == *lid) {
-                            issue.linear_state = Some(fresh.state_name.clone());
-                            // Only sync title for imported issues (not manually attached)
-                            if issue.linear_imported {
+                        if issue.linear_imported {
+                            if let Some(fresh) = app.linear_issues.iter().find(|i| i.id == *lid) {
                                 issue.title = fresh.title.clone();
                             }
                         }
@@ -498,9 +571,18 @@ fn run_tui() -> anyhow::Result<()> {
 
         if app.busy_count > 0 {
             app.spinner_tick = app.spinner_tick.wrapping_add(1);
+            needs_redraw = true;
         }
 
-        app.clear_expired_message();
+        // --- Flush dirty state to disk (once per tick, not per action) ---
+        if app.state_dirty {
+            let _ = config::save_state(&app.to_state(), &app.config.project_root);
+            app.state_dirty = false;
+        }
+
+        if app.clear_expired_message() {
+            needs_redraw = true;
+        }
     }
 
     let _ = config::save_state(&app.to_state(), &app.config.project_root);

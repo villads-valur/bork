@@ -3,7 +3,7 @@ use std::process::Command;
 use anyhow::{bail, Context};
 
 use crate::config;
-use crate::types::{AgentMode, AgentStatus, Column, Issue, IssueKind};
+use crate::types::{AgentMode, Column, Issue, IssueKind};
 
 /// Create a git worktree and register it with bork's state.json.
 pub fn run_worktree(issue_id: &str, slug: Option<&str>, title: Option<&str>) -> anyhow::Result<()> {
@@ -27,8 +27,11 @@ fn run_worktree_in(
         );
     }
 
-    let worktree_dir = issue_id;
-    if config.project_root.join(worktree_dir).exists() {
+    let worktree_dir = match slug {
+        Some(s) => format!("{}-{}", issue_id, s),
+        None => issue_id.to_string(),
+    };
+    if config.project_root.join(&worktree_dir).exists() {
         bail!(
             "Directory '{}' already exists. Use the existing worktree or remove it first.",
             worktree_dir
@@ -64,10 +67,8 @@ fn run_worktree_in(
             title: title.to_string(),
             kind: IssueKind::Agentic,
             column: Column::Todo,
-            tmux_session: None,
             agent_kind: config.agent_kind,
             agent_mode: AgentMode::Plan,
-            agent_status: AgentStatus::Stopped,
             prompt: None,
             worktree: Some(worktree_dir.to_string()),
             done_at: None,
@@ -75,10 +76,9 @@ fn run_worktree_in(
             linear_id: None,
             linear_identifier: None,
             linear_url: None,
-            linear_state: None,
-            linear_branch: None,
             linear_imported: false,
             pr_number: None,
+            pr_imported: false,
         };
         state.issues.push(issue);
     } else {
@@ -175,6 +175,7 @@ mod tests {
             agent_kind: crate::types::AgentKind::OpenCode,
             default_prompt: None,
             done_session_ttl: 300,
+            debug: false,
         };
 
         (tmp, project, cfg)
@@ -187,12 +188,12 @@ mod tests {
         let result = run_worktree_in(&cfg, "bork-1", Some("fix-bug"), None);
         assert!(result.is_ok(), "run_worktree failed: {:?}", result.err());
 
-        assert!(project.join("bork-1").exists());
-        assert!(project.join("bork-1/.git").exists());
+        assert!(project.join("bork-1-fix-bug").exists());
+        assert!(project.join("bork-1-fix-bug/.git").exists());
 
         let state = config::load_state(&project);
         let issue = state.issues.iter().find(|i| i.id == "bork-1").unwrap();
-        assert_eq!(issue.worktree, Some("bork-1".to_string()));
+        assert_eq!(issue.worktree, Some("bork-1-fix-bug".to_string()));
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -207,7 +208,7 @@ mod tests {
         let state = config::load_state(&cfg.project_root);
         let issue = state.issues.iter().find(|i| i.id == "bork-2").unwrap();
         assert_eq!(issue.title, "New feature");
-        assert_eq!(issue.worktree, Some("bork-2".to_string()));
+        assert_eq!(issue.worktree, Some("bork-2-new-feature".to_string()));
         assert_eq!(issue.column, Column::Todo);
 
         let _ = fs::remove_dir_all(&tmp);
@@ -217,7 +218,7 @@ mod tests {
     fn test_worktree_fails_if_dir_exists() {
         let (tmp, project, cfg) = setup_test_project();
 
-        fs::create_dir_all(project.join("bork-1")).unwrap();
+        fs::create_dir_all(project.join("bork-1-fix-bug")).unwrap();
 
         let result = run_worktree_in(&cfg, "bork-1", Some("fix-bug"), None);
         assert!(result.is_err());

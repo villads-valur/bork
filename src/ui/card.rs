@@ -7,7 +7,7 @@ use ratatui::Frame;
 use crate::types::{AgentStatus, Issue, IssueKind, PrState, PrStatus, WorktreeStatus};
 use crate::ui::styles;
 
-pub const CARD_HEIGHT: u16 = 6;
+pub const CARD_HEIGHT: u16 = 7;
 
 pub struct CardContext<'a> {
     pub issue: &'a Issue,
@@ -18,6 +18,7 @@ pub struct CardContext<'a> {
     pub branch: Option<&'a str>,
     pub git_status: Option<&'a WorktreeStatus>,
     pub pr: Option<&'a PrStatus>,
+    pub ports: Option<&'a Vec<u16>>,
 }
 
 pub fn render_card(frame: &mut Frame, ctx: &CardContext, area: Rect) {
@@ -42,36 +43,27 @@ pub fn render_card(frame: &mut Frame, ctx: &CardContext, area: Rect) {
 
     let max_width = inner.width as usize;
 
-    // Line 1: Title
-    let title_text = truncate(&ctx.issue.title, max_width);
+    let title_text = styles::truncate(&ctx.issue.title, max_width);
     let title_line = Line::from(Span::styled(title_text, title_style));
-
-    // Line 2: Session indicator + agent status (clean, no branch crammed in)
     let status_line = format_status_line(ctx);
-
-    // Line 3: Branch + git changes (full width for the branch name)
-    let branch_line = format_branch_line(ctx.branch, ctx.git_status, max_width);
-
-    // Line 4: PR info or Linear metadata
-    let info_line = if ctx.pr.is_some() {
-        format_pr_line(ctx.pr)
-    } else {
-        format_linear_line(ctx.issue)
-    };
+    let pr_line = format_pr_line(ctx.pr);
+    let bottom_line = format_bottom_line(ctx.issue, ctx.branch, ctx.ports, max_width);
 
     let mut lines = vec![title_line];
     if inner.height > 1 {
         lines.push(status_line);
     }
     if inner.height > 2 {
-        lines.push(branch_line);
-    }
-    if inner.height > 3 {
-        lines.push(info_line);
+        lines.push(pr_line);
     }
 
     let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, inner);
+
+    if inner.height > 3 {
+        let bottom_area = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
+        frame.render_widget(Paragraph::new(bottom_line), bottom_area);
+    }
 }
 
 fn format_status_line(ctx: &CardContext) -> Line<'static> {
@@ -95,42 +87,14 @@ fn format_status_line(ctx: &CardContext) -> Line<'static> {
         _ => ctx.agent_status.to_string(),
     };
 
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled(session_indicator, session_style),
         Span::raw(" "),
         Span::styled(ctx.agent_status.symbol(), Style::default().fg(status_color)),
         Span::styled(format!(" {}", status_label), styles::dim_style()),
-    ])
-}
-
-fn format_branch_line(
-    branch: Option<&str>,
-    git_status: Option<&WorktreeStatus>,
-    max_width: usize,
-) -> Line<'static> {
-    let Some(branch_name) = branch else {
-        return Line::from("");
-    };
-
-    // Strip the "{issue-id}/" prefix since the card border already shows the issue ID
-    let display_branch = branch_name
-        .find('/')
-        .map(|i| &branch_name[i + 1..])
-        .unwrap_or(branch_name);
-
-    let git_spans = format_git_status(git_status);
-    let git_width: usize = git_spans.iter().map(|s| s.width()).sum();
-    let gap = if git_width > 0 { 1 } else { 0 };
-    let available_for_branch = max_width.saturating_sub(2 + gap + git_width);
-
-    let mut spans = vec![
-        Span::raw("  "),
-        Span::styled(
-            truncate(display_branch, available_for_branch),
-            styles::dim_style(),
-        ),
     ];
 
+    let git_spans = format_git_status(ctx.git_status);
     if !git_spans.is_empty() {
         spans.push(Span::raw(" "));
         spans.extend(git_spans);
@@ -139,27 +103,66 @@ fn format_branch_line(
     Line::from(spans)
 }
 
-fn format_linear_line(issue: &Issue) -> Line<'static> {
-    let Some(ref identifier) = issue.linear_identifier else {
+fn format_bottom_line(
+    issue: &Issue,
+    branch: Option<&str>,
+    ports: Option<&Vec<u16>>,
+    max_width: usize,
+) -> Line<'static> {
+    let has_linear = issue.linear_identifier.is_some();
+    let has_branch = branch.is_some();
+    let has_ports = ports.is_some_and(|p| !p.is_empty());
+
+    if !has_linear && !has_branch && !has_ports {
         return Line::from("");
-    };
-
-    let mut spans = vec![
-        Span::raw("  "),
-        Span::styled(
-            format!("\u{25c8} {}", identifier),
-            Style::default().fg(Color::Blue),
-        ),
-    ];
-
-    if let Some(ref state) = issue.linear_state {
-        spans.push(Span::styled(
-            format!(" \u{25cf} {}", state),
-            styles::dim_style(),
-        ));
     }
 
-    Line::from(spans)
+    // Left side: Linear identifier
+    let mut left_spans: Vec<Span<'static>> = vec![Span::raw("  ")];
+    let mut left_width: usize = 2;
+
+    if let Some(ref identifier) = issue.linear_identifier {
+        let text = format!("\u{25c8} {}", identifier);
+        left_width += text.len();
+        left_spans.push(Span::styled(text, Style::default().fg(Color::Blue)));
+    }
+
+    // Right side: branch icon + ports
+    let mut right_spans: Vec<Span<'static>> = Vec::new();
+    let mut right_width: usize = 0;
+
+    if has_ports {
+        // 🔌 is 2 cells wide in most terminals
+        right_spans.push(Span::styled("\u{1f50c}", Style::default()));
+        right_width += 2;
+    }
+
+    if has_branch {
+        if !right_spans.is_empty() {
+            right_spans.insert(0, Span::raw(" "));
+            right_width += 1;
+        }
+        right_spans.insert(
+            0,
+            Span::styled("\u{1f33f}", Style::default().fg(Color::Green)),
+        );
+        right_width += 2;
+    }
+
+    if !right_spans.is_empty() {
+        // Reserve 1 cell padding before the right card border
+        let total = left_width + right_width + 1;
+        let gap = if total < max_width {
+            max_width - total
+        } else {
+            1
+        };
+        left_spans.push(Span::raw(" ".repeat(gap)));
+        left_spans.extend(right_spans);
+        left_spans.push(Span::raw(" "));
+    }
+
+    Line::from(left_spans)
 }
 
 fn format_git_status(status: Option<&WorktreeStatus>) -> Vec<Span<'static>> {
@@ -244,16 +247,5 @@ fn format_pr_line(pr: Option<&PrStatus>) -> Line<'static> {
 
             Line::from(spans)
         }
-    }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else if max > 3 {
-        let end: String = s.chars().take(max - 3).collect();
-        format!("{}...", end)
-    } else {
-        s.chars().take(max).collect()
     }
 }

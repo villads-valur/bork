@@ -1,3 +1,5 @@
+use crossterm::event::KeyEvent;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Quit,
@@ -8,6 +10,7 @@ pub enum Action {
     JumpColumnLeft,
     JumpColumnRight,
     OpenSession,
+    OpenTerminal,
     KillSession,
     MoveIssueLeft,
     MoveIssueRight,
@@ -17,6 +20,7 @@ pub enum Action {
     ScrollToBottom,
     SyncPRs,
     OpenPR,
+    OpenLinear,
     AssignWorktree,
     CreateIssue,
     AddIssue,
@@ -37,6 +41,7 @@ pub enum Action {
     DialogPrevField,
     DialogSubmit,
     DialogCancel,
+    DialogPromptKey(KeyEvent),
     SearchStart,
     SearchChar(char),
     SearchBackspace,
@@ -51,7 +56,15 @@ pub enum Action {
     LinearPickerChar(char),
     LinearPickerBackspace,
     LinearPickerRefresh,
+    PickerSwitchTab,
     ShowHelp,
     CloseHelp,
+    DebugReset,
+    DebugInspect,
+    DebugInspectorClose,
+    DebugInspectorScrollUp,
+    DebugInspectorScrollDown,
+    DebugInspectorScrollTop,
+    DebugInspectorScrollBottom,
     Noop,
 }
