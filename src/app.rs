@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use ratatui::style::{Modifier, Style};
-use ratatui_textarea::{CursorMove, TextArea};
+use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 
 use crate::config::{AppConfig, AppState};
 use crate::external::linear::LinearIssue;
@@ -91,6 +91,7 @@ fn make_prompt_textarea(text: &str) -> TextArea<'static> {
             .add_modifier(Modifier::REVERSED),
     );
     ta.set_block(ratatui::widgets::Block::default());
+    ta.set_wrap_mode(WrapMode::Word);
     ta
 }
 
@@ -171,6 +172,12 @@ impl DialogState {
 
     pub fn prompt_text(&self) -> String {
         self.prompt.lines().join("\n")
+    }
+
+    pub fn set_prompt_text(&mut self, text: &str) {
+        self.prompt = make_prompt_textarea(text);
+        self.prompt.move_cursor(CursorMove::Bottom);
+        self.prompt.move_cursor(CursorMove::End);
     }
 
     pub fn current_field(&self) -> DialogField {

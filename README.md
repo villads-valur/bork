@@ -203,6 +203,7 @@ These are installed automatically by `bork init`. Use `bork install` / `bork uni
 | `Tab` / `Enter` | Next field (auto-submits from last field) |
 | `Shift+Tab` | Previous field |
 | `Shift+Enter` | Submit from any field |
+| `Ctrl+e` | Open prompt in `$EDITOR` (on Prompt field) |
 | `Esc` / `Ctrl+c` | Cancel |
 | `Space` / `h` / `l` | Cycle mode (on Mode field); open Linear picker (on Linear field) |
 
