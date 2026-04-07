@@ -59,6 +59,20 @@ pub fn ensure_bork_session(project_name: &str) -> Result<EnsureResult, AppError>
             .args(["set-option", "-t", session_name, "status", "off"])
             .status();
 
+        // Forward terminal title changes to the outer terminal (e.g. Ghostty tab title)
+        let _ = Command::new("tmux")
+            .args(["set-option", "-t", session_name, "set-titles", "on"])
+            .status();
+        let _ = Command::new("tmux")
+            .args([
+                "set-option",
+                "-t",
+                session_name,
+                "set-titles-string",
+                "#{pane_title}",
+            ])
+            .status();
+
         // Bind Ctrl+q to detach (scoped to this tmux server, not the user's outer tmux)
         let _ = Command::new("tmux")
             .args(["bind-key", "-n", "C-q", "detach-client"])
