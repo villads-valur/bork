@@ -151,7 +151,7 @@ pub fn render_import_picker(frame: &mut Frame, app: &App) {
         footer_spans.push(Span::styled(":switch  ", styles::statusbar_desc_style()));
     }
 
-    footer_spans.push(Span::styled("^R", styles::statusbar_key_style()));
+    footer_spans.push(Span::styled("Ctrl+r", styles::statusbar_key_style()));
     footer_spans.push(Span::styled(":refresh  ", styles::statusbar_desc_style()));
     footer_spans.push(Span::styled("Esc", styles::statusbar_key_style()));
     footer_spans.push(Span::styled(":close", styles::statusbar_desc_style()));

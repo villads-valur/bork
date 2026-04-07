@@ -11,8 +11,10 @@ mod ui;
 mod worktree;
 
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::{Command as StdCommand, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -407,6 +409,17 @@ fn run_tui() -> anyhow::Result<()> {
                             } => {
                                 pending_popup_for_launch = Some((issue_index, popup_title));
                             }
+                            PostAction::OpenEditor { initial_content } => {
+                                if let Some(edited) = open_external_editor(
+                                    &mut terminal,
+                                    &initial_content,
+                                    &app.config.project_name,
+                                )? {
+                                    if let Some(dialog) = app.dialog.as_mut() {
+                                        dialog.set_prompt_text(&edited);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -614,4 +627,67 @@ fn open_tmux_popup(
     terminal.clear()?;
 
     Ok(())
+}
+
+fn open_external_editor(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    initial_content: &str,
+    project_name: &str,
+) -> anyhow::Result<Option<String>> {
+    let Some((editor_cmd, editor_args)) = resolve_editor() else {
+        return Err(anyhow::anyhow!("No editor found. Set $EDITOR or $VISUAL."));
+    };
+
+    let temp_path = std::env::temp_dir().join(format!(".bork-edit-{}.md", std::process::id()));
+    fs::write(&temp_path, initial_content)?;
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+
+    let status = StdCommand::new(&editor_cmd)
+        .args(&editor_args)
+        .arg(&temp_path)
+        .status();
+
+    enable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        SetTitle(format!("bork: {}", project_name))
+    )?;
+    terminal.clear()?;
+
+    let result = match status {
+        Ok(s) if s.success() => fs::read_to_string(&temp_path).ok(),
+        _ => None,
+    };
+    let _ = fs::remove_file(&temp_path);
+
+    Ok(result)
+}
+
+fn resolve_editor() -> Option<(String, Vec<String>)> {
+    for var in ["VISUAL", "EDITOR"] {
+        if let Ok(val) = std::env::var(var) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                let mut parts = trimmed.split_whitespace();
+                let cmd = parts.next().unwrap().to_string();
+                let args: Vec<String> = parts.map(String::from).collect();
+                return Some((cmd, args));
+            }
+        }
+    }
+    for name in ["vim", "nvim", "vi", "nano"] {
+        if StdCommand::new("which")
+            .arg(name)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            return Some((name.to_string(), vec![]));
+        }
+    }
+    None
 }

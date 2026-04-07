@@ -42,6 +42,7 @@ pub enum Action {
     DialogSubmit,
     DialogCancel,
     DialogPromptKey(KeyEvent),
+    DialogOpenEditor,
     SearchStart,
     SearchChar(char),
     SearchBackspace,
