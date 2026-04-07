@@ -22,6 +22,8 @@ pub enum Action {
     OpenPR,
     OpenLinear,
     AssignWorktree,
+    OpenReview,
+    OpenReviewPR,
     CreateIssue,
     AddIssue,
     EditIssue,

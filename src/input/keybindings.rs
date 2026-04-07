@@ -63,6 +63,9 @@ fn map_normal_key(key: KeyEvent) -> Action {
         KeyCode::Char('g') => Action::ScrollToTop,
         KeyCode::Char('G') => Action::ScrollToBottom,
 
+        KeyCode::Char('r') => Action::OpenReview,
+        KeyCode::Char('R') => Action::OpenReviewPR,
+
         KeyCode::Char('P') => Action::SyncPRs,
         KeyCode::Char('o') => Action::OpenPR,
         KeyCode::Char('O') => Action::OpenLinear,
@@ -289,6 +292,15 @@ mod tests {
         assert_eq!(
             map_normal_key(key(KeyCode::Char('G'))),
             Action::ScrollToBottom
+        );
+    }
+
+    #[test]
+    fn normal_review() {
+        assert_eq!(map_normal_key(key(KeyCode::Char('r'))), Action::OpenReview);
+        assert_eq!(
+            map_normal_key(key(KeyCode::Char('R'))),
+            Action::OpenReviewPR
         );
     }
 
