@@ -153,8 +153,12 @@ fn map_dialog_prompt_key(key: KeyEvent) -> Action {
         return Action::DialogSubmit;
     }
 
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        return Action::DialogCancel;
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return match key.code {
+            KeyCode::Char('c') => Action::DialogCancel,
+            KeyCode::Char('s') => Action::DialogSubmit,
+            _ => Action::DialogPromptKey(key),
+        };
     }
 
     match key.code {
@@ -188,6 +192,7 @@ fn map_dialog_key(key: KeyEvent) -> Action {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
             KeyCode::Char('c') => Action::DialogCancel,
+            KeyCode::Char('s') => Action::DialogSubmit,
             KeyCode::Char('w') => Action::DialogDeleteWord,
             KeyCode::Char('u') => Action::DialogClearToStart,
             KeyCode::Char('a') => Action::DialogMoveStart,
