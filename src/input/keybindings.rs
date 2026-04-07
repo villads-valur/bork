@@ -154,11 +154,12 @@ fn map_dialog_prompt_key(key: KeyEvent) -> Action {
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL) {
-        return match key.code {
-            KeyCode::Char('c') => Action::DialogCancel,
-            KeyCode::Char('s') => Action::DialogSubmit,
-            _ => Action::DialogPromptKey(key),
-        };
+        match key.code {
+            KeyCode::Char('c') => return Action::DialogCancel,
+            KeyCode::Char('s') => return Action::DialogSubmit,
+            KeyCode::Char('e') => return Action::DialogOpenEditor,
+            _ => {}
+        }
     }
 
     match key.code {

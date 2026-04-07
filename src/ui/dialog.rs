@@ -1,7 +1,9 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{
+    Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 use ratatui::Frame;
 
 use crate::app::{App, DialogField};
@@ -170,14 +172,21 @@ pub fn render_dialog(frame: &mut Frame, app: &App) {
         ])
     } else {
         let next_key = if is_prompt_focused { "Tab" } else { "Enter" };
-        Line::from(vec![
+        let mut spans = vec![
             Span::styled(next_key, styles::statusbar_key_style()),
             Span::styled(":next  ", styles::statusbar_desc_style()),
+        ];
+        if is_prompt_focused {
+            spans.push(Span::styled("Ctrl+e", styles::statusbar_key_style()));
+            spans.push(Span::styled(":editor  ", styles::statusbar_desc_style()));
+        }
+        spans.extend([
             Span::styled("Ctrl+S", styles::statusbar_key_style()),
             Span::styled(submit_hint, styles::statusbar_desc_style()),
             Span::styled("Esc", styles::statusbar_key_style()),
             Span::styled(":cancel", styles::statusbar_desc_style()),
-        ])
+        ]);
+        Line::from(spans)
     };
     let footer_area = Rect::new(inner.x + 1, footer_y, inner.width - 2, 1);
     frame.render_widget(Paragraph::new(footer), footer_area);
@@ -189,111 +198,33 @@ fn render_prompt_field(
     area: Rect,
     focused: bool,
 ) {
-    let width = area.width as usize;
-    if width == 0 || area.height == 0 {
+    if area.width == 0 || area.height == 0 {
         return;
     }
 
-    let lines = dialog.prompt.lines();
-    let (cursor_row, cursor_col) = dialog.prompt.cursor();
-    let value_style = field_value_style(focused);
+    let content_len = dialog.prompt.lines().len();
+    let cursor_row = dialog.prompt.cursor().0;
 
-    // Build visual lines by wrapping each logical line at the area width.
-    // Track which visual line + column the cursor maps to.
-    let mut visual_lines: Vec<String> = Vec::new();
-    let mut cursor_visual_row: usize = 0;
-    let mut cursor_visual_col: usize = 0;
-
-    for (line_idx, line) in lines.iter().enumerate() {
-        let chars: Vec<char> = line.chars().collect();
-        if chars.is_empty() {
-            if line_idx == cursor_row {
-                cursor_visual_row = visual_lines.len();
-                cursor_visual_col = 0;
-            }
-            visual_lines.push(String::new());
-            continue;
-        }
-
-        let mut col = 0;
-        while col < chars.len() {
-            let end = (col + width).min(chars.len());
-            let segment: String = chars[col..end].iter().collect();
-
-            if line_idx == cursor_row && cursor_col >= col && cursor_col < end {
-                cursor_visual_row = visual_lines.len();
-                cursor_visual_col = cursor_col - col;
-            }
-
-            visual_lines.push(segment);
-            col = end;
-        }
-
-        // Cursor at end of line (past last char)
-        if line_idx == cursor_row && cursor_col >= chars.len() {
-            if chars.len().is_multiple_of(width) {
-                // Line fills the last segment exactly, cursor wraps to a new visual line
-                visual_lines.push(String::new());
-                cursor_visual_row = visual_lines.len() - 1;
-                cursor_visual_col = 0;
-            } else {
-                // Cursor sits at the end of the last partial segment
-                let last_segment_start = chars.len() - (chars.len() % width);
-                cursor_visual_row = visual_lines.len() - 1;
-                cursor_visual_col = cursor_col - last_segment_start;
-            }
-        }
-    }
-
-    // Compute scroll offset so the cursor is always visible.
-    // We keep the cursor within the viewport by scrolling just enough.
-    let viewport_height = area.height as usize;
-    let scroll_offset = if visual_lines.len() <= viewport_height {
-        0
-    } else {
-        // Ensure cursor_visual_row is in [scroll_offset, scroll_offset + viewport_height)
-        // Scroll down as little as needed to keep cursor visible
-        cursor_visual_row.saturating_sub(viewport_height - 1)
-    };
-
-    // Render visible lines
-    let visible_end = (scroll_offset + viewport_height).min(visual_lines.len());
-    let visible_slice = &visual_lines[scroll_offset..visible_end];
-
-    let display_lines: Vec<Line> = visible_slice
-        .iter()
-        .map(|l| Line::from(Span::styled(l.as_str(), value_style)))
-        .collect();
-
-    frame.render_widget(Paragraph::new(display_lines), area);
-
-    // Render cursor only when focused
     if focused {
-        let cursor_screen_row = cursor_visual_row.saturating_sub(scroll_offset);
-        if cursor_screen_row < viewport_height {
-            let cursor_x = area.x + cursor_visual_col as u16;
-            let cursor_y = area.y + cursor_screen_row as u16;
-
-            if cursor_x < area.x + area.width {
-                let cursor_char = visual_lines
-                    .get(cursor_visual_row)
-                    .and_then(|line| line.chars().nth(cursor_visual_col))
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| " ".to_string());
-
-                let cursor_area = Rect::new(cursor_x, cursor_y, 1, 1);
-                frame.render_widget(
-                    Paragraph::new(Span::styled(
-                        cursor_char,
-                        Style::default()
-                            .fg(styles::ACCENT)
-                            .add_modifier(Modifier::REVERSED),
-                    )),
-                    cursor_area,
-                );
-            }
-        }
+        frame.render_widget(&dialog.prompt, area);
+    } else {
+        let text = dialog.prompt_text();
+        let display_lines: Vec<Line> = text
+            .lines()
+            .map(|l| Line::from(Span::styled(l, styles::dim_style())))
+            .collect();
+        frame.render_widget(
+            Paragraph::new(display_lines).wrap(ratatui::widgets::Wrap { trim: false }),
+            area,
+        );
     }
+
+    let scrollbar_content = content_len.max(area.height as usize);
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .thumb_style(Style::default().fg(styles::ACCENT))
+        .track_style(styles::dim_style());
+    let mut state = ScrollbarState::new(scrollbar_content).position(cursor_row);
+    frame.render_stateful_widget(scrollbar, area, &mut state);
 }
 
 const TITLE_MAX_ROWS: u16 = 3;

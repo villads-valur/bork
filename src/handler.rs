@@ -31,6 +31,9 @@ pub enum PostAction {
         issue_index: usize,
         popup_title: String,
     },
+    OpenEditor {
+        initial_content: String,
+    },
 }
 
 pub fn handle_action(
@@ -46,10 +49,7 @@ pub fn handle_action(
             handle_confirm(app, action, action_tx);
             PostAction::None
         }
-        InputMode::Dialog => {
-            handle_dialog(app, action);
-            PostAction::None
-        }
+        InputMode::Dialog => handle_dialog(app, action),
         InputMode::Search => {
             handle_search(app, action);
             PostAction::None
@@ -412,7 +412,7 @@ fn handle_debug_inspector(app: &mut App, action: Action) {
     }
 }
 
-fn handle_dialog(app: &mut App, action: Action) {
+fn handle_dialog(app: &mut App, action: Action) -> PostAction {
     let on_linear = app.dialog.as_ref().is_some_and(|d| d.is_on_linear_field());
     let on_github = app.dialog.as_ref().is_some_and(|d| d.is_on_github_field());
 
@@ -421,20 +421,20 @@ fn handle_dialog(app: &mut App, action: Action) {
             Action::DialogChar(' ') => {
                 app.picker_tab = ImportSource::Linear;
                 app.open_linear_picker_with_context(LinearPickerContext::Attach);
-                return;
+                return PostAction::None;
             }
             Action::DialogNextField => {
                 submit_dialog(app);
-                return;
+                return PostAction::None;
             }
             Action::DialogBackspace | Action::DialogDelete => {
                 if let Some(dialog) = app.dialog.as_mut() {
                     dialog.linear_issue = None;
                     dialog.linear_detached = true;
                 }
-                return;
+                return PostAction::None;
             }
-            Action::DialogChar(_) => return,
+            Action::DialogChar(_) => return PostAction::None,
             _ => {}
         }
     }
@@ -444,20 +444,20 @@ fn handle_dialog(app: &mut App, action: Action) {
             Action::DialogChar(' ') => {
                 app.picker_tab = ImportSource::GitHub;
                 app.open_import_picker_with_context(LinearPickerContext::Attach);
-                return;
+                return PostAction::None;
             }
             Action::DialogNextField => {
                 submit_dialog(app);
-                return;
+                return PostAction::None;
             }
             Action::DialogBackspace | Action::DialogDelete => {
                 if let Some(dialog) = app.dialog.as_mut() {
                     dialog.github_pr = None;
                     dialog.github_pr_cleared = true;
                 }
-                return;
+                return PostAction::None;
             }
-            Action::DialogChar(_) => return,
+            Action::DialogChar(_) => return PostAction::None,
             _ => {}
         }
     }
@@ -465,23 +465,31 @@ fn handle_dialog(app: &mut App, action: Action) {
     match action {
         Action::DialogSubmit => {
             submit_dialog(app);
-            return;
+            return PostAction::None;
         }
         Action::DialogCancel => {
             app.close_dialog();
-            return;
+            return PostAction::None;
         }
         Action::DialogNextField => {
             if let Some(dialog) = app.dialog.as_mut() {
                 dialog.next_field();
             }
-            return;
+            return PostAction::None;
+        }
+        Action::DialogOpenEditor => {
+            let Some(dialog) = app.dialog.as_ref() else {
+                return PostAction::None;
+            };
+            return PostAction::OpenEditor {
+                initial_content: dialog.prompt_text(),
+            };
         }
         _ => {}
     }
 
     let Some(dialog) = app.dialog.as_mut() else {
-        return;
+        return PostAction::None;
     };
 
     match action {
@@ -500,6 +508,8 @@ fn handle_dialog(app: &mut App, action: Action) {
         Action::DialogPrevField => dialog.prev_field(),
         _ => {}
     }
+
+    PostAction::None
 }
 
 fn submit_dialog(app: &mut App) {
