@@ -1087,10 +1087,6 @@ mod tests {
             &git_wake_tx(),
         );
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 0);
-        assert!(
-            app.dialog.is_some(),
-            "dialog should remain open after wrapping"
-        );
     }
 
     #[test]
@@ -1563,10 +1559,6 @@ mod tests {
             &git_wake_tx(),
         );
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 0);
-        assert!(
-            app.dialog.is_some(),
-            "dialog should remain open after wrapping"
-        );
     }
 
     #[test]
@@ -1620,10 +1612,6 @@ mod tests {
             &git_wake_tx(),
         );
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 0);
-        assert!(
-            app.dialog.is_some(),
-            "dialog should remain open after wrapping"
-        );
     }
 
     #[test]
