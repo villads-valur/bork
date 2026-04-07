@@ -473,9 +473,7 @@ fn handle_dialog(app: &mut App, action: Action) -> PostAction {
         }
         Action::DialogNextField => {
             if let Some(dialog) = app.dialog.as_mut() {
-                if dialog.next_field() {
-                    submit_dialog(app);
-                }
+                dialog.next_field();
             }
             return PostAction::None;
         }
@@ -1078,7 +1076,17 @@ mod tests {
             &git_wake_tx(),
         );
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 3);
-        // Field 3 is the last (prompt). Next field from here submits the dialog.
+
+        // Tab on last field (Prompt) wraps to Kind(0)
+        handle_action(
+            &mut app,
+            Action::DialogNextField,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+            &linear_wake_tx(),
+            &git_wake_tx(),
+        );
+        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 0);
     }
 
     #[test]
@@ -1110,10 +1118,12 @@ mod tests {
     }
 
     #[test]
-    fn dialog_prev_field_does_not_go_below_zero() {
+    fn dialog_prev_field_wraps_to_last_field() {
         let mut app = test_app();
         app.open_dialog();
 
+        // Agentic, no linear: Kind(0), Mode(1), Title(2), Prompt(3)
+        // Starts on Title (field 2). Two Shift+Tabs -> Kind(0)
         handle_action(
             &mut app,
             Action::DialogPrevField,
@@ -1132,6 +1142,17 @@ mod tests {
             &git_wake_tx(),
         );
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 0);
+
+        // One more Shift+Tab wraps to last field (Prompt = 3)
+        handle_action(
+            &mut app,
+            Action::DialogPrevField,
+            &mpsc::channel().0,
+            &pr_wake_tx(),
+            &linear_wake_tx(),
+            &git_wake_tx(),
+        );
+        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 3);
     }
 
     #[test]
@@ -1482,11 +1503,11 @@ mod tests {
     }
 
     // ================================================================
-    // Dialog with Linear field: tab-through and submit
+    // Dialog with Linear field: tab-through wraps
     // ================================================================
 
     #[test]
-    fn edit_dialog_with_linear_tabs_through_and_submits() {
+    fn edit_dialog_with_linear_tabs_through_and_wraps() {
         let mut app = test_app();
         app.linear_available = true;
 
@@ -1528,7 +1549,7 @@ mod tests {
         );
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 4);
 
-        // Tab on Prompt (last field) should submit
+        // Tab on Prompt (last field) wraps to Kind(0)
         handle_action(
             &mut app,
             Action::DialogNextField,
@@ -1537,12 +1558,11 @@ mod tests {
             &linear_wake_tx(),
             &git_wake_tx(),
         );
-        assert_eq!(app.input_mode, crate::app::InputMode::Normal);
-        assert!(app.dialog.is_none(), "dialog should be closed after submit");
+        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 0);
     }
 
     #[test]
-    fn edit_dialog_with_linear_tab_submits_even_without_issues_loaded() {
+    fn edit_dialog_with_linear_tab_wraps_without_issues_loaded() {
         let mut app = test_app();
         app.linear_available = true;
         // No linear issues loaded
@@ -1571,7 +1591,7 @@ mod tests {
         app.open_edit_dialog(&issue, 0);
 
         // Agentic + linear: Kind(0), Mode(1), Linear(2), Title(3), Prompt(4)
-        // Starts on Title(3). Tab to Prompt(4), then tab submits.
+        // Starts on Title(3). Tab to Prompt(4), then tab wraps.
         handle_action(
             &mut app,
             Action::DialogNextField,
@@ -1582,7 +1602,7 @@ mod tests {
         );
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 4);
 
-        // Tab on Prompt (last field) should submit even without linear issues loaded
+        // Tab on Prompt (last field) wraps to Kind(0)
         handle_action(
             &mut app,
             Action::DialogNextField,
@@ -1591,11 +1611,7 @@ mod tests {
             &linear_wake_tx(),
             &git_wake_tx(),
         );
-        assert_eq!(app.input_mode, crate::app::InputMode::Normal);
-        assert!(
-            app.dialog.is_none(),
-            "dialog should close on tab from last field"
-        );
+        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 0);
     }
 
     #[test]

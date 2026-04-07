@@ -165,7 +165,7 @@ pub fn render_dialog(frame: &mut Frame, app: &App) {
             Span::styled(":attach  ", styles::statusbar_desc_style()),
             Span::styled("Bksp", styles::statusbar_key_style()),
             Span::styled(":detach  ", styles::statusbar_desc_style()),
-            Span::styled("Shift+Enter", styles::statusbar_key_style()),
+            Span::styled("Ctrl+S", styles::statusbar_key_style()),
             Span::styled(submit_hint, styles::statusbar_desc_style()),
             Span::styled("Esc", styles::statusbar_key_style()),
             Span::styled(":cancel", styles::statusbar_desc_style()),
@@ -181,7 +181,7 @@ pub fn render_dialog(frame: &mut Frame, app: &App) {
             spans.push(Span::styled(":editor  ", styles::statusbar_desc_style()));
         }
         spans.extend([
-            Span::styled("Shift+Enter", styles::statusbar_key_style()),
+            Span::styled("Ctrl+S", styles::statusbar_key_style()),
             Span::styled(submit_hint, styles::statusbar_desc_style()),
             Span::styled("Esc", styles::statusbar_key_style()),
             Span::styled(":cancel", styles::statusbar_desc_style()),

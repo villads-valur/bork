@@ -231,18 +231,15 @@ impl DialogState {
         self.current_field() == DialogField::GithubPr
     }
 
-    pub fn next_field(&mut self) -> bool {
-        let next = self.focused_field + 1;
-        if next >= self.active_field_count() {
-            return true;
-        }
-        self.focused_field = next;
-        false
+    pub fn next_field(&mut self) {
+        self.focused_field = (self.focused_field + 1) % self.active_field_count();
     }
 
     pub fn prev_field(&mut self) {
         if self.focused_field > 0 {
             self.focused_field -= 1;
+        } else {
+            self.focused_field = self.active_field_count() - 1;
         }
     }
 
