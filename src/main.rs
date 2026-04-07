@@ -351,6 +351,12 @@ fn run_tui() -> anyhow::Result<()> {
     let (linear_wake_tx, linear_wake_rx) = mpsc::channel::<()>();
     let mut linear_wake_rx = Some(linear_wake_rx);
 
+    let (tuicr_check_tx, tuicr_check_rx) = mpsc::channel::<bool>();
+    thread::spawn(move || {
+        let available = external::tuicr::check_available();
+        let _ = tuicr_check_tx.send(available);
+    });
+
     let mut pending_popup_session: Option<(String, String)> = None;
     let mut pending_popup_for_launch: Option<(usize, String)> = None;
     let mut needs_redraw = true;
@@ -543,6 +549,11 @@ fn run_tui() -> anyhow::Result<()> {
             if let Ok(mut skip) = git_skip_set.lock() {
                 *skip = app.done_worktree_names();
             }
+        }
+
+        // --- tuicr: check availability ---
+        if let Ok(true) = tuicr_check_rx.try_recv() {
+            app.tuicr_available = true;
         }
 
         // --- Linear: check availability then consume poll results ---

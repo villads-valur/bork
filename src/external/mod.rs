@@ -5,3 +5,4 @@ pub mod linear;
 pub mod opencode;
 pub mod ports;
 pub mod tmux;
+pub mod tuicr;

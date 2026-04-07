@@ -5,7 +5,7 @@ use std::thread;
 
 use crate::app::{App, ConfirmAction, ImportSource, InputMode, LinearPickerContext};
 use crate::config::{self, AppConfig};
-use crate::external::{github, opencode, tmux};
+use crate::external::{github, opencode, tmux, tuicr};
 use crate::input::Action;
 use crate::lock;
 use crate::types::{AgentMode, Column, Issue, IssueKind};
@@ -274,6 +274,54 @@ fn handle_normal(
                 issue_index: idx,
                 popup_title,
             }
+        }
+
+        Action::OpenReview | Action::OpenReviewPR => {
+            if !app.tuicr_available {
+                return PostAction::None;
+            }
+            let Some(issue) = app.selected_issue() else {
+                return PostAction::None;
+            };
+            let Some(wt) = issue.worktree.clone() else {
+                app.set_message("No worktree assigned");
+                return PostAction::None;
+            };
+            let session_name = issue.session_name(&app.config.project_name);
+            if !app.is_session_alive(&session_name) {
+                app.set_message("No active session");
+                return PostAction::None;
+            }
+            let pr_mode = action == Action::OpenReviewPR;
+            let popup_title = format!("{}: {}", issue.id, issue.title);
+            let worktree_path = app.config.project_root.join(&wt);
+            let tx = action_tx.clone();
+            app.busy_count += 1;
+            app.set_message(if pr_mode {
+                "Opening tuicr --pr..."
+            } else {
+                "Opening tuicr..."
+            });
+
+            thread::spawn(move || {
+                let result = match tuicr::open_in_session(&session_name, &worktree_path, pr_mode) {
+                    Ok(()) => ActionResult {
+                        message: "tuicr ready".to_string(),
+                        session_to_open: Some(session_name),
+                        popup_title: Some(popup_title),
+                        session_id: None,
+                    },
+                    Err(e) => ActionResult {
+                        message: format!("Failed to open tuicr: {e}"),
+                        session_to_open: None,
+                        popup_title: None,
+                        session_id: None,
+                    },
+                };
+                let _ = tx.send(result);
+            });
+
+            PostAction::None
         }
 
         Action::SyncPRs => {

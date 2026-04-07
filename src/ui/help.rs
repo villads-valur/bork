@@ -15,6 +15,11 @@ struct Section {
     bindings: &'static [(&'static str, &'static str)],
 }
 
+const TUICR_SECTION: Section = Section {
+    title: "Review",
+    bindings: &[("r", "Review changes"), ("R", "Review PR (--pr)")],
+};
+
 const DEBUG_SECTION: Section = Section {
     title: "Debug",
     bindings: &[
@@ -72,9 +77,13 @@ const SECTIONS: &[Section] = &[
     },
 ];
 
-fn content_height(debug: bool) -> u16 {
+fn content_height(tuicr: bool, debug: bool) -> u16 {
     let mut section_rows: u16 = SECTIONS.iter().map(|s| 1 + s.bindings.len() as u16).sum();
     let mut count = SECTIONS.len();
+    if tuicr {
+        section_rows += 1 + TUICR_SECTION.bindings.len() as u16;
+        count += 1;
+    }
     if debug {
         section_rows += 1 + DEBUG_SECTION.bindings.len() as u16;
         count += 1;
@@ -90,8 +99,9 @@ pub fn render_help(frame: &mut Frame, app: &App) {
 
     let area = frame.area();
     let debug = app.config.debug;
+    let tuicr = app.tuicr_available;
     let width = HELP_WIDTH.min(area.width);
-    let height = (content_height(debug) + 2).min(area.height); // +2 for border
+    let height = (content_height(tuicr, debug) + 2).min(area.height); // +2 for border
     let x = area.width.saturating_sub(width) / 2;
     let y = area.height.saturating_sub(height) / 2;
 
@@ -119,14 +129,13 @@ pub fn render_help(frame: &mut Frame, app: &App) {
     let max_row = inner.height.saturating_sub(1); // reserve last row for footer
     let mut row: u16 = 0;
 
-    let all_sections: Vec<&Section> = if debug {
-        SECTIONS
-            .iter()
-            .chain(std::iter::once(&DEBUG_SECTION))
-            .collect()
-    } else {
-        SECTIONS.iter().collect()
-    };
+    let mut all_sections: Vec<&Section> = SECTIONS.iter().collect();
+    if tuicr {
+        all_sections.push(&TUICR_SECTION);
+    }
+    if debug {
+        all_sections.push(&DEBUG_SECTION);
+    }
 
     for (i, section) in all_sections.iter().enumerate() {
         if i > 0 {
