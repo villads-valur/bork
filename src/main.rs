@@ -829,15 +829,24 @@ fn run_tui() -> anyhow::Result<()> {
 
         // --- tuicr: check availability ---
         if let Ok(true) = tuicr_check_rx.try_recv() {
-            app.project_mut().tuicr_available = true;
+            for p in &mut app.projects {
+                p.tuicr_available = true;
+            }
         }
 
         // --- Linear: check availability then consume poll results ---
         if let Ok(true) = linear_check_rx.try_recv() {
             needs_redraw = true;
-            app.project_mut().linear_available = true;
+            for p in &mut app.projects {
+                p.linear_available = true;
+            }
             if let Some(wake_rx) = workers.linear_wake_rx.take() {
                 workers.linear_rx = Some(spawn_linear_worker(wake_rx));
+            }
+            for sw in swimlane_workers.values_mut() {
+                if let Some(wake_rx) = sw.linear_wake_rx.take() {
+                    sw.linear_rx = Some(spawn_linear_worker(wake_rx));
+                }
             }
         }
         if let Some(ref rx) = workers.linear_rx {
