@@ -83,10 +83,10 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(":nav  ", styles::statusbar_desc_style()),
             Span::styled("Enter", styles::statusbar_key_style()),
             Span::styled(":switch  ", styles::statusbar_desc_style()),
+            Span::styled("Space", styles::statusbar_key_style()),
+            Span::styled(":swimlane  ", styles::statusbar_desc_style()),
             Span::styled("Esc", styles::statusbar_key_style()),
-            Span::styled(":close  ", styles::statusbar_desc_style()),
-            Span::styled("Ctrl+P", styles::statusbar_key_style()),
-            Span::styled(":toggle", styles::statusbar_desc_style()),
+            Span::styled(":close", styles::statusbar_desc_style()),
         ]);
         frame.render_widget(Paragraph::new(line), area);
         return;

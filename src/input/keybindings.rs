@@ -7,9 +7,10 @@ pub fn map_key_to_action(
     key: KeyEvent,
     mode: InputMode,
     dialog_field: Option<DialogField>,
+    swimlane_count: usize,
 ) -> Action {
     match mode {
-        InputMode::Normal => map_normal_key(key),
+        InputMode::Normal => map_normal_key(key, swimlane_count),
         InputMode::Confirm => map_confirm_key(key),
         InputMode::Dialog => {
             if dialog_field == Some(DialogField::Prompt) {
@@ -26,13 +27,20 @@ pub fn map_key_to_action(
     }
 }
 
-fn map_normal_key(key: KeyEvent) -> Action {
+fn map_normal_key(key: KeyEvent, swimlane_count: usize) -> Action {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
             KeyCode::Char('c') => Action::Quit,
             KeyCode::Char('p') => Action::ToggleSidebar,
             KeyCode::Char('r') => Action::DebugReset,
             KeyCode::Char('e') => Action::DebugInspect,
+            _ => Action::Noop,
+        };
+    }
+
+    if key.modifiers.contains(KeyModifiers::SUPER) {
+        return match key.code {
+            KeyCode::Char('p') => Action::ToggleSidebar,
             _ => Action::Noop,
         };
     }
@@ -45,6 +53,8 @@ fn map_normal_key(key: KeyEvent) -> Action {
         KeyCode::Char('h') | KeyCode::Left => Action::FocusLeft,
         KeyCode::Char('l') | KeyCode::Right => Action::FocusRight,
 
+        KeyCode::Tab if swimlane_count > 1 => Action::NextSwimlane,
+        KeyCode::BackTab if swimlane_count > 1 => Action::PrevSwimlane,
         KeyCode::Tab => Action::JumpColumnRight,
         KeyCode::BackTab => Action::JumpColumnLeft,
 
@@ -91,11 +101,19 @@ fn map_sidebar_key(key: KeyEvent) -> Action {
         };
     }
 
+    if key.modifiers.contains(KeyModifiers::SUPER) {
+        return match key.code {
+            KeyCode::Char('p') => Action::ToggleSidebar,
+            _ => Action::Noop,
+        };
+    }
+
     match key.code {
         KeyCode::Char('q') => Action::Quit,
         KeyCode::Char('j') | KeyCode::Down => Action::SidebarDown,
         KeyCode::Char('k') | KeyCode::Up => Action::SidebarUp,
         KeyCode::Enter => Action::SidebarSelect,
+        KeyCode::Char(' ') => Action::SidebarToggleSwimlane,
         KeyCode::Esc => Action::ToggleSidebar,
         _ => Action::Noop,
     }
@@ -250,108 +268,147 @@ mod tests {
 
     #[test]
     fn normal_quit() {
-        assert_eq!(map_normal_key(key(KeyCode::Char('q'))), Action::Quit);
-        assert_eq!(map_normal_key(ctrl('c')), Action::Quit);
+        assert_eq!(map_normal_key(key(KeyCode::Char('q')), 1), Action::Quit);
+        assert_eq!(map_normal_key(ctrl('c'), 1), Action::Quit);
     }
 
     #[test]
     fn normal_navigation() {
-        assert_eq!(map_normal_key(key(KeyCode::Char('j'))), Action::MoveDown);
-        assert_eq!(map_normal_key(key(KeyCode::Down)), Action::MoveDown);
-        assert_eq!(map_normal_key(key(KeyCode::Char('k'))), Action::MoveUp);
-        assert_eq!(map_normal_key(key(KeyCode::Up)), Action::MoveUp);
-        assert_eq!(map_normal_key(key(KeyCode::Char('h'))), Action::FocusLeft);
-        assert_eq!(map_normal_key(key(KeyCode::Left)), Action::FocusLeft);
-        assert_eq!(map_normal_key(key(KeyCode::Char('l'))), Action::FocusRight);
-        assert_eq!(map_normal_key(key(KeyCode::Right)), Action::FocusRight);
+        assert_eq!(map_normal_key(key(KeyCode::Char('j')), 1), Action::MoveDown);
+        assert_eq!(map_normal_key(key(KeyCode::Down), 1), Action::MoveDown);
+        assert_eq!(map_normal_key(key(KeyCode::Char('k')), 1), Action::MoveUp);
+        assert_eq!(map_normal_key(key(KeyCode::Up), 1), Action::MoveUp);
+        assert_eq!(
+            map_normal_key(key(KeyCode::Char('h')), 1),
+            Action::FocusLeft
+        );
+        assert_eq!(map_normal_key(key(KeyCode::Left), 1), Action::FocusLeft);
+        assert_eq!(
+            map_normal_key(key(KeyCode::Char('l')), 1),
+            Action::FocusRight
+        );
+        assert_eq!(map_normal_key(key(KeyCode::Right), 1), Action::FocusRight);
     }
 
     #[test]
     fn normal_jump_columns() {
-        assert_eq!(map_normal_key(key(KeyCode::Tab)), Action::JumpColumnRight);
         assert_eq!(
-            map_normal_key(key(KeyCode::BackTab)),
+            map_normal_key(key(KeyCode::Tab), 1),
+            Action::JumpColumnRight
+        );
+        assert_eq!(
+            map_normal_key(key(KeyCode::BackTab), 1),
             Action::JumpColumnLeft
         );
     }
 
     #[test]
     fn normal_session_actions() {
-        assert_eq!(map_normal_key(key(KeyCode::Enter)), Action::OpenSession);
+        assert_eq!(map_normal_key(key(KeyCode::Enter), 1), Action::OpenSession);
         assert_eq!(
-            map_normal_key(key(KeyCode::Char('t'))),
+            map_normal_key(key(KeyCode::Char('t')), 1),
             Action::OpenTerminal
         );
-        assert_eq!(map_normal_key(key(KeyCode::Char('x'))), Action::KillSession);
+        assert_eq!(
+            map_normal_key(key(KeyCode::Char('x')), 1),
+            Action::KillSession
+        );
     }
 
     #[test]
     fn normal_issue_crud() {
-        assert_eq!(map_normal_key(key(KeyCode::Char('n'))), Action::CreateIssue);
-        assert_eq!(map_normal_key(key(KeyCode::Char('a'))), Action::AddIssue);
-        assert_eq!(map_normal_key(key(KeyCode::Char('e'))), Action::EditIssue);
-        assert_eq!(map_normal_key(key(KeyCode::Char('d'))), Action::DeleteIssue);
+        assert_eq!(
+            map_normal_key(key(KeyCode::Char('n')), 1),
+            Action::CreateIssue
+        );
+        assert_eq!(map_normal_key(key(KeyCode::Char('a')), 1), Action::AddIssue);
+        assert_eq!(
+            map_normal_key(key(KeyCode::Char('e')), 1),
+            Action::EditIssue
+        );
+        assert_eq!(
+            map_normal_key(key(KeyCode::Char('d')), 1),
+            Action::DeleteIssue
+        );
     }
 
     #[test]
     fn normal_move_issue() {
         assert_eq!(
-            map_normal_key(key(KeyCode::Char('H'))),
+            map_normal_key(key(KeyCode::Char('H')), 1),
             Action::MoveIssueLeft
         );
         assert_eq!(
-            map_normal_key(key(KeyCode::Char('L'))),
+            map_normal_key(key(KeyCode::Char('L')), 1),
             Action::MoveIssueRight
         );
-        assert_eq!(map_normal_key(key(KeyCode::Char('D'))), Action::MoveToDone);
-        assert_eq!(map_normal_key(key(KeyCode::Char('T'))), Action::MoveToTodo);
+        assert_eq!(
+            map_normal_key(key(KeyCode::Char('D')), 1),
+            Action::MoveToDone
+        );
+        assert_eq!(
+            map_normal_key(key(KeyCode::Char('T')), 1),
+            Action::MoveToTodo
+        );
     }
 
     #[test]
     fn normal_scroll() {
-        assert_eq!(map_normal_key(key(KeyCode::Char('g'))), Action::ScrollToTop);
         assert_eq!(
-            map_normal_key(key(KeyCode::Char('G'))),
+            map_normal_key(key(KeyCode::Char('g')), 1),
+            Action::ScrollToTop
+        );
+        assert_eq!(
+            map_normal_key(key(KeyCode::Char('G')), 1),
             Action::ScrollToBottom
         );
     }
 
     #[test]
     fn normal_review() {
-        assert_eq!(map_normal_key(key(KeyCode::Char('r'))), Action::OpenReview);
         assert_eq!(
-            map_normal_key(key(KeyCode::Char('R'))),
+            map_normal_key(key(KeyCode::Char('r')), 1),
+            Action::OpenReview
+        );
+        assert_eq!(
+            map_normal_key(key(KeyCode::Char('R')), 1),
             Action::OpenReviewPR
         );
     }
 
     #[test]
     fn normal_external() {
-        assert_eq!(map_normal_key(key(KeyCode::Char('P'))), Action::SyncPRs);
-        assert_eq!(map_normal_key(key(KeyCode::Char('o'))), Action::OpenPR);
-        assert_eq!(map_normal_key(key(KeyCode::Char('O'))), Action::OpenLinear);
+        assert_eq!(map_normal_key(key(KeyCode::Char('P')), 1), Action::SyncPRs);
+        assert_eq!(map_normal_key(key(KeyCode::Char('o')), 1), Action::OpenPR);
         assert_eq!(
-            map_normal_key(key(KeyCode::Char('W'))),
+            map_normal_key(key(KeyCode::Char('O')), 1),
+            Action::OpenLinear
+        );
+        assert_eq!(
+            map_normal_key(key(KeyCode::Char('W')), 1),
             Action::AssignWorktree
         );
         assert_eq!(
-            map_normal_key(key(KeyCode::Char('I'))),
+            map_normal_key(key(KeyCode::Char('I')), 1),
             Action::OpenLinearPicker
         );
     }
 
     #[test]
     fn normal_search_and_help() {
-        assert_eq!(map_normal_key(key(KeyCode::Char('/'))), Action::SearchStart);
-        assert_eq!(map_normal_key(key(KeyCode::Char('?'))), Action::ShowHelp);
-        assert_eq!(map_normal_key(key(KeyCode::Esc)), Action::ClearSearch);
+        assert_eq!(
+            map_normal_key(key(KeyCode::Char('/')), 1),
+            Action::SearchStart
+        );
+        assert_eq!(map_normal_key(key(KeyCode::Char('?')), 1), Action::ShowHelp);
+        assert_eq!(map_normal_key(key(KeyCode::Esc), 1), Action::ClearSearch);
     }
 
     #[test]
     fn normal_noop() {
-        assert_eq!(map_normal_key(key(KeyCode::Char('z'))), Action::Noop);
-        assert_eq!(map_normal_key(key(KeyCode::F(1))), Action::Noop);
-        assert_eq!(map_normal_key(ctrl('x')), Action::Noop);
+        assert_eq!(map_normal_key(key(KeyCode::Char('z')), 1), Action::Noop);
+        assert_eq!(map_normal_key(key(KeyCode::F(1)), 1), Action::Noop);
+        assert_eq!(map_normal_key(ctrl('x'), 1), Action::Noop);
     }
 
     // --- Confirm mode ---
@@ -571,10 +628,16 @@ mod tests {
     #[test]
     fn dispatch_by_mode() {
         let k = key(KeyCode::Char('q'));
-        assert_eq!(map_key_to_action(k, InputMode::Normal, None), Action::Quit,);
-        assert_eq!(map_key_to_action(k, InputMode::Confirm, None), Action::Noop,);
         assert_eq!(
-            map_key_to_action(k, InputMode::Search, None),
+            map_key_to_action(k, InputMode::Normal, None, 1),
+            Action::Quit,
+        );
+        assert_eq!(
+            map_key_to_action(k, InputMode::Confirm, None, 1),
+            Action::Noop,
+        );
+        assert_eq!(
+            map_key_to_action(k, InputMode::Search, None, 1),
             Action::SearchChar('q'),
         );
     }
@@ -583,12 +646,29 @@ mod tests {
     fn dispatch_dialog_prompt_vs_other_field() {
         let enter = key(KeyCode::Enter);
         assert_eq!(
-            map_key_to_action(enter, InputMode::Dialog, Some(DialogField::Title)),
+            map_key_to_action(enter, InputMode::Dialog, Some(DialogField::Title), 1),
             Action::DialogNextField,
         );
         assert_eq!(
-            map_key_to_action(enter, InputMode::Dialog, Some(DialogField::Prompt)),
+            map_key_to_action(enter, InputMode::Dialog, Some(DialogField::Prompt), 1),
             Action::DialogPromptKey(enter),
+        );
+    }
+
+    #[test]
+    fn tab_switches_swimlane_when_multiple() {
+        assert_eq!(
+            map_normal_key(key(KeyCode::Tab), 1),
+            Action::JumpColumnRight,
+        );
+        assert_eq!(map_normal_key(key(KeyCode::Tab), 2), Action::NextSwimlane,);
+        assert_eq!(
+            map_normal_key(key(KeyCode::BackTab), 1),
+            Action::JumpColumnLeft,
+        );
+        assert_eq!(
+            map_normal_key(key(KeyCode::BackTab), 2),
+            Action::PrevSwimlane,
         );
     }
 }

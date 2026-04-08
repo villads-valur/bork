@@ -102,6 +102,15 @@ pub fn unregister_project(path: &Path) -> anyhow::Result<bool> {
     Ok(removed)
 }
 
+pub fn prune_stale_projects() {
+    let mut config = load_global_config();
+    let before = config.projects.len();
+    config.projects.retain(|e| e.path.join(".bork").is_dir());
+    if config.projects.len() < before {
+        let _ = save_global_config(&config);
+    }
+}
+
 pub fn list_projects() -> Vec<ProjectEntry> {
     load_global_config().projects
 }

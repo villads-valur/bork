@@ -30,7 +30,11 @@ const DEBUG_SECTION: Section = Section {
 
 const PROJECTS_SECTION: Section = Section {
     title: "Projects",
-    bindings: &[("Ctrl+P", "Toggle project sidebar")],
+    bindings: &[
+        ("Ctrl+P", "Toggle project sidebar"),
+        ("Space", "Toggle swimlane (sidebar)"),
+        ("Tab / S-Tab", "Switch swimlane focus"),
+    ],
 };
 
 const SECTIONS: &[Section] = &[

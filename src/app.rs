@@ -705,6 +705,14 @@ pub struct SidebarState {
     pub focused: bool,
     pub selected: usize,
     pub activity: HashMap<usize, bool>,
+    pub swimlane_indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CardSize {
+    Full,
+    Medium,
+    Compact,
 }
 
 #[derive(Debug)]
@@ -1096,6 +1104,7 @@ fn clear_to_start(text: &mut String, cursor: &mut usize) {
 pub struct App {
     pub projects: Vec<Project>,
     pub focused_project: usize,
+    pub focused_swimlane: usize,
     pub sidebar: Option<SidebarState>,
     pub input_mode: InputMode,
     pub confirm_message: Option<String>,
@@ -1119,6 +1128,7 @@ impl App {
         App {
             projects: vec![project],
             focused_project: 0,
+            focused_swimlane: 0,
             sidebar: None,
             input_mode: InputMode::Normal,
             confirm_message: None,
@@ -1150,6 +1160,7 @@ impl App {
                 focused: false,
                 selected: 0,
                 activity: HashMap::new(),
+                swimlane_indices: Vec::new(),
             });
         }
     }
@@ -1160,6 +1171,49 @@ impl App {
 
     pub fn project_mut(&mut self) -> &mut Project {
         &mut self.projects[self.focused_project]
+    }
+
+    pub fn active_project_index(&self) -> usize {
+        if self.focused_swimlane == 0 {
+            return self.focused_project;
+        }
+        self.sidebar
+            .as_ref()
+            .and_then(|s| s.swimlane_indices.get(self.focused_swimlane - 1).copied())
+            .unwrap_or(self.focused_project)
+    }
+
+    pub fn active_project(&self) -> &Project {
+        &self.projects[self.active_project_index()]
+    }
+
+    pub fn active_project_mut(&mut self) -> &mut Project {
+        let idx = self.active_project_index();
+        &mut self.projects[idx]
+    }
+
+    pub fn visible_swimlanes(&self) -> Vec<usize> {
+        let mut lanes = vec![self.focused_project];
+        if let Some(ref sidebar) = self.sidebar {
+            for &idx in &sidebar.swimlane_indices {
+                if idx != self.focused_project && idx < self.projects.len() {
+                    lanes.push(idx);
+                }
+            }
+        }
+        lanes
+    }
+
+    pub fn visible_swimlane_count(&self) -> usize {
+        self.visible_swimlanes().len()
+    }
+
+    pub fn card_size(&self) -> CardSize {
+        match self.visible_swimlane_count() {
+            2 => CardSize::Medium,
+            n if n >= 3 => CardSize::Compact,
+            _ => CardSize::Full,
+        }
     }
 
     pub fn set_message(&mut self, msg: impl Into<String>) {

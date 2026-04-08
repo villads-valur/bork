@@ -88,71 +88,71 @@ fn handle_normal(
         }
 
         Action::MoveUp => {
-            app.project_mut().move_selection_up();
+            app.active_project_mut().move_selection_up();
             PostAction::None
         }
         Action::MoveDown => {
-            app.project_mut().move_selection_down();
+            app.active_project_mut().move_selection_down();
             PostAction::None
         }
         Action::FocusLeft => {
-            app.project_mut().focus_left();
+            app.active_project_mut().focus_left();
             PostAction::None
         }
         Action::FocusRight => {
-            app.project_mut().focus_right();
+            app.active_project_mut().focus_right();
             PostAction::None
         }
         Action::JumpColumnLeft => {
-            app.project_mut().jump_column_left();
+            app.active_project_mut().jump_column_left();
             PostAction::None
         }
         Action::JumpColumnRight => {
-            app.project_mut().jump_column_right();
+            app.active_project_mut().jump_column_right();
             PostAction::None
         }
 
         Action::ScrollToTop => {
-            app.project_mut().scroll_to_top();
+            app.active_project_mut().scroll_to_top();
             PostAction::None
         }
         Action::ScrollToBottom => {
-            app.project_mut().scroll_to_bottom();
+            app.active_project_mut().scroll_to_bottom();
             PostAction::None
         }
 
         Action::MoveIssueRight => {
-            let p = app.project_mut();
+            let p = app.active_project_mut();
             p.move_issue_right();
             p.mark_dirty();
             PostAction::None
         }
         Action::MoveIssueLeft => {
-            let p = app.project_mut();
+            let p = app.active_project_mut();
             p.move_issue_left();
             p.mark_dirty();
             PostAction::None
         }
         Action::MoveToDone => {
-            let p = app.project_mut();
+            let p = app.active_project_mut();
             p.move_to_done();
             p.mark_dirty();
             PostAction::None
         }
         Action::MoveToTodo => {
-            let p = app.project_mut();
+            let p = app.active_project_mut();
             p.move_to_todo();
             p.mark_dirty();
             PostAction::None
         }
 
         Action::KillSession => {
-            let Some(issue) = app.project().selected_issue() else {
+            let Some(issue) = app.active_project().selected_issue() else {
                 return PostAction::None;
             };
 
-            let session_name = issue.session_name(&app.project().config.project_name);
-            if !app.project().is_session_alive(&session_name) {
+            let session_name = issue.session_name(&app.active_project().config.project_name);
+            if !app.active_project().is_session_alive(&session_name) {
                 app.set_message("No active session to kill");
                 return PostAction::None;
             }
@@ -170,25 +170,26 @@ fn handle_normal(
         }
 
         Action::AddIssue => {
-            let column = Column::from_index(app.project().selected_column).unwrap_or(Column::Todo);
+            let column =
+                Column::from_index(app.active_project().selected_column).unwrap_or(Column::Todo);
             app.open_dialog_in_column(column);
             PostAction::None
         }
 
         Action::EditIssue => {
-            let Some(idx) = app.project().selected_issue_index() else {
+            let Some(idx) = app.active_project().selected_issue_index() else {
                 return PostAction::None;
             };
-            let issue = app.project().issues[idx].clone();
+            let issue = app.active_project().issues[idx].clone();
             app.open_edit_dialog(&issue, idx);
             PostAction::None
         }
 
         Action::DeleteIssue => {
-            let Some(issue) = app.project().selected_issue() else {
+            let Some(issue) = app.active_project().selected_issue() else {
                 return PostAction::None;
             };
-            let Some(idx) = app.project().selected_issue_index() else {
+            let Some(idx) = app.active_project().selected_issue_index() else {
                 return PostAction::None;
             };
 
@@ -219,11 +220,30 @@ fn handle_normal(
             PostAction::None
         }
 
+        Action::NextSwimlane => {
+            let count = app.visible_swimlane_count();
+            if count > 1 {
+                app.focused_swimlane = (app.focused_swimlane + 1) % count;
+            }
+            PostAction::None
+        }
+        Action::PrevSwimlane => {
+            let count = app.visible_swimlane_count();
+            if count > 1 {
+                if app.focused_swimlane == 0 {
+                    app.focused_swimlane = count - 1;
+                } else {
+                    app.focused_swimlane -= 1;
+                }
+            }
+            PostAction::None
+        }
+
         Action::OpenTerminal => {
-            let session_name = format!("{}-terminal", app.project().config.project_name);
+            let session_name = format!("{}-terminal", app.active_project().config.project_name);
             let popup_title = "Terminal".to_string();
 
-            if app.project().is_session_alive(&session_name) {
+            if app.active_project().is_session_alive(&session_name) {
                 return PostAction::OpenTmuxPopup {
                     session_name,
                     popup_title,
@@ -233,7 +253,7 @@ fn handle_normal(
             app.busy_count += 1;
             app.set_message("Opening terminal...");
             let tx = action_tx.clone();
-            let project_root = app.project().config.project_root.clone();
+            let project_root = app.active_project().config.project_root.clone();
 
             thread::spawn(move || {
                 let result = match tmux::create_session(&session_name, &project_root) {
@@ -257,20 +277,20 @@ fn handle_normal(
         }
 
         Action::OpenSession => {
-            let Some(idx) = app.project().selected_issue_index() else {
+            let Some(idx) = app.active_project().selected_issue_index() else {
                 return PostAction::None;
             };
-            let issue = app.project().issues[idx].clone();
+            let issue = app.active_project().issues[idx].clone();
 
             if issue.kind == IssueKind::NonAgentic {
                 app.open_edit_dialog(&issue, idx);
                 return PostAction::None;
             }
 
-            let session_name = issue.session_name(&app.project().config.project_name);
+            let session_name = issue.session_name(&app.active_project().config.project_name);
             let popup_title = format!("{}: {}", issue.id, issue.title);
 
-            if app.project().is_session_alive(&session_name) {
+            if app.active_project().is_session_alive(&session_name) {
                 return PostAction::OpenTmuxPopup {
                     session_name,
                     popup_title,
@@ -280,7 +300,7 @@ fn handle_normal(
             app.busy_count += 1;
             app.set_message("Launching session...");
 
-            let config = app.project().config.clone();
+            let config = app.active_project().config.clone();
             let tx = action_tx.clone();
 
             thread::spawn(move || {
@@ -295,24 +315,24 @@ fn handle_normal(
         }
 
         Action::OpenReview | Action::OpenReviewPR => {
-            if !app.project().tuicr_available {
+            if !app.active_project().tuicr_available {
                 return PostAction::None;
             }
-            let Some(issue) = app.project().selected_issue() else {
+            let Some(issue) = app.active_project().selected_issue() else {
                 return PostAction::None;
             };
             let Some(wt) = issue.worktree.clone() else {
                 app.set_message("No worktree assigned");
                 return PostAction::None;
             };
-            let session_name = issue.session_name(&app.project().config.project_name);
-            if !app.project().is_session_alive(&session_name) {
+            let session_name = issue.session_name(&app.active_project().config.project_name);
+            if !app.active_project().is_session_alive(&session_name) {
                 app.set_message("No active session");
                 return PostAction::None;
             }
             let pr_mode = action == Action::OpenReviewPR;
             let popup_title = format!("{}: {}", issue.id, issue.title);
-            let worktree_path = app.project().config.project_root.join(&wt);
+            let worktree_path = app.active_project().config.project_root.join(&wt);
             let tx = action_tx.clone();
             app.busy_count += 1;
             app.set_message(if pr_mode {
@@ -349,15 +369,15 @@ fn handle_normal(
         }
 
         Action::OpenPR => {
-            let Some(issue) = app.project().selected_issue() else {
+            let Some(issue) = app.active_project().selected_issue() else {
                 return PostAction::None;
             };
-            let Some(pr) = app.project().pr_for(issue) else {
+            let Some(pr) = app.active_project().pr_for(issue) else {
                 app.set_message("No PR found for this issue");
                 return PostAction::None;
             };
             let pr_number = pr.number;
-            let main_worktree = app.project().config.project_root.join("main");
+            let main_worktree = app.active_project().config.project_root.join("main");
             thread::spawn(move || {
                 github::open_pr_in_browser(pr_number, &main_worktree);
             });
@@ -365,7 +385,7 @@ fn handle_normal(
         }
 
         Action::OpenLinear => {
-            let Some(issue) = app.project().selected_issue() else {
+            let Some(issue) = app.active_project().selected_issue() else {
                 return PostAction::None;
             };
             let Some(url) = issue.linear_url.clone() else {
@@ -379,21 +399,21 @@ fn handle_normal(
         }
 
         Action::AssignWorktree => {
-            let Some(idx) = app.project().selected_issue_index() else {
+            let Some(idx) = app.active_project().selected_issue_index() else {
                 return PostAction::None;
             };
-            if let Some(old) = app.project_mut().issues[idx].worktree.take() {
+            if let Some(old) = app.active_project_mut().issues[idx].worktree.take() {
                 app.set_message(format!("Cleared worktree '{old}', re-detecting..."));
             } else {
                 app.set_message("No worktree assigned, re-detecting...");
             }
-            if app.project_mut().auto_assign_worktrees() {
-                if let Some(wt) = app.project().issues[idx].worktree.as_ref() {
+            if app.active_project_mut().auto_assign_worktrees() {
+                if let Some(wt) = app.active_project().issues[idx].worktree.as_ref() {
                     app.set_message(format!("Assigned worktree: {wt}"));
                 }
             }
             let _ = git_wake_tx.send(());
-            app.project_mut().mark_dirty();
+            app.active_project_mut().mark_dirty();
             PostAction::None
         }
 
@@ -408,21 +428,21 @@ fn handle_normal(
         }
 
         Action::DebugReset => {
-            if !app.project().config.debug {
+            if !app.active_project().config.debug {
                 return PostAction::None;
             }
-            lock::release_lock(&app.project().config.project_root);
-            let session_name = app.project().config.project_name.clone();
+            lock::release_lock(&app.active_project().config.project_root);
+            let session_name = app.active_project().config.project_name.clone();
             let _ = tmux::kill_session(&session_name);
             app.should_quit = true;
             PostAction::None
         }
 
         Action::DebugInspect => {
-            if !app.project().config.debug {
+            if !app.active_project().config.debug {
                 return PostAction::None;
             }
-            let Some(issue) = app.project().selected_issue().cloned() else {
+            let Some(issue) = app.active_project().selected_issue().cloned() else {
                 app.set_message("No issue selected");
                 return PostAction::None;
             };
@@ -937,6 +957,31 @@ fn handle_sidebar(app: &mut App, action: Action) -> PostAction {
                 }
             }
             PostAction::None
+        }
+        Action::SidebarToggleSwimlane => {
+            if let Some(ref mut sidebar) = app.sidebar {
+                let idx = sidebar.selected;
+                if idx == app.focused_project {
+                    // Can't toggle the focused project off
+                    PostAction::None
+                } else if let Some(pos) = sidebar.swimlane_indices.iter().position(|&i| i == idx) {
+                    sidebar.swimlane_indices.remove(pos);
+                    // Reset swimlane focus if it was pointing at a removed lane
+                    let total = 1 + sidebar.swimlane_indices.len();
+                    if app.focused_swimlane >= total {
+                        app.focused_swimlane = 0;
+                    }
+                    PostAction::None
+                } else if sidebar.swimlane_indices.len() < 2 {
+                    sidebar.swimlane_indices.push(idx);
+                    PostAction::None
+                } else {
+                    app.set_message("Maximum 3 projects visible (1 focused + 2 extra)");
+                    PostAction::None
+                }
+            } else {
+                PostAction::None
+            }
         }
         Action::Quit => {
             app.should_quit = true;

@@ -311,15 +311,14 @@ fn main() -> anyhow::Result<()> {
 fn run_project_command(command: ProjectCommand) -> anyhow::Result<()> {
     match command {
         ProjectCommand::List => {
+            global_config::prune_stale_projects();
             let projects = global_config::list_projects();
             if projects.is_empty() {
                 println!("No projects registered.");
                 println!("Run 'bork init' or 'bork project add' to register a project.");
             } else {
                 for entry in &projects {
-                    let exists = entry.path.join(".bork").is_dir();
-                    let marker = if exists { " " } else { "?" };
-                    println!("{} {} ({})", marker, entry.name, entry.path.display());
+                    println!("  {} ({})", entry.name, entry.path.display());
                 }
             }
             Ok(())
@@ -484,6 +483,7 @@ fn run_tui() -> anyhow::Result<()> {
     let mut app = App::new(config, state);
 
     // --- Register current project and load others for multi-project sidebar ---
+    global_config::prune_stale_projects();
     let current_root = app.project().config.project_root.clone();
     let _ = global_config::register_project(&app.project().config.project_name, &current_root);
     let current_canonical =
@@ -547,7 +547,12 @@ fn run_tui() -> anyhow::Result<()> {
                     if key.kind == KeyEventKind::Press {
                         needs_redraw = true;
                         let dialog_field = app.dialog.as_ref().map(|d| d.current_field());
-                        let action = map_key_to_action(key, app.input_mode, dialog_field);
+                        let action = map_key_to_action(
+                            key,
+                            app.input_mode,
+                            dialog_field,
+                            app.visible_swimlane_count(),
+                        );
                         let post_action = handler::handle_action(
                             &mut app,
                             action,
@@ -603,7 +608,6 @@ fn run_tui() -> anyhow::Result<()> {
                                     app.pending_confirm = None;
                                     app.debug_inspector_json = None;
                                     app.input_mode = InputMode::Normal;
-
                                     if app.project().state_dirty {
                                         let _ = config::save_state(
                                             &app.project().to_state(),
@@ -612,9 +616,11 @@ fn run_tui() -> anyhow::Result<()> {
                                         app.project_mut().state_dirty = false;
                                     }
 
-                                    app.project_mut().live = None;
                                     app.focused_project = index;
-                                    app.project_mut().live = Some(crate::app::LiveState::default());
+                                    if app.project().live.is_none() {
+                                        app.project_mut().live =
+                                            Some(crate::app::LiveState::default());
+                                    }
 
                                     workers = spawn_project_workers(app.project());
                                     let _ = execute!(

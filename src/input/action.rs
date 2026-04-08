@@ -73,5 +73,8 @@ pub enum Action {
     SidebarUp,
     SidebarDown,
     SidebarSelect,
+    SidebarToggleSwimlane,
+    NextSwimlane,
+    PrevSwimlane,
     Noop,
 }

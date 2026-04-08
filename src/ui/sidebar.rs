@@ -30,6 +30,7 @@ pub fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
         .enumerate()
         .map(|(i, project)| {
             let is_focused = i == app.focused_project;
+            let is_swimlane = sidebar.swimlane_indices.contains(&i);
             let has_activity = sidebar.activity.get(&i).copied().unwrap_or(false);
 
             let marker = if is_focused {
@@ -49,27 +50,40 @@ pub fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
             };
 
             let name = &project.config.project_name;
-            let max_name = area.width.saturating_sub(5) as usize;
+            let swimlane_tag = if is_focused || is_swimlane {
+                " \u{25aa}"
+            } else {
+                ""
+            };
+            let max_name = area.width.saturating_sub(7) as usize;
             let display_name = styles::truncate(name, max_name);
 
             let name_style = if is_focused {
                 Style::default()
                     .fg(styles::ACCENT)
                     .add_modifier(Modifier::BOLD)
-            } else {
+            } else if is_swimlane {
                 Style::default().fg(Color::White)
+            } else {
+                Style::default().fg(Color::DarkGray)
             };
+
+            let tag_style = Style::default().fg(styles::ACCENT);
 
             let mut style = Style::default();
             if sidebar.focused && i == sidebar.selected {
                 style = style.add_modifier(Modifier::REVERSED);
             }
 
-            ListItem::new(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(format!(" {} ", marker), marker_style),
                 Span::styled(display_name, name_style),
-            ]))
-            .style(style)
+            ];
+            if !swimlane_tag.is_empty() {
+                spans.push(Span::styled(swimlane_tag, tag_style));
+            }
+
+            ListItem::new(Line::from(spans)).style(style)
         })
         .collect();
 

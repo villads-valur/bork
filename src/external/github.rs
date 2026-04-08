@@ -1,16 +1,17 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use crate::types::{ChecksStatus, PrState, PrStatus, ReviewDecision};
 
+#[derive(Clone)]
 struct RepoIdentity {
     owner: String,
     name: String,
 }
 
-static REPO_IDENTITY: OnceLock<Option<RepoIdentity>> = OnceLock::new();
+static REPO_CACHE: Mutex<Option<HashMap<PathBuf, RepoIdentity>>> = Mutex::new(None);
 
 const PR_FIELDS: &str = r#"
     number url title state isDraft headRefName
@@ -35,23 +36,31 @@ fn parse_repo_identity(json_str: &str) -> Option<RepoIdentity> {
     Some(RepoIdentity { owner, name })
 }
 
-fn get_repo_identity(main_worktree: &Path) -> Option<&'static RepoIdentity> {
-    REPO_IDENTITY
-        .get_or_init(|| {
-            let output = Command::new("gh")
-                .args(["repo", "view", "--json", "owner,name"])
-                .current_dir(main_worktree)
-                .output()
-                .ok()?;
+fn get_repo_identity(main_worktree: &Path) -> Option<RepoIdentity> {
+    let canonical =
+        std::fs::canonicalize(main_worktree).unwrap_or_else(|_| main_worktree.to_path_buf());
 
-            if !output.status.success() {
-                return None;
-            }
+    let mut cache = REPO_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let map = cache.get_or_insert_with(HashMap::new);
 
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            parse_repo_identity(&stdout)
-        })
-        .as_ref()
+    if let Some(identity) = map.get(&canonical) {
+        return Some(identity.clone());
+    }
+
+    let output = Command::new("gh")
+        .args(["repo", "view", "--json", "owner,name"])
+        .current_dir(main_worktree)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let identity = parse_repo_identity(&stdout)?;
+    map.insert(canonical, identity.clone());
+    Some(identity)
 }
 
 pub fn fetch_prs(main_worktree: &Path) -> Vec<PrStatus> {
