@@ -523,6 +523,41 @@ fn run_tui() -> anyhow::Result<()> {
                                     }
                                 }
                             }
+                            PostAction::SwitchProject { index } => {
+                                if index < app.projects.len() {
+                                    // Save current project state
+                                    if app.project().state_dirty {
+                                        let _ = config::save_state(
+                                            &app.project().to_state(),
+                                            &app.project().config.project_root,
+                                        );
+                                        app.project_mut().state_dirty = false;
+                                    }
+
+                                    // Discard old project's live data
+                                    app.project_mut().live = None;
+
+                                    // Switch focus
+                                    app.focused_project = index;
+
+                                    // Ensure new project has live data
+                                    if app.project().live.is_none() {
+                                        app.project_mut().live =
+                                            Some(crate::app::LiveState::default());
+                                    }
+
+                                    // TODO: Phase 4 - stop old workers, start new ones
+                                    // For now, workers only run for the original project.
+                                    // The new project will show issue cards without live data
+                                    // (git status, PR badges, session status) until workers
+                                    // are implemented.
+
+                                    app.set_message(format!(
+                                        "Switched to {}",
+                                        app.project().config.project_name
+                                    ));
+                                }
+                            }
                         }
                     }
                 }

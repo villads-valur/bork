@@ -34,6 +34,9 @@ pub enum PostAction {
     OpenEditor {
         initial_content: String,
     },
+    SwitchProject {
+        index: usize,
+    },
 }
 
 pub fn handle_action(
@@ -67,7 +70,7 @@ pub fn handle_action(
             PostAction::None
         }
         InputMode::Normal => handle_normal(app, action, action_tx, pr_wake_tx, git_wake_tx),
-        InputMode::Sidebar => PostAction::None,
+        InputMode::Sidebar => handle_sidebar(app, action),
     }
 }
 
@@ -203,6 +206,22 @@ fn handle_normal(
 
         Action::ShowHelp => {
             app.open_help();
+            PostAction::None
+        }
+
+        Action::ToggleSidebar => {
+            if let Some(ref mut sidebar) = app.sidebar {
+                if sidebar.visible && sidebar.focused {
+                    sidebar.focused = false;
+                    sidebar.visible = false;
+                    app.input_mode = InputMode::Normal;
+                } else {
+                    sidebar.visible = true;
+                    sidebar.focused = true;
+                    sidebar.selected = app.focused_project;
+                    app.input_mode = InputMode::Sidebar;
+                }
+            }
             PostAction::None
         }
 
@@ -887,6 +906,49 @@ fn attach_github_to_dialog(app: &mut App) {
     if let Some(ref mut dialog) = app.dialog {
         dialog.github_pr = Some(pr);
         dialog.github_pr_cleared = false;
+    }
+}
+
+fn handle_sidebar(app: &mut App, action: Action) -> PostAction {
+    match action {
+        Action::ToggleSidebar | Action::SidebarSelect => {
+            if let Some(ref mut sidebar) = app.sidebar {
+                let switch =
+                    action == Action::SidebarSelect && sidebar.selected != app.focused_project;
+
+                sidebar.focused = false;
+                sidebar.visible = false;
+                app.input_mode = InputMode::Normal;
+
+                if switch {
+                    return PostAction::SwitchProject {
+                        index: sidebar.selected,
+                    };
+                }
+            }
+            PostAction::None
+        }
+        Action::SidebarDown => {
+            if let Some(ref mut sidebar) = app.sidebar {
+                if sidebar.selected + 1 < app.projects.len() {
+                    sidebar.selected += 1;
+                }
+            }
+            PostAction::None
+        }
+        Action::SidebarUp => {
+            if let Some(ref mut sidebar) = app.sidebar {
+                if sidebar.selected > 0 {
+                    sidebar.selected -= 1;
+                }
+            }
+            PostAction::None
+        }
+        Action::Quit => {
+            app.should_quit = true;
+            PostAction::None
+        }
+        _ => PostAction::None,
     }
 }
 

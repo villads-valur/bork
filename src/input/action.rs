@@ -69,5 +69,9 @@ pub enum Action {
     DebugInspectorScrollDown,
     DebugInspectorScrollTop,
     DebugInspectorScrollBottom,
+    ToggleSidebar,
+    SidebarUp,
+    SidebarDown,
+    SidebarSelect,
     Noop,
 }

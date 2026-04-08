@@ -22,7 +22,7 @@ pub fn map_key_to_action(
         InputMode::LinearPicker => map_linear_picker_key(key),
         InputMode::Help => map_help_key(key),
         InputMode::DebugInspector => map_debug_inspector_key(key),
-        InputMode::Sidebar => map_normal_key(key),
+        InputMode::Sidebar => map_sidebar_key(key),
     }
 }
 
@@ -30,6 +30,7 @@ fn map_normal_key(key: KeyEvent) -> Action {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
             KeyCode::Char('c') => Action::Quit,
+            KeyCode::Char('p') => Action::ToggleSidebar,
             KeyCode::Char('r') => Action::DebugReset,
             KeyCode::Char('e') => Action::DebugInspect,
             _ => Action::Noop,
@@ -77,6 +78,25 @@ fn map_normal_key(key: KeyEvent) -> Action {
         KeyCode::Esc => Action::ClearSearch,
         KeyCode::Char('I') => Action::OpenLinearPicker,
 
+        _ => Action::Noop,
+    }
+}
+
+fn map_sidebar_key(key: KeyEvent) -> Action {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return match key.code {
+            KeyCode::Char('c') => Action::Quit,
+            KeyCode::Char('p') => Action::ToggleSidebar,
+            _ => Action::Noop,
+        };
+    }
+
+    match key.code {
+        KeyCode::Char('q') => Action::Quit,
+        KeyCode::Char('j') | KeyCode::Down => Action::SidebarDown,
+        KeyCode::Char('k') | KeyCode::Up => Action::SidebarUp,
+        KeyCode::Enter => Action::SidebarSelect,
+        KeyCode::Esc => Action::ToggleSidebar,
         _ => Action::Noop,
     }
 }

@@ -74,6 +74,24 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    // Sidebar mode
+    if app.input_mode == InputMode::Sidebar {
+        let line = Line::from(vec![
+            Span::styled(" j", styles::statusbar_key_style()),
+            Span::styled("/", styles::statusbar_desc_style()),
+            Span::styled("k", styles::statusbar_key_style()),
+            Span::styled(":nav  ", styles::statusbar_desc_style()),
+            Span::styled("Enter", styles::statusbar_key_style()),
+            Span::styled(":switch  ", styles::statusbar_desc_style()),
+            Span::styled("Esc", styles::statusbar_key_style()),
+            Span::styled(":close  ", styles::statusbar_desc_style()),
+            Span::styled("Ctrl+P", styles::statusbar_key_style()),
+            Span::styled(":toggle", styles::statusbar_desc_style()),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+
     // Overlay modes: footer is handled by the overlay itself
     if matches!(
         app.input_mode,

@@ -28,6 +28,11 @@ const DEBUG_SECTION: Section = Section {
     ],
 };
 
+const PROJECTS_SECTION: Section = Section {
+    title: "Projects",
+    bindings: &[("Ctrl+P", "Toggle project sidebar")],
+};
+
 const SECTIONS: &[Section] = &[
     Section {
         title: "Navigation",
@@ -77,11 +82,15 @@ const SECTIONS: &[Section] = &[
     },
 ];
 
-fn content_height(tuicr: bool, debug: bool) -> u16 {
+fn content_height(tuicr: bool, debug: bool, multi_project: bool) -> u16 {
     let mut section_rows: u16 = SECTIONS.iter().map(|s| 1 + s.bindings.len() as u16).sum();
     let mut count = SECTIONS.len();
     if tuicr {
         section_rows += 1 + TUICR_SECTION.bindings.len() as u16;
+        count += 1;
+    }
+    if multi_project {
+        section_rows += 1 + PROJECTS_SECTION.bindings.len() as u16;
         count += 1;
     }
     if debug {
@@ -100,8 +109,9 @@ pub fn render_help(frame: &mut Frame, app: &App) {
     let area = frame.area();
     let debug = app.project().config.debug;
     let tuicr = app.project().tuicr_available;
+    let multi_project = app.sidebar.is_some();
     let width = HELP_WIDTH.min(area.width);
-    let height = (content_height(tuicr, debug) + 2).min(area.height); // +2 for border
+    let height = (content_height(tuicr, debug, multi_project) + 2).min(area.height); // +2 for border
     let x = area.width.saturating_sub(width) / 2;
     let y = area.height.saturating_sub(height) / 2;
 
@@ -132,6 +142,9 @@ pub fn render_help(frame: &mut Frame, app: &App) {
     let mut all_sections: Vec<&Section> = SECTIONS.iter().collect();
     if tuicr {
         all_sections.push(&TUICR_SECTION);
+    }
+    if multi_project {
+        all_sections.push(&PROJECTS_SECTION);
     }
     if debug {
         all_sections.push(&DEBUG_SECTION);
