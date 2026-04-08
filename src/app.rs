@@ -1172,12 +1172,10 @@ impl App {
     }
 
     pub fn active_project_index(&self) -> usize {
-        if self.focused_swimlane == 0 {
-            return self.focused_project;
-        }
-        self.sidebar
-            .as_ref()
-            .and_then(|s| s.swimlane_indices.get(self.focused_swimlane - 1).copied())
+        let lanes = self.visible_swimlanes();
+        lanes
+            .get(self.focused_swimlane)
+            .copied()
             .unwrap_or(self.focused_project)
     }
 

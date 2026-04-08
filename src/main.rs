@@ -617,6 +617,7 @@ fn run_tui() -> anyhow::Result<()> {
                                     }
 
                                     app.focused_project = index;
+                                    app.focused_swimlane = 0;
 
                                     workers = spawn_project_workers(app.project());
                                     let _ = execute!(

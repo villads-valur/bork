@@ -966,9 +966,7 @@ fn handle_sidebar(app: &mut App, action: Action) -> PostAction {
                     PostAction::None
                 } else if let Some(pos) = sidebar.swimlane_indices.iter().position(|&i| i == idx) {
                     sidebar.swimlane_indices.remove(pos);
-                    // Reset swimlane focus if it was pointing at a removed lane
-                    let total = 1 + sidebar.swimlane_indices.len();
-                    if app.focused_swimlane >= total {
+                    if app.focused_swimlane >= app.visible_swimlane_count() {
                         app.focused_swimlane = 0;
                     }
                     PostAction::None
