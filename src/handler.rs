@@ -925,19 +925,25 @@ fn attach_github_to_dialog(app: &mut App) {
 
 fn handle_sidebar(app: &mut App, action: Action) -> PostAction {
     match action {
-        Action::ToggleSidebar | Action::SidebarSelect => {
+        Action::ToggleSidebar => {
             if let Some(ref mut sidebar) = app.sidebar {
-                let switch =
-                    action == Action::SidebarSelect && sidebar.selected != app.focused_project;
-
                 sidebar.focused = false;
                 sidebar.visible = false;
                 app.input_mode = InputMode::Normal;
+            }
+            PostAction::None
+        }
+        Action::SidebarSelect => {
+            if let Some(ref mut sidebar) = app.sidebar {
+                let idx = sidebar.selected;
+                sidebar.swimlane_indices = vec![idx];
+                sidebar.focused = false;
+                sidebar.visible = false;
+                app.input_mode = InputMode::Normal;
+                app.focused_swimlane = 0;
 
-                if switch {
-                    return PostAction::SwitchProject {
-                        index: sidebar.selected,
-                    };
+                if idx != app.focused_project {
+                    return PostAction::SwitchProject { index: idx };
                 }
             }
             PostAction::None
