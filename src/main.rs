@@ -402,6 +402,25 @@ fn run_tui() -> anyhow::Result<()> {
 
     let mut app = App::new(config, state);
 
+    // --- Load other registered projects for multi-project sidebar ---
+    let current_root = app.project().config.project_root.clone();
+    let global = global_config::load_global_config();
+    for entry in &global.projects {
+        let canonical = std::fs::canonicalize(&entry.path).unwrap_or_else(|_| entry.path.clone());
+        let current_canonical =
+            std::fs::canonicalize(&current_root).unwrap_or_else(|_| current_root.clone());
+        if canonical == current_canonical {
+            continue;
+        }
+        if !entry.path.join(".bork").is_dir() {
+            continue;
+        }
+        let proj_config = config::load_config_from(&entry.path);
+        let proj_state = config::load_state(&entry.path);
+        app.add_background_project(proj_config, proj_state);
+    }
+    app.enable_sidebar();
+
     // --- Ensure agent-status dir ---
     config::ensure_agent_status_dir(&app.project().config.project_root);
 

@@ -1137,6 +1137,23 @@ impl App {
         }
     }
 
+    pub fn add_background_project(&mut self, config: AppConfig, state: AppState) {
+        let mut project = Project::new(config, state);
+        project.live = None; // suspended, no workers yet
+        self.projects.push(project);
+    }
+
+    pub fn enable_sidebar(&mut self) {
+        if self.projects.len() > 1 {
+            self.sidebar = Some(SidebarState {
+                visible: false,
+                focused: false,
+                selected: 0,
+                activity: HashMap::new(),
+            });
+        }
+    }
+
     pub fn project(&self) -> &Project {
         &self.projects[self.focused_project]
     }
