@@ -959,22 +959,22 @@ fn handle_sidebar(app: &mut App, action: Action) -> PostAction {
             PostAction::None
         }
         Action::SidebarToggleSwimlane => {
+            let lane_count = app.visible_swimlane_count();
             if let Some(ref mut sidebar) = app.sidebar {
                 let idx = sidebar.selected;
                 if idx == app.focused_project {
-                    // Can't toggle the focused project off
                     PostAction::None
                 } else if let Some(pos) = sidebar.swimlane_indices.iter().position(|&i| i == idx) {
                     sidebar.swimlane_indices.remove(pos);
-                    if app.focused_swimlane >= app.visible_swimlane_count() {
+                    if app.focused_swimlane >= sidebar.swimlane_indices.len() + 1 {
                         app.focused_swimlane = 0;
                     }
                     PostAction::None
-                } else if sidebar.swimlane_indices.len() < 2 {
+                } else if lane_count < 3 {
                     sidebar.swimlane_indices.push(idx);
                     PostAction::None
                 } else {
-                    app.set_message("Maximum 3 projects visible (1 focused + 2 extra)");
+                    app.set_message("Maximum 3 projects visible");
                     PostAction::None
                 }
             } else {

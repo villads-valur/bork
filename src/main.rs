@@ -619,6 +619,9 @@ fn run_tui() -> anyhow::Result<()> {
 
                                     app.focused_project = index;
                                     app.focused_swimlane = 0;
+                                    if let Some(ref mut sidebar) = app.sidebar {
+                                        sidebar.swimlane_indices.retain(|&i| i != index);
+                                    }
 
                                     if let Some(existing) = swimlane_workers.remove(&index) {
                                         workers = existing;
