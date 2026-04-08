@@ -410,6 +410,37 @@ fn spawn_project_workers(project: &app::Project) -> ProjectWorkers {
     }
 }
 
+const ACTIVITY_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+fn spawn_activity_poller(projects: Vec<(usize, PathBuf)>) -> mpsc::Receiver<HashMap<usize, bool>> {
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || loop {
+        let mut activity: HashMap<usize, bool> = HashMap::new();
+        for (idx, root) in &projects {
+            let status_dir = root.join(".bork").join("agent-status");
+            let statuses = read_agent_statuses(&status_dir);
+            let has_activity = statuses.values().any(|info| {
+                matches!(
+                    info.status,
+                    types::AgentStatus::Busy
+                        | types::AgentStatus::WaitingInput
+                        | types::AgentStatus::WaitingPermission
+                        | types::AgentStatus::WaitingApproval
+                        | types::AgentStatus::Error
+                )
+            });
+            activity.insert(*idx, has_activity);
+        }
+        if tx.send(activity).is_err() {
+            break;
+        }
+        thread::sleep(ACTIVITY_POLL_INTERVAL);
+    });
+
+    rx
+}
+
 fn run_tui() -> anyhow::Result<()> {
     // --- Load config + state (before tmux wrap so we have project_name) ---
     let config = config::load_config();
@@ -474,6 +505,19 @@ fn run_tui() -> anyhow::Result<()> {
     // --- Workers ---
     let (action_tx, action_rx) = mpsc::channel::<ActionResult>();
     let mut workers = spawn_project_workers(app.project());
+
+    // --- Activity poller for sidebar markers ---
+    let activity_rx = if app.sidebar.is_some() {
+        let project_paths: Vec<(usize, PathBuf)> = app
+            .projects
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (i, p.config.project_root.clone()))
+            .collect();
+        Some(spawn_activity_poller(project_paths))
+    } else {
+        None
+    };
 
     let (linear_check_tx, linear_check_rx) = mpsc::channel::<bool>();
     thread::spawn(move || {
@@ -785,6 +829,18 @@ fn run_tui() -> anyhow::Result<()> {
                                 issue.title = title.clone();
                             }
                         }
+                    }
+                }
+            }
+        }
+
+        // --- Drain activity poller for sidebar markers ---
+        if let Some(ref rx) = activity_rx {
+            while let Ok(activity) = rx.try_recv() {
+                if let Some(ref mut sidebar) = app.sidebar {
+                    if sidebar.activity != activity {
+                        sidebar.activity = activity;
+                        needs_redraw = true;
                     }
                 }
             }
