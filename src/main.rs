@@ -360,6 +360,56 @@ fn run_project_command(command: ProjectCommand) -> anyhow::Result<()> {
     }
 }
 
+struct ProjectWorkers {
+    session_rx: mpsc::Receiver<SessionPollResult>,
+    port_rx: mpsc::Receiver<PortPollResult>,
+    port_sessions: Arc<Mutex<HashSet<String>>>,
+    git_rx: mpsc::Receiver<GitPollResult>,
+    git_wake_tx: mpsc::Sender<()>,
+    git_skip_set: Arc<Mutex<HashSet<String>>>,
+    pr_rx: mpsc::Receiver<PrPollResult>,
+    pr_wake_tx: mpsc::Sender<()>,
+    linear_rx: Option<mpsc::Receiver<LinearPollResult>>,
+    linear_wake_tx: mpsc::Sender<()>,
+    linear_wake_rx: Option<mpsc::Receiver<()>>,
+}
+
+fn spawn_project_workers(project: &app::Project) -> ProjectWorkers {
+    let project_root = project.config.project_root.clone();
+
+    config::ensure_agent_status_dir(&project_root);
+
+    let status_dir = config::agent_status_dir(&project_root);
+    let session_rx = spawn_session_status_worker(status_dir);
+
+    let port_sessions = Arc::new(Mutex::new(HashSet::<String>::new()));
+    let port_rx = spawn_port_poll_worker(port_sessions.clone());
+
+    let git_skip_set = Arc::new(Mutex::new(project.done_worktree_names()));
+    let (git_wake_tx, git_wake_rx) = mpsc::channel::<()>();
+    let git_rx = spawn_git_status_worker(project_root.clone(), git_skip_set.clone(), git_wake_rx);
+
+    let (pr_wake_tx, pr_wake_rx) = mpsc::channel::<()>();
+    let main_worktree = project_root.join("main");
+    let pr_rx = spawn_pr_poll_worker(main_worktree, pr_wake_rx);
+
+    let (linear_wake_tx, linear_wake_rx) = mpsc::channel::<()>();
+
+    ProjectWorkers {
+        session_rx,
+        port_rx,
+        port_sessions,
+        git_rx,
+        git_wake_tx,
+        git_skip_set,
+        pr_rx,
+        pr_wake_tx,
+        linear_rx: None,
+        linear_wake_tx,
+        linear_wake_rx: Some(linear_wake_rx),
+    }
+}
+
 fn run_tui() -> anyhow::Result<()> {
     // --- Load config + state (before tmux wrap so we have project_name) ---
     let config = config::load_config();
@@ -421,34 +471,15 @@ fn run_tui() -> anyhow::Result<()> {
     }
     app.enable_sidebar();
 
-    // --- Ensure agent-status dir ---
-    config::ensure_agent_status_dir(&app.project().config.project_root);
-
-    // --- Channels ---
+    // --- Workers ---
     let (action_tx, action_rx) = mpsc::channel::<ActionResult>();
-    let status_dir = config::agent_status_dir(&app.project().config.project_root);
-    let session_rx = spawn_session_status_worker(status_dir);
-    let port_sessions = Arc::new(Mutex::new(HashSet::<String>::new()));
-    let port_rx = spawn_port_poll_worker(port_sessions.clone());
-    let git_skip_set = Arc::new(Mutex::new(app.project().done_worktree_names()));
-    let (git_wake_tx, git_wake_rx) = mpsc::channel::<()>();
-    let git_rx = spawn_git_status_worker(
-        app.project().config.project_root.clone(),
-        git_skip_set.clone(),
-        git_wake_rx,
-    );
-    let (pr_wake_tx, pr_wake_rx) = mpsc::channel::<()>();
-    let main_worktree = app.project().config.project_root.join("main");
-    let pr_rx = spawn_pr_poll_worker(main_worktree, pr_wake_rx);
+    let mut workers = spawn_project_workers(app.project());
 
     let (linear_check_tx, linear_check_rx) = mpsc::channel::<bool>();
     thread::spawn(move || {
         let available = external::linear::check_available();
         let _ = linear_check_tx.send(available);
     });
-    let mut linear_rx: Option<mpsc::Receiver<LinearPollResult>> = None;
-    let (linear_wake_tx, linear_wake_rx) = mpsc::channel::<()>();
-    let mut linear_wake_rx = Some(linear_wake_rx);
 
     let (tuicr_check_tx, tuicr_check_rx) = mpsc::channel::<bool>();
     thread::spawn(move || {
@@ -480,9 +511,9 @@ fn run_tui() -> anyhow::Result<()> {
                             &mut app,
                             action,
                             &action_tx,
-                            &pr_wake_tx,
-                            &linear_wake_tx,
-                            &git_wake_tx,
+                            &workers.pr_wake_tx,
+                            &workers.linear_wake_tx,
+                            &workers.git_wake_tx,
                         );
 
                         match post_action {
@@ -524,7 +555,7 @@ fn run_tui() -> anyhow::Result<()> {
                                 }
                             }
                             PostAction::SwitchProject { index } => {
-                                if index < app.projects.len() {
+                                if index < app.projects.len() && index != app.focused_project {
                                     // Save current project state
                                     if app.project().state_dirty {
                                         let _ = config::save_state(
@@ -546,11 +577,9 @@ fn run_tui() -> anyhow::Result<()> {
                                             Some(crate::app::LiveState::default());
                                     }
 
-                                    // TODO: Phase 4 - stop old workers, start new ones
-                                    // For now, workers only run for the original project.
-                                    // The new project will show issue cards without live data
-                                    // (git status, PR badges, session status) until workers
-                                    // are implemented.
+                                    // Drop old workers (threads exit on next send failure)
+                                    // and spawn fresh ones for the new project
+                                    workers = spawn_project_workers(app.project());
 
                                     app.set_message(format!(
                                         "Switched to {}",
@@ -618,18 +647,18 @@ fn run_tui() -> anyhow::Result<()> {
             needs_redraw = true;
         }
 
-        while let Ok(poll) = session_rx.try_recv() {
+        while let Ok(poll) = workers.session_rx.try_recv() {
             needs_redraw = true;
             let live = app.project_mut().live_mut();
             live.active_sessions = poll.sessions;
             live.agent_statuses = poll.agent_statuses;
             // Update shared sessions set for the port poll worker
-            if let Ok(mut shared) = port_sessions.lock() {
+            if let Ok(mut shared) = workers.port_sessions.lock() {
                 *shared = live.active_sessions.clone();
             }
         }
 
-        while let Ok(port_result) = port_rx.try_recv() {
+        while let Ok(port_result) = workers.port_rx.try_recv() {
             app.project_mut().live_mut().listening_ports = port_result.ports;
         }
 
@@ -658,7 +687,7 @@ fn run_tui() -> anyhow::Result<()> {
         }
 
         let mut git_data_changed = false;
-        while let Ok(git_result) = git_rx.try_recv() {
+        while let Ok(git_result) = workers.git_rx.try_recv() {
             needs_redraw = true;
             git_data_changed = true;
             let live = app.project_mut().live_mut();
@@ -668,7 +697,7 @@ fn run_tui() -> anyhow::Result<()> {
         }
 
         let mut pr_data_changed = false;
-        while let Ok(pr_result) = pr_rx.try_recv() {
+        while let Ok(pr_result) = workers.pr_rx.try_recv() {
             needs_redraw = true;
             pr_data_changed = true;
             let live = app.project_mut().live_mut();
@@ -712,14 +741,14 @@ fn run_tui() -> anyhow::Result<()> {
             let mut worktree_changed = app.project_mut().auto_assign_worktrees();
             worktree_changed = app.project_mut().clear_stale_worktrees() || worktree_changed;
             if worktree_changed {
-                let _ = git_wake_tx.send(());
+                let _ = workers.git_wake_tx.send(());
                 app.project_mut().mark_dirty();
             }
         }
 
         // --- Update git skip set when issues changed columns or git data arrived ---
         if git_data_changed || app.project().state_dirty {
-            if let Ok(mut skip) = git_skip_set.lock() {
+            if let Ok(mut skip) = workers.git_skip_set.lock() {
                 *skip = app.project().done_worktree_names();
             }
         }
@@ -733,11 +762,11 @@ fn run_tui() -> anyhow::Result<()> {
         if let Ok(true) = linear_check_rx.try_recv() {
             needs_redraw = true;
             app.project_mut().linear_available = true;
-            if let Some(wake_rx) = linear_wake_rx.take() {
-                linear_rx = Some(spawn_linear_worker(wake_rx));
+            if let Some(wake_rx) = workers.linear_wake_rx.take() {
+                workers.linear_rx = Some(spawn_linear_worker(wake_rx));
             }
         }
-        if let Some(ref rx) = linear_rx {
+        if let Some(ref rx) = workers.linear_rx {
             while let Ok(result) = rx.try_recv() {
                 needs_redraw = true;
                 app.project_mut().live_mut().linear_issues = result.issues;
