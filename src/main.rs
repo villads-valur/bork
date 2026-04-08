@@ -617,10 +617,6 @@ fn run_tui() -> anyhow::Result<()> {
                                     }
 
                                     app.focused_project = index;
-                                    if app.project().live.is_none() {
-                                        app.project_mut().live =
-                                            Some(crate::app::LiveState::default());
-                                    }
 
                                     workers = spawn_project_workers(app.project());
                                     let _ = execute!(

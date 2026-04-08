@@ -1148,9 +1148,7 @@ impl App {
     }
 
     pub fn add_background_project(&mut self, config: AppConfig, state: AppState) {
-        let mut project = Project::new(config, state);
-        project.live = None;
-        self.projects.push(project);
+        self.projects.push(Project::new(config, state));
     }
 
     pub fn enable_sidebar(&mut self) {
