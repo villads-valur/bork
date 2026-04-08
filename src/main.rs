@@ -502,6 +502,7 @@ fn run_tui() -> anyhow::Result<()> {
     // --- Workers ---
     let (action_tx, action_rx) = mpsc::channel::<ActionResult>();
     let mut workers = spawn_project_workers(app.project());
+    let mut swimlane_workers: HashMap<usize, ProjectWorkers> = HashMap::new();
 
     // --- Activity poller for sidebar markers ---
     let activity_rx = if app.sidebar.is_some() {
@@ -619,7 +620,11 @@ fn run_tui() -> anyhow::Result<()> {
                                     app.focused_project = index;
                                     app.focused_swimlane = 0;
 
-                                    workers = spawn_project_workers(app.project());
+                                    if let Some(existing) = swimlane_workers.remove(&index) {
+                                        workers = existing;
+                                    } else {
+                                        workers = spawn_project_workers(app.project());
+                                    }
                                     let _ = execute!(
                                         terminal.backend_mut(),
                                         SetTitle(format!(
@@ -691,6 +696,24 @@ fn run_tui() -> anyhow::Result<()> {
             )?;
             app.message = None;
             needs_redraw = true;
+        }
+
+        // --- Sync swimlane workers ---
+        if let Some(ref sidebar) = app.sidebar {
+            let active_swimlanes: HashSet<usize> = sidebar
+                .swimlane_indices
+                .iter()
+                .filter(|&&idx| idx != app.focused_project)
+                .copied()
+                .collect();
+            for &idx in &active_swimlanes {
+                if !swimlane_workers.contains_key(&idx) && idx < app.projects.len() {
+                    swimlane_workers.insert(idx, spawn_project_workers(&app.projects[idx]));
+                }
+            }
+            swimlane_workers.retain(|idx, _| active_swimlanes.contains(idx));
+        } else {
+            swimlane_workers.clear();
         }
 
         while let Ok(poll) = workers.session_rx.try_recv() {
@@ -832,6 +855,52 @@ fn run_tui() -> anyhow::Result<()> {
                             }
                         }
                     }
+                }
+            }
+        }
+
+        // --- Drain swimlane workers ---
+        for (&proj_idx, sw) in &swimlane_workers {
+            if proj_idx >= app.projects.len() {
+                continue;
+            }
+            while let Ok(poll) = sw.session_rx.try_recv() {
+                needs_redraw = true;
+                let live = app.projects[proj_idx].live_mut();
+                live.active_sessions = poll.sessions;
+                live.agent_statuses = poll.agent_statuses;
+                if let Ok(mut shared) = sw.port_sessions.lock() {
+                    *shared = live.active_sessions.clone();
+                }
+            }
+            while let Ok(port_result) = sw.port_rx.try_recv() {
+                app.projects[proj_idx].live_mut().listening_ports = port_result.ports;
+            }
+            while let Ok(git_result) = sw.git_rx.try_recv() {
+                needs_redraw = true;
+                let live = app.projects[proj_idx].live_mut();
+                live.worktree_statuses = git_result.statuses;
+                live.worktree_branches = git_result.branches;
+                live.git_poll_done = true;
+                let changed = app.projects[proj_idx].auto_assign_worktrees();
+                let stale = app.projects[proj_idx].clear_stale_worktrees();
+                if changed || stale {
+                    app.projects[proj_idx].mark_dirty();
+                }
+            }
+            while let Ok(pr_result) = sw.pr_rx.try_recv() {
+                needs_redraw = true;
+                let live = app.projects[proj_idx].live_mut();
+                live.pr_statuses = pr_result.prs;
+                live.user_prs = pr_result.user_prs;
+                if pr_result.github_user.is_some() {
+                    live.github_user = pr_result.github_user;
+                }
+            }
+            if let Some(ref rx) = sw.linear_rx {
+                while let Ok(result) = rx.try_recv() {
+                    needs_redraw = true;
+                    app.projects[proj_idx].live_mut().linear_issues = result.issues;
                 }
             }
         }

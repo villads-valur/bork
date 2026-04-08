@@ -125,7 +125,9 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let bindings: &[(&str, &str)] = &[
+    let swimlane_count = app.visible_swimlane_count();
+
+    let mut bindings: Vec<(&str, &str)> = vec![
         ("h/l", "focus"),
         ("j/k", "nav"),
         ("Enter", "open"),
@@ -135,6 +137,10 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         ("?", "help"),
         ("q", "quit"),
     ];
+
+    if swimlane_count > 1 {
+        bindings.insert(0, ("Tab", "lane"));
+    }
 
     let mut spans = vec![Span::raw(" ")];
     for (i, (key, desc)) in bindings.iter().enumerate() {
@@ -146,6 +152,25 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             format!(":{desc}"),
             styles::statusbar_desc_style(),
         ));
+    }
+
+    if swimlane_count > 1 {
+        let active_name = &app.active_project().config.project_name;
+        let right_text = format!(
+            " {} ({}/{}) ",
+            active_name,
+            app.focused_swimlane + 1,
+            swimlane_count
+        );
+        let left_width: usize = spans.iter().map(|s| s.width()).sum();
+        let gap = (area.width as usize).saturating_sub(left_width + right_text.len());
+        if gap > 0 {
+            spans.push(Span::raw(" ".repeat(gap)));
+            spans.push(Span::styled(
+                right_text,
+                Style::default().fg(styles::ACCENT),
+            ));
+        }
     }
 
     let line = Line::from(spans);
