@@ -1243,7 +1243,7 @@ impl App {
     }
 
     pub fn open_dialog_in_column(&mut self, column: Column) {
-        let p = self.project();
+        let p = self.active_project();
         let github_available = p.has_github_prs();
         let mut state = DialogState::new(p.config.agent_kind, p.linear_available, github_available);
         state.target_column = Some(column);
@@ -1252,7 +1252,7 @@ impl App {
     }
 
     pub fn open_edit_dialog(&mut self, issue: &Issue, index: usize) {
-        let p = self.project();
+        let p = self.active_project();
         let github_available = p.has_github_prs();
         let live = p.live();
         self.dialog = Some(DialogState::from_issue(
@@ -1276,7 +1276,7 @@ impl App {
     }
 
     pub fn open_import_picker_with_context(&mut self, context: LinearPickerContext) {
-        let p = self.project();
+        let p = self.active_project();
         let has_linear = !p.live().linear_issues.is_empty();
         let has_github = p.has_github_prs();
 
@@ -1327,7 +1327,7 @@ impl App {
             Some(p) => p,
             None => return Vec::new(),
         };
-        self.project().filtered_linear_issues(picker)
+        self.active_project().filtered_linear_issues(picker)
     }
 
     pub fn filtered_github_prs(&self) -> Vec<&PrStatus> {
@@ -1335,7 +1335,7 @@ impl App {
             Some(p) => p,
             None => return Vec::new(),
         };
-        self.project().filtered_github_prs(picker)
+        self.active_project().filtered_github_prs(picker)
     }
 
     pub fn open_help(&mut self) {
@@ -1388,18 +1388,18 @@ impl App {
     }
 
     pub fn search_push_char(&mut self, c: char) {
-        let p = self.project_mut();
+        let p = self.active_project_mut();
         p.search_query.push(c);
         p.clamp_all_rows();
         p.focus_first_match();
     }
 
     pub fn search_delete_char(&mut self) {
-        if self.project().search_query.is_empty() {
+        if self.active_project().search_query.is_empty() {
             self.cancel_search();
             return;
         }
-        let p = self.project_mut();
+        let p = self.active_project_mut();
         p.search_query.pop();
         p.clamp_all_rows();
         p.focus_first_match();
@@ -1410,14 +1410,14 @@ impl App {
     }
 
     pub fn cancel_search(&mut self) {
-        let p = self.project_mut();
+        let p = self.active_project_mut();
         p.search_query.clear();
         p.clamp_all_rows();
         self.input_mode = InputMode::Normal;
     }
 
     pub fn clear_search(&mut self) {
-        let p = self.project_mut();
+        let p = self.active_project_mut();
         if !p.search_query.is_empty() {
             p.search_query.clear();
             p.clamp_all_rows();
@@ -1425,7 +1425,7 @@ impl App {
     }
 
     pub fn has_active_search(&self) -> bool {
-        self.project().has_active_search()
+        self.active_project().has_active_search()
     }
 }
 
