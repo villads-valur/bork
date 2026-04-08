@@ -307,6 +307,11 @@ pub fn run_init(
         eprintln!("You can run 'bork install' later to set up hooks.");
     }
 
+    // Register project in global config
+    if let Err(e) = crate::global_config::register_project(dir_name, &container) {
+        eprintln!("Warning: failed to register project globally: {}", e);
+    }
+
     println!();
     println!("Initialized bork project in ./{}/", dir_name);
     println!();

@@ -2,6 +2,7 @@ mod app;
 mod config;
 mod error;
 mod external;
+mod global_config;
 mod handler;
 mod init;
 mod input;
@@ -245,6 +246,30 @@ enum Command {
         #[arg(long)]
         title: Option<String>,
     },
+
+    /// Manage registered bork projects
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProjectCommand {
+    /// List all registered projects
+    List,
+
+    /// Register a project (defaults to current directory)
+    Add {
+        /// Path to project container (must have .bork/ directory)
+        path: Option<String>,
+    },
+
+    /// Unregister a project (defaults to current directory)
+    Remove {
+        /// Path to project container
+        path: Option<String>,
+    },
 }
 
 #[derive(Clone, ValueEnum)]
@@ -278,7 +303,60 @@ fn main() -> anyhow::Result<()> {
             slug,
             title,
         }) => worktree::run_worktree(&issue_id, slug.as_deref(), title.as_deref()),
+        Some(Command::Project { command }) => run_project_command(command),
         None => run_tui(),
+    }
+}
+
+fn run_project_command(command: ProjectCommand) -> anyhow::Result<()> {
+    match command {
+        ProjectCommand::List => {
+            let projects = global_config::list_projects();
+            if projects.is_empty() {
+                println!("No projects registered.");
+                println!("Run 'bork init' or 'bork project add' to register a project.");
+            } else {
+                for entry in &projects {
+                    let exists = entry.path.join(".bork").is_dir();
+                    let marker = if exists { " " } else { "?" };
+                    println!("{} {} ({})", marker, entry.name, entry.path.display());
+                }
+            }
+            Ok(())
+        }
+        ProjectCommand::Add { path } => {
+            let target = match path {
+                Some(p) => PathBuf::from(p),
+                None => std::env::current_dir()?,
+            };
+            if !target.join(".bork").is_dir() {
+                anyhow::bail!(
+                    "No .bork/ directory found in {}. Run 'bork init' first.",
+                    target.display()
+                );
+            }
+            let config = config::load_config_from(&target);
+            global_config::register_project(&config.project_name, &target)?;
+            println!(
+                "Registered project '{}' at {}",
+                config.project_name,
+                target.display()
+            );
+            Ok(())
+        }
+        ProjectCommand::Remove { path } => {
+            let target = match path {
+                Some(p) => PathBuf::from(p),
+                None => std::env::current_dir()?,
+            };
+            let removed = global_config::unregister_project(&target)?;
+            if removed {
+                println!("Unregistered project at {}", target.display());
+            } else {
+                println!("No project registered at {}", target.display());
+            }
+            Ok(())
+        }
     }
 }
 
