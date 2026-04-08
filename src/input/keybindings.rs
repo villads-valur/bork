@@ -38,13 +38,6 @@ fn map_normal_key(key: KeyEvent, swimlane_count: usize) -> Action {
         };
     }
 
-    if key.modifiers.contains(KeyModifiers::SUPER) {
-        return match key.code {
-            KeyCode::Char('p') => Action::ToggleSidebar,
-            _ => Action::Noop,
-        };
-    }
-
     match key.code {
         KeyCode::Char('q') => Action::Quit,
 
@@ -98,13 +91,6 @@ fn map_sidebar_key(key: KeyEvent) -> Action {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
             KeyCode::Char('c') => Action::Quit,
-            KeyCode::Char('p') => Action::ToggleSidebar,
-            _ => Action::Noop,
-        };
-    }
-
-    if key.modifiers.contains(KeyModifiers::SUPER) {
-        return match key.code {
             KeyCode::Char('p') => Action::ToggleSidebar,
             _ => Action::Noop,
         };

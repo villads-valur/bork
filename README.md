@@ -20,7 +20,7 @@
 
 ## Overview
 
-Bork is a terminal UI for managing multiple AI coding sessions. It gives you a 4-column kanban board where each issue maps to a git worktree and a tmux session running [OpenCode](https://opencode.ai) or [Claude Code](https://docs.anthropic.com/en/docs/claude-code). Switch between sessions with a keypress, see agent status at a glance, and keep your work organized.
+Bork is a terminal UI for managing multiple AI coding sessions. It gives you a 4-column kanban board where each issue maps to a git worktree and a tmux session running [OpenCode](https://opencode.ai) or [Claude Code](https://docs.anthropic.com/en/docs/claude-code). Switch between sessions with a keypress, see agent status at a glance, and keep your work organized. Register multiple projects and view them side-by-side in stacked swimlanes.
 
 ## Quickstart
 
@@ -72,6 +72,7 @@ Press `n` to create an issue, `Enter` to launch an agent session. You're up and 
 - **Auto-import PRs** &mdash; Open PRs authored by you are automatically added to the Code Review column
 - **Search and filter** &mdash; Type `/` to fuzzy-filter the board by title or issue ID
 - **Issue kinds** &mdash; Agentic issues launch AI sessions; non-agentic "todo" items skip the agent entirely
+- **Multi-project view** &mdash; Register multiple projects and view them in stacked swimlanes with a collapsible project sidebar
 - **Zero-dependency state** &mdash; JSON file persistence with atomic writes, no database
 
 ## Requirements
@@ -120,6 +121,9 @@ bork --help
 | `bork install` | Install agent status hooks |
 | `bork worktree <id> [slug]` | Create a git worktree for an issue |
 | `bork uninstall` | Remove agent status hooks |
+| `bork project list` | List all registered projects |
+| `bork project add [path]` | Register a project (defaults to current directory) |
+| `bork project remove [path]` | Unregister a project |
 
 ### `bork init`
 
@@ -146,7 +150,7 @@ repo/                        # Container directory
 └── .claude/skills/worktree/ # Worktree skill for Claude Code
 ```
 
-Agent status hooks are installed automatically. The directory name defaults to the repo name, or you can pass a second argument to override it.
+Agent status hooks are installed automatically and the project is registered in the global project registry (`~/.config/bork/projects.json`). The directory name defaults to the repo name, or you can pass a second argument to override it.
 
 ### `bork install` / `bork uninstall`
 
@@ -165,13 +169,16 @@ These are installed automatically by `bork init`. Use `bork install` / `bork uni
 |-----|--------|
 | `j` / `Down` | Move selection down |
 | `k` / `Up` | Move selection up |
-| `h` / `Left` | Focus column left |
-| `l` / `Right` | Focus column right |
-| `Tab` | Jump to next column |
-| `Shift+Tab` | Jump to previous column |
+| `h` | Focus left (within column, then wrap to previous) |
+| `l` | Focus right (within column, then wrap to next) |
+| `Left` | Jump to previous column |
+| `Right` | Jump to next column |
+| `Tab` | Jump to next column (or switch swimlane if multiple visible) |
+| `Shift+Tab` | Jump to previous column (or switch swimlane if multiple visible) |
 | `g` | Scroll to top |
 | `G` | Scroll to bottom |
 | `Enter` | Open session (resume or launch if none, attach if running) |
+| `Ctrl+P` | Toggle project sidebar |
 | `P` | Force-sync PR statuses from GitHub |
 | `o` | Open PR in browser (if issue has a matching PR) |
 | `t` | Open project-root terminal in tmux |
@@ -207,6 +214,16 @@ These are installed automatically by `bork init`. Use `bork install` / `bork uni
 | `Esc` / `Ctrl+c` | Cancel |
 | `Space` / `h` / `l` | Cycle mode (on Mode field); open Linear picker (on Linear field) |
 
+### Sidebar Mode
+
+| Key | Action |
+|-----|--------|
+| `j` / `Down` | Move selection down |
+| `k` / `Up` | Move selection up |
+| `Enter` | Focus selected project (single board view) |
+| `Space` | Toggle project as swimlane (add/remove from view) |
+| `Esc` / `Ctrl+P` | Close sidebar |
+
 ### Confirm Mode
 
 | Key | Action |
@@ -229,6 +246,10 @@ default_prompt = "Check AGENTS.md for project context and start working on the i
 Issue data is stored in `.bork/state.json` as a flat JSON array. Writes are atomic (write to temp file, then rename) so state is never corrupted even if bork crashes.
 
 Agent status files are written to `.bork/agent-status/` by the hooks installed with `bork install`.
+
+### Global Project Registry
+
+Bork maintains a registry of all your projects at `~/.config/bork/projects.json`. Projects are automatically registered when you run `bork init` or launch the TUI. Projects whose directories no longer exist are automatically removed from the registry. You can also manage it manually with `bork project add`, `bork project remove`, and `bork project list`.
 
 ## Agent Status Indicators
 
@@ -273,6 +294,64 @@ When the [Linear CLI](https://linear.app/docs/cli) is installed and authenticate
 - **State sync** &mdash; Linear issue state is refreshed on each poll cycle. Imported issues also sync their title from Linear.
 
 If the `linear` CLI is not found at startup, all Linear features are silently disabled.
+
+## Multi-Project View
+
+When you have two or more projects registered, bork enables a project sidebar and swimlane view for managing multiple projects from a single TUI instance.
+
+### Getting Started
+
+Projects are registered automatically when you run `bork init`. To add existing projects:
+
+```bash
+cd ~/projects/my-app
+bork project add               # Register the current directory
+
+bork project add ~/projects/other-app   # Register a specific path
+bork project list                        # See all registered projects
+```
+
+A project must have a `.bork/` directory (created by `bork init`) to be registered.
+
+### Project Sidebar
+
+Press `Ctrl+P` to open the sidebar. It lists all registered projects with status markers:
+
+| Marker | Meaning |
+|--------|---------|
+| `◆` | Focused project (has workers running) |
+| `▪` | Visible as a swimlane |
+| `●` | Has active agent sessions (yellow) |
+
+Use `j`/`k` to navigate, then:
+
+- **`Enter`** &mdash; Focus the selected project. This switches to a single board view showing only that project.
+- **`Space`** &mdash; Toggle the selected project as a swimlane. This adds or removes it from the stacked view. You can have up to 3 projects visible at once.
+- **`Esc`** or **`Ctrl+P`** &mdash; Close the sidebar.
+
+### Swimlane View
+
+When multiple projects are visible as swimlanes, their kanban boards are stacked vertically. Card sizes adapt to the available space:
+
+| Projects Visible | Card Height | Detail Level |
+|------------------|-------------|--------------|
+| 1 | Full (5 lines) | Title, status, PR line, branch, linear |
+| 2 | Medium (3 lines) | Title, status + git changes, PR badge |
+| 3 | Compact (2 lines) | Title, status icon + branch |
+
+Use **`Tab`** / **`Shift+Tab`** to switch focus between swimlanes. The focused swimlane has a highlighted header and receives all keyboard input (navigation, issue management, etc.).
+
+The footer shows which swimlane is active and its position (e.g. `legora (2/3)`).
+
+### How It Works
+
+- Each visible swimlane gets its own set of background workers polling for git status, PR data, and session info. Live data appears within a few seconds of adding a swimlane.
+- When you switch between projects, the previous project's data is cached. Switching back shows the cached data immediately while fresh data loads.
+- The activity poller checks agent status files for all registered projects every 5 seconds, updating the sidebar markers.
+
+### Single-Project Mode
+
+If only one project is registered, bork works exactly as before. There is no sidebar, no swimlane UI, and no changes to the keybindings or behavior.
 
 ## Dev Server Detection
 
