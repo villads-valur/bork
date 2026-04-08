@@ -16,13 +16,13 @@ pub fn render_header(frame: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!("- {} ", app.config.project_name),
+            format!("- {} ", app.project().config.project_name),
             Style::default().fg(styles::TEXT),
         ),
         Span::styled(concat!("v", env!("CARGO_PKG_VERSION")), styles::dim_style()),
     ];
 
-    if app.config.debug {
+    if app.project().config.debug {
         title_spans.push(Span::styled(
             " [DEBUG]",
             Style::default()
@@ -63,7 +63,7 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     if app.input_mode == InputMode::Search {
         let line = Line::from(vec![
             Span::styled(
-                format!(" /{}", app.search_query),
+                format!(" /{}", app.project().search_query),
                 Style::default()
                     .fg(styles::TEXT)
                     .add_modifier(Modifier::BOLD),
@@ -96,7 +96,7 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     if app.has_active_search() {
         let line = Line::from(vec![
             Span::styled(
-                format!(" /{}", app.search_query),
+                format!(" /{}", app.project().search_query),
                 Style::default().fg(styles::ACCENT),
             ),
             Span::raw("  "),

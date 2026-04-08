@@ -325,23 +325,23 @@ fn run_tui() -> anyhow::Result<()> {
     let mut app = App::new(config, state);
 
     // --- Ensure agent-status dir ---
-    config::ensure_agent_status_dir(&app.config.project_root);
+    config::ensure_agent_status_dir(&app.project().config.project_root);
 
     // --- Channels ---
     let (action_tx, action_rx) = mpsc::channel::<ActionResult>();
-    let status_dir = config::agent_status_dir(&app.config.project_root);
+    let status_dir = config::agent_status_dir(&app.project().config.project_root);
     let session_rx = spawn_session_status_worker(status_dir);
     let port_sessions = Arc::new(Mutex::new(HashSet::<String>::new()));
     let port_rx = spawn_port_poll_worker(port_sessions.clone());
-    let git_skip_set = Arc::new(Mutex::new(app.done_worktree_names()));
+    let git_skip_set = Arc::new(Mutex::new(app.project().done_worktree_names()));
     let (git_wake_tx, git_wake_rx) = mpsc::channel::<()>();
     let git_rx = spawn_git_status_worker(
-        app.config.project_root.clone(),
+        app.project().config.project_root.clone(),
         git_skip_set.clone(),
         git_wake_rx,
     );
     let (pr_wake_tx, pr_wake_rx) = mpsc::channel::<()>();
-    let main_worktree = app.config.project_root.join("main");
+    let main_worktree = app.project().config.project_root.join("main");
     let pr_rx = spawn_pr_poll_worker(main_worktree, pr_wake_rx);
 
     let (linear_check_tx, linear_check_rx) = mpsc::channel::<bool>();
@@ -394,18 +394,18 @@ fn run_tui() -> anyhow::Result<()> {
                                 session_name,
                                 popup_title,
                             } => {
-                                if app.state_dirty {
+                                if app.project().state_dirty {
                                     let _ = config::save_state(
-                                        &app.to_state(),
-                                        &app.config.project_root,
+                                        &app.project().to_state(),
+                                        &app.project().config.project_root,
                                     );
-                                    app.state_dirty = false;
+                                    app.project_mut().state_dirty = false;
                                 }
                                 open_tmux_popup(
                                     &mut terminal,
                                     &session_name,
                                     &popup_title,
-                                    &app.config.project_name,
+                                    &app.project().config.project_name,
                                 )?;
                                 app.message = None;
                             }
@@ -419,7 +419,7 @@ fn run_tui() -> anyhow::Result<()> {
                                 if let Some(edited) = open_external_editor(
                                     &mut terminal,
                                     &initial_content,
-                                    &app.config.project_name,
+                                    &app.project().config.project_name,
                                 )? {
                                     if let Some(dialog) = app.dialog.as_mut() {
                                         dialog.set_prompt_text(&edited);
@@ -445,7 +445,12 @@ fn run_tui() -> anyhow::Result<()> {
             app.set_message(result.message);
 
             if let Some((issue_id, agent_sid)) = result.session_id {
-                if let Some(issue) = app.issues.iter_mut().find(|i| i.id == issue_id) {
+                if let Some(issue) = app
+                    .project_mut()
+                    .issues
+                    .iter_mut()
+                    .find(|i| i.id == issue_id)
+                {
                     issue.session_id = Some(agent_sid);
                 }
             }
@@ -456,8 +461,8 @@ fn run_tui() -> anyhow::Result<()> {
                     pending_popup_session = Some((session_name, popup_title));
                 } else if let Some((launch_idx, popup_title)) = pending_popup_for_launch.take() {
                     // Agent session launch
-                    if app.issues[launch_idx].column == types::Column::Todo {
-                        app.issues[launch_idx].column = types::Column::InProgress;
+                    if app.project().issues[launch_idx].column == types::Column::Todo {
+                        app.project_mut().issues[launch_idx].column = types::Column::InProgress;
                     }
                     pending_popup_session = Some((session_name, popup_title));
                 }
@@ -466,13 +471,16 @@ fn run_tui() -> anyhow::Result<()> {
 
         if let Some((session_name, popup_title)) = pending_popup_session.take() {
             // Flush state before yielding terminal to tmux popup (could last a long time)
-            let _ = config::save_state(&app.to_state(), &app.config.project_root);
-            app.state_dirty = false;
+            let _ = config::save_state(
+                &app.project().to_state(),
+                &app.project().config.project_root,
+            );
+            app.project_mut().state_dirty = false;
             open_tmux_popup(
                 &mut terminal,
                 &session_name,
                 &popup_title,
-                &app.config.project_name,
+                &app.project().config.project_name,
             )?;
             app.message = None;
             needs_redraw = true;
@@ -480,16 +488,17 @@ fn run_tui() -> anyhow::Result<()> {
 
         while let Ok(poll) = session_rx.try_recv() {
             needs_redraw = true;
-            app.active_sessions = poll.sessions;
-            app.agent_statuses = poll.agent_statuses;
+            let live = app.project_mut().live_mut();
+            live.active_sessions = poll.sessions;
+            live.agent_statuses = poll.agent_statuses;
             // Update shared sessions set for the port poll worker
             if let Ok(mut shared) = port_sessions.lock() {
-                *shared = app.active_sessions.clone();
+                *shared = live.active_sessions.clone();
             }
         }
 
         while let Ok(port_result) = port_rx.try_recv() {
-            app.listening_ports = port_result.ports;
+            app.project_mut().live_mut().listening_ports = port_result.ports;
         }
 
         // --- Auto-kill Done sessions past TTL ---
@@ -497,14 +506,18 @@ fn run_tui() -> anyhow::Result<()> {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let cleanup_indices = app.issues_needing_session_cleanup(now);
+        let cleanup_indices = app.project().issues_needing_session_cleanup(now);
         for idx in cleanup_indices {
             needs_redraw = true;
-            let session_name = app.issues[idx].session_name(&app.config.project_name);
-            let status_file = config::agent_status_dir(&app.config.project_root)
+            let session_name =
+                app.project().issues[idx].session_name(&app.project().config.project_name);
+            let status_file = config::agent_status_dir(&app.project().config.project_root)
                 .join(format!("{}.json", session_name));
             let sn = session_name.clone();
-            app.active_sessions.remove(&session_name);
+            app.project_mut()
+                .live_mut()
+                .active_sessions
+                .remove(&session_name);
             thread::spawn(move || {
                 let _ = external::tmux::kill_session(&sn);
                 let _ = std::fs::remove_file(&status_file);
@@ -516,26 +529,35 @@ fn run_tui() -> anyhow::Result<()> {
         while let Ok(git_result) = git_rx.try_recv() {
             needs_redraw = true;
             git_data_changed = true;
-            app.worktree_statuses = git_result.statuses;
-            app.worktree_branches = git_result.branches;
-            app.git_poll_done = true;
+            let live = app.project_mut().live_mut();
+            live.worktree_statuses = git_result.statuses;
+            live.worktree_branches = git_result.branches;
+            live.git_poll_done = true;
         }
 
         let mut pr_data_changed = false;
         while let Ok(pr_result) = pr_rx.try_recv() {
             needs_redraw = true;
             pr_data_changed = true;
-            app.pr_statuses = pr_result.prs;
-            app.user_prs = pr_result.user_prs;
+            let live = app.project_mut().live_mut();
+            live.pr_statuses = pr_result.prs;
+            live.user_prs = pr_result.user_prs;
             if pr_result.github_user.is_some() {
-                app.github_user = pr_result.github_user;
+                live.github_user = pr_result.github_user;
             }
 
-            for issue in &mut app.issues {
+            let p = &mut app.projects[app.focused_project];
+            let pr_titles: Vec<(u32, String)> = p
+                .live()
+                .pr_statuses
+                .values()
+                .map(|pr| (pr.number, pr.title.clone()))
+                .collect();
+            for issue in &mut p.issues {
                 if let Some(pr_num) = issue.pr_number {
                     if issue.pr_imported {
-                        if let Some(pr) = app.pr_statuses.values().find(|p| p.number == pr_num) {
-                            issue.title = pr.title.clone();
+                        if let Some((_, title)) = pr_titles.iter().find(|(n, _)| *n == pr_num) {
+                            issue.title = title.clone();
                         }
                     }
                 }
@@ -543,36 +565,42 @@ fn run_tui() -> anyhow::Result<()> {
         }
 
         // --- Auto-import open PRs as issues (only when new PR data arrived) ---
-        if pr_data_changed && app.sync_prs_as_issues() {
-            app.mark_dirty();
+        if pr_data_changed {
+            let (changed, msg) = app.project_mut().sync_prs_as_issues();
+            if let Some(m) = msg {
+                app.set_message(m);
+            }
+            if changed {
+                app.project_mut().mark_dirty();
+            }
         }
 
         // --- Auto-assign worktrees (only when git data changed) ---
         if git_data_changed {
-            let mut worktree_changed = app.auto_assign_worktrees();
-            worktree_changed = app.clear_stale_worktrees() || worktree_changed;
+            let mut worktree_changed = app.project_mut().auto_assign_worktrees();
+            worktree_changed = app.project_mut().clear_stale_worktrees() || worktree_changed;
             if worktree_changed {
                 let _ = git_wake_tx.send(());
-                app.mark_dirty();
+                app.project_mut().mark_dirty();
             }
         }
 
         // --- Update git skip set when issues changed columns or git data arrived ---
-        if git_data_changed || app.state_dirty {
+        if git_data_changed || app.project().state_dirty {
             if let Ok(mut skip) = git_skip_set.lock() {
-                *skip = app.done_worktree_names();
+                *skip = app.project().done_worktree_names();
             }
         }
 
         // --- tuicr: check availability ---
         if let Ok(true) = tuicr_check_rx.try_recv() {
-            app.tuicr_available = true;
+            app.project_mut().tuicr_available = true;
         }
 
         // --- Linear: check availability then consume poll results ---
         if let Ok(true) = linear_check_rx.try_recv() {
             needs_redraw = true;
-            app.linear_available = true;
+            app.project_mut().linear_available = true;
             if let Some(wake_rx) = linear_wake_rx.take() {
                 linear_rx = Some(spawn_linear_worker(wake_rx));
             }
@@ -580,12 +608,20 @@ fn run_tui() -> anyhow::Result<()> {
         if let Some(ref rx) = linear_rx {
             while let Ok(result) = rx.try_recv() {
                 needs_redraw = true;
-                app.linear_issues = result.issues;
-                for issue in &mut app.issues {
+                app.project_mut().live_mut().linear_issues = result.issues;
+                let p = &mut app.projects[app.focused_project];
+                let linear_titles: Vec<(String, String)> = p
+                    .live()
+                    .linear_issues
+                    .iter()
+                    .map(|i| (i.id.clone(), i.title.clone()))
+                    .collect();
+                for issue in &mut p.issues {
                     if let Some(ref lid) = issue.linear_id {
                         if issue.linear_imported {
-                            if let Some(fresh) = app.linear_issues.iter().find(|i| i.id == *lid) {
-                                issue.title = fresh.title.clone();
+                            if let Some((_, title)) = linear_titles.iter().find(|(id, _)| id == lid)
+                            {
+                                issue.title = title.clone();
                             }
                         }
                     }
@@ -599,9 +635,12 @@ fn run_tui() -> anyhow::Result<()> {
         }
 
         // --- Flush dirty state to disk (once per tick, not per action) ---
-        if app.state_dirty {
-            let _ = config::save_state(&app.to_state(), &app.config.project_root);
-            app.state_dirty = false;
+        if app.project().state_dirty {
+            let _ = config::save_state(
+                &app.project().to_state(),
+                &app.project().config.project_root,
+            );
+            app.project_mut().state_dirty = false;
         }
 
         if app.clear_expired_message() {
@@ -609,8 +648,11 @@ fn run_tui() -> anyhow::Result<()> {
         }
     }
 
-    let _ = config::save_state(&app.to_state(), &app.config.project_root);
-    lock::release_lock(&app.config.project_root);
+    let _ = config::save_state(
+        &app.project().to_state(),
+        &app.project().config.project_root,
+    );
+    lock::release_lock(&app.project().config.project_root);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, SetTitle(""))?;

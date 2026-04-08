@@ -22,6 +22,7 @@ pub fn map_key_to_action(
         InputMode::LinearPicker => map_linear_picker_key(key),
         InputMode::Help => map_help_key(key),
         InputMode::DebugInspector => map_debug_inspector_key(key),
+        InputMode::Sidebar => map_normal_key(key),
     }
 }
 

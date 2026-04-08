@@ -19,15 +19,15 @@ pub fn render_board(frame: &mut Frame, app: &App, area: Rect) {
     .split(area);
 
     for (col_idx, column) in Column::ALL.iter().enumerate() {
-        let is_selected_col = col_idx == app.selected_column;
+        let is_selected_col = col_idx == app.project().selected_column;
         render_column(frame, app, *column, columns[col_idx], is_selected_col);
     }
 }
 
 fn render_column(frame: &mut Frame, app: &App, column: Column, area: Rect, is_selected_col: bool) {
-    let issues = app.issues_in_column(column);
+    let issues = app.project().issues_in_column(column);
     let count = issues.len();
-    let selected_row = app.selected_row[column.index()];
+    let selected_row = app.project().selected_row[column.index()];
 
     let border_style = if is_selected_col {
         styles::card_border_style(true)
@@ -102,13 +102,15 @@ fn render_column(frame: &mut Frame, app: &App, column: Column, area: Rect, is_se
         let ctx = card::CardContext {
             issue,
             selected: is_selected,
-            session_alive: app.is_session_alive(&issue.session_name(&app.config.project_name)),
-            agent_status: app.resolved_agent_status(issue),
-            activity: app.resolved_activity(issue),
-            branch: app.branch_for(issue),
-            git_status: app.worktree_status_for(issue),
-            pr: app.pr_for(issue),
-            ports: app.listening_ports_for(issue),
+            session_alive: app
+                .project()
+                .is_session_alive(&issue.session_name(&app.project().config.project_name)),
+            agent_status: app.project().resolved_agent_status(issue),
+            activity: app.project().resolved_activity(issue),
+            branch: app.project().branch_for(issue),
+            git_status: app.project().worktree_status_for(issue),
+            pr: app.project().pr_for(issue),
+            ports: app.project().listening_ports_for(issue),
         };
 
         card::render_card(frame, &ctx, card_area);
