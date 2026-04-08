@@ -483,20 +483,14 @@ fn run_tui() -> anyhow::Result<()> {
 
     let mut app = App::new(config, state);
 
-    // --- Auto-register current project in global config ---
+    // --- Register current project and load others for multi-project sidebar ---
     let current_root = app.project().config.project_root.clone();
     let _ = global_config::register_project(&app.project().config.project_name, &current_root);
-
-    // --- Load other registered projects for multi-project sidebar ---
-    let global = global_config::load_global_config();
-    for entry in &global.projects {
+    let current_canonical =
+        std::fs::canonicalize(&current_root).unwrap_or_else(|_| current_root.clone());
+    for entry in &global_config::load_global_config().projects {
         let canonical = std::fs::canonicalize(&entry.path).unwrap_or_else(|_| entry.path.clone());
-        let current_canonical =
-            std::fs::canonicalize(&current_root).unwrap_or_else(|_| current_root.clone());
-        if canonical == current_canonical {
-            continue;
-        }
-        if !entry.path.join(".bork").is_dir() {
+        if canonical == current_canonical || !entry.path.join(".bork").is_dir() {
             continue;
         }
         let proj_config = config::load_config_from(&entry.path);
@@ -603,7 +597,6 @@ fn run_tui() -> anyhow::Result<()> {
                             }
                             PostAction::SwitchProject { index } => {
                                 if index < app.projects.len() && index != app.focused_project {
-                                    // Close any open overlays
                                     app.dialog = None;
                                     app.linear_picker = None;
                                     app.confirm_message = None;
@@ -611,7 +604,6 @@ fn run_tui() -> anyhow::Result<()> {
                                     app.debug_inspector_json = None;
                                     app.input_mode = InputMode::Normal;
 
-                                    // Save current project state
                                     if app.project().state_dirty {
                                         let _ = config::save_state(
                                             &app.project().to_state(),
@@ -620,23 +612,11 @@ fn run_tui() -> anyhow::Result<()> {
                                         app.project_mut().state_dirty = false;
                                     }
 
-                                    // Discard old project's live data
                                     app.project_mut().live = None;
-
-                                    // Switch focus
                                     app.focused_project = index;
+                                    app.project_mut().live = Some(crate::app::LiveState::default());
 
-                                    // Ensure new project has live data
-                                    if app.project().live.is_none() {
-                                        app.project_mut().live =
-                                            Some(crate::app::LiveState::default());
-                                    }
-
-                                    // Drop old workers (threads exit on next send failure)
-                                    // and spawn fresh ones for the new project
                                     workers = spawn_project_workers(app.project());
-
-                                    // Update terminal title
                                     let _ = execute!(
                                         terminal.backend_mut(),
                                         SetTitle(format!(
@@ -644,7 +624,6 @@ fn run_tui() -> anyhow::Result<()> {
                                             app.project().config.project_name
                                         ))
                                     );
-
                                     app.set_message(format!(
                                         "Switched to {}",
                                         app.project().config.project_name
@@ -854,7 +833,6 @@ fn run_tui() -> anyhow::Result<()> {
             }
         }
 
-        // --- Drain activity poller for sidebar markers ---
         if let Some(ref rx) = activity_rx {
             while let Ok(activity) = rx.try_recv() {
                 if let Some(ref mut sidebar) = app.sidebar {

@@ -25,16 +25,12 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     status_bar::render_header(frame, app, vertical[0]);
 
-    if let Some(sb) = &app.sidebar {
-        if sb.visible {
-            let horizontal =
-                Layout::horizontal([Constraint::Length(22), Constraint::Min(1)]).split(vertical[1]);
-
-            sidebar::render_sidebar(frame, app, horizontal[0]);
-            board::render_board(frame, app, horizontal[1]);
-        } else {
-            board::render_board(frame, app, vertical[1]);
-        }
+    let sidebar_visible = app.sidebar.as_ref().is_some_and(|s| s.visible);
+    if sidebar_visible {
+        let horizontal =
+            Layout::horizontal([Constraint::Length(22), Constraint::Min(1)]).split(vertical[1]);
+        sidebar::render_sidebar(frame, app, horizontal[0]);
+        board::render_board(frame, app, horizontal[1]);
     } else {
         board::render_board(frame, app, vertical[1]);
     }

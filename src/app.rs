@@ -1139,7 +1139,7 @@ impl App {
 
     pub fn add_background_project(&mut self, config: AppConfig, state: AppState) {
         let mut project = Project::new(config, state);
-        project.live = None; // suspended, no workers yet
+        project.live = None;
         self.projects.push(project);
     }
 

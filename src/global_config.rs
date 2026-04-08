@@ -114,7 +114,7 @@ mod tests {
     // Serialize tests that modify XDG_CONFIG_HOME
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    fn with_temp_config(name: &str, test: impl FnOnce(PathBuf)) {
+    fn with_temp_config(name: &str, test: impl FnOnce()) {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let dir =
@@ -125,7 +125,7 @@ mod tests {
         let old = std::env::var("XDG_CONFIG_HOME").ok();
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
 
-        test(dir.clone());
+        test();
 
         if let Some(v) = old {
             unsafe { std::env::set_var("XDG_CONFIG_HOME", v) };
@@ -144,7 +144,7 @@ mod tests {
 
     #[test]
     fn load_empty_returns_default() {
-        with_temp_config("empty", |_| {
+        with_temp_config("empty", || {
             let config = load_global_config();
             assert!(config.projects.is_empty());
         });
@@ -152,7 +152,7 @@ mod tests {
 
     #[test]
     fn register_and_list() {
-        with_temp_config("register", |_| {
+        with_temp_config("register", || {
             let dir = make_temp_dir("register");
 
             register_project("test-proj", &dir).unwrap();
@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn register_idempotent() {
-        with_temp_config("idempotent", |_| {
+        with_temp_config("idempotent", || {
             let dir = make_temp_dir("idempotent");
 
             register_project("proj-v1", &dir).unwrap();
@@ -181,7 +181,7 @@ mod tests {
 
     #[test]
     fn unregister_removes_entry() {
-        with_temp_config("unregister", |_| {
+        with_temp_config("unregister", || {
             let dir = make_temp_dir("unregister");
 
             register_project("doomed", &dir).unwrap();
@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn unregister_missing_returns_false() {
-        with_temp_config("unreg-missing", |_| {
+        with_temp_config("unreg-missing", || {
             let removed =
                 unregister_project(Path::new("/nonexistent/path/that/wont/exist")).unwrap();
             assert!(!removed);
@@ -206,7 +206,7 @@ mod tests {
 
     #[test]
     fn roundtrip_preserves_data() {
-        with_temp_config("roundtrip", |_| {
+        with_temp_config("roundtrip", || {
             let dir1 = make_temp_dir("rt1");
             let dir2 = make_temp_dir("rt2");
 

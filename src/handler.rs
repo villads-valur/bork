@@ -211,16 +211,10 @@ fn handle_normal(
 
         Action::ToggleSidebar => {
             if let Some(ref mut sidebar) = app.sidebar {
-                if sidebar.visible && sidebar.focused {
-                    sidebar.focused = false;
-                    sidebar.visible = false;
-                    app.input_mode = InputMode::Normal;
-                } else {
-                    sidebar.visible = true;
-                    sidebar.focused = true;
-                    sidebar.selected = app.focused_project;
-                    app.input_mode = InputMode::Sidebar;
-                }
+                sidebar.visible = true;
+                sidebar.focused = true;
+                sidebar.selected = app.focused_project;
+                app.input_mode = InputMode::Sidebar;
             }
             PostAction::None
         }
