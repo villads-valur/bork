@@ -30,7 +30,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
-use app::App;
+use app::{App, InputMode};
 use handler::{ActionResult, PostAction};
 use input::map_key_to_action;
 use types::{AgentKind, AgentStatusInfo};
@@ -483,8 +483,11 @@ fn run_tui() -> anyhow::Result<()> {
 
     let mut app = App::new(config, state);
 
-    // --- Load other registered projects for multi-project sidebar ---
+    // --- Auto-register current project in global config ---
     let current_root = app.project().config.project_root.clone();
+    let _ = global_config::register_project(&app.project().config.project_name, &current_root);
+
+    // --- Load other registered projects for multi-project sidebar ---
     let global = global_config::load_global_config();
     for entry in &global.projects {
         let canonical = std::fs::canonicalize(&entry.path).unwrap_or_else(|_| entry.path.clone());
@@ -600,6 +603,14 @@ fn run_tui() -> anyhow::Result<()> {
                             }
                             PostAction::SwitchProject { index } => {
                                 if index < app.projects.len() && index != app.focused_project {
+                                    // Close any open overlays
+                                    app.dialog = None;
+                                    app.linear_picker = None;
+                                    app.confirm_message = None;
+                                    app.pending_confirm = None;
+                                    app.debug_inspector_json = None;
+                                    app.input_mode = InputMode::Normal;
+
                                     // Save current project state
                                     if app.project().state_dirty {
                                         let _ = config::save_state(
@@ -624,6 +635,15 @@ fn run_tui() -> anyhow::Result<()> {
                                     // Drop old workers (threads exit on next send failure)
                                     // and spawn fresh ones for the new project
                                     workers = spawn_project_workers(app.project());
+
+                                    // Update terminal title
+                                    let _ = execute!(
+                                        terminal.backend_mut(),
+                                        SetTitle(format!(
+                                            "bork: {}",
+                                            app.project().config.project_name
+                                        ))
+                                    );
 
                                     app.set_message(format!(
                                         "Switched to {}",
