@@ -1158,7 +1158,7 @@ impl App {
                 focused: false,
                 selected: 0,
                 activity: HashMap::new(),
-                swimlane_indices: Vec::new(),
+                swimlane_indices: vec![self.focused_project],
             });
         }
     }
@@ -1189,15 +1189,17 @@ impl App {
     }
 
     pub fn visible_swimlanes(&self) -> Vec<usize> {
-        let mut lanes = vec![self.focused_project];
         if let Some(ref sidebar) = self.sidebar {
-            for &idx in &sidebar.swimlane_indices {
-                if idx != self.focused_project && idx < self.projects.len() {
-                    lanes.push(idx);
-                }
+            if !sidebar.swimlane_indices.is_empty() {
+                return sidebar
+                    .swimlane_indices
+                    .iter()
+                    .filter(|&&idx| idx < self.projects.len())
+                    .copied()
+                    .collect();
             }
         }
-        lanes
+        vec![self.focused_project]
     }
 
     pub fn visible_swimlane_count(&self) -> usize {

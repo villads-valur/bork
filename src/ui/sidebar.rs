@@ -35,6 +35,8 @@ pub fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
 
             let marker = if is_focused {
                 "◆"
+            } else if is_swimlane {
+                "▪"
             } else if has_activity {
                 "●"
             } else {
@@ -43,6 +45,8 @@ pub fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
 
             let marker_style = if is_focused {
                 Style::default().fg(styles::ACCENT)
+            } else if is_swimlane {
+                Style::default().fg(styles::ACCENT)
             } else if has_activity {
                 Style::default().fg(Color::Yellow)
             } else {
@@ -50,11 +54,7 @@ pub fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
             };
 
             let name = &project.config.project_name;
-            let swimlane_tag = if is_focused || is_swimlane {
-                " \u{25aa}"
-            } else {
-                ""
-            };
+            let swimlane_tag = "";
             let max_name = area.width.saturating_sub(7) as usize;
             let display_name = styles::truncate(name, max_name);
 

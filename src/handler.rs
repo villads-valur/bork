@@ -962,15 +962,24 @@ fn handle_sidebar(app: &mut App, action: Action) -> PostAction {
             let lane_count = app.visible_swimlane_count();
             if let Some(ref mut sidebar) = app.sidebar {
                 let idx = sidebar.selected;
-                if idx == app.focused_project {
-                    PostAction::None
-                } else if let Some(pos) = sidebar.swimlane_indices.iter().position(|&i| i == idx) {
-                    sidebar.swimlane_indices.remove(pos);
-                    if app.focused_swimlane >= sidebar.swimlane_indices.len() + 1 {
-                        app.focused_swimlane = 0;
+                if let Some(pos) = sidebar.swimlane_indices.iter().position(|&i| i == idx) {
+                    // Already in swimlanes: remove it
+                    if sidebar.swimlane_indices.len() <= 1 {
+                        // Can't remove the last swimlane
+                        PostAction::None
+                    } else {
+                        sidebar.swimlane_indices.remove(pos);
+                        // If we removed the focused project, switch focus to first remaining
+                        if idx == app.focused_project {
+                            app.focused_project = sidebar.swimlane_indices[0];
+                        }
+                        if app.focused_swimlane >= sidebar.swimlane_indices.len() {
+                            app.focused_swimlane = 0;
+                        }
+                        PostAction::None
                     }
-                    PostAction::None
                 } else if lane_count < 3 {
+                    // Add to swimlanes
                     sidebar.swimlane_indices.push(idx);
                     PostAction::None
                 } else {
