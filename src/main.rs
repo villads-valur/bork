@@ -580,9 +580,18 @@ fn run_tui() -> anyhow::Result<()> {
             needs_redraw = false;
         }
 
-        if event::poll(TICK_RATE)? {
-            loop {
-                if let Event::Key(key) = event::read()? {
+        match event::poll(TICK_RATE) {
+            Ok(false) => {}
+            Err(_) => break, // Terminal broken (e.g. tmux killed)
+            Ok(true) => loop {
+                let event = match event::read() {
+                    Ok(e) => e,
+                    Err(_) => {
+                        app.should_quit = true;
+                        break;
+                    }
+                };
+                if let Event::Key(key) = event {
                     if key.kind == KeyEventKind::Press {
                         needs_redraw = true;
                         let dialog_field = app.dialog.as_ref().map(|d| d.current_field());
@@ -696,10 +705,11 @@ fn run_tui() -> anyhow::Result<()> {
                         }
                     }
                 }
-                if !event::poll(Duration::ZERO)? {
-                    break;
+                match event::poll(Duration::ZERO) {
+                    Ok(true) => continue,
+                    _ => break,
                 }
-            }
+            },
         }
 
         if app.should_quit || lock::signal_received() {
