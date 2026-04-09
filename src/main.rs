@@ -2,6 +2,7 @@ mod app;
 mod config;
 mod error;
 mod external;
+mod global_config;
 mod handler;
 mod init;
 mod input;
@@ -15,6 +16,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -29,7 +31,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
-use app::App;
+use app::{App, InputMode, ProjectId};
 use handler::{ActionResult, PostAction};
 use input::map_key_to_action;
 use types::{AgentKind, AgentStatusInfo};
@@ -245,6 +247,30 @@ enum Command {
         #[arg(long)]
         title: Option<String>,
     },
+
+    /// Manage registered bork projects
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProjectCommand {
+    /// List all registered projects
+    List,
+
+    /// Register a project (defaults to current directory)
+    Add {
+        /// Path to project container (must have .bork/ directory)
+        path: Option<String>,
+    },
+
+    /// Unregister a project (defaults to current directory)
+    Remove {
+        /// Path to project container
+        path: Option<String>,
+    },
 }
 
 #[derive(Clone, ValueEnum)]
@@ -278,31 +304,201 @@ fn main() -> anyhow::Result<()> {
             slug,
             title,
         }) => worktree::run_worktree(&issue_id, slug.as_deref(), title.as_deref()),
+        Some(Command::Project { command }) => run_project_command(command),
         None => run_tui(),
     }
 }
 
-fn run_tui() -> anyhow::Result<()> {
-    // --- Load config + state (before tmux wrap so we have project_name) ---
-    let config = config::load_config();
-    let state = config::load_state(&config.project_root);
+fn run_project_command(command: ProjectCommand) -> anyhow::Result<()> {
+    match command {
+        ProjectCommand::List => {
+            global_config::prune_stale_projects();
+            let projects = global_config::list_projects();
+            if projects.is_empty() {
+                println!("No projects registered.");
+                println!("Run 'bork init' or 'bork project add' to register a project.");
+            } else {
+                for entry in &projects {
+                    println!("  {} ({})", entry.name, entry.path.display());
+                }
+            }
+            Ok(())
+        }
+        ProjectCommand::Add { path } => {
+            let target = match path {
+                Some(p) => PathBuf::from(p),
+                None => std::env::current_dir()?,
+            };
+            if !target.join(".bork").join("config.toml").exists() {
+                anyhow::bail!(
+                    "No bork project found in {}. Run 'bork init' first.",
+                    target.display()
+                );
+            }
+            let config = config::load_config_from(&target);
+            global_config::register_project(&config.project_name, &target)?;
+            println!(
+                "Registered project '{}' at {}",
+                config.project_name,
+                target.display()
+            );
+            Ok(())
+        }
+        ProjectCommand::Remove { path } => {
+            let target = match path {
+                Some(p) => PathBuf::from(p),
+                None => std::env::current_dir()?,
+            };
+            let removed = global_config::unregister_project(&target)?;
+            if removed {
+                println!("Unregistered project at {}", target.display());
+            } else {
+                println!("No project registered at {}", target.display());
+            }
+            Ok(())
+        }
+    }
+}
 
-    // Tmux auto-wrap: outer process creates session + attaches, inner runs TUI
-    match external::tmux::ensure_bork_session(&config.project_name)? {
+struct SharedWorkers {
+    port_rx: mpsc::Receiver<PortPollResult>,
+    port_sessions: Arc<Mutex<HashSet<String>>>,
+    linear_rx: Option<mpsc::Receiver<LinearPollResult>>,
+    linear_wake_tx: mpsc::Sender<()>,
+    linear_wake_rx: Option<mpsc::Receiver<()>>,
+    shutdown: Arc<AtomicBool>,
+}
+
+struct ProjectWorkers {
+    session_rx: mpsc::Receiver<SessionPollResult>,
+    git_rx: mpsc::Receiver<GitPollResult>,
+    git_wake_tx: mpsc::Sender<()>,
+    git_skip_set: Arc<Mutex<HashSet<String>>>,
+    pr_rx: mpsc::Receiver<PrPollResult>,
+    pr_wake_tx: mpsc::Sender<()>,
+    shutdown: Arc<AtomicBool>,
+}
+
+fn spawn_shared_workers() -> SharedWorkers {
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    let port_sessions = Arc::new(Mutex::new(HashSet::<String>::new()));
+    let port_rx = spawn_port_poll_worker(port_sessions.clone());
+
+    let (linear_wake_tx, linear_wake_rx) = mpsc::channel::<()>();
+
+    SharedWorkers {
+        port_rx,
+        port_sessions,
+        linear_rx: None,
+        linear_wake_tx,
+        linear_wake_rx: Some(linear_wake_rx),
+        shutdown,
+    }
+}
+
+fn spawn_project_workers(project: &app::Project, shutdown: &Arc<AtomicBool>) -> ProjectWorkers {
+    let project_root = project.config.project_root.clone();
+
+    let status_dir = config::agent_status_dir(&project_root);
+    let session_rx = spawn_session_status_worker(status_dir);
+
+    let git_skip_set = Arc::new(Mutex::new(project.done_worktree_names()));
+    let (git_wake_tx, git_wake_rx) = mpsc::channel::<()>();
+    let git_rx = spawn_git_status_worker(project_root.clone(), git_skip_set.clone(), git_wake_rx);
+
+    let (pr_wake_tx, pr_wake_rx) = mpsc::channel::<()>();
+    let main_worktree = project_root.join("main");
+    let pr_rx = spawn_pr_poll_worker(main_worktree, pr_wake_rx);
+
+    ProjectWorkers {
+        session_rx,
+        git_rx,
+        git_wake_tx,
+        git_skip_set,
+        pr_rx,
+        pr_wake_tx,
+        shutdown: shutdown.clone(),
+    }
+}
+
+const ACTIVITY_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+fn spawn_activity_poller(
+    projects: Vec<(ProjectId, PathBuf)>,
+) -> mpsc::Receiver<HashMap<ProjectId, bool>> {
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || loop {
+        let mut activity: HashMap<ProjectId, bool> = HashMap::new();
+        for (id, root) in &projects {
+            let status_dir = root.join(".bork").join("agent-status");
+            let statuses = read_agent_statuses(&status_dir);
+            let has_activity = statuses.values().any(|info| {
+                matches!(
+                    info.status,
+                    types::AgentStatus::Busy
+                        | types::AgentStatus::WaitingInput
+                        | types::AgentStatus::WaitingPermission
+                        | types::AgentStatus::WaitingApproval
+                        | types::AgentStatus::Error
+                )
+            });
+            activity.insert(id.clone(), has_activity);
+        }
+        if tx.send(activity).is_err() {
+            break;
+        }
+        thread::sleep(ACTIVITY_POLL_INTERVAL);
+    });
+
+    rx
+}
+
+fn run_tui() -> anyhow::Result<()> {
+    // --- Determine which project to focus ---
+    global_config::prune_stale_projects();
+    let local_root = config::find_project_root();
+    let has_local_project = local_root.join(".bork").join("config.toml").exists();
+
+    let config;
+    let state;
+
+    if has_local_project {
+        config = config::load_config_from(&local_root);
+        state = config::load_state(&local_root);
+        config::ensure_agent_status_dir(&config.project_root);
+    } else {
+        let registered = global_config::list_projects();
+        if registered.is_empty() {
+            anyhow::bail!(
+                "No bork project found. Run 'bork init <repo>' to create one, \
+                 or 'bork project add <path>' to register an existing project."
+            );
+        }
+        let entry = &registered[0];
+        config = config::load_config_from(&entry.path);
+        state = config::load_state(&entry.path);
+        config::ensure_agent_status_dir(&config.project_root);
+    }
+
+    // Tmux auto-wrap: always use a single global "bork" session
+    match external::tmux::ensure_bork_session("bork")? {
         external::tmux::EnsureResult::AlreadyInside => {}
         external::tmux::EnsureResult::Wrapped { exit_code } => {
             std::process::exit(exit_code);
         }
     }
 
-    // --- Single-instance lock (only the inner/TUI process holds the lock) ---
-    lock::acquire_lock(&config.project_root)?;
+    // --- Single-instance lock (global, not per-project) ---
+    let lock_root = global_config::global_config_dir();
+    lock::acquire_lock(&lock_root)?;
 
     // --- Panic hook ---
-    let panic_project_root = config.project_root.clone();
+    let panic_lock_root = lock_root.clone();
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
-        lock::release_lock(&panic_project_root);
+        lock::release_lock(&panic_lock_root);
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen, SetTitle(""));
         original_hook(panic_info);
@@ -324,34 +520,46 @@ fn run_tui() -> anyhow::Result<()> {
 
     let mut app = App::new(config, state);
 
-    // --- Ensure agent-status dir ---
-    config::ensure_agent_status_dir(&app.config.project_root);
+    // --- Register current project and load others for multi-project sidebar ---
+    let current_root = app.project().config.project_root.clone();
+    let _ = global_config::register_if_absent(&app.project().config.project_name, &current_root);
+    let current_canonical =
+        std::fs::canonicalize(&current_root).unwrap_or_else(|_| current_root.clone());
+    for entry in &global_config::load_global_config().projects {
+        let canonical = std::fs::canonicalize(&entry.path).unwrap_or_else(|_| entry.path.clone());
+        if canonical == current_canonical || !entry.path.join(".bork").join("config.toml").exists()
+        {
+            continue;
+        }
+        let proj_config = config::load_config_from(&entry.path);
+        let proj_state = config::load_state(&entry.path);
+        app.add_background_project(proj_config, proj_state);
+    }
+    app.enable_sidebar();
 
-    // --- Channels ---
+    // --- Workers ---
     let (action_tx, action_rx) = mpsc::channel::<ActionResult>();
-    let status_dir = config::agent_status_dir(&app.config.project_root);
-    let session_rx = spawn_session_status_worker(status_dir);
-    let port_sessions = Arc::new(Mutex::new(HashSet::<String>::new()));
-    let port_rx = spawn_port_poll_worker(port_sessions.clone());
-    let git_skip_set = Arc::new(Mutex::new(app.done_worktree_names()));
-    let (git_wake_tx, git_wake_rx) = mpsc::channel::<()>();
-    let git_rx = spawn_git_status_worker(
-        app.config.project_root.clone(),
-        git_skip_set.clone(),
-        git_wake_rx,
-    );
-    let (pr_wake_tx, pr_wake_rx) = mpsc::channel::<()>();
-    let main_worktree = app.config.project_root.join("main");
-    let pr_rx = spawn_pr_poll_worker(main_worktree, pr_wake_rx);
+    let mut shared = spawn_shared_workers();
+    let mut workers = spawn_project_workers(app.project(), &shared.shutdown);
+    let mut swimlane_workers: HashMap<ProjectId, ProjectWorkers> = HashMap::new();
+
+    // --- Activity poller for sidebar markers ---
+    let activity_rx = if app.sidebar.is_some() {
+        let project_paths: Vec<(ProjectId, PathBuf)> = app
+            .projects
+            .iter()
+            .map(|p| (p.id(), p.config.project_root.clone()))
+            .collect();
+        Some(spawn_activity_poller(project_paths))
+    } else {
+        None
+    };
 
     let (linear_check_tx, linear_check_rx) = mpsc::channel::<bool>();
     thread::spawn(move || {
         let available = external::linear::check_available();
         let _ = linear_check_tx.send(available);
     });
-    let mut linear_rx: Option<mpsc::Receiver<LinearPollResult>> = None;
-    let (linear_wake_tx, linear_wake_rx) = mpsc::channel::<()>();
-    let mut linear_wake_rx = Some(linear_wake_rx);
 
     let (tuicr_check_tx, tuicr_check_rx) = mpsc::channel::<bool>();
     thread::spawn(move || {
@@ -360,7 +568,7 @@ fn run_tui() -> anyhow::Result<()> {
     });
 
     let mut pending_popup_session: Option<(String, String)> = None;
-    let mut pending_popup_for_launch: Option<(usize, String)> = None;
+    let mut pending_popup_for_launch: Option<(usize, ProjectId, String)> = None; // (issue_index, project_id, popup_title)
     let mut needs_redraw = true;
 
     // --- Main event loop ---
@@ -372,20 +580,36 @@ fn run_tui() -> anyhow::Result<()> {
             needs_redraw = false;
         }
 
-        if event::poll(TICK_RATE)? {
-            loop {
-                if let Event::Key(key) = event::read()? {
+        match event::poll(TICK_RATE) {
+            Ok(false) => {}
+            Err(_) => break, // Terminal broken (e.g. tmux killed)
+            Ok(true) => loop {
+                let event = match event::read() {
+                    Ok(e) => e,
+                    Err(_) => {
+                        app.should_quit = true;
+                        break;
+                    }
+                };
+                if let Event::Key(key) = event {
                     if key.kind == KeyEventKind::Press {
                         needs_redraw = true;
                         let dialog_field = app.dialog.as_ref().map(|d| d.current_field());
-                        let action = map_key_to_action(key, app.input_mode, dialog_field);
+                        let action = map_key_to_action(
+                            key,
+                            app.input_mode,
+                            dialog_field,
+                            app.visible_swimlane_count(),
+                        );
+                        let ctx = app.action_context();
                         let post_action = handler::handle_action(
                             &mut app,
                             action,
+                            &ctx,
                             &action_tx,
-                            &pr_wake_tx,
-                            &linear_wake_tx,
-                            &git_wake_tx,
+                            &workers.pr_wake_tx,
+                            &shared.linear_wake_tx,
+                            &workers.git_wake_tx,
                         );
 
                         match post_action {
@@ -394,18 +618,18 @@ fn run_tui() -> anyhow::Result<()> {
                                 session_name,
                                 popup_title,
                             } => {
-                                if app.state_dirty {
+                                if app.project().state_dirty {
                                     let _ = config::save_state(
-                                        &app.to_state(),
-                                        &app.config.project_root,
+                                        &app.project().to_state(),
+                                        &app.project().config.project_root,
                                     );
-                                    app.state_dirty = false;
+                                    app.project_mut().state_dirty = false;
                                 }
                                 open_tmux_popup(
                                     &mut terminal,
                                     &session_name,
                                     &popup_title,
-                                    &app.config.project_name,
+                                    &app.project().config.project_name,
                                 )?;
                                 app.message = None;
                             }
@@ -413,26 +637,79 @@ fn run_tui() -> anyhow::Result<()> {
                                 issue_index,
                                 popup_title,
                             } => {
-                                pending_popup_for_launch = Some((issue_index, popup_title));
+                                pending_popup_for_launch =
+                                    Some((issue_index, app.active_project_id(), popup_title));
                             }
                             PostAction::OpenEditor { initial_content } => {
                                 if let Some(edited) = open_external_editor(
                                     &mut terminal,
                                     &initial_content,
-                                    &app.config.project_name,
+                                    &app.project().config.project_name,
                                 )? {
                                     if let Some(dialog) = app.dialog.as_mut() {
                                         dialog.set_prompt_text(&edited);
                                     }
                                 }
                             }
+                            PostAction::SwitchProject { id } => {
+                                if app.find_project(&id).is_some() && id != app.focused_project {
+                                    app.dialog = None;
+                                    app.linear_picker = None;
+                                    app.confirm_message = None;
+                                    app.pending_confirm = None;
+                                    app.debug_inspector_json = None;
+                                    app.input_mode = InputMode::Normal;
+                                    if app.project().state_dirty {
+                                        let _ = config::save_state(
+                                            &app.project().to_state(),
+                                            &app.project().config.project_root,
+                                        );
+                                        app.project_mut().state_dirty = false;
+                                    }
+
+                                    let old_focused = app.focused_project.clone();
+                                    app.focused_project = id.clone();
+                                    app.focused_swimlane = 0;
+
+                                    let old_workers = if let Some(existing) =
+                                        swimlane_workers.remove(&id)
+                                    {
+                                        std::mem::replace(&mut workers, existing)
+                                    } else {
+                                        std::mem::replace(
+                                            &mut workers,
+                                            spawn_project_workers(app.project(), &shared.shutdown),
+                                        )
+                                    };
+
+                                    let still_swimlane = app
+                                        .sidebar
+                                        .as_ref()
+                                        .is_some_and(|s| s.swimlanes.contains(&old_focused));
+                                    if still_swimlane {
+                                        swimlane_workers.insert(old_focused, old_workers);
+                                    }
+                                    let _ = execute!(
+                                        terminal.backend_mut(),
+                                        SetTitle(format!(
+                                            "bork: {}",
+                                            app.project().config.project_name
+                                        ))
+                                    );
+                                    app.set_message(format!(
+                                        "Switched to {}",
+                                        app.project().config.project_name
+                                    ));
+                                }
+                            }
                         }
                     }
                 }
-                if !event::poll(Duration::ZERO)? {
-                    break;
+                match event::poll(Duration::ZERO) {
+                    Ok(true) => continue,
+                    _ => break,
                 }
-            }
+            },
         }
 
         if app.should_quit || lock::signal_received() {
@@ -445,19 +722,31 @@ fn run_tui() -> anyhow::Result<()> {
             app.set_message(result.message);
 
             if let Some((issue_id, agent_sid)) = result.session_id {
-                if let Some(issue) = app.issues.iter_mut().find(|i| i.id == issue_id) {
-                    issue.session_id = Some(agent_sid);
+                for project in &mut app.projects {
+                    if let Some(issue) = project.issues.iter_mut().find(|i| i.id == issue_id) {
+                        issue.session_id = Some(agent_sid);
+                        project.mark_dirty();
+                        break;
+                    }
                 }
             }
 
             if let Some(session_name) = result.session_to_open {
                 if let Some(popup_title) = result.popup_title {
-                    // Direct popup (e.g. OpenTerminal)
                     pending_popup_session = Some((session_name, popup_title));
-                } else if let Some((launch_idx, popup_title)) = pending_popup_for_launch.take() {
-                    // Agent session launch
-                    if app.issues[launch_idx].column == types::Column::Todo {
-                        app.issues[launch_idx].column = types::Column::InProgress;
+                } else if let Some((launch_idx, proj_id, popup_title)) =
+                    pending_popup_for_launch.take()
+                {
+                    if let Some(proj_pos) = app.projects.iter().position(|p| p.id() == proj_id) {
+                        if launch_idx < app.projects[proj_pos].issues.len() {
+                            if app.projects[proj_pos].issues[launch_idx].column
+                                == types::Column::Todo
+                            {
+                                app.projects[proj_pos].issues[launch_idx].column =
+                                    types::Column::InProgress;
+                                app.projects[proj_pos].mark_dirty();
+                            }
+                        }
                     }
                     pending_popup_session = Some((session_name, popup_title));
                 }
@@ -466,30 +755,55 @@ fn run_tui() -> anyhow::Result<()> {
 
         if let Some((session_name, popup_title)) = pending_popup_session.take() {
             // Flush state before yielding terminal to tmux popup (could last a long time)
-            let _ = config::save_state(&app.to_state(), &app.config.project_root);
-            app.state_dirty = false;
+            let _ = config::save_state(
+                &app.project().to_state(),
+                &app.project().config.project_root,
+            );
+            app.project_mut().state_dirty = false;
             open_tmux_popup(
                 &mut terminal,
                 &session_name,
                 &popup_title,
-                &app.config.project_name,
+                &app.project().config.project_name,
             )?;
             app.message = None;
             needs_redraw = true;
         }
 
-        while let Ok(poll) = session_rx.try_recv() {
-            needs_redraw = true;
-            app.active_sessions = poll.sessions;
-            app.agent_statuses = poll.agent_statuses;
-            // Update shared sessions set for the port poll worker
-            if let Ok(mut shared) = port_sessions.lock() {
-                *shared = app.active_sessions.clone();
+        // --- Sync swimlane workers ---
+        if let Some(ref sidebar) = app.sidebar {
+            let active_swimlanes: HashSet<ProjectId> = sidebar
+                .swimlanes
+                .iter()
+                .filter(|id| **id != app.focused_project)
+                .cloned()
+                .collect();
+            for id in &active_swimlanes {
+                if !swimlane_workers.contains_key(id) {
+                    if let Some(project) = app.find_project(id) {
+                        swimlane_workers
+                            .insert(id.clone(), spawn_project_workers(project, &shared.shutdown));
+                    }
+                }
             }
+            swimlane_workers.retain(|id, _| active_swimlanes.contains(id));
+        } else {
+            swimlane_workers.clear();
         }
 
-        while let Ok(port_result) = port_rx.try_recv() {
-            app.listening_ports = port_result.ports;
+        while let Ok(poll) = workers.session_rx.try_recv() {
+            needs_redraw = true;
+            let live = &mut app.project_mut().live;
+            live.active_sessions = poll.sessions;
+            live.agent_statuses = poll.agent_statuses;
+        }
+
+        // --- Shared: port data (distributed to all projects) ---
+        while let Ok(port_result) = shared.port_rx.try_recv() {
+            for project in &mut app.projects {
+                project.live.listening_ports = port_result.ports.clone();
+            }
+            needs_redraw = true;
         }
 
         // --- Auto-kill Done sessions past TTL ---
@@ -497,14 +811,15 @@ fn run_tui() -> anyhow::Result<()> {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let cleanup_indices = app.issues_needing_session_cleanup(now);
+        let cleanup_indices = app.project().issues_needing_session_cleanup(now);
         for idx in cleanup_indices {
             needs_redraw = true;
-            let session_name = app.issues[idx].session_name(&app.config.project_name);
-            let status_file = config::agent_status_dir(&app.config.project_root)
+            let session_name =
+                app.project().issues[idx].session_name(&app.project().config.project_name);
+            let status_file = config::agent_status_dir(&app.project().config.project_root)
                 .join(format!("{}.json", session_name));
             let sn = session_name.clone();
-            app.active_sessions.remove(&session_name);
+            app.project_mut().live.active_sessions.remove(&session_name);
             thread::spawn(move || {
                 let _ = external::tmux::kill_session(&sn);
                 let _ = std::fs::remove_file(&status_file);
@@ -513,29 +828,38 @@ fn run_tui() -> anyhow::Result<()> {
         }
 
         let mut git_data_changed = false;
-        while let Ok(git_result) = git_rx.try_recv() {
+        while let Ok(git_result) = workers.git_rx.try_recv() {
             needs_redraw = true;
             git_data_changed = true;
-            app.worktree_statuses = git_result.statuses;
-            app.worktree_branches = git_result.branches;
-            app.git_poll_done = true;
+            let live = &mut app.project_mut().live;
+            live.worktree_statuses = git_result.statuses;
+            live.worktree_branches = git_result.branches;
+            live.git_poll_done = true;
         }
 
         let mut pr_data_changed = false;
-        while let Ok(pr_result) = pr_rx.try_recv() {
+        while let Ok(pr_result) = workers.pr_rx.try_recv() {
             needs_redraw = true;
             pr_data_changed = true;
-            app.pr_statuses = pr_result.prs;
-            app.user_prs = pr_result.user_prs;
+            let live = &mut app.project_mut().live;
+            live.pr_statuses = pr_result.prs;
+            live.user_prs = pr_result.user_prs;
             if pr_result.github_user.is_some() {
-                app.github_user = pr_result.github_user;
+                live.github_user = pr_result.github_user;
             }
 
-            for issue in &mut app.issues {
+            let p = app.project_mut();
+            let pr_titles: Vec<(u32, String)> = p
+                .live
+                .pr_statuses
+                .values()
+                .map(|pr| (pr.number, pr.title.clone()))
+                .collect();
+            for issue in &mut p.issues {
                 if let Some(pr_num) = issue.pr_number {
                     if issue.pr_imported {
-                        if let Some(pr) = app.pr_statuses.values().find(|p| p.number == pr_num) {
-                            issue.title = pr.title.clone();
+                        if let Some((_, title)) = pr_titles.iter().find(|(n, _)| *n == pr_num) {
+                            issue.title = title.clone();
                         }
                     }
                 }
@@ -543,51 +867,146 @@ fn run_tui() -> anyhow::Result<()> {
         }
 
         // --- Auto-import open PRs as issues (only when new PR data arrived) ---
-        if pr_data_changed && app.sync_prs_as_issues() {
-            app.mark_dirty();
+        if pr_data_changed {
+            let (changed, msg) = app.project_mut().sync_prs_as_issues();
+            if let Some(m) = msg {
+                app.set_message(m);
+            }
+            if changed {
+                app.project_mut().mark_dirty();
+            }
         }
 
         // --- Auto-assign worktrees (only when git data changed) ---
         if git_data_changed {
-            let mut worktree_changed = app.auto_assign_worktrees();
-            worktree_changed = app.clear_stale_worktrees() || worktree_changed;
+            let mut worktree_changed = app.project_mut().auto_assign_worktrees();
+            worktree_changed = app.project_mut().clear_stale_worktrees() || worktree_changed;
             if worktree_changed {
-                let _ = git_wake_tx.send(());
-                app.mark_dirty();
+                let _ = workers.git_wake_tx.send(());
+                app.project_mut().mark_dirty();
             }
         }
 
         // --- Update git skip set when issues changed columns or git data arrived ---
-        if git_data_changed || app.state_dirty {
-            if let Ok(mut skip) = git_skip_set.lock() {
-                *skip = app.done_worktree_names();
+        if git_data_changed || app.project().state_dirty {
+            if let Ok(mut skip) = workers.git_skip_set.lock() {
+                *skip = app.project().done_worktree_names();
             }
         }
 
         // --- tuicr: check availability ---
         if let Ok(true) = tuicr_check_rx.try_recv() {
-            app.tuicr_available = true;
-        }
-
-        // --- Linear: check availability then consume poll results ---
-        if let Ok(true) = linear_check_rx.try_recv() {
-            needs_redraw = true;
-            app.linear_available = true;
-            if let Some(wake_rx) = linear_wake_rx.take() {
-                linear_rx = Some(spawn_linear_worker(wake_rx));
+            for p in &mut app.projects {
+                p.tuicr_available = true;
             }
         }
-        if let Some(ref rx) = linear_rx {
+
+        // --- Linear: check availability then consume poll results (shared) ---
+        if let Ok(true) = linear_check_rx.try_recv() {
+            needs_redraw = true;
+            for p in &mut app.projects {
+                p.linear_available = true;
+            }
+            if let Some(wake_rx) = shared.linear_wake_rx.take() {
+                shared.linear_rx = Some(spawn_linear_worker(wake_rx));
+            }
+        }
+        if let Some(ref rx) = shared.linear_rx {
             while let Ok(result) = rx.try_recv() {
                 needs_redraw = true;
-                app.linear_issues = result.issues;
-                for issue in &mut app.issues {
-                    if let Some(ref lid) = issue.linear_id {
-                        if issue.linear_imported {
-                            if let Some(fresh) = app.linear_issues.iter().find(|i| i.id == *lid) {
-                                issue.title = fresh.title.clone();
+                for project in &mut app.projects {
+                    project.live.linear_issues = result.issues.clone();
+                    let linear_titles: Vec<(String, String)> = project
+                        .live
+                        .linear_issues
+                        .iter()
+                        .map(|i| (i.id.clone(), i.title.clone()))
+                        .collect();
+                    for issue in &mut project.issues {
+                        if let Some(ref lid) = issue.linear_id {
+                            if issue.linear_imported {
+                                if let Some((_, title)) =
+                                    linear_titles.iter().find(|(id, _)| id == lid)
+                                {
+                                    issue.title = title.clone();
+                                }
                             }
                         }
+                    }
+                }
+            }
+        }
+
+        // --- Drain swimlane workers (per-project: session, git, pr only) ---
+        let sw_ids: Vec<ProjectId> = swimlane_workers.keys().cloned().collect();
+        for proj_id in &sw_ids {
+            let Some(sw) = swimlane_workers.get(proj_id) else {
+                continue;
+            };
+            let Some(proj_pos) = app.projects.iter().position(|p| p.id() == *proj_id) else {
+                continue;
+            };
+            while let Ok(poll) = sw.session_rx.try_recv() {
+                needs_redraw = true;
+                let live = &mut app.projects[proj_pos].live;
+                live.active_sessions = poll.sessions;
+                live.agent_statuses = poll.agent_statuses;
+            }
+            let mut sw_git_changed = false;
+            while let Ok(git_result) = sw.git_rx.try_recv() {
+                needs_redraw = true;
+                sw_git_changed = true;
+                let live = &mut app.projects[proj_pos].live;
+                live.worktree_statuses = git_result.statuses;
+                live.worktree_branches = git_result.branches;
+                live.git_poll_done = true;
+            }
+            if sw_git_changed {
+                let changed = app.projects[proj_pos].auto_assign_worktrees();
+                let stale = app.projects[proj_pos].clear_stale_worktrees();
+                if changed || stale {
+                    app.projects[proj_pos].mark_dirty();
+                }
+                if let Ok(mut skip) = sw.git_skip_set.lock() {
+                    *skip = app.projects[proj_pos].done_worktree_names();
+                }
+            }
+            let mut sw_pr_changed = false;
+            while let Ok(pr_result) = sw.pr_rx.try_recv() {
+                needs_redraw = true;
+                sw_pr_changed = true;
+                let live = &mut app.projects[proj_pos].live;
+                live.pr_statuses = pr_result.prs;
+                live.user_prs = pr_result.user_prs;
+                if pr_result.github_user.is_some() {
+                    live.github_user = pr_result.github_user;
+                }
+            }
+            if sw_pr_changed {
+                let (changed, msg) = app.projects[proj_pos].sync_prs_as_issues();
+                if let Some(m) = msg {
+                    app.set_message(m);
+                }
+                if changed {
+                    app.projects[proj_pos].mark_dirty();
+                }
+            }
+        }
+
+        // Rebuild shared port sessions from all projects' active sessions
+        if let Ok(mut port_sess) = shared.port_sessions.lock() {
+            port_sess.clear();
+            for project in &app.projects {
+                port_sess.extend(project.live.active_sessions.iter().cloned());
+            }
+        }
+
+        if let Some(ref rx) = activity_rx {
+            while let Ok(activity) = rx.try_recv() {
+                if let Some(ref mut sidebar) = app.sidebar {
+                    if sidebar.activity != activity {
+                        sidebar.activity = activity;
+                        needs_redraw = true;
                     }
                 }
             }
@@ -599,9 +1018,11 @@ fn run_tui() -> anyhow::Result<()> {
         }
 
         // --- Flush dirty state to disk (once per tick, not per action) ---
-        if app.state_dirty {
-            let _ = config::save_state(&app.to_state(), &app.config.project_root);
-            app.state_dirty = false;
+        for project in &mut app.projects {
+            if project.state_dirty {
+                let _ = config::save_state(&project.to_state(), &project.config.project_root);
+                project.state_dirty = false;
+            }
         }
 
         if app.clear_expired_message() {
@@ -609,8 +1030,14 @@ fn run_tui() -> anyhow::Result<()> {
         }
     }
 
-    let _ = config::save_state(&app.to_state(), &app.config.project_root);
-    lock::release_lock(&app.config.project_root);
+    shared.shutdown.store(true, Ordering::Relaxed);
+
+    for project in &app.projects {
+        if project.state_dirty {
+            let _ = config::save_state(&project.to_state(), &project.config.project_root);
+        }
+    }
+    lock::release_lock(&lock_root);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, SetTitle(""))?;

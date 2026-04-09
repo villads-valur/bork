@@ -1,16 +1,17 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 
 use crate::types::{ChecksStatus, PrState, PrStatus, ReviewDecision};
 
+#[derive(Clone)]
 struct RepoIdentity {
     owner: String,
     name: String,
 }
 
-static REPO_IDENTITY: OnceLock<Option<RepoIdentity>> = OnceLock::new();
+static REPO_CACHE: Mutex<Option<HashMap<PathBuf, RepoIdentity>>> = Mutex::new(None);
 
 const PR_FIELDS: &str = r#"
     number url title state isDraft headRefName
@@ -26,7 +27,7 @@ const PR_FIELDS: &str = r#"
     }
 "#;
 
-static GITHUB_USER: OnceLock<Option<String>> = OnceLock::new();
+static GITHUB_USER: Mutex<Option<String>> = Mutex::new(None);
 
 fn parse_repo_identity(json_str: &str) -> Option<RepoIdentity> {
     let parsed: serde_json::Value = serde_json::from_str(json_str.trim()).ok()?;
@@ -35,23 +36,39 @@ fn parse_repo_identity(json_str: &str) -> Option<RepoIdentity> {
     Some(RepoIdentity { owner, name })
 }
 
-fn get_repo_identity(main_worktree: &Path) -> Option<&'static RepoIdentity> {
-    REPO_IDENTITY
-        .get_or_init(|| {
-            let output = Command::new("gh")
-                .args(["repo", "view", "--json", "owner,name"])
-                .current_dir(main_worktree)
-                .output()
-                .ok()?;
+fn get_repo_identity(main_worktree: &Path) -> Option<RepoIdentity> {
+    let canonical =
+        std::fs::canonicalize(main_worktree).unwrap_or_else(|_| main_worktree.to_path_buf());
 
-            if !output.status.success() {
-                return None;
+    // Check cache (short lock)
+    {
+        let cache = REPO_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(map) = cache.as_ref() {
+            if let Some(identity) = map.get(&canonical) {
+                return Some(identity.clone());
             }
+        }
+    }
 
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            parse_repo_identity(&stdout)
-        })
-        .as_ref()
+    // Cache miss: fetch without holding the lock
+    let output = Command::new("gh")
+        .args(["repo", "view", "--json", "owner,name"])
+        .current_dir(main_worktree)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let identity = parse_repo_identity(&stdout)?;
+
+    // Re-acquire lock to insert
+    let mut cache = REPO_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let map = cache.get_or_insert_with(HashMap::new);
+    map.insert(canonical, identity.clone());
+    Some(identity)
 }
 
 pub fn fetch_prs(main_worktree: &Path) -> Vec<PrStatus> {
@@ -239,26 +256,28 @@ fn parse_search_response(json_str: &str) -> Vec<PrStatus> {
 }
 
 pub fn fetch_current_user(main_worktree: &Path) -> Option<String> {
-    GITHUB_USER
-        .get_or_init(|| {
-            let output = Command::new("gh")
-                .args(["api", "user", "-q", ".login"])
-                .current_dir(main_worktree)
-                .output()
-                .ok()?;
+    let mut cached = GITHUB_USER.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ref user) = *cached {
+        return Some(user.clone());
+    }
 
-            if !output.status.success() {
-                return None;
-            }
+    let output = Command::new("gh")
+        .args(["api", "user", "-q", ".login"])
+        .current_dir(main_worktree)
+        .output()
+        .ok()?;
 
-            let login = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if login.is_empty() {
-                None
-            } else {
-                Some(login)
-            }
-        })
-        .clone()
+    if !output.status.success() {
+        return None;
+    }
+
+    let login = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if login.is_empty() {
+        return None;
+    }
+
+    *cached = Some(login.clone());
+    Some(login)
 }
 
 pub fn open_pr_in_browser(pr_number: u32, main_worktree: &Path) {

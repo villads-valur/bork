@@ -3,7 +3,9 @@ use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
 
-use crate::app::{App, ConfirmAction, ImportSource, InputMode, LinearPickerContext};
+use crate::app::{
+    ActionContext, App, ConfirmAction, ImportSource, InputMode, LinearPickerContext, ProjectId,
+};
 use crate::config::{self, AppConfig};
 use crate::external::{github, opencode, tmux, tuicr};
 use crate::input::Action;
@@ -34,11 +36,15 @@ pub enum PostAction {
     OpenEditor {
         initial_content: String,
     },
+    SwitchProject {
+        id: ProjectId,
+    },
 }
 
 pub fn handle_action(
     app: &mut App,
     action: Action,
+    ctx: &ActionContext,
     action_tx: &mpsc::Sender<ActionResult>,
     pr_wake_tx: &PrWakeTx,
     linear_wake_tx: &LinearWakeTx,
@@ -46,16 +52,16 @@ pub fn handle_action(
 ) -> PostAction {
     match app.input_mode {
         InputMode::Confirm => {
-            handle_confirm(app, action, action_tx);
+            handle_confirm(app, action, ctx, action_tx);
             PostAction::None
         }
-        InputMode::Dialog => handle_dialog(app, action),
+        InputMode::Dialog => handle_dialog(app, action, ctx),
         InputMode::Search => {
-            handle_search(app, action);
+            handle_search(app, action, ctx);
             PostAction::None
         }
         InputMode::LinearPicker => {
-            handle_linear_picker(app, action, linear_wake_tx, pr_wake_tx);
+            handle_linear_picker(app, action, ctx, linear_wake_tx, pr_wake_tx);
             PostAction::None
         }
         InputMode::Help => {
@@ -66,13 +72,15 @@ pub fn handle_action(
             handle_debug_inspector(app, action);
             PostAction::None
         }
-        InputMode::Normal => handle_normal(app, action, action_tx, pr_wake_tx, git_wake_tx),
+        InputMode::Normal => handle_normal(app, action, ctx, action_tx, pr_wake_tx, git_wake_tx),
+        InputMode::Sidebar => handle_sidebar(app, action),
     }
 }
 
 fn handle_normal(
     app: &mut App,
     action: Action,
+    ctx: &ActionContext,
     action_tx: &mpsc::Sender<ActionResult>,
     pr_wake_tx: &PrWakeTx,
     git_wake_tx: &GitWakeTx,
@@ -84,115 +92,126 @@ fn handle_normal(
         }
 
         Action::MoveUp => {
-            app.move_selection_up();
+            app.context_project_mut(ctx).move_selection_up();
             PostAction::None
         }
         Action::MoveDown => {
-            app.move_selection_down();
+            app.context_project_mut(ctx).move_selection_down();
             PostAction::None
         }
         Action::FocusLeft => {
-            app.focus_left();
+            app.context_project_mut(ctx).focus_left();
             PostAction::None
         }
         Action::FocusRight => {
-            app.focus_right();
+            app.context_project_mut(ctx).focus_right();
             PostAction::None
         }
         Action::JumpColumnLeft => {
-            app.jump_column_left();
+            app.context_project_mut(ctx).jump_column_left();
             PostAction::None
         }
         Action::JumpColumnRight => {
-            app.jump_column_right();
+            app.context_project_mut(ctx).jump_column_right();
             PostAction::None
         }
 
         Action::ScrollToTop => {
-            app.scroll_to_top();
+            app.context_project_mut(ctx).scroll_to_top();
             PostAction::None
         }
         Action::ScrollToBottom => {
-            app.scroll_to_bottom();
+            app.context_project_mut(ctx).scroll_to_bottom();
             PostAction::None
         }
 
         Action::MoveIssueRight => {
-            app.move_issue_right();
-            app.mark_dirty();
+            let p = app.context_project_mut(ctx);
+            p.move_issue_right();
+            p.mark_dirty();
             PostAction::None
         }
         Action::MoveIssueLeft => {
-            app.move_issue_left();
-            app.mark_dirty();
+            let p = app.context_project_mut(ctx);
+            p.move_issue_left();
+            p.mark_dirty();
             PostAction::None
         }
         Action::MoveToDone => {
-            app.move_to_done();
-            app.mark_dirty();
+            let p = app.context_project_mut(ctx);
+            p.move_to_done();
+            p.mark_dirty();
             PostAction::None
         }
         Action::MoveToTodo => {
-            app.move_to_todo();
-            app.mark_dirty();
+            let p = app.context_project_mut(ctx);
+            p.move_to_todo();
+            p.mark_dirty();
             PostAction::None
         }
 
         Action::KillSession => {
-            let Some(issue) = app.selected_issue() else {
+            let Some(issue) = app.context_project(ctx).selected_issue() else {
                 return PostAction::None;
             };
 
-            let session_name = issue.session_name(&app.config.project_name);
-            if !app.is_session_alive(&session_name) {
+            let session_name = issue.session_name(&app.context_project(ctx).config.project_name);
+            if !app.context_project(ctx).is_session_alive(&session_name) {
                 app.set_message("No active session to kill");
                 return PostAction::None;
             }
 
             app.start_confirm(
                 format!("Kill session '{}'? (y/n)", session_name),
-                ConfirmAction::KillSession { session_name },
+                ConfirmAction::KillSession {
+                    session_name,
+                    project_id: ctx.project_id.clone(),
+                },
             );
             PostAction::None
         }
 
         Action::CreateIssue => {
-            app.open_dialog();
+            app.open_dialog(ctx);
             PostAction::None
         }
 
         Action::AddIssue => {
-            let column = Column::from_index(app.selected_column).unwrap_or(Column::Todo);
-            app.open_dialog_in_column(column);
+            let column = Column::from_index(app.context_project(ctx).selected_column)
+                .unwrap_or(Column::Todo);
+            app.open_dialog_in_column(column, ctx);
             PostAction::None
         }
 
         Action::EditIssue => {
-            let Some(idx) = app.selected_issue_index() else {
+            let Some(idx) = app.context_project(ctx).selected_issue_index() else {
                 return PostAction::None;
             };
-            let issue = app.issues[idx].clone();
-            app.open_edit_dialog(&issue, idx);
+            let issue = app.context_project(ctx).issues[idx].clone();
+            app.open_edit_dialog(&issue, idx, ctx);
             PostAction::None
         }
 
         Action::DeleteIssue => {
-            let Some(issue) = app.selected_issue() else {
+            let Some(issue) = app.context_project(ctx).selected_issue() else {
                 return PostAction::None;
             };
-            let Some(idx) = app.selected_issue_index() else {
+            let Some(idx) = app.context_project(ctx).selected_issue_index() else {
                 return PostAction::None;
             };
 
             app.start_confirm(
                 format!("Delete {}: {}? (y/n)", issue.id, issue.title),
-                ConfirmAction::DeleteIssue { issue_index: idx },
+                ConfirmAction::DeleteIssue {
+                    issue_index: idx,
+                    project_id: ctx.project_id.clone(),
+                },
             );
             PostAction::None
         }
 
         Action::OpenLinearPicker => {
-            app.open_import_picker();
+            app.open_import_picker(ctx);
             PostAction::None
         }
 
@@ -201,11 +220,45 @@ fn handle_normal(
             PostAction::None
         }
 
+        Action::ToggleSidebar => {
+            app.reload_projects();
+            if let Some(ref mut sidebar) = app.sidebar {
+                sidebar.visible = true;
+                sidebar.focused = true;
+                sidebar.selected = app
+                    .projects
+                    .iter()
+                    .position(|p| p.id() == app.focused_project)
+                    .unwrap_or(0);
+                app.input_mode = InputMode::Sidebar;
+            }
+            PostAction::None
+        }
+
+        Action::NextSwimlane => {
+            let count = app.visible_swimlane_count();
+            if count > 1 {
+                app.focused_swimlane = (app.focused_swimlane + 1) % count;
+            }
+            PostAction::None
+        }
+        Action::PrevSwimlane => {
+            let count = app.visible_swimlane_count();
+            if count > 1 {
+                if app.focused_swimlane == 0 {
+                    app.focused_swimlane = count - 1;
+                } else {
+                    app.focused_swimlane -= 1;
+                }
+            }
+            PostAction::None
+        }
+
         Action::OpenTerminal => {
-            let session_name = format!("{}-terminal", app.config.project_name);
+            let session_name = format!("{}-terminal", app.context_project(ctx).config.project_name);
             let popup_title = "Terminal".to_string();
 
-            if app.is_session_alive(&session_name) {
+            if app.context_project(ctx).is_session_alive(&session_name) {
                 return PostAction::OpenTmuxPopup {
                     session_name,
                     popup_title,
@@ -215,7 +268,7 @@ fn handle_normal(
             app.busy_count += 1;
             app.set_message("Opening terminal...");
             let tx = action_tx.clone();
-            let project_root = app.config.project_root.clone();
+            let project_root = app.context_project(ctx).config.project_root.clone();
 
             thread::spawn(move || {
                 let result = match tmux::create_session(&session_name, &project_root) {
@@ -239,20 +292,20 @@ fn handle_normal(
         }
 
         Action::OpenSession => {
-            let Some(idx) = app.selected_issue_index() else {
+            let Some(idx) = app.context_project(ctx).selected_issue_index() else {
                 return PostAction::None;
             };
-            let issue = app.issues[idx].clone();
+            let issue = app.context_project(ctx).issues[idx].clone();
 
             if issue.kind == IssueKind::NonAgentic {
-                app.open_edit_dialog(&issue, idx);
+                app.open_edit_dialog(&issue, idx, ctx);
                 return PostAction::None;
             }
 
-            let session_name = issue.session_name(&app.config.project_name);
+            let session_name = issue.session_name(&app.context_project(ctx).config.project_name);
             let popup_title = format!("{}: {}", issue.id, issue.title);
 
-            if app.is_session_alive(&session_name) {
+            if app.context_project(ctx).is_session_alive(&session_name) {
                 return PostAction::OpenTmuxPopup {
                     session_name,
                     popup_title,
@@ -262,7 +315,7 @@ fn handle_normal(
             app.busy_count += 1;
             app.set_message("Launching session...");
 
-            let config = app.config.clone();
+            let config = app.context_project(ctx).config.clone();
             let tx = action_tx.clone();
 
             thread::spawn(move || {
@@ -277,24 +330,24 @@ fn handle_normal(
         }
 
         Action::OpenReview | Action::OpenReviewPR => {
-            if !app.tuicr_available {
+            if !app.context_project(ctx).tuicr_available {
                 return PostAction::None;
             }
-            let Some(issue) = app.selected_issue() else {
+            let Some(issue) = app.context_project(ctx).selected_issue() else {
                 return PostAction::None;
             };
             let Some(wt) = issue.worktree.clone() else {
                 app.set_message("No worktree assigned");
                 return PostAction::None;
             };
-            let session_name = issue.session_name(&app.config.project_name);
-            if !app.is_session_alive(&session_name) {
+            let session_name = issue.session_name(&app.context_project(ctx).config.project_name);
+            if !app.context_project(ctx).is_session_alive(&session_name) {
                 app.set_message("No active session");
                 return PostAction::None;
             }
             let pr_mode = action == Action::OpenReviewPR;
             let popup_title = format!("{}: {}", issue.id, issue.title);
-            let worktree_path = app.config.project_root.join(&wt);
+            let worktree_path = app.context_project(ctx).config.project_root.join(&wt);
             let tx = action_tx.clone();
             app.busy_count += 1;
             app.set_message(if pr_mode {
@@ -331,15 +384,15 @@ fn handle_normal(
         }
 
         Action::OpenPR => {
-            let Some(issue) = app.selected_issue() else {
+            let Some(issue) = app.context_project(ctx).selected_issue() else {
                 return PostAction::None;
             };
-            let Some(pr) = app.pr_for(issue) else {
+            let Some(pr) = app.context_project(ctx).pr_for(issue) else {
                 app.set_message("No PR found for this issue");
                 return PostAction::None;
             };
             let pr_number = pr.number;
-            let main_worktree = app.config.project_root.join("main");
+            let main_worktree = app.context_project(ctx).config.project_root.join("main");
             thread::spawn(move || {
                 github::open_pr_in_browser(pr_number, &main_worktree);
             });
@@ -347,7 +400,7 @@ fn handle_normal(
         }
 
         Action::OpenLinear => {
-            let Some(issue) = app.selected_issue() else {
+            let Some(issue) = app.context_project(ctx).selected_issue() else {
                 return PostAction::None;
             };
             let Some(url) = issue.linear_url.clone() else {
@@ -361,21 +414,21 @@ fn handle_normal(
         }
 
         Action::AssignWorktree => {
-            let Some(idx) = app.selected_issue_index() else {
+            let Some(idx) = app.context_project(ctx).selected_issue_index() else {
                 return PostAction::None;
             };
-            if let Some(old) = app.issues[idx].worktree.take() {
+            if let Some(old) = app.context_project_mut(ctx).issues[idx].worktree.take() {
                 app.set_message(format!("Cleared worktree '{old}', re-detecting..."));
             } else {
                 app.set_message("No worktree assigned, re-detecting...");
             }
-            if app.auto_assign_worktrees() {
-                if let Some(wt) = app.issues[idx].worktree.as_ref() {
+            if app.context_project_mut(ctx).auto_assign_worktrees() {
+                if let Some(wt) = app.context_project(ctx).issues[idx].worktree.as_ref() {
                     app.set_message(format!("Assigned worktree: {wt}"));
                 }
             }
             let _ = git_wake_tx.send(());
-            app.mark_dirty();
+            app.context_project_mut(ctx).mark_dirty();
             PostAction::None
         }
 
@@ -385,26 +438,26 @@ fn handle_normal(
         }
 
         Action::ClearSearch => {
-            app.clear_search();
+            app.clear_search(ctx);
             PostAction::None
         }
 
         Action::DebugReset => {
-            if !app.config.debug {
+            if !app.context_project(ctx).config.debug {
                 return PostAction::None;
             }
-            lock::release_lock(&app.config.project_root);
-            let session_name = app.config.project_name.clone();
+            lock::release_lock(&app.context_project(ctx).config.project_root);
+            let session_name = app.context_project(ctx).config.project_name.clone();
             let _ = tmux::kill_session(&session_name);
             app.should_quit = true;
             PostAction::None
         }
 
         Action::DebugInspect => {
-            if !app.config.debug {
+            if !app.context_project(ctx).config.debug {
                 return PostAction::None;
             }
-            let Some(issue) = app.selected_issue().cloned() else {
+            let Some(issue) = app.context_project(ctx).selected_issue().cloned() else {
                 app.set_message("No issue selected");
                 return PostAction::None;
             };
@@ -417,12 +470,12 @@ fn handle_normal(
     }
 }
 
-fn handle_search(app: &mut App, action: Action) {
+fn handle_search(app: &mut App, action: Action, ctx: &ActionContext) {
     match action {
-        Action::SearchChar(c) => app.search_push_char(c),
-        Action::SearchBackspace => app.search_delete_char(),
+        Action::SearchChar(c) => app.search_push_char(c, ctx),
+        Action::SearchBackspace => app.search_delete_char(ctx),
         Action::SearchConfirm => app.confirm_search(),
-        Action::SearchCancel => app.cancel_search(),
+        Action::SearchCancel => app.cancel_search(ctx),
         _ => {}
     }
 }
@@ -460,7 +513,7 @@ fn handle_debug_inspector(app: &mut App, action: Action) {
     }
 }
 
-fn handle_dialog(app: &mut App, action: Action) -> PostAction {
+fn handle_dialog(app: &mut App, action: Action, ctx: &ActionContext) -> PostAction {
     let on_linear = app.dialog.as_ref().is_some_and(|d| d.is_on_linear_field());
     let on_github = app.dialog.as_ref().is_some_and(|d| d.is_on_github_field());
 
@@ -468,11 +521,11 @@ fn handle_dialog(app: &mut App, action: Action) -> PostAction {
         match action {
             Action::DialogChar(' ') => {
                 app.picker_tab = ImportSource::Linear;
-                app.open_linear_picker_with_context(LinearPickerContext::Attach);
+                app.open_linear_picker_with_context(LinearPickerContext::Attach, ctx);
                 return PostAction::None;
             }
             Action::DialogNextField => {
-                submit_dialog(app);
+                submit_dialog(app, ctx);
                 return PostAction::None;
             }
             Action::DialogBackspace | Action::DialogDelete => {
@@ -491,11 +544,11 @@ fn handle_dialog(app: &mut App, action: Action) -> PostAction {
         match action {
             Action::DialogChar(' ') => {
                 app.picker_tab = ImportSource::GitHub;
-                app.open_import_picker_with_context(LinearPickerContext::Attach);
+                app.open_import_picker_with_context(LinearPickerContext::Attach, ctx);
                 return PostAction::None;
             }
             Action::DialogNextField => {
-                submit_dialog(app);
+                submit_dialog(app, ctx);
                 return PostAction::None;
             }
             Action::DialogBackspace | Action::DialogDelete => {
@@ -512,7 +565,7 @@ fn handle_dialog(app: &mut App, action: Action) -> PostAction {
 
     match action {
         Action::DialogSubmit => {
-            submit_dialog(app);
+            submit_dialog(app, ctx);
             return PostAction::None;
         }
         Action::DialogCancel => {
@@ -560,7 +613,7 @@ fn handle_dialog(app: &mut App, action: Action) -> PostAction {
     PostAction::None
 }
 
-fn submit_dialog(app: &mut App) {
+fn submit_dialog(app: &mut App, ctx: &ActionContext) {
     let dialog = match app.dialog.take() {
         Some(d) => d,
         None => return,
@@ -581,32 +634,37 @@ fn submit_dialog(app: &mut App) {
         Some(prompt_text)
     };
 
+    let proj_id = ctx.project_id.clone();
+
     if let Some(idx) = dialog.editing_index {
-        if idx < app.issues.len() {
-            app.issues[idx].title = title;
-            app.issues[idx].prompt = prompt;
-            app.issues[idx].agent_mode = dialog.agent_mode;
-            app.issues[idx].kind = dialog.kind;
+        let p = app.find_project_mut(&proj_id).unwrap();
+        if idx < p.issues.len() {
+            p.issues[idx].title = title;
+            p.issues[idx].prompt = prompt;
+            p.issues[idx].agent_mode = dialog.agent_mode;
+            p.issues[idx].kind = dialog.kind;
 
-            apply_linear_fields(&mut app.issues[idx], &dialog);
-            apply_pr_fields(&mut app.issues[idx], &dialog);
+            apply_linear_fields(&mut p.issues[idx], &dialog);
+            apply_pr_fields(&mut p.issues[idx], &dialog);
 
-            app.set_message(format!("Updated {}", app.issues[idx].id));
-            app.mark_dirty();
+            let updated_id = p.issues[idx].id.clone();
+            p.mark_dirty();
+            app.set_message(format!("Updated {}", updated_id));
         }
         return;
     }
 
-    let id = app.next_issue_id();
+    let id = app.find_project(&proj_id).unwrap().next_issue_id();
     let column = dialog.target_column.unwrap_or(Column::Todo);
     let column_index = column.index();
+    let agent_kind = app.find_project(&proj_id).unwrap().config.agent_kind;
 
     let mut issue = Issue {
         id: id.clone(),
         title,
         kind: dialog.kind,
         column,
-        agent_kind: app.config.agent_kind,
+        agent_kind,
         agent_mode: dialog.agent_mode,
         prompt,
         worktree: None,
@@ -623,16 +681,16 @@ fn submit_dialog(app: &mut App) {
     apply_linear_fields(&mut issue, &dialog);
     apply_pr_fields(&mut issue, &dialog);
 
-    app.issues.push(issue);
-    app.set_message(format!("Created {}", id));
-
-    app.selected_column = column_index;
-    let count = app.issues_in_column(column).len();
+    let p = app.find_project_mut(&proj_id).unwrap();
+    p.issues.push(issue);
+    p.selected_column = column_index;
+    let count = p.issues_in_column(column).len();
     if count > 0 {
-        app.selected_row[column_index] = count - 1;
+        p.selected_row[column_index] = count - 1;
     }
+    p.mark_dirty();
 
-    app.mark_dirty();
+    app.set_message(format!("Created {}", id));
 }
 
 fn apply_linear_fields(issue: &mut Issue, dialog: &crate::app::DialogState) {
@@ -664,6 +722,7 @@ fn apply_pr_fields(issue: &mut Issue, dialog: &crate::app::DialogState) {
 fn handle_linear_picker(
     app: &mut App,
     action: Action,
+    ctx: &ActionContext,
     linear_wake_tx: &LinearWakeTx,
     pr_wake_tx: &PrWakeTx,
 ) {
@@ -672,8 +731,8 @@ fn handle_linear_picker(
             app.close_linear_picker();
         }
         Action::PickerSwitchTab => {
-            let has_linear = !app.linear_issues.is_empty();
-            let has_github = app.has_github_prs();
+            let has_linear = !app.context_project(ctx).live.linear_issues.is_empty();
+            let has_github = app.context_project(ctx).has_github_prs();
             if has_linear && has_github {
                 app.picker_tab = match app.picker_tab {
                     ImportSource::Linear => ImportSource::GitHub,
@@ -715,10 +774,14 @@ fn handle_linear_picker(
             }
         }
         Action::LinearPickerSelect => match (app.linear_picker_context, app.picker_tab) {
-            (LinearPickerContext::Attach, ImportSource::Linear) => attach_linear_to_dialog(app),
-            (LinearPickerContext::Attach, ImportSource::GitHub) => attach_github_to_dialog(app),
-            (_, ImportSource::Linear) => import_linear_issue(app),
-            (_, ImportSource::GitHub) => import_github_pr(app),
+            (LinearPickerContext::Attach, ImportSource::Linear) => {
+                attach_linear_to_dialog(app, ctx)
+            }
+            (LinearPickerContext::Attach, ImportSource::GitHub) => {
+                attach_github_to_dialog(app, ctx)
+            }
+            (_, ImportSource::Linear) => import_linear_issue(app, ctx),
+            (_, ImportSource::GitHub) => import_github_pr(app, ctx),
         },
         Action::LinearPickerRefresh => match app.picker_tab {
             ImportSource::Linear => {
@@ -734,7 +797,7 @@ fn handle_linear_picker(
     }
 }
 
-fn attach_linear_to_dialog(app: &mut App) {
+fn attach_linear_to_dialog(app: &mut App, ctx: &ActionContext) {
     let filtered = app.filtered_linear_issues();
     let selected_idx = app.linear_picker.as_ref().map(|p| p.selected).unwrap_or(0);
 
@@ -753,7 +816,7 @@ fn attach_linear_to_dialog(app: &mut App) {
     }
 }
 
-fn import_linear_issue(app: &mut App) {
+fn import_linear_issue(app: &mut App, ctx: &ActionContext) {
     let filtered = app.filtered_linear_issues();
     let selected_idx = app.linear_picker.as_ref().map(|p| p.selected).unwrap_or(0);
 
@@ -764,7 +827,15 @@ fn import_linear_issue(app: &mut App) {
 
     let id = linear_issue.identifier.to_lowercase();
 
-    if app.issues.iter().any(|i| i.id == id) {
+    let proj_id = ctx.project_id.clone();
+
+    if app
+        .find_project(&proj_id)
+        .unwrap()
+        .issues
+        .iter()
+        .any(|i| i.id == id)
+    {
         app.set_message(format!(
             "{} is already on the board",
             linear_issue.identifier
@@ -773,12 +844,13 @@ fn import_linear_issue(app: &mut App) {
         return;
     }
 
+    let agent_kind = app.find_project(&proj_id).unwrap().config.agent_kind;
     let issue = Issue {
         id,
         title: linear_issue.title.clone(),
         kind: IssueKind::Agentic,
         column: Column::Todo,
-        agent_kind: app.config.agent_kind,
+        agent_kind,
         agent_mode: crate::types::AgentMode::Plan,
         prompt: None,
         worktree: None,
@@ -792,20 +864,20 @@ fn import_linear_issue(app: &mut App) {
         pr_imported: false,
     };
 
-    app.issues.push(issue);
+    let p = app.find_project_mut(&proj_id).unwrap();
+    p.issues.push(issue);
+    let count = p.issues_in_column(Column::Todo).len();
+    if count > 0 {
+        p.selected_column = 0;
+        p.selected_row[0] = count - 1;
+    }
+    p.mark_dirty();
+
     app.set_message(format!("Imported {}", linear_issue.identifier));
     app.close_linear_picker();
-
-    let count = app.issues_in_column(Column::Todo).len();
-    if count > 0 {
-        app.selected_column = 0;
-        app.selected_row[0] = count - 1;
-    }
-
-    app.mark_dirty();
 }
 
-fn import_github_pr(app: &mut App) {
+fn import_github_pr(app: &mut App, ctx: &ActionContext) {
     let filtered = app.filtered_github_prs();
     let selected_idx = app.linear_picker.as_ref().map(|p| p.selected).unwrap_or(0);
 
@@ -814,19 +886,28 @@ fn import_github_pr(app: &mut App) {
         None => return,
     };
 
-    if app.issues.iter().any(|i| i.pr_number == Some(pr.number)) {
+    let proj_id = ctx.project_id.clone();
+
+    if app
+        .find_project(&proj_id)
+        .unwrap()
+        .issues
+        .iter()
+        .any(|i| i.pr_number == Some(pr.number))
+    {
         app.set_message(format!("PR #{} is already on the board", pr.number));
         app.close_linear_picker();
         return;
     }
 
-    let id = app.next_issue_id();
+    let id = app.find_project(&proj_id).unwrap().next_issue_id();
+    let agent_kind = app.find_project(&proj_id).unwrap().config.agent_kind;
     let issue = Issue {
         id,
         title: pr.title.clone(),
         kind: IssueKind::Agentic,
         column: Column::CodeReview,
-        agent_kind: app.config.agent_kind,
+        agent_kind,
         agent_mode: AgentMode::Plan,
         prompt: None,
         worktree: None,
@@ -840,20 +921,20 @@ fn import_github_pr(app: &mut App) {
         pr_imported: true,
     };
 
-    app.issues.push(issue);
+    let p = app.find_project_mut(&proj_id).unwrap();
+    p.issues.push(issue);
+    let count = p.issues_in_column(Column::CodeReview).len();
+    if count > 0 {
+        p.selected_column = Column::CodeReview.index();
+        p.selected_row[Column::CodeReview.index()] = count - 1;
+    }
+    p.mark_dirty();
+
     app.set_message(format!("Imported PR #{}", pr.number));
     app.close_linear_picker();
-
-    let count = app.issues_in_column(Column::CodeReview).len();
-    if count > 0 {
-        app.selected_column = Column::CodeReview.index();
-        app.selected_row[Column::CodeReview.index()] = count - 1;
-    }
-
-    app.mark_dirty();
 }
 
-fn attach_github_to_dialog(app: &mut App) {
+fn attach_github_to_dialog(app: &mut App, ctx: &ActionContext) {
     let filtered = app.filtered_github_prs();
     let selected_idx = app.linear_picker.as_ref().map(|p| p.selected).unwrap_or(0);
 
@@ -872,16 +953,103 @@ fn attach_github_to_dialog(app: &mut App) {
     }
 }
 
-fn handle_confirm(app: &mut App, action: Action, action_tx: &mpsc::Sender<ActionResult>) {
+fn handle_sidebar(app: &mut App, action: Action) -> PostAction {
+    match action {
+        Action::ToggleSidebar => {
+            if let Some(ref mut sidebar) = app.sidebar {
+                sidebar.focused = false;
+                sidebar.visible = false;
+                app.input_mode = InputMode::Normal;
+            }
+            PostAction::None
+        }
+        Action::SidebarSelect => {
+            if let Some(ref mut sidebar) = app.sidebar {
+                let proj_id = app.projects[sidebar.selected].id();
+                sidebar.swimlanes = vec![proj_id.clone()];
+                sidebar.focused = false;
+                sidebar.visible = false;
+                app.input_mode = InputMode::Normal;
+                app.focused_swimlane = 0;
+
+                if proj_id != app.focused_project {
+                    return PostAction::SwitchProject { id: proj_id };
+                }
+            }
+            PostAction::None
+        }
+        Action::SidebarDown => {
+            if let Some(ref mut sidebar) = app.sidebar {
+                if sidebar.selected + 1 < app.projects.len() {
+                    sidebar.selected += 1;
+                }
+            }
+            PostAction::None
+        }
+        Action::SidebarUp => {
+            if let Some(ref mut sidebar) = app.sidebar {
+                if sidebar.selected > 0 {
+                    sidebar.selected -= 1;
+                }
+            }
+            PostAction::None
+        }
+        Action::SidebarToggleSwimlane => {
+            let lane_count = app.visible_swimlane_count();
+            if let Some(ref mut sidebar) = app.sidebar {
+                let idx = sidebar.selected;
+                let proj_id = app.projects[idx].id();
+                if let Some(pos) = sidebar.swimlanes.iter().position(|id| *id == proj_id) {
+                    if sidebar.swimlanes.len() > 1 {
+                        sidebar.swimlanes.remove(pos);
+                        if proj_id == app.focused_project {
+                            app.focused_project = sidebar.swimlanes[0].clone();
+                        }
+                        if app.focused_swimlane == pos {
+                            app.focused_swimlane = pos.min(sidebar.swimlanes.len() - 1);
+                        } else if app.focused_swimlane > pos {
+                            app.focused_swimlane -= 1;
+                        }
+                    }
+                } else if lane_count < 3 {
+                    sidebar.swimlanes.push(proj_id);
+                } else {
+                    app.set_message("Maximum 3 projects visible");
+                }
+            }
+            PostAction::None
+        }
+        Action::ShowHelp => {
+            app.open_help();
+            PostAction::None
+        }
+        Action::Quit => {
+            app.should_quit = true;
+            PostAction::None
+        }
+        _ => PostAction::None,
+    }
+}
+
+fn handle_confirm(
+    app: &mut App,
+    action: Action,
+    _ctx: &ActionContext,
+    action_tx: &mpsc::Sender<ActionResult>,
+) {
     match action {
         Action::ConfirmYes => {
             if let Some(confirm_action) = app.take_confirm_action() {
                 match confirm_action {
-                    ConfirmAction::KillSession { session_name } => {
+                    ConfirmAction::KillSession {
+                        session_name,
+                        project_id,
+                    } => {
                         app.busy_count += 1;
                         let tx = action_tx.clone();
+                        let project = app.find_project(&project_id).unwrap();
                         let status_file =
-                            agent_status_file(&app.config.project_root, &session_name);
+                            agent_status_file(&project.config.project_root, &session_name);
 
                         thread::spawn(move || {
                             let message = match tmux::kill_session(&session_name) {
@@ -899,15 +1067,19 @@ fn handle_confirm(app: &mut App, action: Action, action_tx: &mpsc::Sender<Action
                             });
                         });
                     }
-                    ConfirmAction::DeleteIssue { issue_index } => {
-                        if issue_index < app.issues.len() {
-                            let issue = &app.issues[issue_index];
-                            let session_name = issue.session_name(&app.config.project_name);
+                    ConfirmAction::DeleteIssue {
+                        issue_index,
+                        project_id,
+                    } => {
+                        let p = app.find_project(&project_id).unwrap();
+                        if issue_index < p.issues.len() {
+                            let issue = &p.issues[issue_index];
+                            let session_name = issue.session_name(&p.config.project_name);
                             let id = issue.id.clone();
                             let status_file =
-                                agent_status_file(&app.config.project_root, &session_name);
+                                agent_status_file(&p.config.project_root, &session_name);
 
-                            if app.is_session_alive(&session_name) {
+                            if p.is_session_alive(&session_name) {
                                 let tx = action_tx.clone();
                                 let sn = session_name.clone();
                                 thread::spawn(move || {
@@ -926,9 +1098,10 @@ fn handle_confirm(app: &mut App, action: Action, action_tx: &mpsc::Sender<Action
                                 app.set_message(format!("Deleted {}", id));
                             }
 
-                            app.issues.remove(issue_index);
-                            app.clamp_all_rows();
-                            app.mark_dirty();
+                            let p = app.find_project_mut(&project_id).unwrap();
+                            p.issues.remove(issue_index);
+                            p.clamp_all_rows();
+                            p.mark_dirty();
                         }
                     }
                 }
@@ -964,7 +1137,7 @@ fn agent_status_file(project_root: &Path, session_name: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::sync::mpsc;
 
     use super::*;
@@ -1029,12 +1202,14 @@ mod tests {
     #[test]
     fn dialog_next_field_does_not_auto_fill_prompt() {
         let mut app = test_app();
-        app.open_dialog();
+        let ctx = app.action_context();
+        app.open_dialog(&ctx);
 
         // Type a title (starts on Title field = 2 for Agentic, no linear)
         handle_action(
             &mut app,
             Action::DialogChar('H'),
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1043,6 +1218,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::DialogChar('i'),
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1053,6 +1229,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::DialogNextField,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1071,12 +1248,14 @@ mod tests {
     #[test]
     fn dialog_next_field_preserves_user_typed_prompt() {
         let mut app = test_app();
-        app.open_dialog();
+        let ctx = app.action_context();
+        app.open_dialog(&ctx);
 
         // Move to prompt field
         handle_action(
             &mut app,
             Action::DialogNextField,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1087,6 +1266,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::DialogChar('g'),
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1095,6 +1275,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::DialogChar('o'),
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1108,7 +1289,8 @@ mod tests {
     #[test]
     fn dialog_next_field_advances_through_all_fields() {
         let mut app = test_app();
-        app.open_dialog();
+        let ctx = app.action_context();
+        app.open_dialog(&ctx);
 
         // Agentic, no linear: Kind(0), Mode(1), Title(2), Prompt(3)
         // Starts on Title (field 2)
@@ -1118,6 +1300,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::DialogNextField,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1129,6 +1312,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::DialogNextField,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1140,12 +1324,14 @@ mod tests {
     #[test]
     fn dialog_prev_field_goes_back() {
         let mut app = test_app();
-        app.open_dialog();
+        let ctx = app.action_context();
+        app.open_dialog(&ctx);
 
         // Starts on Title (field 2). Advance to Prompt (field 3)
         handle_action(
             &mut app,
             Action::DialogNextField,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1157,6 +1343,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::DialogPrevField,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1168,13 +1355,15 @@ mod tests {
     #[test]
     fn dialog_prev_field_wraps_to_last_field() {
         let mut app = test_app();
-        app.open_dialog();
+        let ctx = app.action_context();
+        app.open_dialog(&ctx);
 
         // Agentic, no linear: Kind(0), Mode(1), Title(2), Prompt(3)
         // Starts on Title (field 2). Two Shift+Tabs -> Kind(0)
         handle_action(
             &mut app,
             Action::DialogPrevField,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1184,6 +1373,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::DialogPrevField,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1195,6 +1385,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::DialogPrevField,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1206,12 +1397,14 @@ mod tests {
     #[test]
     fn dialog_space_char_appended_to_prompt() {
         let mut app = test_app();
-        app.open_dialog();
+        let ctx = app.action_context();
+        app.open_dialog(&ctx);
 
         // Move to prompt field
         handle_action(
             &mut app,
             Action::DialogNextField,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1221,6 +1414,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::DialogChar('a'),
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1229,6 +1423,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::DialogChar(' '),
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1237,6 +1432,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::DialogChar('b'),
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1249,12 +1445,14 @@ mod tests {
     #[test]
     fn dialog_cancel_closes_dialog() {
         let mut app = test_app();
-        app.open_dialog();
+        let ctx = app.action_context();
+        app.open_dialog(&ctx);
         assert!(app.dialog.is_some());
 
         handle_action(
             &mut app,
             Action::DialogCancel,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1266,7 +1464,7 @@ mod tests {
     #[test]
     fn open_session_on_non_agentic_opens_edit_dialog() {
         let mut app = test_app();
-        app.issues.push(crate::types::Issue {
+        app.project_mut().issues.push(crate::types::Issue {
             id: "bork-1".to_string(),
             title: "Manual task".to_string(),
             kind: crate::types::IssueKind::NonAgentic,
@@ -1285,9 +1483,11 @@ mod tests {
             pr_imported: false,
         });
 
+        let ctx = app.action_context();
         let post = handle_action(
             &mut app,
             Action::OpenSession,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1306,7 +1506,7 @@ mod tests {
         let mut app = test_app();
 
         // Create an issue first
-        app.issues.push(crate::types::Issue {
+        app.project_mut().issues.push(crate::types::Issue {
             id: "bork-1".to_string(),
             title: "Test".to_string(),
             kind: crate::types::IssueKind::Agentic,
@@ -1326,13 +1526,15 @@ mod tests {
         });
 
         // Open edit dialog
-        let issue = app.issues[0].clone();
-        app.open_edit_dialog(&issue, 0);
+        let ctx = app.action_context();
+        let issue = app.project().issues[0].clone();
+        app.open_edit_dialog(&issue, 0, &ctx);
 
         // Move from title to prompt
         handle_action(
             &mut app,
             Action::DialogNextField,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1371,15 +1573,18 @@ mod tests {
     #[test]
     fn linear_picker_import_creates_issue_in_todo() {
         let mut app = test_app();
-        app.linear_available = true;
-        app.linear_issues = vec![test_linear_issue("uuid-1", "TEST-1", "First issue")];
+        app.project_mut().linear_available = true;
+        app.project_mut().live.linear_issues =
+            vec![test_linear_issue("uuid-1", "TEST-1", "First issue")];
 
-        app.open_linear_picker();
+        let ctx = app.action_context();
+        app.open_linear_picker(&ctx);
         assert_eq!(app.input_mode, crate::app::InputMode::LinearPicker);
 
         handle_action(
             &mut app,
             Action::LinearPickerSelect,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1387,34 +1592,44 @@ mod tests {
         );
 
         assert_eq!(app.input_mode, crate::app::InputMode::Normal);
-        assert_eq!(app.issues.len(), 1);
-        assert_eq!(app.issues[0].id, "test-1");
-        assert_eq!(app.issues[0].title, "First issue");
-        assert_eq!(app.issues[0].column, Column::Todo);
-        assert_eq!(app.issues[0].linear_id, Some("uuid-1".to_string()));
-        assert_eq!(app.issues[0].linear_identifier, Some("TEST-1".to_string()));
+        assert_eq!(app.project().issues.len(), 1);
+        assert_eq!(app.project().issues[0].id, "test-1");
+        assert_eq!(app.project().issues[0].title, "First issue");
+        assert_eq!(app.project().issues[0].column, Column::Todo);
+        assert_eq!(
+            app.project().issues[0].linear_id,
+            Some("uuid-1".to_string())
+        );
+        assert_eq!(
+            app.project().issues[0].linear_identifier,
+            Some("TEST-1".to_string())
+        );
     }
 
     #[test]
     fn linear_picker_import_rejects_duplicate() {
         let mut app = test_app();
-        app.linear_available = true;
-        app.linear_issues = vec![test_linear_issue("uuid-1", "TEST-1", "First issue")];
+        app.project_mut().linear_available = true;
+        app.project_mut().live.linear_issues =
+            vec![test_linear_issue("uuid-1", "TEST-1", "First issue")];
+
+        let ctx = app.action_context();
 
         // Import once
-        app.open_linear_picker();
+        app.open_linear_picker(&ctx);
         handle_action(
             &mut app,
             Action::LinearPickerSelect,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
             &git_wake_tx(),
         );
-        assert_eq!(app.issues.len(), 1);
+        assert_eq!(app.project().issues.len(), 1);
 
         // Try to import again (should show issue but reject the import)
-        app.open_linear_picker();
+        app.open_linear_picker(&ctx);
 
         // The picker should still show the issue (visible but marked as imported)
         let filtered = app.filtered_linear_issues();
@@ -1424,29 +1639,32 @@ mod tests {
         handle_action(
             &mut app,
             Action::LinearPickerSelect,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
             &git_wake_tx(),
         );
-        assert_eq!(app.issues.len(), 1);
+        assert_eq!(app.project().issues.len(), 1);
     }
 
     #[test]
     fn linear_picker_search_filters_issues() {
         let mut app = test_app();
-        app.linear_available = true;
-        app.linear_issues = vec![
+        app.project_mut().linear_available = true;
+        app.project_mut().live.linear_issues = vec![
             test_linear_issue("uuid-1", "TEST-1", "Login page"),
             test_linear_issue("uuid-2", "TEST-2", "Dashboard bug"),
         ];
 
-        app.open_linear_picker();
+        let ctx = app.action_context();
+        app.open_linear_picker(&ctx);
 
         // Type search
         handle_action(
             &mut app,
             Action::LinearPickerChar('l'),
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1455,6 +1673,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::LinearPickerChar('o'),
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1463,6 +1682,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::LinearPickerChar('g'),
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1477,19 +1697,21 @@ mod tests {
     #[test]
     fn linear_picker_navigation() {
         let mut app = test_app();
-        app.linear_available = true;
-        app.linear_issues = vec![
+        app.project_mut().linear_available = true;
+        app.project_mut().live.linear_issues = vec![
             test_linear_issue("uuid-1", "TEST-1", "First"),
             test_linear_issue("uuid-2", "TEST-2", "Second"),
             test_linear_issue("uuid-3", "TEST-3", "Third"),
         ];
 
-        app.open_linear_picker();
+        let ctx = app.action_context();
+        app.open_linear_picker(&ctx);
         assert_eq!(app.linear_picker.as_ref().unwrap().selected, 0);
 
         handle_action(
             &mut app,
             Action::LinearPickerDown,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1500,6 +1722,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::LinearPickerDown,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1511,6 +1734,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::LinearPickerDown,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1521,6 +1745,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::LinearPickerUp,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1532,13 +1757,15 @@ mod tests {
     #[test]
     fn linear_picker_close_restores_normal() {
         let mut app = test_app();
-        app.linear_available = true;
-        app.linear_issues = vec![test_linear_issue("uuid-1", "TEST-1", "First")];
+        app.project_mut().linear_available = true;
+        app.project_mut().live.linear_issues = vec![test_linear_issue("uuid-1", "TEST-1", "First")];
 
-        app.open_linear_picker();
+        let ctx = app.action_context();
+        app.open_linear_picker(&ctx);
         handle_action(
             &mut app,
             Action::LinearPickerClose,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1547,7 +1774,7 @@ mod tests {
 
         assert_eq!(app.input_mode, crate::app::InputMode::Normal);
         assert!(app.linear_picker.is_none());
-        assert_eq!(app.issues.len(), 0);
+        assert_eq!(app.project().issues.len(), 0);
     }
 
     // ================================================================
@@ -1557,9 +1784,9 @@ mod tests {
     #[test]
     fn edit_dialog_with_linear_tabs_through_and_wraps() {
         let mut app = test_app();
-        app.linear_available = true;
+        app.project_mut().linear_available = true;
 
-        app.issues.push(crate::types::Issue {
+        app.project_mut().issues.push(crate::types::Issue {
             id: "bork-1".to_string(),
             title: "Test issue".to_string(),
             kind: crate::types::IssueKind::Agentic,
@@ -1578,8 +1805,9 @@ mod tests {
             pr_imported: false,
         });
 
-        let issue = app.issues[0].clone();
-        app.open_edit_dialog(&issue, 0);
+        let ctx = app.action_context();
+        let issue = app.project().issues[0].clone();
+        app.open_edit_dialog(&issue, 0, &ctx);
 
         // Agentic + linear: Kind(0), Mode(1), Linear(2), Title(3), Prompt(4)
         // Should start on Title (field 3)
@@ -1590,6 +1818,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::DialogNextField,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1601,6 +1830,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::DialogNextField,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1612,11 +1842,11 @@ mod tests {
     #[test]
     fn edit_dialog_with_linear_tab_wraps_without_issues_loaded() {
         let mut app = test_app();
-        app.linear_available = true;
+        app.project_mut().linear_available = true;
         // No linear issues loaded
-        app.linear_issues = vec![];
+        app.project_mut().live.linear_issues = vec![];
 
-        app.issues.push(crate::types::Issue {
+        app.project_mut().issues.push(crate::types::Issue {
             id: "bork-1".to_string(),
             title: "Test issue".to_string(),
             kind: crate::types::IssueKind::Agentic,
@@ -1635,14 +1865,16 @@ mod tests {
             pr_imported: false,
         });
 
-        let issue = app.issues[0].clone();
-        app.open_edit_dialog(&issue, 0);
+        let ctx = app.action_context();
+        let issue = app.project().issues[0].clone();
+        app.open_edit_dialog(&issue, 0, &ctx);
 
         // Agentic + linear: Kind(0), Mode(1), Linear(2), Title(3), Prompt(4)
         // Starts on Title(3). Tab to Prompt(4), then tab wraps.
         handle_action(
             &mut app,
             Action::DialogNextField,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1654,6 +1886,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::DialogNextField,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1665,9 +1898,9 @@ mod tests {
     #[test]
     fn edit_dialog_with_linear_shift_enter_submits_from_any_field() {
         let mut app = test_app();
-        app.linear_available = true;
+        app.project_mut().linear_available = true;
 
-        app.issues.push(crate::types::Issue {
+        app.project_mut().issues.push(crate::types::Issue {
             id: "bork-1".to_string(),
             title: "Test issue".to_string(),
             kind: crate::types::IssueKind::Agentic,
@@ -1686,8 +1919,9 @@ mod tests {
             pr_imported: false,
         });
 
-        let issue = app.issues[0].clone();
-        app.open_edit_dialog(&issue, 0);
+        let ctx = app.action_context();
+        let issue = app.project().issues[0].clone();
+        app.open_edit_dialog(&issue, 0, &ctx);
 
         // Starts on Title(3). Shift+Enter should submit from any field.
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 3);
@@ -1695,6 +1929,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::DialogSubmit,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1710,16 +1945,24 @@ mod tests {
 
     fn app_with_issues() -> App {
         let mut app = test_app();
-        app.issues.push(test_issue("bork-1", Column::Todo));
-        app.issues.push(test_issue("bork-2", Column::Todo));
-        app.issues.push(test_issue("bork-3", Column::InProgress));
+        app.project_mut()
+            .issues
+            .push(test_issue("bork-1", Column::Todo));
+        app.project_mut()
+            .issues
+            .push(test_issue("bork-2", Column::Todo));
+        app.project_mut()
+            .issues
+            .push(test_issue("bork-3", Column::InProgress));
         app
     }
 
     fn act(app: &mut App, action: Action) -> PostAction {
+        let ctx = app.action_context();
         handle_action(
             app,
             action,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1730,64 +1973,64 @@ mod tests {
     #[test]
     fn move_down_increments_row() {
         let mut app = app_with_issues();
-        assert_eq!(app.selected_row[0], 0);
+        assert_eq!(app.project().selected_row[0], 0);
         act(&mut app, Action::MoveDown);
-        assert_eq!(app.selected_row[0], 1);
+        assert_eq!(app.project().selected_row[0], 1);
     }
 
     #[test]
     fn move_up_decrements_row() {
         let mut app = app_with_issues();
-        app.selected_row[0] = 1;
+        app.project_mut().selected_row[0] = 1;
         act(&mut app, Action::MoveUp);
-        assert_eq!(app.selected_row[0], 0);
+        assert_eq!(app.project().selected_row[0], 0);
     }
 
     #[test]
     fn focus_right_moves_down_then_next_column() {
         let mut app = app_with_issues();
-        assert_eq!(app.selected_column, 0);
-        assert_eq!(app.selected_row[0], 0);
+        assert_eq!(app.project().selected_column, 0);
+        assert_eq!(app.project().selected_row[0], 0);
         // 2 issues in Todo: first FocusRight moves to row 1
         act(&mut app, Action::FocusRight);
-        assert_eq!(app.selected_column, 0);
-        assert_eq!(app.selected_row[0], 1);
+        assert_eq!(app.project().selected_column, 0);
+        assert_eq!(app.project().selected_row[0], 1);
         // At bottom of Todo: next FocusRight jumps to InProgress
         act(&mut app, Action::FocusRight);
-        assert_eq!(app.selected_column, 1);
+        assert_eq!(app.project().selected_column, 1);
     }
 
     #[test]
     fn focus_left_moves_up_then_prev_column() {
         let mut app = app_with_issues();
-        app.selected_column = 1;
+        app.project_mut().selected_column = 1;
         // InProgress has 1 issue at row 0, so FocusLeft jumps to Todo
         act(&mut app, Action::FocusLeft);
-        assert_eq!(app.selected_column, 0);
+        assert_eq!(app.project().selected_column, 0);
     }
 
     #[test]
     fn jump_column_right() {
         let mut app = app_with_issues();
-        assert_eq!(app.selected_column, 0);
+        assert_eq!(app.project().selected_column, 0);
         act(&mut app, Action::JumpColumnRight);
         // Should jump to InProgress (next column with issues)
-        assert_eq!(app.selected_column, 1);
+        assert_eq!(app.project().selected_column, 1);
     }
 
     #[test]
     fn scroll_to_top() {
         let mut app = app_with_issues();
-        app.selected_row[0] = 1;
+        app.project_mut().selected_row[0] = 1;
         act(&mut app, Action::ScrollToTop);
-        assert_eq!(app.selected_row[0], 0);
+        assert_eq!(app.project().selected_row[0], 0);
     }
 
     #[test]
     fn scroll_to_bottom() {
         let mut app = app_with_issues();
         act(&mut app, Action::ScrollToBottom);
-        assert_eq!(app.selected_row[0], 1); // 2 issues in Todo, last index is 1
+        assert_eq!(app.project().selected_row[0], 1); // 2 issues in Todo, last index is 1
     }
 
     // ================================================================
@@ -1797,38 +2040,38 @@ mod tests {
     #[test]
     fn move_issue_right_changes_column() {
         let mut app = app_with_issues();
-        assert_eq!(app.issues[0].column, Column::Todo);
+        assert_eq!(app.project().issues[0].column, Column::Todo);
         act(&mut app, Action::MoveIssueRight);
-        assert_eq!(app.issues[0].column, Column::InProgress);
-        assert!(app.state_dirty);
+        assert_eq!(app.project().issues[0].column, Column::InProgress);
+        assert!(app.project().state_dirty);
     }
 
     #[test]
     fn move_issue_left_changes_column() {
         let mut app = app_with_issues();
-        app.selected_column = 1;
-        assert_eq!(app.issues[2].column, Column::InProgress);
+        app.project_mut().selected_column = 1;
+        assert_eq!(app.project().issues[2].column, Column::InProgress);
         act(&mut app, Action::MoveIssueLeft);
-        assert_eq!(app.issues[2].column, Column::Todo);
-        assert!(app.state_dirty);
+        assert_eq!(app.project().issues[2].column, Column::Todo);
+        assert!(app.project().state_dirty);
     }
 
     #[test]
     fn move_to_done() {
         let mut app = app_with_issues();
         act(&mut app, Action::MoveToDone);
-        assert_eq!(app.issues[0].column, Column::Done);
-        assert!(app.issues[0].done_at.is_some());
-        assert!(app.state_dirty);
+        assert_eq!(app.project().issues[0].column, Column::Done);
+        assert!(app.project().issues[0].done_at.is_some());
+        assert!(app.project().state_dirty);
     }
 
     #[test]
     fn move_to_todo() {
         let mut app = app_with_issues();
-        app.selected_column = 1;
+        app.project_mut().selected_column = 1;
         act(&mut app, Action::MoveToTodo);
-        assert_eq!(app.issues[2].column, Column::Todo);
-        assert!(app.state_dirty);
+        assert_eq!(app.project().issues[2].column, Column::Todo);
+        assert!(app.project().state_dirty);
     }
 
     // ================================================================
@@ -1869,9 +2112,9 @@ mod tests {
         act(&mut app, Action::ConfirmYes);
         assert_eq!(app.input_mode, InputMode::Normal);
         // bork-1 was deleted (no active session so synchronous)
-        assert_eq!(app.issues.len(), 2);
-        assert_eq!(app.issues[0].id, "bork-2");
-        assert!(app.state_dirty);
+        assert_eq!(app.project().issues.len(), 2);
+        assert_eq!(app.project().issues[0].id, "bork-2");
+        assert!(app.project().state_dirty);
     }
 
     #[test]
@@ -1880,7 +2123,7 @@ mod tests {
         act(&mut app, Action::DeleteIssue);
         act(&mut app, Action::ConfirmNo);
         assert_eq!(app.input_mode, InputMode::Normal);
-        assert_eq!(app.issues.len(), 3);
+        assert_eq!(app.project().issues.len(), 3);
     }
 
     // ================================================================
@@ -1927,7 +2170,7 @@ mod tests {
     #[test]
     fn add_issue_opens_dialog_for_current_column() {
         let mut app = app_with_issues();
-        app.selected_column = 1; // InProgress
+        app.project_mut().selected_column = 1; // InProgress
         act(&mut app, Action::AddIssue);
         assert_eq!(app.input_mode, InputMode::Dialog);
         let dialog = app.dialog.as_ref().unwrap();
@@ -1952,7 +2195,7 @@ mod tests {
         act(&mut app, Action::SearchStart);
         act(&mut app, Action::SearchChar('a'));
         act(&mut app, Action::SearchChar('b'));
-        assert_eq!(app.search_query, "ab");
+        assert_eq!(app.project().search_query, "ab");
     }
 
     #[test]
@@ -1962,7 +2205,7 @@ mod tests {
         act(&mut app, Action::SearchChar('a'));
         act(&mut app, Action::SearchChar('b'));
         act(&mut app, Action::SearchBackspace);
-        assert_eq!(app.search_query, "a");
+        assert_eq!(app.project().search_query, "a");
     }
 
     #[test]
@@ -1972,7 +2215,7 @@ mod tests {
         act(&mut app, Action::SearchChar('x'));
         act(&mut app, Action::SearchConfirm);
         assert_eq!(app.input_mode, InputMode::Normal);
-        assert_eq!(app.search_query, "x"); // query preserved
+        assert_eq!(app.project().search_query, "x"); // query preserved
     }
 
     #[test]
@@ -1982,7 +2225,7 @@ mod tests {
         act(&mut app, Action::SearchChar('x'));
         act(&mut app, Action::SearchCancel);
         assert_eq!(app.input_mode, InputMode::Normal);
-        assert_eq!(app.search_query, ""); // query cleared
+        assert_eq!(app.project().search_query, ""); // query cleared
     }
 
     // ================================================================
@@ -2001,8 +2244,332 @@ mod tests {
     #[test]
     fn kill_session_with_active_session_opens_confirm() {
         let mut app = app_with_issues();
-        app.active_sessions.insert("bork-bork-1".to_string());
+        app.project_mut()
+            .live
+            .active_sessions
+            .insert("bork-bork-1".to_string());
         act(&mut app, Action::KillSession);
         assert_eq!(app.input_mode, InputMode::Confirm);
+    }
+
+    // --- Multi-project / sidebar tests ---
+
+    fn test_config_named(name: &str) -> AppConfig {
+        AppConfig {
+            project_name: name.to_string(),
+            project_root: PathBuf::from(format!("/tmp/test-{}", name)),
+            agent_kind: crate::types::AgentKind::OpenCode,
+            default_prompt: None,
+            done_session_ttl: DEFAULT_DONE_SESSION_TTL,
+            debug: false,
+        }
+    }
+
+    fn test_multi_app() -> App {
+        let mut app = App::new(
+            test_config_named("alpha"),
+            crate::config::AppState {
+                issues: vec![test_issue("alpha-1", Column::Todo)],
+            },
+        );
+        app.add_background_project(
+            test_config_named("beta"),
+            crate::config::AppState {
+                issues: vec![test_issue("beta-1", Column::InProgress)],
+            },
+        );
+        app.add_background_project(
+            test_config_named("gamma"),
+            crate::config::AppState {
+                issues: vec![test_issue("gamma-1", Column::Todo)],
+            },
+        );
+        app.enable_sidebar();
+        app
+    }
+
+    #[test]
+    fn sidebar_toggle_opens_and_closes() {
+        let mut app = test_multi_app();
+        assert_eq!(app.input_mode, InputMode::Normal);
+
+        let post = handle_sidebar(&mut app, Action::ToggleSidebar);
+        assert!(matches!(post, PostAction::None));
+    }
+
+    #[test]
+    fn sidebar_navigation_bounds() {
+        let mut app = test_multi_app();
+        app.sidebar.as_mut().unwrap().focused = true;
+        app.input_mode = InputMode::Sidebar;
+
+        handle_sidebar(&mut app, Action::SidebarUp);
+        assert_eq!(app.sidebar.as_ref().unwrap().selected, 0);
+
+        handle_sidebar(&mut app, Action::SidebarDown);
+        assert_eq!(app.sidebar.as_ref().unwrap().selected, 1);
+
+        handle_sidebar(&mut app, Action::SidebarDown);
+        assert_eq!(app.sidebar.as_ref().unwrap().selected, 2);
+
+        handle_sidebar(&mut app, Action::SidebarDown);
+        assert_eq!(app.sidebar.as_ref().unwrap().selected, 2);
+    }
+
+    #[test]
+    fn sidebar_select_returns_switch_project() {
+        let mut app = test_multi_app();
+        app.sidebar.as_mut().unwrap().selected = 1;
+
+        let post = handle_sidebar(&mut app, Action::SidebarSelect);
+        assert!(matches!(post, PostAction::SwitchProject { .. }));
+        if let PostAction::SwitchProject { id } = &post {
+            assert_eq!(*id, app.projects[1].id());
+        }
+        assert_eq!(
+            app.sidebar.as_ref().unwrap().swimlanes,
+            vec![app.projects[1].id()]
+        );
+    }
+
+    #[test]
+    fn sidebar_select_same_project_no_switch() {
+        let mut app = test_multi_app();
+        app.sidebar.as_mut().unwrap().selected = 0;
+
+        let post = handle_sidebar(&mut app, Action::SidebarSelect);
+        assert!(matches!(post, PostAction::None));
+    }
+
+    #[test]
+    fn sidebar_toggle_swimlane_add_remove() {
+        let mut app = test_multi_app();
+        let beta_id = app.projects[1].id();
+        app.sidebar.as_mut().unwrap().selected = 1;
+
+        handle_sidebar(&mut app, Action::SidebarToggleSwimlane);
+        assert!(app.sidebar.as_ref().unwrap().swimlanes.contains(&beta_id));
+
+        app.sidebar.as_mut().unwrap().selected = 1;
+        handle_sidebar(&mut app, Action::SidebarToggleSwimlane);
+        assert!(!app.sidebar.as_ref().unwrap().swimlanes.contains(&beta_id));
+    }
+
+    #[test]
+    fn sidebar_toggle_swimlane_max_three() {
+        let mut app = test_multi_app();
+        app.sidebar.as_mut().unwrap().swimlanes = vec![
+            app.projects[0].id(),
+            app.projects[1].id(),
+            app.projects[2].id(),
+        ];
+
+        app.add_background_project(
+            test_config_named("delta"),
+            crate::config::AppState { issues: vec![] },
+        );
+
+        app.sidebar.as_mut().unwrap().selected = 3;
+        handle_sidebar(&mut app, Action::SidebarToggleSwimlane);
+        assert_eq!(app.sidebar.as_ref().unwrap().swimlanes.len(), 3);
+        assert!(app.message.is_some());
+    }
+
+    #[test]
+    fn sidebar_toggle_swimlane_cant_remove_last() {
+        let mut app = test_multi_app();
+        let alpha_id = app.projects[0].id();
+        app.sidebar.as_mut().unwrap().swimlanes = vec![alpha_id.clone()];
+        app.sidebar.as_mut().unwrap().selected = 0;
+
+        handle_sidebar(&mut app, Action::SidebarToggleSwimlane);
+        assert_eq!(app.sidebar.as_ref().unwrap().swimlanes, vec![alpha_id]);
+    }
+
+    #[test]
+    fn next_prev_swimlane_wraps() {
+        let mut app = test_multi_app();
+        app.sidebar.as_mut().unwrap().swimlanes = vec![
+            app.projects[0].id(),
+            app.projects[1].id(),
+            app.projects[2].id(),
+        ];
+        app.focused_swimlane = 0;
+
+        act(&mut app, Action::NextSwimlane);
+        assert_eq!(app.focused_swimlane, 1);
+
+        act(&mut app, Action::NextSwimlane);
+        assert_eq!(app.focused_swimlane, 2);
+
+        act(&mut app, Action::NextSwimlane);
+        assert_eq!(app.focused_swimlane, 0);
+
+        act(&mut app, Action::PrevSwimlane);
+        assert_eq!(app.focused_swimlane, 2);
+    }
+
+    #[test]
+    fn next_swimlane_noop_single() {
+        let mut app = test_multi_app();
+        app.focused_swimlane = 0;
+
+        act(&mut app, Action::NextSwimlane);
+        assert_eq!(app.focused_swimlane, 0);
+    }
+
+    // --- High-impact multi-project tests ---
+
+    #[test]
+    fn create_issue_on_swimlane_goes_to_correct_project() {
+        let mut app = test_multi_app();
+        let alpha_id = app.projects[0].id();
+        let beta_id = app.projects[1].id();
+        app.sidebar.as_mut().unwrap().swimlanes = vec![alpha_id, beta_id];
+        app.focused_swimlane = 1; // focus beta
+
+        let ctx = app.action_context();
+        assert_eq!(ctx.project_id, app.projects[1].id());
+
+        // Open dialog on beta
+        app.open_dialog(&ctx);
+        assert_eq!(app.input_mode, InputMode::Dialog);
+
+        if let Some(ref mut dialog) = app.dialog {
+            dialog.title = "Beta issue".to_string();
+        }
+
+        submit_dialog(&mut app, &ctx);
+
+        // Verify issue is in beta (projects[1]), not alpha (projects[0])
+        assert_eq!(
+            app.projects[0].issues.len(),
+            1,
+            "alpha should still have 1 issue"
+        );
+        assert_eq!(
+            app.projects[1].issues.len(),
+            2,
+            "beta should now have 2 issues"
+        );
+        assert!(
+            app.projects[1]
+                .issues
+                .last()
+                .unwrap()
+                .id
+                .starts_with("beta-"),
+            "new issue should have beta prefix"
+        );
+    }
+
+    #[test]
+    fn delete_on_swimlane_deletes_from_correct_project() {
+        let mut app = test_multi_app();
+        let alpha_id = app.projects[0].id();
+        let beta_id = app.projects[1].id();
+        app.sidebar.as_mut().unwrap().swimlanes = vec![alpha_id.clone(), beta_id.clone()];
+        app.focused_swimlane = 1; // focus beta
+
+        let ctx = app.action_context();
+        // Select first issue in beta
+        app.context_project_mut(&ctx).selected_column = 1; // InProgress
+        app.context_project_mut(&ctx).selected_row[1] = 0;
+
+        act(&mut app, Action::DeleteIssue);
+        assert_eq!(app.input_mode, InputMode::Confirm);
+
+        // Verify ConfirmAction has beta's project_id
+        match app.pending_confirm.as_ref().unwrap() {
+            ConfirmAction::DeleteIssue { project_id, .. } => {
+                assert_eq!(*project_id, beta_id);
+            }
+            _ => panic!("expected DeleteIssue"),
+        }
+    }
+
+    #[test]
+    fn enter_collapses_to_single_swimlane() {
+        let mut app = test_multi_app();
+        let alpha_id = app.projects[0].id();
+        let beta_id = app.projects[1].id();
+        let gamma_id = app.projects[2].id();
+        app.sidebar.as_mut().unwrap().swimlanes = vec![alpha_id, beta_id.clone(), gamma_id];
+
+        assert_eq!(app.visible_swimlane_count(), 3);
+
+        // Select beta in sidebar and press Enter
+        app.sidebar.as_mut().unwrap().selected = 1;
+        app.sidebar.as_mut().unwrap().focused = true;
+        app.input_mode = InputMode::Sidebar;
+
+        let post = handle_sidebar(&mut app, Action::SidebarSelect);
+        match post {
+            PostAction::SwitchProject { id } => {
+                assert_eq!(id, beta_id);
+            }
+            _ => panic!("expected SwitchProject"),
+        }
+
+        // Swimlanes should be collapsed to just beta
+        assert_eq!(app.sidebar.as_ref().unwrap().swimlanes, vec![beta_id]);
+        assert_eq!(app.focused_swimlane, 0);
+    }
+
+    #[test]
+    fn remove_middle_swimlane_adjusts_focus() {
+        let mut app = test_multi_app();
+        let alpha_id = app.projects[0].id();
+        let beta_id = app.projects[1].id();
+        let gamma_id = app.projects[2].id();
+        app.sidebar.as_mut().unwrap().swimlanes =
+            vec![alpha_id.clone(), beta_id.clone(), gamma_id.clone()];
+        app.focused_swimlane = 2; // focused on gamma (index 2)
+
+        // Remove beta (index 1) via sidebar
+        app.sidebar.as_mut().unwrap().selected = 1;
+        handle_sidebar(&mut app, Action::SidebarToggleSwimlane);
+
+        // Beta should be gone
+        assert_eq!(app.sidebar.as_ref().unwrap().swimlanes.len(), 2);
+        assert!(!app.sidebar.as_ref().unwrap().swimlanes.contains(&beta_id));
+
+        // focused_swimlane was 2, removed at position 1, so it should shift to 1
+        assert_eq!(app.focused_swimlane, 1);
+
+        // Gamma should still be accessible
+        let lanes = app.visible_swimlanes();
+        assert_eq!(lanes[1], gamma_id);
+    }
+
+    #[test]
+    fn pr_data_stays_per_project() {
+        let mut app = test_multi_app();
+
+        // Simulate PR data arriving for alpha only
+        let pr = crate::types::PrStatus {
+            number: 42,
+            title: "Alpha PR".to_string(),
+            url: "https://github.com/test/alpha/pull/42".to_string(),
+            author: "testuser".to_string(),
+            state: crate::types::PrState::Open,
+            is_draft: false,
+            checks: None,
+            review: None,
+            additions: 10,
+            deletions: 5,
+            head_branch: "feature".to_string(),
+        };
+        app.projects[0]
+            .live
+            .pr_statuses
+            .insert("feature".to_string(), pr);
+
+        // Alpha should have PR data
+        assert_eq!(app.projects[0].live.pr_statuses.len(), 1);
+
+        // Beta and gamma should NOT
+        assert_eq!(app.projects[1].live.pr_statuses.len(), 0);
+        assert_eq!(app.projects[2].live.pr_statuses.len(), 0);
     }
 }

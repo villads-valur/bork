@@ -19,8 +19,8 @@ pub fn render_import_picker(frame: &mut Frame, app: &App) {
         None => return,
     };
 
-    let has_linear = !app.linear_issues.is_empty();
-    let has_github = app.has_github_prs();
+    let has_linear = !app.active_project().live.linear_issues.is_empty();
+    let has_github = app.active_project().has_github_prs();
     let show_tabs = has_linear && has_github;
 
     let area = frame.area();
@@ -201,6 +201,7 @@ fn render_linear_list(
     let count = filtered.len();
 
     let imported_ids: HashSet<&str> = app
+        .project()
         .issues
         .iter()
         .filter_map(|i| i.linear_id.as_deref())
@@ -214,7 +215,7 @@ fn render_linear_list(
 
     if count == 0 {
         let empty_area = Rect::new(inner.x + 1, list_start_y, inner.width - 2, 1);
-        let msg = if app.linear_issues.is_empty() {
+        let msg = if app.active_project().live.linear_issues.is_empty() {
             "No issues loaded"
         } else {
             "No matching issues"
@@ -304,7 +305,12 @@ fn render_github_list(
     let filtered = app.filtered_github_prs();
     let count = filtered.len();
 
-    let imported_pr_numbers: HashSet<u32> = app.issues.iter().filter_map(|i| i.pr_number).collect();
+    let imported_pr_numbers: HashSet<u32> = app
+        .project()
+        .issues
+        .iter()
+        .filter_map(|i| i.pr_number)
+        .collect();
 
     let scroll = if visible_count == 0 || picker.selected < visible_count {
         0
@@ -314,7 +320,7 @@ fn render_github_list(
 
     if count == 0 {
         let empty_area = Rect::new(inner.x + 1, list_start_y, inner.width - 2, 1);
-        let msg = if app.pr_statuses.is_empty() {
+        let msg = if app.active_project().live.pr_statuses.is_empty() {
             "No PRs loaded"
         } else {
             "No matching PRs"

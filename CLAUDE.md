@@ -12,10 +12,14 @@ Terminal kanban board for orchestrating OpenCode/Claude coding sessions across g
 
 ```
 Main Thread (50ms tick event loop)
-├── Session Status Worker (persistent, polls every 2s - tmux sessions + agent status files)
-├── Git Status Worker (persistent, polls every 3s - worktree changes + branches)
-├── PR Status Worker (persistent, polls every 60s - GitHub PRs via gh api graphql)
-├── Linear Worker (persistent, polls every 45s - assigned Linear issues, conditional on `linear` CLI)
+├── Primary ProjectWorkers (for focused project)
+│   ├── Session Status Worker (polls every 2s - tmux sessions + agent status files)
+│   ├── Port Poll Worker (polls every 5s - listening TCP ports)
+│   ├── Git Status Worker (polls every 3s - worktree changes + branches)
+│   ├── PR Status Worker (polls every 60s - GitHub PRs via gh api graphql)
+│   └── Linear Worker (polls every 45s - assigned Linear issues, conditional on `linear` CLI)
+├── Swimlane Workers (one ProjectWorkers set per visible swimlane, excluding focused)
+├── Activity Poller (polls every 5s - agent status dirs for all registered projects)
 └── Action Threads (fire-and-forget per user action)
 ```
 
@@ -27,14 +31,17 @@ KeyEvent → map_key_to_action() → Action → handle_action() → App mutation
 
 All rendering is pure: UI functions take `&App` and produce widgets, never mutate state.
 
+All user-facing actions route through `active_project()` / `active_project_mut()` which returns the project in the currently focused swimlane (not necessarily the primary focused project).
+
 ### File Structure
 
 ```
 src/
-├── main.rs           # Entry point, CLI (clap), event loop, terminal setup
-├── app.rs            # App state struct, navigation logic, worktree detection
+├── main.rs           # Entry point, CLI (clap), event loop, terminal setup, worker management
+├── app.rs            # App/Project/LiveState/SidebarState structs, navigation, worktree detection
 ├── handler.rs        # Action dispatch, state mutations, dialog submit/confirm
 ├── config.rs         # Config/state persistence (atomic writes)
+├── global_config.rs  # Global project registry (~/.config/bork/projects.json)
 ├── types.rs          # Domain types (Issue, Column, AgentKind, IssueKind, PrStatus, etc.)
 ├── error.rs          # Error types
 ├── init.rs           # `bork init` subcommand (clone repo, scaffold .bork/ directory)
@@ -42,26 +49,50 @@ src/
 ├── worktree.rs       # `bork worktree` subcommand (create git worktree, register with state)
 ├── input/
 │   ├── mod.rs
-│   ├── action.rs     # Action enum (~63 variants)
+│   ├── action.rs     # Action enum (~70 variants)
 │   └── keybindings.rs # KeyEvent → Action mapping (vim-style, per input mode)
 ├── external/
 │   ├── mod.rs
 │   ├── tmux.rs       # Tmux session management
 │   ├── opencode.rs   # Agent session launcher (opencode + claude)
 │   ├── git.rs        # Git worktree status polling
-│   ├── github.rs     # GitHub PR polling via gh api graphql
+│   ├── github.rs     # GitHub PR polling via gh api graphql (per-repo identity cache)
 │   ├── linear.rs     # Linear CLI integration (assigned issues via graphql)
 │   └── hooks.rs      # Agent status hooks (install/uninstall for opencode + claude)
 └── ui/
-    ├── mod.rs         # Root render, layout composition
-    ├── board.rs       # 4-column kanban board (To Do, In Progress, Code Review, Done)
-    ├── card.rs        # Issue card widget (status, branch, git changes, PR badges)
+    ├── mod.rs         # Root render, layout composition, swimlane splitting
+    ├── board.rs       # 4-column kanban board with adaptive card sizes
+    ├── card.rs        # Issue card widget (Full/Medium/Compact sizes)
+    ├── sidebar.rs     # Project sidebar with activity markers
     ├── dialog.rs      # New/edit issue dialog overlay
     ├── help.rs        # Help overlay (keybinding reference popup)
     ├── linear_picker.rs # Import picker for Linear issues and GitHub PRs
-    ├── status_bar.rs  # Header + footer
+    ├── status_bar.rs  # Header + footer (swimlane indicator)
     └── styles.rs      # Colors, styles, shared UI utilities (ANSI 16 only)
 ```
+
+## Data Model
+
+```
+App
+├── projects: Vec<Project>          # All registered projects
+├── focused_project: usize          # Primary project (has main workers)
+├── focused_swimlane: usize         # Which swimlane receives keyboard input
+├── sidebar: Option<SidebarState>   # None if single project
+│   └── swimlane_indices: Vec<usize>  # Source of truth for visible swimlanes
+└── (global UI state: input_mode, dialog, picker, message, etc.)
+
+Project
+├── issues: Vec<Issue>              # Persistent (saved to state.json)
+├── config: AppConfig               # From .bork/config.toml
+├── selected_column/row             # Board cursor (per-project)
+├── live: LiveState                 # Ephemeral worker data (sessions, git, PRs, etc.)
+└── state_dirty: bool               # Triggers flush to disk
+```
+
+Key accessors:
+- `app.project()` → primary focused project (has workers)
+- `app.active_project()` → project in the focused swimlane (receives user actions)
 
 ## Project Layout
 
@@ -78,6 +109,11 @@ bork/                           # container (the agent's cwd)
 
 State lives in `.bork/` at the container root. Config is detected by walking up from cwd looking for a `.bork/` directory.
 
+## Global State
+
+- `~/.config/bork/projects.json` — registry of all bork projects (auto-registered, auto-pruned)
+- `~/.config/bork/bork.pid` — flock-based single instance lock
+
 ## Build & Run
 
 ```bash
@@ -88,10 +124,10 @@ The binary is symlinked to `/opt/homebrew/bin/bork`.
 
 ## Conventions
 
-- Vim-style navigation: h/j/k/l
-- State: {project_root}/.bork/state.json (atomic writes)
+- Vim-style navigation: h/j/k/l for column jumping and vertical movement
+- State: {project_root}/.bork/state.json (atomic writes via .tmp.{pid} + rename)
 - Config: {project_root}/.bork/config.toml
 - Issue IDs: {project_name}-{number} (e.g. bork-1, bork-2)
-- Tmux sessions named: {project_name}-{issue-id}
-- Wrapper tmux session named: {project_name}
+- Tmux agent sessions named: {project_name}-{issue-id}
+- Wrapper tmux session: always named "bork" (single global session)
 - Opencode launched at project root with --prompt for issue context

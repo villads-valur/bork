@@ -22,8 +22,13 @@ pub const DEFAULT_PROMPT_FALLBACK: &str = "The source code is in main/. Use `bor
 impl Default for AppConfig {
     fn default() -> Self {
         let project_root = find_project_root();
+        let project_name = project_root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("project")
+            .to_string();
         Self {
-            project_name: "bork".to_string(),
+            project_name,
             project_root,
             agent_kind: AgentKind::OpenCode,
             default_prompt: None,
@@ -41,7 +46,7 @@ pub struct AppState {
 /// Walk up from cwd looking for a `.bork/` directory.
 /// This identifies the project container root.
 /// Falls back to cwd if not found.
-fn find_project_root() -> PathBuf {
+pub fn find_project_root() -> PathBuf {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut dir = cwd.as_path();
 
@@ -81,19 +86,29 @@ fn config_path(project_root: &Path) -> PathBuf {
 
 pub fn load_config() -> AppConfig {
     let project_root = find_project_root();
-    let path = config_path(&project_root);
+    load_config_from(&project_root)
+}
+
+pub fn load_config_from(project_root: &Path) -> AppConfig {
+    let path = config_path(project_root);
 
     if path.exists() {
         if let Ok(contents) = fs::read_to_string(&path) {
             if let Ok(mut config) = toml_parse(&contents) {
-                config.project_root = project_root;
+                config.project_root = project_root.to_path_buf();
                 return config;
             }
         }
     }
 
+    let name = project_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("project")
+        .to_string();
     AppConfig {
-        project_root,
+        project_name: name,
+        project_root: project_root.to_path_buf(),
         ..AppConfig::default()
     }
 }

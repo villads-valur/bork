@@ -4,10 +4,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
+use crate::app::CardSize;
 use crate::types::{AgentStatus, Issue, IssueKind, PrState, PrStatus, WorktreeStatus};
 use crate::ui::styles;
 
 pub const CARD_HEIGHT: u16 = 7;
+pub const CARD_HEIGHT_MEDIUM: u16 = 5;
+pub const CARD_HEIGHT_COMPACT: u16 = 4;
 
 pub struct CardContext<'a> {
     pub issue: &'a Issue,
@@ -21,8 +24,8 @@ pub struct CardContext<'a> {
     pub ports: Option<&'a Vec<u16>>,
 }
 
-pub fn render_card(frame: &mut Frame, ctx: &CardContext, area: Rect) {
-    if area.height < CARD_HEIGHT || area.width < 10 {
+pub fn render_card(frame: &mut Frame, ctx: &CardContext, area: Rect, card_size: CardSize) {
+    if area.width < 10 || area.height < 3 {
         return;
     }
 
@@ -43,6 +46,20 @@ pub fn render_card(frame: &mut Frame, ctx: &CardContext, area: Rect) {
 
     let max_width = inner.width as usize;
 
+    match card_size {
+        CardSize::Full => render_full(frame, ctx, inner, max_width, title_style),
+        CardSize::Medium => render_medium(frame, ctx, inner, max_width, title_style),
+        CardSize::Compact => render_compact(frame, ctx, inner, max_width, title_style),
+    }
+}
+
+fn render_full(
+    frame: &mut Frame,
+    ctx: &CardContext,
+    inner: Rect,
+    max_width: usize,
+    title_style: Style,
+) {
     let title_text = styles::truncate(&ctx.issue.title, max_width);
     let title_line = Line::from(Span::styled(title_text, title_style));
     let status_line = format_status_line(ctx);
@@ -64,6 +81,76 @@ pub fn render_card(frame: &mut Frame, ctx: &CardContext, area: Rect) {
         let bottom_area = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
         frame.render_widget(Paragraph::new(bottom_line), bottom_area);
     }
+}
+
+fn render_medium(
+    frame: &mut Frame,
+    ctx: &CardContext,
+    inner: Rect,
+    max_width: usize,
+    title_style: Style,
+) {
+    let title_text = styles::truncate(&ctx.issue.title, max_width);
+    let title_line = Line::from(Span::styled(title_text, title_style));
+    let status_line = format_status_line(ctx);
+    let pr_line = format_pr_compact(ctx.pr);
+
+    let mut lines = vec![title_line, status_line];
+    if inner.height > 2 {
+        lines.push(pr_line);
+    }
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_compact(
+    frame: &mut Frame,
+    ctx: &CardContext,
+    inner: Rect,
+    max_width: usize,
+    title_style: Style,
+) {
+    let title_text = styles::truncate(&ctx.issue.title, max_width);
+    let title_line = Line::from(Span::styled(title_text, title_style));
+
+    let mut status_spans = Vec::new();
+    if ctx.issue.kind != IssueKind::NonAgentic {
+        let status_color = styles::agent_status_color(&ctx.agent_status);
+        if ctx.session_alive {
+            status_spans.push(Span::styled("▶", styles::session_alive_style()));
+            status_spans.push(Span::raw(" "));
+        }
+        status_spans.push(Span::styled(
+            ctx.agent_status.symbol(),
+            Style::default().fg(status_color),
+        ));
+
+        let git_spans = format_git_status(ctx.git_status);
+        if !git_spans.is_empty() {
+            status_spans.push(Span::raw(" "));
+            status_spans.extend(git_spans);
+        }
+    }
+
+    if let Some(branch) = ctx.branch {
+        if !status_spans.is_empty() {
+            status_spans.push(Span::raw("  "));
+        }
+        status_spans.push(Span::styled("\u{1f33f}", Style::default().fg(Color::Green)));
+        let max_branch = max_width.saturating_sub(12);
+        status_spans.push(Span::styled(
+            styles::truncate(branch, max_branch),
+            styles::dim_style(),
+        ));
+    }
+
+    let status_line = Line::from(status_spans);
+    let mut lines = vec![title_line];
+    if inner.height > 1 {
+        lines.push(status_line);
+    }
+
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn format_status_line(ctx: &CardContext) -> Line<'static> {
@@ -117,7 +204,6 @@ fn format_bottom_line(
         return Line::from("");
     }
 
-    // Left side: Linear identifier
     let mut left_spans: Vec<Span<'static>> = vec![Span::raw("  ")];
     let mut left_width: usize = 2;
 
@@ -127,12 +213,10 @@ fn format_bottom_line(
         left_spans.push(Span::styled(text, Style::default().fg(Color::Blue)));
     }
 
-    // Right side: branch icon + ports
     let mut right_spans: Vec<Span<'static>> = Vec::new();
     let mut right_width: usize = 0;
 
     if has_ports {
-        // 🔌 is 2 cells wide in most terminals
         right_spans.push(Span::styled("\u{1f50c}", Style::default()));
         right_width += 2;
     }
@@ -150,7 +234,6 @@ fn format_bottom_line(
     }
 
     if !right_spans.is_empty() {
-        // Reserve 1 cell padding before the right card border
         let total = left_width + right_width + 1;
         let gap = if total < max_width {
             max_width - total
@@ -246,6 +329,36 @@ fn format_pr_line(pr: Option<&PrStatus>) -> Line<'static> {
             }
 
             Line::from(spans)
+        }
+    }
+}
+
+fn format_pr_compact(pr: Option<&PrStatus>) -> Line<'static> {
+    let Some(pr) = pr else {
+        return Line::from("");
+    };
+
+    let pr_number = Span::styled(format!("  #{}", pr.number), styles::dim_style());
+
+    match &pr.state {
+        PrState::Merged | PrState::Closed => {
+            let (label, color) = styles::pr_state_style(&pr.state);
+            Line::from(vec![
+                pr_number,
+                Span::raw(" "),
+                Span::styled(label, Style::default().fg(color)),
+            ])
+        }
+        PrState::Open => {
+            let (checks_sym, checks_color) = styles::checks_icon(pr.checks);
+            let (review_sym, review_color) = styles::review_icon(pr.review);
+            Line::from(vec![
+                pr_number,
+                Span::raw(" "),
+                Span::styled(checks_sym, Style::default().fg(checks_color)),
+                Span::raw(" "),
+                Span::styled(review_sym, Style::default().fg(review_color)),
+            ])
         }
     }
 }

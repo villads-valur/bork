@@ -8,21 +8,25 @@ use crate::app::{App, InputMode};
 use crate::ui::styles;
 
 pub fn render_header(frame: &mut Frame, app: &App, area: Rect) {
-    let mut title_spans = vec![
-        Span::styled(
-            " BORK ",
-            Style::default()
-                .fg(styles::ACCENT)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("- {} ", app.config.project_name),
+    let has_swimlanes = app.visible_swimlane_count() > 1;
+    let mut title_spans = vec![Span::styled(
+        " BORK ",
+        Style::default()
+            .fg(styles::ACCENT)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if !has_swimlanes {
+        title_spans.push(Span::styled(
+            format!("- {} ", app.active_project().config.project_name),
             Style::default().fg(styles::TEXT),
-        ),
-        Span::styled(concat!("v", env!("CARGO_PKG_VERSION")), styles::dim_style()),
-    ];
+        ));
+    }
+    title_spans.push(Span::styled(
+        concat!("v", env!("CARGO_PKG_VERSION")),
+        styles::dim_style(),
+    ));
 
-    if app.config.debug {
+    if app.active_project().config.debug {
         title_spans.push(Span::styled(
             " [DEBUG]",
             Style::default()
@@ -63,12 +67,30 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     if app.input_mode == InputMode::Search {
         let line = Line::from(vec![
             Span::styled(
-                format!(" /{}", app.search_query),
+                format!(" /{}", app.active_project().search_query),
                 Style::default()
                     .fg(styles::TEXT)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled("\u{2588}", Style::default().fg(styles::ACCENT)),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+
+    // Sidebar mode
+    if app.input_mode == InputMode::Sidebar {
+        let line = Line::from(vec![
+            Span::styled(" j", styles::statusbar_key_style()),
+            Span::styled("/", styles::statusbar_desc_style()),
+            Span::styled("k", styles::statusbar_key_style()),
+            Span::styled(":nav  ", styles::statusbar_desc_style()),
+            Span::styled("Enter", styles::statusbar_key_style()),
+            Span::styled(":switch  ", styles::statusbar_desc_style()),
+            Span::styled("Space", styles::statusbar_key_style()),
+            Span::styled(":swimlane  ", styles::statusbar_desc_style()),
+            Span::styled("Esc", styles::statusbar_key_style()),
+            Span::styled(":close", styles::statusbar_desc_style()),
         ]);
         frame.render_widget(Paragraph::new(line), area);
         return;
@@ -96,7 +118,7 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     if app.has_active_search() {
         let line = Line::from(vec![
             Span::styled(
-                format!(" /{}", app.search_query),
+                format!(" /{}", app.active_project().search_query),
                 Style::default().fg(styles::ACCENT),
             ),
             Span::raw("  "),
@@ -107,7 +129,9 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let bindings: &[(&str, &str)] = &[
+    let swimlane_count = app.visible_swimlane_count();
+
+    let mut bindings: Vec<(&str, &str)> = vec![
         ("h/l", "focus"),
         ("j/k", "nav"),
         ("Enter", "open"),
@@ -117,6 +141,10 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         ("?", "help"),
         ("q", "quit"),
     ];
+
+    if swimlane_count > 1 {
+        bindings.insert(0, ("Tab", "lane"));
+    }
 
     let mut spans = vec![Span::raw(" ")];
     for (i, (key, desc)) in bindings.iter().enumerate() {
@@ -128,6 +156,25 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             format!(":{desc}"),
             styles::statusbar_desc_style(),
         ));
+    }
+
+    if swimlane_count > 1 {
+        let active_name = &app.active_project().config.project_name;
+        let right_text = format!(
+            " {} ({}/{}) ",
+            active_name,
+            app.focused_swimlane + 1,
+            swimlane_count
+        );
+        let left_width: usize = spans.iter().map(|s| s.width()).sum();
+        let gap = (area.width as usize).saturating_sub(left_width + right_text.len());
+        if gap > 0 {
+            spans.push(Span::raw(" ".repeat(gap)));
+            spans.push(Span::styled(
+                right_text,
+                Style::default().fg(styles::ACCENT),
+            ));
+        }
     }
 
     let line = Line::from(spans);
