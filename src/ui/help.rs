@@ -110,8 +110,8 @@ pub fn render_help(frame: &mut Frame, app: &App) {
     }
 
     let area = frame.area();
-    let debug = app.project().config.debug;
-    let tuicr = app.project().tuicr_available;
+    let debug = app.active_project().config.debug;
+    let tuicr = app.active_project().tuicr_available;
     let multi_project = app.sidebar.is_some();
     let width = HELP_WIDTH.min(area.width);
     let height = (content_height(tuicr, debug, multi_project) + 2).min(area.height); // +2 for border
