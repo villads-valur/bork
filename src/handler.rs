@@ -9,13 +9,18 @@ use crate::app::{
 };
 use crate::config::{self, AppConfig};
 use crate::external::{github, opencode, tmux, tuicr};
+use crate::global_config::ReloadResult;
 use crate::input::Action;
 use crate::lock;
 use crate::types::{AgentMode, Column, Issue, IssueKind};
 
-pub type PrWakeTx = mpsc::Sender<()>;
-pub type LinearWakeTx = mpsc::Sender<()>;
-pub type GitWakeTx = mpsc::Sender<()>;
+pub struct ActionChannels<'a> {
+    pub action_tx: &'a mpsc::Sender<ActionResult>,
+    pub pr_wake_tx: &'a mpsc::Sender<()>,
+    pub linear_wake_tx: &'a mpsc::Sender<()>,
+    pub git_wake_tx: &'a mpsc::Sender<()>,
+    pub reload_tx: &'a mpsc::Sender<ReloadResult>,
+}
 
 pub struct ActionResult {
     pub message: String,
@@ -47,14 +52,11 @@ pub fn handle_action(
     app: &mut App,
     action: Action,
     ctx: &ActionContext,
-    action_tx: &mpsc::Sender<ActionResult>,
-    pr_wake_tx: &PrWakeTx,
-    linear_wake_tx: &LinearWakeTx,
-    git_wake_tx: &GitWakeTx,
+    ch: &ActionChannels<'_>,
 ) -> PostAction {
     match app.input_mode {
         InputMode::Confirm => {
-            handle_confirm(app, action, ctx, action_tx);
+            handle_confirm(app, action, ctx, ch.action_tx);
             PostAction::None
         }
         InputMode::Dialog => handle_dialog(app, action, ctx),
@@ -63,7 +65,7 @@ pub fn handle_action(
             PostAction::None
         }
         InputMode::LinearPicker => {
-            handle_linear_picker(app, action, ctx, linear_wake_tx, pr_wake_tx);
+            handle_linear_picker(app, action, ctx, ch.linear_wake_tx, ch.pr_wake_tx);
             PostAction::None
         }
         InputMode::Help => {
@@ -74,7 +76,7 @@ pub fn handle_action(
             handle_debug_inspector(app, action);
             PostAction::None
         }
-        InputMode::Normal => handle_normal(app, action, ctx, action_tx, pr_wake_tx, git_wake_tx),
+        InputMode::Normal => handle_normal(app, action, ctx, ch),
         InputMode::Sidebar => handle_sidebar(app, action),
     }
 }
@@ -83,9 +85,7 @@ fn handle_normal(
     app: &mut App,
     action: Action,
     ctx: &ActionContext,
-    action_tx: &mpsc::Sender<ActionResult>,
-    pr_wake_tx: &PrWakeTx,
-    git_wake_tx: &GitWakeTx,
+    ch: &ActionChannels<'_>,
 ) -> PostAction {
     match action {
         Action::Quit => {
@@ -223,7 +223,6 @@ fn handle_normal(
         }
 
         Action::ToggleSidebar => {
-            app.reload_projects();
             if let Some(ref mut sidebar) = app.sidebar {
                 sidebar.visible = true;
                 sidebar.focused = true;
@@ -234,6 +233,12 @@ fn handle_normal(
                     .unwrap_or(0);
                 app.input_mode = InputMode::Sidebar;
             }
+            let known = app.known_project_roots();
+            let tx = ch.reload_tx.clone();
+            thread::spawn(move || {
+                let result = crate::global_config::discover_new_projects(known);
+                let _ = tx.send(result);
+            });
             PostAction::None
         }
 
@@ -269,7 +274,7 @@ fn handle_normal(
 
             app.busy_count += 1;
             app.set_message("Opening terminal...");
-            let tx = action_tx.clone();
+            let tx = ch.action_tx.clone();
             let project_root = app.context_project(ctx).config.project_root.clone();
 
             thread::spawn(move || {
@@ -320,7 +325,7 @@ fn handle_normal(
             app.set_message("Launching session...");
 
             let config = app.context_project(ctx).config.clone();
-            let tx = action_tx.clone();
+            let tx = ch.action_tx.clone();
 
             thread::spawn(move || {
                 let result = launch_and_report(issue, config);
@@ -352,7 +357,7 @@ fn handle_normal(
             let pr_mode = action == Action::OpenReviewPR;
             let popup_title = format!("{}: {}", issue.id, issue.title);
             let worktree_path = app.context_project(ctx).config.project_root.join(&wt);
-            let tx = action_tx.clone();
+            let tx = ch.action_tx.clone();
             app.busy_count += 1;
             app.set_message(if pr_mode {
                 "Opening tuicr --pr..."
@@ -384,7 +389,7 @@ fn handle_normal(
         }
 
         Action::SyncPRs => {
-            let _ = pr_wake_tx.send(());
+            let _ = ch.pr_wake_tx.send(());
             app.set_message("Syncing PRs...");
             PostAction::None
         }
@@ -433,7 +438,7 @@ fn handle_normal(
                     app.set_message(format!("Assigned worktree: {wt}"));
                 }
             }
-            let _ = git_wake_tx.send(());
+            let _ = ch.git_wake_tx.send(());
             app.context_project_mut(ctx).mark_dirty();
             PostAction::None
         }
@@ -729,8 +734,8 @@ fn handle_linear_picker(
     app: &mut App,
     action: Action,
     ctx: &ActionContext,
-    linear_wake_tx: &LinearWakeTx,
-    pr_wake_tx: &PrWakeTx,
+    linear_wake_tx: &mpsc::Sender<()>,
+    pr_wake_tx: &mpsc::Sender<()>,
 ) {
     match action {
         Action::LinearPickerClose => {
@@ -1161,18 +1166,6 @@ mod tests {
     use crate::input::Action;
     use crate::types::Column;
 
-    fn pr_wake_tx() -> mpsc::Sender<()> {
-        mpsc::channel().0
-    }
-
-    fn linear_wake_tx() -> mpsc::Sender<()> {
-        mpsc::channel().0
-    }
-
-    fn git_wake_tx() -> mpsc::Sender<()> {
-        mpsc::channel().0
-    }
-
     fn test_config() -> AppConfig {
         AppConfig {
             project_name: "bork".to_string(),
@@ -1221,35 +1214,11 @@ mod tests {
         app.open_dialog(&ctx);
 
         // Type a title (starts on Title field = 2 for Agentic, no linear)
-        handle_action(
-            &mut app,
-            Action::DialogChar('H'),
-            &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
-        );
-        handle_action(
-            &mut app,
-            Action::DialogChar('i'),
-            &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
-        );
+        handle_action(&mut app, Action::DialogChar('H'), &ctx, &test_channels());
+        handle_action(&mut app, Action::DialogChar('i'), &ctx, &test_channels());
 
         // Move from title (field 2) to prompt (field 3)
-        handle_action(
-            &mut app,
-            Action::DialogNextField,
-            &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
-        );
+        handle_action(&mut app, Action::DialogNextField, &ctx, &test_channels());
 
         let dialog = app.dialog.as_ref().unwrap();
         assert_eq!(dialog.focused_field, 3);
@@ -1267,35 +1236,11 @@ mod tests {
         app.open_dialog(&ctx);
 
         // Move to prompt field
-        handle_action(
-            &mut app,
-            Action::DialogNextField,
-            &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
-        );
+        handle_action(&mut app, Action::DialogNextField, &ctx, &test_channels());
 
         // Type something in the prompt
-        handle_action(
-            &mut app,
-            Action::DialogChar('g'),
-            &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
-        );
-        handle_action(
-            &mut app,
-            Action::DialogChar('o'),
-            &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
-        );
+        handle_action(&mut app, Action::DialogChar('g'), &ctx, &test_channels());
+        handle_action(&mut app, Action::DialogChar('o'), &ctx, &test_channels());
 
         let dialog = app.dialog.as_ref().unwrap();
         assert_eq!(dialog.prompt_text(), "go");
@@ -1312,27 +1257,11 @@ mod tests {
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 2);
 
         // Tab: Title(2) -> Prompt(3)
-        handle_action(
-            &mut app,
-            Action::DialogNextField,
-            &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
-        );
+        handle_action(&mut app, Action::DialogNextField, &ctx, &test_channels());
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 3);
 
         // Tab on last field (Prompt) wraps to Kind(0)
-        handle_action(
-            &mut app,
-            Action::DialogNextField,
-            &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
-        );
+        handle_action(&mut app, Action::DialogNextField, &ctx, &test_channels());
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 0);
     }
 
@@ -1343,27 +1272,11 @@ mod tests {
         app.open_dialog(&ctx);
 
         // Starts on Title (field 2). Advance to Prompt (field 3)
-        handle_action(
-            &mut app,
-            Action::DialogNextField,
-            &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
-        );
+        handle_action(&mut app, Action::DialogNextField, &ctx, &test_channels());
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 3);
 
         // Go back to Title (field 2)
-        handle_action(
-            &mut app,
-            Action::DialogPrevField,
-            &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
-        );
+        handle_action(&mut app, Action::DialogPrevField, &ctx, &test_channels());
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 2);
     }
 
@@ -1375,37 +1288,13 @@ mod tests {
 
         // Agentic, no linear: Kind(0), Mode(1), Title(2), Prompt(3)
         // Starts on Title (field 2). Two Shift+Tabs -> Kind(0)
-        handle_action(
-            &mut app,
-            Action::DialogPrevField,
-            &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
-        );
+        handle_action(&mut app, Action::DialogPrevField, &ctx, &test_channels());
 
-        handle_action(
-            &mut app,
-            Action::DialogPrevField,
-            &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
-        );
+        handle_action(&mut app, Action::DialogPrevField, &ctx, &test_channels());
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 0);
 
         // One more Shift+Tab wraps to last field (Prompt = 3)
-        handle_action(
-            &mut app,
-            Action::DialogPrevField,
-            &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
-        );
+        handle_action(&mut app, Action::DialogPrevField, &ctx, &test_channels());
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 3);
     }
 
@@ -1416,43 +1305,11 @@ mod tests {
         app.open_dialog(&ctx);
 
         // Move to prompt field
-        handle_action(
-            &mut app,
-            Action::DialogNextField,
-            &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
-        );
+        handle_action(&mut app, Action::DialogNextField, &ctx, &test_channels());
 
-        handle_action(
-            &mut app,
-            Action::DialogChar('a'),
-            &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
-        );
-        handle_action(
-            &mut app,
-            Action::DialogChar(' '),
-            &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
-        );
-        handle_action(
-            &mut app,
-            Action::DialogChar('b'),
-            &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
-        );
+        handle_action(&mut app, Action::DialogChar('a'), &ctx, &test_channels());
+        handle_action(&mut app, Action::DialogChar(' '), &ctx, &test_channels());
+        handle_action(&mut app, Action::DialogChar('b'), &ctx, &test_channels());
 
         assert_eq!(app.dialog.as_ref().unwrap().prompt_text(), "a b");
     }
@@ -1464,15 +1321,7 @@ mod tests {
         app.open_dialog(&ctx);
         assert!(app.dialog.is_some());
 
-        handle_action(
-            &mut app,
-            Action::DialogCancel,
-            &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
-        );
+        handle_action(&mut app, Action::DialogCancel, &ctx, &test_channels());
         assert!(app.dialog.is_none());
     }
 
@@ -1499,15 +1348,7 @@ mod tests {
         });
 
         let ctx = app.action_context();
-        let post = handle_action(
-            &mut app,
-            Action::OpenSession,
-            &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
-        );
+        let post = handle_action(&mut app, Action::OpenSession, &ctx, &test_channels());
 
         assert!(matches!(post, PostAction::None));
         assert_eq!(app.input_mode, InputMode::Dialog);
@@ -1546,15 +1387,7 @@ mod tests {
         app.open_edit_dialog(&issue, 0, &ctx);
 
         // Move from title to prompt
-        handle_action(
-            &mut app,
-            Action::DialogNextField,
-            &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
-        );
+        handle_action(&mut app, Action::DialogNextField, &ctx, &test_channels());
 
         let dialog = app.dialog.as_ref().unwrap();
         assert_eq!(
@@ -1596,15 +1429,7 @@ mod tests {
         app.open_linear_picker(&ctx);
         assert_eq!(app.input_mode, crate::app::InputMode::LinearPicker);
 
-        handle_action(
-            &mut app,
-            Action::LinearPickerSelect,
-            &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
-        );
+        handle_action(&mut app, Action::LinearPickerSelect, &ctx, &test_channels());
 
         assert_eq!(app.input_mode, crate::app::InputMode::Normal);
         assert_eq!(app.project().issues.len(), 1);
@@ -1632,15 +1457,7 @@ mod tests {
 
         // Import once
         app.open_linear_picker(&ctx);
-        handle_action(
-            &mut app,
-            Action::LinearPickerSelect,
-            &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
-        );
+        handle_action(&mut app, Action::LinearPickerSelect, &ctx, &test_channels());
         assert_eq!(app.project().issues.len(), 1);
 
         // Try to import again (should show issue but reject the import)
@@ -1651,15 +1468,7 @@ mod tests {
         assert_eq!(filtered.len(), 1);
 
         // Attempting to import should not create a duplicate
-        handle_action(
-            &mut app,
-            Action::LinearPickerSelect,
-            &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
-        );
+        handle_action(&mut app, Action::LinearPickerSelect, &ctx, &test_channels());
         assert_eq!(app.project().issues.len(), 1);
     }
 
@@ -1680,28 +1489,19 @@ mod tests {
             &mut app,
             Action::LinearPickerChar('l'),
             &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
+            &test_channels(),
         );
         handle_action(
             &mut app,
             Action::LinearPickerChar('o'),
             &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
+            &test_channels(),
         );
         handle_action(
             &mut app,
             Action::LinearPickerChar('g'),
             &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
+            &test_channels(),
         );
 
         let filtered = app.filtered_linear_issues();
@@ -1723,49 +1523,17 @@ mod tests {
         app.open_linear_picker(&ctx);
         assert_eq!(app.linear_picker.as_ref().unwrap().selected, 0);
 
-        handle_action(
-            &mut app,
-            Action::LinearPickerDown,
-            &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
-        );
+        handle_action(&mut app, Action::LinearPickerDown, &ctx, &test_channels());
         assert_eq!(app.linear_picker.as_ref().unwrap().selected, 1);
 
-        handle_action(
-            &mut app,
-            Action::LinearPickerDown,
-            &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
-        );
+        handle_action(&mut app, Action::LinearPickerDown, &ctx, &test_channels());
         assert_eq!(app.linear_picker.as_ref().unwrap().selected, 2);
 
         // Should not go past the last item
-        handle_action(
-            &mut app,
-            Action::LinearPickerDown,
-            &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
-        );
+        handle_action(&mut app, Action::LinearPickerDown, &ctx, &test_channels());
         assert_eq!(app.linear_picker.as_ref().unwrap().selected, 2);
 
-        handle_action(
-            &mut app,
-            Action::LinearPickerUp,
-            &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
-        );
+        handle_action(&mut app, Action::LinearPickerUp, &ctx, &test_channels());
         assert_eq!(app.linear_picker.as_ref().unwrap().selected, 1);
     }
 
@@ -1777,15 +1545,7 @@ mod tests {
 
         let ctx = app.action_context();
         app.open_linear_picker(&ctx);
-        handle_action(
-            &mut app,
-            Action::LinearPickerClose,
-            &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
-        );
+        handle_action(&mut app, Action::LinearPickerClose, &ctx, &test_channels());
 
         assert_eq!(app.input_mode, crate::app::InputMode::Normal);
         assert!(app.linear_picker.is_none());
@@ -1830,27 +1590,11 @@ mod tests {
         assert_eq!(app.dialog.as_ref().unwrap().active_field_count(), 5);
 
         // Tab: Title(3) -> Prompt(4)
-        handle_action(
-            &mut app,
-            Action::DialogNextField,
-            &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
-        );
+        handle_action(&mut app, Action::DialogNextField, &ctx, &test_channels());
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 4);
 
         // Tab on Prompt (last field) wraps to Kind(0)
-        handle_action(
-            &mut app,
-            Action::DialogNextField,
-            &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
-        );
+        handle_action(&mut app, Action::DialogNextField, &ctx, &test_channels());
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 0);
     }
 
@@ -1886,27 +1630,11 @@ mod tests {
 
         // Agentic + linear: Kind(0), Mode(1), Linear(2), Title(3), Prompt(4)
         // Starts on Title(3). Tab to Prompt(4), then tab wraps.
-        handle_action(
-            &mut app,
-            Action::DialogNextField,
-            &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
-        );
+        handle_action(&mut app, Action::DialogNextField, &ctx, &test_channels());
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 4);
 
         // Tab on Prompt (last field) wraps to Kind(0)
-        handle_action(
-            &mut app,
-            Action::DialogNextField,
-            &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
-        );
+        handle_action(&mut app, Action::DialogNextField, &ctx, &test_channels());
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 0);
     }
 
@@ -1941,15 +1669,7 @@ mod tests {
         // Starts on Title(3). Shift+Enter should submit from any field.
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 3);
 
-        handle_action(
-            &mut app,
-            Action::DialogSubmit,
-            &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
-        );
+        handle_action(&mut app, Action::DialogSubmit, &ctx, &test_channels());
         assert_eq!(app.input_mode, crate::app::InputMode::Normal);
         assert!(app.dialog.is_none());
     }
@@ -1972,17 +1692,22 @@ mod tests {
         app
     }
 
+    fn test_channels() -> ActionChannels<'static> {
+        // Leak the senders so the references are 'static for test convenience.
+        // The receivers are dropped, but that's fine — sends just return Err.
+        ActionChannels {
+            action_tx: Box::leak(Box::new(mpsc::channel().0)),
+            pr_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
+            linear_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
+            git_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
+            reload_tx: Box::leak(Box::new(mpsc::channel().0)),
+        }
+    }
+
     fn act(app: &mut App, action: Action) -> PostAction {
         let ctx = app.action_context();
-        handle_action(
-            app,
-            action,
-            &ctx,
-            &mpsc::channel().0,
-            &pr_wake_tx(),
-            &linear_wake_tx(),
-            &git_wake_tx(),
-        )
+        let ch = test_channels();
+        handle_action(app, action, &ctx, &ch)
     }
 
     #[test]
@@ -2357,6 +2082,32 @@ mod tests {
 
         let post = handle_sidebar(&mut app, Action::ToggleSidebar);
         assert!(matches!(post, PostAction::None));
+    }
+
+    #[test]
+    fn sidebar_toggle_opens_immediately_and_dispatches_reload() {
+        let mut app = test_multi_app();
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert!(!app.sidebar.as_ref().unwrap().visible);
+
+        let (reload_tx, reload_rx) = mpsc::channel();
+        let ctx = app.action_context();
+        let ch = ActionChannels {
+            action_tx: Box::leak(Box::new(mpsc::channel().0)),
+            pr_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
+            linear_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
+            git_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
+            reload_tx: &reload_tx,
+        };
+        handle_action(&mut app, Action::ToggleSidebar, &ctx, &ch);
+
+        assert_eq!(app.input_mode, InputMode::Sidebar);
+        assert!(app.sidebar.as_ref().unwrap().visible);
+        assert!(app.sidebar.as_ref().unwrap().focused);
+
+        // Background thread should send a ReloadResult
+        let result = reload_rx.recv_timeout(std::time::Duration::from_secs(5));
+        assert!(result.is_ok());
     }
 
     #[test]

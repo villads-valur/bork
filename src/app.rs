@@ -1299,25 +1299,14 @@ impl App {
         }
     }
 
-    pub fn reload_projects(&mut self) {
-        crate::global_config::prune_stale_projects();
+    pub fn known_project_roots(&self) -> HashSet<ProjectId> {
+        self.projects.iter().map(|p| p.id()).collect()
+    }
 
-        let known_roots: HashSet<ProjectId> = self.projects.iter().map(|p| p.id()).collect();
-
-        for entry in &crate::global_config::load_global_config().projects {
-            if !entry.path.join(".bork").join("config.toml").exists() {
-                continue;
-            }
-            let canonical =
-                std::fs::canonicalize(&entry.path).unwrap_or_else(|_| entry.path.clone());
-            if known_roots.contains(&canonical) {
-                continue;
-            }
-            let proj_config = crate::config::load_config_from(&entry.path);
-            let proj_state = crate::config::load_state(&entry.path);
-            self.add_background_project(proj_config, proj_state);
+    pub fn apply_reload_result(&mut self, result: crate::global_config::ReloadResult) {
+        for (config, state) in result.new_projects {
+            self.add_background_project(config, state);
         }
-
         if self.projects.len() > 1 && self.sidebar.is_none() {
             self.enable_sidebar();
         }
@@ -4008,6 +3997,89 @@ mod tests {
         };
         let project = app.context_project_mut(&bogus_ctx);
         assert_eq!(project.config.project_name, "alpha");
+    }
+
+    // --- apply_reload_result tests ---
+
+    #[test]
+    fn apply_reload_adds_new_projects() {
+        let mut app = test_app(vec![]);
+        assert_eq!(app.projects.len(), 1);
+        assert!(app.sidebar.is_none());
+
+        let result = crate::global_config::ReloadResult {
+            new_projects: vec![(test_config_named("beta"), AppState::default())],
+        };
+        app.apply_reload_result(result);
+
+        assert_eq!(app.projects.len(), 2);
+        assert_eq!(app.projects[1].config.project_name, "beta");
+        assert!(app.sidebar.is_some());
+    }
+
+    #[test]
+    fn apply_reload_empty_is_noop() {
+        let mut app = test_app(vec![]);
+        let result = crate::global_config::ReloadResult {
+            new_projects: vec![],
+        };
+        app.apply_reload_result(result);
+
+        assert_eq!(app.projects.len(), 1);
+        assert!(app.sidebar.is_none());
+    }
+
+    #[test]
+    fn apply_reload_preserves_existing_sidebar_state() {
+        let mut app = test_multi_app();
+        let beta_id = app.projects[1].id();
+        app.sidebar.as_mut().unwrap().swimlanes = vec![app.projects[0].id(), beta_id.clone()];
+        app.sidebar.as_mut().unwrap().selected = 1;
+
+        let result = crate::global_config::ReloadResult {
+            new_projects: vec![],
+        };
+        app.apply_reload_result(result);
+
+        let sidebar = app.sidebar.as_ref().unwrap();
+        assert_eq!(sidebar.swimlanes.len(), 2);
+        assert!(sidebar.swimlanes.contains(&beta_id));
+        assert_eq!(sidebar.selected, 1);
+    }
+
+    #[test]
+    fn apply_reload_enables_sidebar_on_second_project() {
+        let mut app = test_app(vec![]);
+        assert!(app.sidebar.is_none());
+
+        let result = crate::global_config::ReloadResult {
+            new_projects: vec![
+                (test_config_named("beta"), AppState::default()),
+                (test_config_named("gamma"), AppState::default()),
+            ],
+        };
+        app.apply_reload_result(result);
+
+        assert_eq!(app.projects.len(), 3);
+        assert!(app.sidebar.is_some());
+    }
+
+    #[test]
+    fn apply_reload_multiple_batches_accumulate() {
+        let mut app = test_app(vec![]);
+
+        let result1 = crate::global_config::ReloadResult {
+            new_projects: vec![(test_config_named("beta"), AppState::default())],
+        };
+        app.apply_reload_result(result1);
+        assert_eq!(app.projects.len(), 2);
+
+        let result2 = crate::global_config::ReloadResult {
+            new_projects: vec![(test_config_named("gamma"), AppState::default())],
+        };
+        app.apply_reload_result(result2);
+        assert_eq!(app.projects.len(), 3);
+        assert_eq!(app.projects[2].config.project_name, "gamma");
     }
 
     // ---------------------------------------------------------------
