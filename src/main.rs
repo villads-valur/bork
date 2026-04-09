@@ -478,20 +478,16 @@ fn run_tui() -> anyhow::Result<()> {
         config::ensure_agent_status_dir(&config.project_root);
     }
 
-    // Tmux auto-wrap: only when launched from a project directory
-    if has_local_project {
-        match external::tmux::ensure_bork_session(&config.project_name)? {
-            external::tmux::EnsureResult::AlreadyInside => {}
-            external::tmux::EnsureResult::Wrapped { exit_code } => {
-                std::process::exit(exit_code);
-            }
+    // Tmux auto-wrap: always use a single global "bork" session
+    match external::tmux::ensure_bork_session("bork")? {
+        external::tmux::EnsureResult::AlreadyInside => {}
+        external::tmux::EnsureResult::Wrapped { exit_code } => {
+            std::process::exit(exit_code);
         }
     }
 
-    // --- Single-instance lock (only when inside a project directory) ---
-    if has_local_project {
-        lock::acquire_lock(&config.project_root)?;
-    }
+    // --- Single-instance lock ---
+    lock::acquire_lock(&config.project_root)?;
 
     // --- Panic hook ---
     let panic_project_root = config.project_root.clone();
