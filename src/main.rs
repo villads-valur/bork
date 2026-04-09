@@ -452,17 +452,29 @@ fn spawn_activity_poller(projects: Vec<(usize, PathBuf)>) -> mpsc::Receiver<Hash
 }
 
 fn run_tui() -> anyhow::Result<()> {
-    // --- Load config + state (before tmux wrap so we have project_name) ---
-    let config = config::load_config();
-    let state = config::load_state(&config.project_root);
+    // --- Determine which project to focus ---
+    global_config::prune_stale_projects();
+    let local_root = config::find_project_root();
+    let has_local_project = local_root.join(".bork").join("config.toml").exists();
 
-    // Only create agent-status dir for projects with a valid config
-    if config
-        .project_root
-        .join(".bork")
-        .join("config.toml")
-        .exists()
-    {
+    let config;
+    let state;
+
+    if has_local_project {
+        config = config::load_config_from(&local_root);
+        state = config::load_state(&local_root);
+        config::ensure_agent_status_dir(&config.project_root);
+    } else {
+        let registered = global_config::list_projects();
+        if registered.is_empty() {
+            anyhow::bail!(
+                "No bork project found. Run 'bork init <repo>' to create one, \
+                 or 'bork project add <path>' to register an existing project."
+            );
+        }
+        let entry = &registered[0];
+        config = config::load_config_from(&entry.path);
+        state = config::load_state(&entry.path);
         config::ensure_agent_status_dir(&config.project_root);
     }
 
@@ -504,7 +516,6 @@ fn run_tui() -> anyhow::Result<()> {
     let mut app = App::new(config, state);
 
     // --- Register current project and load others for multi-project sidebar ---
-    global_config::prune_stale_projects();
     let current_root = app.project().config.project_root.clone();
     let _ = global_config::register_if_absent(&app.project().config.project_name, &current_root);
     let current_canonical =
