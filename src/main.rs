@@ -53,6 +53,7 @@ const GIT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const PORT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const LINEAR_POLL_INTERVAL: Duration = Duration::from_secs(45);
 const PR_POLL_INTERVAL: Duration = Duration::from_secs(60);
+const STATE_POLL_TICKS: usize = 40; // 40 * 50ms = 2s
 
 struct SessionPollResult {
     sessions: HashSet<String>,
@@ -570,6 +571,7 @@ fn run_tui() -> anyhow::Result<()> {
     let mut pending_popup_session: Option<(String, String)> = None;
     let mut pending_popup_for_launch: Option<(usize, ProjectId, String)> = None; // (issue_index, project_id, popup_title)
     let mut needs_redraw = true;
+    let mut state_poll_counter: usize = 0;
 
     // --- Main event loop ---
     loop {
@@ -624,6 +626,7 @@ fn run_tui() -> anyhow::Result<()> {
                                         &app.project().config.project_root,
                                     );
                                     app.project_mut().state_dirty = false;
+                                    app.project_mut().update_base_snapshot();
                                 }
                                 open_tmux_popup(
                                     &mut terminal,
@@ -665,6 +668,7 @@ fn run_tui() -> anyhow::Result<()> {
                                             &app.project().config.project_root,
                                         );
                                         app.project_mut().state_dirty = false;
+                                        app.project_mut().update_base_snapshot();
                                     }
 
                                     let old_focused = app.focused_project.clone();
@@ -760,6 +764,7 @@ fn run_tui() -> anyhow::Result<()> {
                 &app.project().config.project_root,
             );
             app.project_mut().state_dirty = false;
+            app.project_mut().update_base_snapshot();
             open_tmux_popup(
                 &mut terminal,
                 &session_name,
@@ -1019,11 +1024,27 @@ fn run_tui() -> anyhow::Result<()> {
             needs_redraw = true;
         }
 
+        // --- Detect external state.json changes (every ~2s) ---
+        state_poll_counter += 1;
+        if state_poll_counter >= STATE_POLL_TICKS {
+            state_poll_counter = 0;
+            for project in &mut app.projects {
+                let current_mtime = config::state_mtime(&project.config.project_root);
+                if current_mtime != project.last_state_mtime {
+                    let new_state = config::load_state(&project.config.project_root);
+                    project.merge_external_state(new_state);
+                    project.last_state_mtime = current_mtime;
+                    needs_redraw = true;
+                }
+            }
+        }
+
         // --- Flush dirty state to disk (once per tick, not per action) ---
         for project in &mut app.projects {
             if project.state_dirty {
                 let _ = config::save_state(&project.to_state(), &project.config.project_root);
                 project.state_dirty = false;
+                project.update_base_snapshot();
             }
         }
 

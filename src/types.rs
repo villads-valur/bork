@@ -187,7 +187,7 @@ impl WorktreeStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Issue {
     pub id: String,
     pub title: String,
