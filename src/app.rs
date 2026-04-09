@@ -751,7 +751,6 @@ pub struct SidebarState {
 pub enum CardSize {
     Full,
     Medium,
-    Compact,
 }
 
 #[derive(Debug, Clone)]
@@ -1343,8 +1342,7 @@ impl App {
 
     pub fn card_size(&self) -> CardSize {
         match self.visible_swimlane_count() {
-            2 => CardSize::Medium,
-            n if n >= 3 => CardSize::Compact,
+            n if n >= 3 => CardSize::Medium,
             _ => CardSize::Full,
         }
     }
@@ -3765,14 +3763,14 @@ mod tests {
         assert_eq!(app.card_size(), CardSize::Full);
 
         app.sidebar.as_mut().unwrap().swimlanes = vec![app.projects[0].id(), app.projects[1].id()];
-        assert_eq!(app.card_size(), CardSize::Medium);
+        assert_eq!(app.card_size(), CardSize::Full);
 
         app.sidebar.as_mut().unwrap().swimlanes = vec![
             app.projects[0].id(),
             app.projects[1].id(),
             app.projects[2].id(),
         ];
-        assert_eq!(app.card_size(), CardSize::Compact);
+        assert_eq!(app.card_size(), CardSize::Medium);
     }
 
     #[test]

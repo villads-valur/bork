@@ -6,7 +6,7 @@ use ratatui::Frame;
 
 use crate::app::{App, CardSize, Project};
 use crate::types::Column;
-use crate::ui::card::{self, CARD_HEIGHT, CARD_HEIGHT_COMPACT, CARD_HEIGHT_MEDIUM};
+use crate::ui::card::{self, CARD_HEIGHT, CARD_HEIGHT_MEDIUM};
 use crate::ui::styles;
 
 const MIN_SWIMLANE_HEIGHT: u16 = 3;
@@ -15,7 +15,6 @@ fn effective_card_height(card_size: CardSize) -> u16 {
     match card_size {
         CardSize::Full => CARD_HEIGHT,
         CardSize::Medium => CARD_HEIGHT_MEDIUM,
-        CardSize::Compact => CARD_HEIGHT_COMPACT,
     }
 }
 
