@@ -389,8 +389,6 @@ fn spawn_project_workers_with_linear(
 fn spawn_project_workers(project: &app::Project) -> ProjectWorkers {
     let project_root = project.config.project_root.clone();
 
-    config::ensure_agent_status_dir(&project_root);
-
     let status_dir = config::agent_status_dir(&project_root);
     let session_rx = spawn_session_status_worker(status_dir);
 
@@ -457,6 +455,16 @@ fn run_tui() -> anyhow::Result<()> {
     // --- Load config + state (before tmux wrap so we have project_name) ---
     let config = config::load_config();
     let state = config::load_state(&config.project_root);
+
+    // Only create agent-status dir for projects with a valid config
+    if config
+        .project_root
+        .join(".bork")
+        .join("config.toml")
+        .exists()
+    {
+        config::ensure_agent_status_dir(&config.project_root);
+    }
 
     // Tmux auto-wrap: outer process creates session + attaches, inner runs TUI
     match external::tmux::ensure_bork_session(&config.project_name)? {
