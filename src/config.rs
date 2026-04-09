@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
@@ -123,6 +124,10 @@ pub fn load_state(project_root: &Path) -> AppState {
         }
     }
     AppState::default()
+}
+
+pub fn state_mtime(project_root: &Path) -> Option<SystemTime> {
+    fs::metadata(state_path(project_root)).ok()?.modified().ok()
 }
 
 pub fn save_state(state: &AppState, project_root: &Path) -> anyhow::Result<()> {

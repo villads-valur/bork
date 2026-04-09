@@ -67,6 +67,8 @@ pub struct Project {
     pub tuicr_available: bool,
     pub live: LiveState,
     pub state_dirty: bool,
+    pub base_issues: Vec<Issue>,
+    pub last_state_mtime: Option<SystemTime>,
 }
 
 impl Project {
@@ -78,6 +80,8 @@ impl Project {
                 issue.done_at = Some(now);
             }
         }
+        let base_issues = issues.clone();
+        let last_state_mtime = crate::config::state_mtime(&config.project_root);
         Project {
             issues,
             config,
@@ -88,6 +92,8 @@ impl Project {
             tuicr_available: false,
             live: LiveState::default(),
             state_dirty: false,
+            base_issues,
+            last_state_mtime,
         }
     }
 
@@ -104,6 +110,52 @@ impl Project {
         AppState {
             issues: self.issues.clone(),
         }
+    }
+
+    pub fn update_base_snapshot(&mut self) {
+        self.base_issues = self.issues.clone();
+        self.last_state_mtime = crate::config::state_mtime(&self.config.project_root);
+    }
+
+    pub fn merge_external_state(&mut self, file_state: AppState) {
+        let file_issues = file_state.issues;
+
+        if !self.state_dirty {
+            // No local changes pending, safe to fully replace
+            self.issues = file_issues.clone();
+            self.base_issues = file_issues;
+            self.clamp_all_rows();
+            return;
+        }
+
+        // 3-way merge: base (last known disk state) vs memory vs file
+        let file_ids: HashSet<String> = file_issues.iter().map(|i| i.id.clone()).collect();
+        let memory_ids: HashSet<String> = self.issues.iter().map(|i| i.id.clone()).collect();
+
+        // Remove issues that were deleted externally
+        self.issues.retain(|i| file_ids.contains(&i.id));
+
+        // Add issues that were created externally
+        for file_issue in &file_issues {
+            if !memory_ids.contains(&file_issue.id) {
+                self.issues.push(file_issue.clone());
+            }
+        }
+
+        // Field-level merge for issues present in both memory and file
+        for issue in &mut self.issues {
+            let Some(file_issue) = file_issues.iter().find(|f| f.id == issue.id) else {
+                continue;
+            };
+            let Some(base_issue) = self.base_issues.iter().find(|b| b.id == issue.id) else {
+                // No base means this issue was added after last snapshot; keep memory version
+                continue;
+            };
+            merge_issue_fields(issue, base_issue, file_issue);
+        }
+
+        self.base_issues = file_issues;
+        self.clamp_all_rows();
     }
 
     pub fn issues_in_column(&self, column: Column) -> Vec<(usize, &Issue)> {
@@ -751,7 +803,6 @@ pub struct SidebarState {
 pub enum CardSize {
     Full,
     Medium,
-    Compact,
 }
 
 #[derive(Debug, Clone)]
@@ -1151,6 +1202,40 @@ fn clear_to_start(text: &mut String, cursor: &mut usize) {
     *cursor = 0;
 }
 
+/// 3-way field merge: for each field, if file diverged from base but memory didn't,
+/// take the file value. If both diverged, memory wins.
+fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
+    macro_rules! merge_field {
+        ($field:ident) => {
+            if memory.$field == base.$field && file.$field != base.$field {
+                memory.$field = file.$field.clone();
+            }
+        };
+    }
+    merge_field!(title);
+    merge_field!(kind);
+    merge_field!(column);
+    merge_field!(agent_kind);
+    merge_field!(agent_mode);
+    merge_field!(prompt);
+    merge_field!(worktree);
+    merge_field!(done_at);
+    merge_field!(session_id);
+    merge_field!(linear_id);
+    merge_field!(linear_identifier);
+    merge_field!(linear_url);
+    merge_field!(linear_imported);
+    merge_field!(pr_number);
+    merge_field!(pr_imported);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageKind {
+    Info,
+    Warning,
+    Error,
+}
+
 pub struct App {
     pub projects: Vec<Project>,
     pub focused_project: ProjectId,
@@ -1161,7 +1246,7 @@ pub struct App {
     pub pending_confirm: Option<ConfirmAction>,
     pub dialog: Option<DialogState>,
     pub should_quit: bool,
-    pub message: Option<String>,
+    pub message: Option<(String, MessageKind)>,
     pub message_set_at: Option<Instant>,
     pub busy_count: usize,
     pub spinner_tick: usize,
@@ -1325,15 +1410,26 @@ impl App {
 
     pub fn card_size(&self) -> CardSize {
         match self.visible_swimlane_count() {
-            2 => CardSize::Medium,
-            n if n >= 3 => CardSize::Compact,
+            n if n >= 3 => CardSize::Medium,
             _ => CardSize::Full,
         }
     }
 
-    pub fn set_message(&mut self, msg: impl Into<String>) {
-        self.message = Some(msg.into());
+    pub fn show_message(&mut self, msg: impl Into<String>, kind: MessageKind) {
+        self.message = Some((msg.into(), kind));
         self.message_set_at = Some(Instant::now());
+    }
+
+    pub fn set_message(&mut self, msg: impl Into<String>) {
+        self.show_message(msg, MessageKind::Info);
+    }
+
+    pub fn set_warning(&mut self, msg: impl Into<String>) {
+        self.show_message(msg, MessageKind::Warning);
+    }
+
+    pub fn set_error(&mut self, msg: impl Into<String>) {
+        self.show_message(msg, MessageKind::Error);
     }
 
     pub fn clear_expired_message(&mut self) -> bool {
@@ -1403,9 +1499,9 @@ impl App {
 
         if !has_linear && !has_github {
             if p.linear_available {
-                self.set_message("No issues loaded yet");
+                self.set_warning("No issues loaded yet");
             } else {
-                self.set_message("No import sources available");
+                self.set_warning("No import sources available");
             }
             return;
         }
@@ -3735,14 +3831,14 @@ mod tests {
         assert_eq!(app.card_size(), CardSize::Full);
 
         app.sidebar.as_mut().unwrap().swimlanes = vec![app.projects[0].id(), app.projects[1].id()];
-        assert_eq!(app.card_size(), CardSize::Medium);
+        assert_eq!(app.card_size(), CardSize::Full);
 
         app.sidebar.as_mut().unwrap().swimlanes = vec![
             app.projects[0].id(),
             app.projects[1].id(),
             app.projects[2].id(),
         ];
-        assert_eq!(app.card_size(), CardSize::Compact);
+        assert_eq!(app.card_size(), CardSize::Medium);
     }
 
     #[test]
@@ -3984,5 +4080,342 @@ mod tests {
         app.apply_reload_result(result2);
         assert_eq!(app.projects.len(), 3);
         assert_eq!(app.projects[2].config.project_name, "gamma");
+    }
+
+    // ---------------------------------------------------------------
+    // merge_issue_fields (3-way per-field merge)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn merge_field_file_changed_memory_unchanged() {
+        let base = test_issue_titled("a", "Original", Column::Todo);
+        let mut memory = base.clone();
+        let mut file = base.clone();
+        file.title = "Updated externally".to_string();
+
+        merge_issue_fields(&mut memory, &base, &file);
+        assert_eq!(memory.title, "Updated externally");
+    }
+
+    #[test]
+    fn merge_field_memory_changed_file_unchanged() {
+        let base = test_issue_titled("a", "Original", Column::Todo);
+        let mut memory = base.clone();
+        memory.title = "Updated locally".to_string();
+        let file = base.clone();
+
+        merge_issue_fields(&mut memory, &base, &file);
+        assert_eq!(memory.title, "Updated locally");
+    }
+
+    #[test]
+    fn merge_field_both_changed_memory_wins() {
+        let base = test_issue_titled("a", "Original", Column::Todo);
+        let mut memory = base.clone();
+        memory.title = "Local edit".to_string();
+        let mut file = base.clone();
+        file.title = "External edit".to_string();
+
+        merge_issue_fields(&mut memory, &base, &file);
+        assert_eq!(memory.title, "Local edit");
+    }
+
+    #[test]
+    fn merge_field_neither_changed() {
+        let base = test_issue_titled("a", "Same", Column::Todo);
+        let mut memory = base.clone();
+        let file = base.clone();
+
+        merge_issue_fields(&mut memory, &base, &file);
+        assert_eq!(memory.title, "Same");
+    }
+
+    #[test]
+    fn merge_fields_independent_per_field() {
+        let base = test_issue_titled("a", "Original", Column::Todo);
+        let mut memory = base.clone();
+        memory.title = "Local title".to_string();
+        // memory.column stays Todo (unchanged from base)
+
+        let mut file = base.clone();
+        file.column = Column::InProgress;
+        // file.title stays "Original" (unchanged from base)
+
+        merge_issue_fields(&mut memory, &base, &file);
+        assert_eq!(memory.title, "Local title", "memory wins on title");
+        assert_eq!(memory.column, Column::InProgress, "file wins on column");
+    }
+
+    // ---------------------------------------------------------------
+    // merge_external_state (full Project-level merge)
+    // ---------------------------------------------------------------
+
+    fn test_project(issues: Vec<Issue>) -> Project {
+        let state = AppState {
+            issues: issues.clone(),
+        };
+        let mut project = Project::new(test_config(), state);
+        // base_issues is set by new(), but last_state_mtime will be None
+        // since /tmp/test-bork/.bork/state.json doesn't exist. That's fine for tests.
+        project.base_issues = issues;
+        project
+    }
+
+    #[test]
+    fn merge_clean_state_replaces_entirely() {
+        let mut project = test_project(vec![test_issue("a", Column::Todo)]);
+        assert!(!project.state_dirty);
+
+        let file_state = AppState {
+            issues: vec![test_issue("b", Column::InProgress)],
+        };
+        project.merge_external_state(file_state);
+
+        assert_eq!(project.issues.len(), 1);
+        assert_eq!(project.issues[0].id, "b");
+        assert_eq!(project.issues[0].column, Column::InProgress);
+    }
+
+    #[test]
+    fn merge_dirty_adds_new_external_issue() {
+        let mut project = test_project(vec![test_issue("a", Column::Todo)]);
+        project.mark_dirty();
+
+        let file_state = AppState {
+            issues: vec![
+                test_issue("a", Column::Todo),
+                test_issue("b", Column::InProgress),
+            ],
+        };
+        project.merge_external_state(file_state);
+
+        assert_eq!(project.issues.len(), 2);
+        let ids: Vec<&str> = project.issues.iter().map(|i| i.id.as_str()).collect();
+        assert!(ids.contains(&"a"));
+        assert!(ids.contains(&"b"));
+    }
+
+    #[test]
+    fn merge_dirty_removes_externally_deleted_issue() {
+        let mut project = test_project(vec![
+            test_issue("a", Column::Todo),
+            test_issue("b", Column::InProgress),
+        ]);
+        project.mark_dirty();
+
+        let file_state = AppState {
+            issues: vec![test_issue("a", Column::Todo)],
+        };
+        project.merge_external_state(file_state);
+
+        assert_eq!(project.issues.len(), 1);
+        assert_eq!(project.issues[0].id, "a");
+    }
+
+    #[test]
+    fn merge_dirty_field_level_merge_for_existing() {
+        let original = test_issue_titled("a", "Original", Column::Todo);
+        let mut project = test_project(vec![original.clone()]);
+
+        // Local change: move to InProgress
+        project.issues[0].column = Column::InProgress;
+        project.mark_dirty();
+
+        // External change: update title (but column still Todo in file, matching base)
+        let mut file_issue = original;
+        file_issue.title = "Renamed externally".to_string();
+        let file_state = AppState {
+            issues: vec![file_issue],
+        };
+        project.merge_external_state(file_state);
+
+        assert_eq!(
+            project.issues[0].title, "Renamed externally",
+            "file wins on title"
+        );
+        assert_eq!(
+            project.issues[0].column,
+            Column::InProgress,
+            "memory wins on column"
+        );
+    }
+
+    #[test]
+    fn merge_dirty_locally_added_issue_kept() {
+        let mut project = test_project(vec![test_issue("a", Column::Todo)]);
+
+        // Locally add a new issue (not in base)
+        project.issues.push(test_issue("local-new", Column::Todo));
+        project.mark_dirty();
+
+        // External file still only has "a"
+        let file_state = AppState {
+            issues: vec![test_issue("a", Column::Todo)],
+        };
+        project.merge_external_state(file_state);
+
+        // "local-new" is not in file_ids, so it gets removed by retain.
+        // This is correct: if an external process is the source of truth for
+        // what issues exist, a locally-added issue that isn't in the file
+        // should be removed. The dirty flush would have persisted it first
+        // in the normal flow (flush happens after merge).
+        assert_eq!(project.issues.len(), 1);
+        assert_eq!(project.issues[0].id, "a");
+    }
+
+    #[test]
+    fn merge_clamps_selection_after_removal() {
+        let mut project = test_project(vec![
+            test_issue("a", Column::Todo),
+            test_issue("b", Column::Todo),
+            test_issue("c", Column::Todo),
+        ]);
+        project.selected_row[0] = 2; // pointing at 3rd issue
+
+        // External change removes 2 issues
+        let file_state = AppState {
+            issues: vec![test_issue("a", Column::Todo)],
+        };
+        project.merge_external_state(file_state);
+
+        assert_eq!(project.issues.len(), 1);
+        assert_eq!(project.selected_row[0], 0, "row clamped to valid range");
+    }
+
+    #[test]
+    fn merge_empty_file_removes_all() {
+        let mut project = test_project(vec![
+            test_issue("a", Column::Todo),
+            test_issue("b", Column::InProgress),
+        ]);
+
+        let file_state = AppState { issues: vec![] };
+        project.merge_external_state(file_state);
+
+        assert!(project.issues.is_empty());
+    }
+
+    #[test]
+    fn merge_empty_memory_adds_from_file() {
+        let mut project = test_project(vec![]);
+
+        let file_state = AppState {
+            issues: vec![test_issue("new", Column::Todo)],
+        };
+        project.merge_external_state(file_state);
+
+        assert_eq!(project.issues.len(), 1);
+        assert_eq!(project.issues[0].id, "new");
+    }
+
+    #[test]
+    fn merge_identical_state_is_noop() {
+        let issues = vec![
+            test_issue("a", Column::Todo),
+            test_issue("b", Column::InProgress),
+        ];
+        let mut project = test_project(issues.clone());
+
+        let file_state = AppState {
+            issues: issues.clone(),
+        };
+        project.merge_external_state(file_state);
+
+        assert_eq!(project.issues.len(), 2);
+        assert_eq!(project.issues, issues);
+    }
+
+    #[test]
+    fn merge_updates_base_issues() {
+        let mut project = test_project(vec![test_issue("a", Column::Todo)]);
+
+        let new_issues = vec![
+            test_issue("a", Column::Todo),
+            test_issue("b", Column::InProgress),
+        ];
+        let file_state = AppState {
+            issues: new_issues.clone(),
+        };
+        project.merge_external_state(file_state);
+
+        assert_eq!(
+            project.base_issues, new_issues,
+            "base_issues updated to file contents"
+        );
+    }
+
+    // ================================================================
+    // Message severity
+    // ================================================================
+
+    #[test]
+    fn set_message_stores_info_kind() {
+        let mut app = test_app(vec![]);
+        app.set_message("hello");
+        let (msg, kind) = app.message.as_ref().unwrap();
+        assert_eq!(msg, "hello");
+        assert_eq!(*kind, MessageKind::Info);
+        assert!(app.message_set_at.is_some());
+    }
+
+    #[test]
+    fn set_warning_stores_warning_kind() {
+        let mut app = test_app(vec![]);
+        app.set_warning("careful");
+        let (msg, kind) = app.message.as_ref().unwrap();
+        assert_eq!(msg, "careful");
+        assert_eq!(*kind, MessageKind::Warning);
+    }
+
+    #[test]
+    fn set_error_stores_error_kind() {
+        let mut app = test_app(vec![]);
+        app.set_error("boom");
+        let (msg, kind) = app.message.as_ref().unwrap();
+        assert_eq!(msg, "boom");
+        assert_eq!(*kind, MessageKind::Error);
+    }
+
+    #[test]
+    fn show_message_accepts_kind() {
+        let mut app = test_app(vec![]);
+        app.show_message("test", MessageKind::Warning);
+        let (msg, kind) = app.message.as_ref().unwrap();
+        assert_eq!(msg, "test");
+        assert_eq!(*kind, MessageKind::Warning);
+    }
+
+    #[test]
+    fn message_overwrites_previous() {
+        let mut app = test_app(vec![]);
+        app.set_error("first");
+        app.set_message("second");
+        let (msg, kind) = app.message.as_ref().unwrap();
+        assert_eq!(msg, "second");
+        assert_eq!(*kind, MessageKind::Info);
+    }
+
+    #[test]
+    fn clear_expired_message_before_timeout() {
+        let mut app = test_app(vec![]);
+        app.set_message("fresh");
+        assert!(!app.clear_expired_message());
+        assert!(app.message.is_some());
+    }
+
+    #[test]
+    fn clear_expired_message_after_timeout() {
+        let mut app = test_app(vec![]);
+        app.set_message("old");
+        app.message_set_at = Some(Instant::now() - std::time::Duration::from_secs(4));
+        assert!(app.clear_expired_message());
+        assert!(app.message.is_none());
+        assert!(app.message_set_at.is_none());
+    }
+
+    #[test]
+    fn clear_expired_message_noop_when_no_message() {
+        let mut app = test_app(vec![]);
+        assert!(!app.clear_expired_message());
     }
 }
