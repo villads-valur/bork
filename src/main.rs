@@ -16,6 +16,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -359,41 +360,48 @@ fn run_project_command(command: ProjectCommand) -> anyhow::Result<()> {
     }
 }
 
-struct ProjectWorkers {
-    session_rx: mpsc::Receiver<SessionPollResult>,
+struct SharedWorkers {
     port_rx: mpsc::Receiver<PortPollResult>,
     port_sessions: Arc<Mutex<HashSet<String>>>,
+    linear_rx: Option<mpsc::Receiver<LinearPollResult>>,
+    linear_wake_tx: mpsc::Sender<()>,
+    linear_wake_rx: Option<mpsc::Receiver<()>>,
+    shutdown: Arc<AtomicBool>,
+}
+
+struct ProjectWorkers {
+    session_rx: mpsc::Receiver<SessionPollResult>,
     git_rx: mpsc::Receiver<GitPollResult>,
     git_wake_tx: mpsc::Sender<()>,
     git_skip_set: Arc<Mutex<HashSet<String>>>,
     pr_rx: mpsc::Receiver<PrPollResult>,
     pr_wake_tx: mpsc::Sender<()>,
-    linear_rx: Option<mpsc::Receiver<LinearPollResult>>,
-    linear_wake_tx: mpsc::Sender<()>,
-    linear_wake_rx: Option<mpsc::Receiver<()>>,
+    shutdown: Arc<AtomicBool>,
 }
 
-fn spawn_project_workers_with_linear(
-    project: &app::Project,
-    linear_available: bool,
-) -> ProjectWorkers {
-    let mut workers = spawn_project_workers(project);
-    if linear_available {
-        if let Some(wake_rx) = workers.linear_wake_rx.take() {
-            workers.linear_rx = Some(spawn_linear_worker(wake_rx));
-        }
+fn spawn_shared_workers() -> SharedWorkers {
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    let port_sessions = Arc::new(Mutex::new(HashSet::<String>::new()));
+    let port_rx = spawn_port_poll_worker(port_sessions.clone());
+
+    let (linear_wake_tx, linear_wake_rx) = mpsc::channel::<()>();
+
+    SharedWorkers {
+        port_rx,
+        port_sessions,
+        linear_rx: None,
+        linear_wake_tx,
+        linear_wake_rx: Some(linear_wake_rx),
+        shutdown,
     }
-    workers
 }
 
-fn spawn_project_workers(project: &app::Project) -> ProjectWorkers {
+fn spawn_project_workers(project: &app::Project, shutdown: &Arc<AtomicBool>) -> ProjectWorkers {
     let project_root = project.config.project_root.clone();
 
     let status_dir = config::agent_status_dir(&project_root);
     let session_rx = spawn_session_status_worker(status_dir);
-
-    let port_sessions = Arc::new(Mutex::new(HashSet::<String>::new()));
-    let port_rx = spawn_port_poll_worker(port_sessions.clone());
 
     let git_skip_set = Arc::new(Mutex::new(project.done_worktree_names()));
     let (git_wake_tx, git_wake_rx) = mpsc::channel::<()>();
@@ -403,20 +411,14 @@ fn spawn_project_workers(project: &app::Project) -> ProjectWorkers {
     let main_worktree = project_root.join("main");
     let pr_rx = spawn_pr_poll_worker(main_worktree, pr_wake_rx);
 
-    let (linear_wake_tx, linear_wake_rx) = mpsc::channel::<()>();
-
     ProjectWorkers {
         session_rx,
-        port_rx,
-        port_sessions,
         git_rx,
         git_wake_tx,
         git_skip_set,
         pr_rx,
         pr_wake_tx,
-        linear_rx: None,
-        linear_wake_tx,
-        linear_wake_rx: Some(linear_wake_rx),
+        shutdown: shutdown.clone(),
     }
 }
 
@@ -537,7 +539,8 @@ fn run_tui() -> anyhow::Result<()> {
 
     // --- Workers ---
     let (action_tx, action_rx) = mpsc::channel::<ActionResult>();
-    let mut workers = spawn_project_workers(app.project());
+    let mut shared = spawn_shared_workers();
+    let mut workers = spawn_project_workers(app.project(), &shared.shutdown);
     let mut swimlane_workers: HashMap<ProjectId, ProjectWorkers> = HashMap::new();
 
     // --- Activity poller for sidebar markers ---
@@ -596,7 +599,7 @@ fn run_tui() -> anyhow::Result<()> {
                             &ctx,
                             &action_tx,
                             &workers.pr_wake_tx,
-                            &workers.linear_wake_tx,
+                            &shared.linear_wake_tx,
                             &workers.git_wake_tx,
                         );
 
@@ -659,18 +662,16 @@ fn run_tui() -> anyhow::Result<()> {
                                     app.focused_project = id.clone();
                                     app.focused_swimlane = 0;
 
-                                    let old_workers =
-                                        if let Some(existing) = swimlane_workers.remove(&id) {
-                                            std::mem::replace(&mut workers, existing)
-                                        } else {
-                                            std::mem::replace(
-                                                &mut workers,
-                                                spawn_project_workers_with_linear(
-                                                    app.project(),
-                                                    app.project().linear_available,
-                                                ),
-                                            )
-                                        };
+                                    let old_workers = if let Some(existing) =
+                                        swimlane_workers.remove(&id)
+                                    {
+                                        std::mem::replace(&mut workers, existing)
+                                    } else {
+                                        std::mem::replace(
+                                            &mut workers,
+                                            spawn_project_workers(app.project(), &shared.shutdown),
+                                        )
+                                    };
 
                                     let still_swimlane = app
                                         .sidebar
@@ -770,11 +771,8 @@ fn run_tui() -> anyhow::Result<()> {
             for id in &active_swimlanes {
                 if !swimlane_workers.contains_key(id) {
                     if let Some(project) = app.find_project(id) {
-                        let linear = project.linear_available;
-                        swimlane_workers.insert(
-                            id.clone(),
-                            spawn_project_workers_with_linear(project, linear),
-                        );
+                        swimlane_workers
+                            .insert(id.clone(), spawn_project_workers(project, &shared.shutdown));
                     }
                 }
             }
@@ -788,14 +786,14 @@ fn run_tui() -> anyhow::Result<()> {
             let live = &mut app.project_mut().live;
             live.active_sessions = poll.sessions;
             live.agent_statuses = poll.agent_statuses;
-            // Update shared sessions set for the port poll worker
-            if let Ok(mut shared) = workers.port_sessions.lock() {
-                *shared = live.active_sessions.clone();
-            }
         }
 
-        while let Ok(port_result) = workers.port_rx.try_recv() {
-            app.project_mut().live.listening_ports = port_result.ports;
+        // --- Shared: port data (distributed to all projects) ---
+        while let Ok(port_result) = shared.port_rx.try_recv() {
+            for project in &mut app.projects {
+                project.live.listening_ports = port_result.ports.clone();
+            }
+            needs_redraw = true;
         }
 
         // --- Auto-kill Done sessions past TTL ---
@@ -893,38 +891,35 @@ fn run_tui() -> anyhow::Result<()> {
             }
         }
 
-        // --- Linear: check availability then consume poll results ---
+        // --- Linear: check availability then consume poll results (shared) ---
         if let Ok(true) = linear_check_rx.try_recv() {
             needs_redraw = true;
             for p in &mut app.projects {
                 p.linear_available = true;
             }
-            if let Some(wake_rx) = workers.linear_wake_rx.take() {
-                workers.linear_rx = Some(spawn_linear_worker(wake_rx));
-            }
-            for sw in swimlane_workers.values_mut() {
-                if let Some(wake_rx) = sw.linear_wake_rx.take() {
-                    sw.linear_rx = Some(spawn_linear_worker(wake_rx));
-                }
+            if let Some(wake_rx) = shared.linear_wake_rx.take() {
+                shared.linear_rx = Some(spawn_linear_worker(wake_rx));
             }
         }
-        if let Some(ref rx) = workers.linear_rx {
+        if let Some(ref rx) = shared.linear_rx {
             while let Ok(result) = rx.try_recv() {
                 needs_redraw = true;
-                app.project_mut().live.linear_issues = result.issues;
-                let p = app.project_mut();
-                let linear_titles: Vec<(String, String)> = p
-                    .live
-                    .linear_issues
-                    .iter()
-                    .map(|i| (i.id.clone(), i.title.clone()))
-                    .collect();
-                for issue in &mut p.issues {
-                    if let Some(ref lid) = issue.linear_id {
-                        if issue.linear_imported {
-                            if let Some((_, title)) = linear_titles.iter().find(|(id, _)| id == lid)
-                            {
-                                issue.title = title.clone();
+                for project in &mut app.projects {
+                    project.live.linear_issues = result.issues.clone();
+                    let linear_titles: Vec<(String, String)> = project
+                        .live
+                        .linear_issues
+                        .iter()
+                        .map(|i| (i.id.clone(), i.title.clone()))
+                        .collect();
+                    for issue in &mut project.issues {
+                        if let Some(ref lid) = issue.linear_id {
+                            if issue.linear_imported {
+                                if let Some((_, title)) =
+                                    linear_titles.iter().find(|(id, _)| id == lid)
+                                {
+                                    issue.title = title.clone();
+                                }
                             }
                         }
                     }
@@ -932,7 +927,7 @@ fn run_tui() -> anyhow::Result<()> {
             }
         }
 
-        // --- Drain swimlane workers ---
+        // --- Drain swimlane workers (per-project: session, git, pr only) ---
         let sw_ids: Vec<ProjectId> = swimlane_workers.keys().cloned().collect();
         for proj_id in &sw_ids {
             let Some(sw) = swimlane_workers.get(proj_id) else {
@@ -946,12 +941,6 @@ fn run_tui() -> anyhow::Result<()> {
                 let live = &mut app.projects[proj_pos].live;
                 live.active_sessions = poll.sessions;
                 live.agent_statuses = poll.agent_statuses;
-                if let Ok(mut shared) = sw.port_sessions.lock() {
-                    *shared = live.active_sessions.clone();
-                }
-            }
-            while let Ok(port_result) = sw.port_rx.try_recv() {
-                app.projects[proj_pos].live.listening_ports = port_result.ports;
             }
             let mut sw_git_changed = false;
             while let Ok(git_result) = sw.git_rx.try_recv() {
@@ -992,11 +981,13 @@ fn run_tui() -> anyhow::Result<()> {
                     app.projects[proj_pos].mark_dirty();
                 }
             }
-            if let Some(ref rx) = sw.linear_rx {
-                while let Ok(result) = rx.try_recv() {
-                    needs_redraw = true;
-                    app.projects[proj_pos].live.linear_issues = result.issues;
-                }
+        }
+
+        // Rebuild shared port sessions from all projects' active sessions
+        if let Ok(mut port_sess) = shared.port_sessions.lock() {
+            port_sess.clear();
+            for project in &app.projects {
+                port_sess.extend(project.live.active_sessions.iter().cloned());
             }
         }
 
@@ -1028,6 +1019,8 @@ fn run_tui() -> anyhow::Result<()> {
             needs_redraw = true;
         }
     }
+
+    shared.shutdown.store(true, Ordering::Relaxed);
 
     for project in &app.projects {
         if project.state_dirty {
