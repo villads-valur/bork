@@ -247,6 +247,7 @@ pub fn create_window(session: &str, window_name: &str, cwd: &Path) -> Result<(),
     let status = Command::new("tmux")
         .args([
             "new-window",
+            "-d",
             "-t",
             session,
             "-n",
@@ -267,12 +268,6 @@ pub fn create_window(session: &str, window_name: &str, cwd: &Path) -> Result<(),
             "tmux new-window failed for '{session}:{window_name}'"
         )));
     }
-
-    // Switch back to the first window so the agent is visible when opening the popup
-    let _ = Command::new("tmux")
-        .args(["select-window", "-t", &format!("{session}:0")])
-        .stderr(Stdio::null())
-        .status();
 
     Ok(())
 }
