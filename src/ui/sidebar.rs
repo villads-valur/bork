@@ -32,9 +32,10 @@ pub fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
         .iter()
         .enumerate()
         .map(|(i, project)| {
-            let is_focused = i == app.focused_project;
-            let is_swimlane = sidebar.swimlane_indices.contains(&i);
-            let has_activity = sidebar.activity.get(&i).copied().unwrap_or(false);
+            let proj_id = project.id();
+            let is_focused = proj_id == app.focused_project;
+            let is_swimlane = sidebar.swimlanes.contains(&proj_id);
+            let has_activity = sidebar.activity.get(&proj_id).copied().unwrap_or(false);
 
             let marker = if is_focused {
                 "◆"

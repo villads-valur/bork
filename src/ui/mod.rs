@@ -42,14 +42,9 @@ pub fn render(frame: &mut Frame, app: &App) {
     let card_size = app.card_size();
 
     if swimlanes.len() <= 1 {
-        board::render_board(
-            frame,
-            &app.projects[swimlanes[0]],
-            app,
-            board_area,
-            card_size,
-            true,
-        );
+        if let Some(project) = app.find_project(&swimlanes[0]) {
+            board::render_board(frame, project, app, board_area, card_size, true);
+        }
     } else {
         let constraints: Vec<Constraint> = swimlanes
             .iter()
@@ -57,18 +52,12 @@ pub fn render(frame: &mut Frame, app: &App) {
             .collect();
         let lane_areas = Layout::vertical(constraints).split(board_area);
 
-        for (lane_idx, (&proj_idx, &lane_area)) in
-            swimlanes.iter().zip(lane_areas.iter()).enumerate()
+        for (lane_idx, (proj_id, &lane_area)) in swimlanes.iter().zip(lane_areas.iter()).enumerate()
         {
             let is_focused_lane = lane_idx == app.focused_swimlane;
-            board::render_board(
-                frame,
-                &app.projects[proj_idx],
-                app,
-                lane_area,
-                card_size,
-                is_focused_lane,
-            );
+            if let Some(project) = app.find_project(proj_id) {
+                board::render_board(frame, project, app, lane_area, card_size, is_focused_lane);
+            }
         }
     }
 

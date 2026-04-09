@@ -3,7 +3,7 @@ use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
 
-use crate::app::{App, ConfirmAction, ImportSource, InputMode, LinearPickerContext};
+use crate::app::{App, ConfirmAction, ImportSource, InputMode, LinearPickerContext, ProjectId};
 use crate::config::{self, AppConfig};
 use crate::external::{github, opencode, tmux, tuicr};
 use crate::input::Action;
@@ -35,7 +35,7 @@ pub enum PostAction {
         initial_content: String,
     },
     SwitchProject {
-        index: usize,
+        id: ProjectId,
     },
 }
 
@@ -161,7 +161,7 @@ fn handle_normal(
                 format!("Kill session '{}'? (y/n)", session_name),
                 ConfirmAction::KillSession {
                     session_name,
-                    project_index: app.active_project_index(),
+                    project_id: app.active_project_id(),
                 },
             );
             PostAction::None
@@ -200,7 +200,7 @@ fn handle_normal(
                 format!("Delete {}: {}? (y/n)", issue.id, issue.title),
                 ConfirmAction::DeleteIssue {
                     issue_index: idx,
-                    project_index: app.active_project_index(),
+                    project_id: app.active_project_id(),
                 },
             );
             PostAction::None
@@ -221,7 +221,11 @@ fn handle_normal(
             if let Some(ref mut sidebar) = app.sidebar {
                 sidebar.visible = true;
                 sidebar.focused = true;
-                sidebar.selected = app.focused_project;
+                sidebar.selected = app
+                    .projects
+                    .iter()
+                    .position(|p| p.id() == app.focused_project)
+                    .unwrap_or(0);
                 app.input_mode = InputMode::Sidebar;
             }
             PostAction::None
@@ -626,10 +630,10 @@ fn submit_dialog(app: &mut App) {
         Some(prompt_text)
     };
 
-    let proj_idx = app.active_project_index();
+    let proj_id = app.active_project_id();
 
     if let Some(idx) = dialog.editing_index {
-        let p = &mut app.projects[proj_idx];
+        let p = app.find_project_mut(&proj_id).unwrap();
         if idx < p.issues.len() {
             p.issues[idx].title = title;
             p.issues[idx].prompt = prompt;
@@ -639,22 +643,24 @@ fn submit_dialog(app: &mut App) {
             apply_linear_fields(&mut p.issues[idx], &dialog);
             apply_pr_fields(&mut p.issues[idx], &dialog);
 
-            app.set_message(format!("Updated {}", app.projects[proj_idx].issues[idx].id));
-            app.projects[proj_idx].mark_dirty();
+            let updated_id = p.issues[idx].id.clone();
+            p.mark_dirty();
+            app.set_message(format!("Updated {}", updated_id));
         }
         return;
     }
 
-    let id = app.projects[proj_idx].next_issue_id();
+    let id = app.find_project(&proj_id).unwrap().next_issue_id();
     let column = dialog.target_column.unwrap_or(Column::Todo);
     let column_index = column.index();
+    let agent_kind = app.find_project(&proj_id).unwrap().config.agent_kind;
 
     let mut issue = Issue {
         id: id.clone(),
         title,
         kind: dialog.kind,
         column,
-        agent_kind: app.projects[proj_idx].config.agent_kind,
+        agent_kind,
         agent_mode: dialog.agent_mode,
         prompt,
         worktree: None,
@@ -671,18 +677,16 @@ fn submit_dialog(app: &mut App) {
     apply_linear_fields(&mut issue, &dialog);
     apply_pr_fields(&mut issue, &dialog);
 
-    let p = &mut app.projects[proj_idx];
+    let p = app.find_project_mut(&proj_id).unwrap();
     p.issues.push(issue);
-    app.set_message(format!("Created {}", id));
-
-    let p = &mut app.projects[proj_idx];
     p.selected_column = column_index;
     let count = p.issues_in_column(column).len();
     if count > 0 {
         p.selected_row[column_index] = count - 1;
     }
-
     p.mark_dirty();
+
+    app.set_message(format!("Created {}", id));
 }
 
 fn apply_linear_fields(issue: &mut Issue, dialog: &crate::app::DialogState) {
@@ -814,9 +818,15 @@ fn import_linear_issue(app: &mut App) {
 
     let id = linear_issue.identifier.to_lowercase();
 
-    let proj_idx = app.active_project_index();
+    let proj_id = app.active_project_id();
 
-    if app.projects[proj_idx].issues.iter().any(|i| i.id == id) {
+    if app
+        .find_project(&proj_id)
+        .unwrap()
+        .issues
+        .iter()
+        .any(|i| i.id == id)
+    {
         app.set_message(format!(
             "{} is already on the board",
             linear_issue.identifier
@@ -825,12 +835,13 @@ fn import_linear_issue(app: &mut App) {
         return;
     }
 
+    let agent_kind = app.find_project(&proj_id).unwrap().config.agent_kind;
     let issue = Issue {
         id,
         title: linear_issue.title.clone(),
         kind: IssueKind::Agentic,
         column: Column::Todo,
-        agent_kind: app.projects[proj_idx].config.agent_kind,
+        agent_kind,
         agent_mode: crate::types::AgentMode::Plan,
         prompt: None,
         worktree: None,
@@ -844,18 +855,17 @@ fn import_linear_issue(app: &mut App) {
         pr_imported: false,
     };
 
-    app.projects[proj_idx].issues.push(issue);
-    app.set_message(format!("Imported {}", linear_issue.identifier));
-    app.close_linear_picker();
-
-    let p = &mut app.projects[proj_idx];
+    let p = app.find_project_mut(&proj_id).unwrap();
+    p.issues.push(issue);
     let count = p.issues_in_column(Column::Todo).len();
     if count > 0 {
         p.selected_column = 0;
         p.selected_row[0] = count - 1;
     }
-
     p.mark_dirty();
+
+    app.set_message(format!("Imported {}", linear_issue.identifier));
+    app.close_linear_picker();
 }
 
 fn import_github_pr(app: &mut App) {
@@ -867,9 +877,11 @@ fn import_github_pr(app: &mut App) {
         None => return,
     };
 
-    let proj_idx = app.active_project_index();
+    let proj_id = app.active_project_id();
 
-    if app.projects[proj_idx]
+    if app
+        .find_project(&proj_id)
+        .unwrap()
         .issues
         .iter()
         .any(|i| i.pr_number == Some(pr.number))
@@ -879,13 +891,14 @@ fn import_github_pr(app: &mut App) {
         return;
     }
 
-    let id = app.projects[proj_idx].next_issue_id();
+    let id = app.find_project(&proj_id).unwrap().next_issue_id();
+    let agent_kind = app.find_project(&proj_id).unwrap().config.agent_kind;
     let issue = Issue {
         id,
         title: pr.title.clone(),
         kind: IssueKind::Agentic,
         column: Column::CodeReview,
-        agent_kind: app.projects[proj_idx].config.agent_kind,
+        agent_kind,
         agent_mode: AgentMode::Plan,
         prompt: None,
         worktree: None,
@@ -899,18 +912,17 @@ fn import_github_pr(app: &mut App) {
         pr_imported: true,
     };
 
-    app.projects[proj_idx].issues.push(issue);
-    app.set_message(format!("Imported PR #{}", pr.number));
-    app.close_linear_picker();
-
-    let p = &mut app.projects[proj_idx];
+    let p = app.find_project_mut(&proj_id).unwrap();
+    p.issues.push(issue);
     let count = p.issues_in_column(Column::CodeReview).len();
     if count > 0 {
         p.selected_column = Column::CodeReview.index();
         p.selected_row[Column::CodeReview.index()] = count - 1;
     }
-
     p.mark_dirty();
+
+    app.set_message(format!("Imported PR #{}", pr.number));
+    app.close_linear_picker();
 }
 
 fn attach_github_to_dialog(app: &mut App) {
@@ -944,15 +956,15 @@ fn handle_sidebar(app: &mut App, action: Action) -> PostAction {
         }
         Action::SidebarSelect => {
             if let Some(ref mut sidebar) = app.sidebar {
-                let idx = sidebar.selected;
-                sidebar.swimlane_indices = vec![idx];
+                let proj_id = app.projects[sidebar.selected].id();
+                sidebar.swimlanes = vec![proj_id.clone()];
                 sidebar.focused = false;
                 sidebar.visible = false;
                 app.input_mode = InputMode::Normal;
                 app.focused_swimlane = 0;
 
-                if idx != app.focused_project {
-                    return PostAction::SwitchProject { index: idx };
+                if proj_id != app.focused_project {
+                    return PostAction::SwitchProject { id: proj_id };
                 }
             }
             PostAction::None
@@ -977,20 +989,21 @@ fn handle_sidebar(app: &mut App, action: Action) -> PostAction {
             let lane_count = app.visible_swimlane_count();
             if let Some(ref mut sidebar) = app.sidebar {
                 let idx = sidebar.selected;
-                if let Some(pos) = sidebar.swimlane_indices.iter().position(|&i| i == idx) {
-                    if sidebar.swimlane_indices.len() > 1 {
-                        sidebar.swimlane_indices.remove(pos);
-                        if idx == app.focused_project {
-                            app.focused_project = sidebar.swimlane_indices[0];
+                let proj_id = app.projects[idx].id();
+                if let Some(pos) = sidebar.swimlanes.iter().position(|id| *id == proj_id) {
+                    if sidebar.swimlanes.len() > 1 {
+                        sidebar.swimlanes.remove(pos);
+                        if proj_id == app.focused_project {
+                            app.focused_project = sidebar.swimlanes[0].clone();
                         }
                         if app.focused_swimlane == pos {
-                            app.focused_swimlane = pos.min(sidebar.swimlane_indices.len() - 1);
+                            app.focused_swimlane = pos.min(sidebar.swimlanes.len() - 1);
                         } else if app.focused_swimlane > pos {
                             app.focused_swimlane -= 1;
                         }
                     }
                 } else if lane_count < 3 {
-                    sidebar.swimlane_indices.push(idx);
+                    sidebar.swimlanes.push(proj_id);
                 } else {
                     app.set_message("Maximum 3 projects visible");
                 }
@@ -1016,14 +1029,13 @@ fn handle_confirm(app: &mut App, action: Action, action_tx: &mpsc::Sender<Action
                 match confirm_action {
                     ConfirmAction::KillSession {
                         session_name,
-                        project_index,
+                        project_id,
                     } => {
                         app.busy_count += 1;
                         let tx = action_tx.clone();
-                        let status_file = agent_status_file(
-                            &app.projects[project_index].config.project_root,
-                            &session_name,
-                        );
+                        let project = app.find_project(&project_id).unwrap();
+                        let status_file =
+                            agent_status_file(&project.config.project_root, &session_name);
 
                         thread::spawn(move || {
                             let message = match tmux::kill_session(&session_name) {
@@ -1043,9 +1055,9 @@ fn handle_confirm(app: &mut App, action: Action, action_tx: &mpsc::Sender<Action
                     }
                     ConfirmAction::DeleteIssue {
                         issue_index,
-                        project_index,
+                        project_id,
                     } => {
-                        let p = &app.projects[project_index];
+                        let p = app.find_project(&project_id).unwrap();
                         if issue_index < p.issues.len() {
                             let issue = &p.issues[issue_index];
                             let session_name = issue.session_name(&p.config.project_name);
@@ -1072,7 +1084,7 @@ fn handle_confirm(app: &mut App, action: Action, action_tx: &mpsc::Sender<Action
                                 app.set_message(format!("Deleted {}", id));
                             }
 
-                            let p = &mut app.projects[project_index];
+                            let p = app.find_project_mut(&project_id).unwrap();
                             p.issues.remove(issue_index);
                             p.clamp_all_rows();
                             p.mark_dirty();
@@ -2240,8 +2252,14 @@ mod tests {
         app.sidebar.as_mut().unwrap().selected = 1;
 
         let post = handle_sidebar(&mut app, Action::SidebarSelect);
-        assert!(matches!(post, PostAction::SwitchProject { index: 1 }));
-        assert_eq!(app.sidebar.as_ref().unwrap().swimlane_indices, vec![1]);
+        assert!(matches!(post, PostAction::SwitchProject { .. }));
+        if let PostAction::SwitchProject { id } = &post {
+            assert_eq!(*id, app.projects[1].id());
+        }
+        assert_eq!(
+            app.sidebar.as_ref().unwrap().swimlanes,
+            vec![app.projects[1].id()]
+        );
     }
 
     #[test]
@@ -2256,20 +2274,25 @@ mod tests {
     #[test]
     fn sidebar_toggle_swimlane_add_remove() {
         let mut app = test_multi_app();
+        let beta_id = app.projects[1].id();
         app.sidebar.as_mut().unwrap().selected = 1;
 
         handle_sidebar(&mut app, Action::SidebarToggleSwimlane);
-        assert!(app.sidebar.as_ref().unwrap().swimlane_indices.contains(&1));
+        assert!(app.sidebar.as_ref().unwrap().swimlanes.contains(&beta_id));
 
         app.sidebar.as_mut().unwrap().selected = 1;
         handle_sidebar(&mut app, Action::SidebarToggleSwimlane);
-        assert!(!app.sidebar.as_ref().unwrap().swimlane_indices.contains(&1));
+        assert!(!app.sidebar.as_ref().unwrap().swimlanes.contains(&beta_id));
     }
 
     #[test]
     fn sidebar_toggle_swimlane_max_three() {
         let mut app = test_multi_app();
-        app.sidebar.as_mut().unwrap().swimlane_indices = vec![0, 1, 2];
+        app.sidebar.as_mut().unwrap().swimlanes = vec![
+            app.projects[0].id(),
+            app.projects[1].id(),
+            app.projects[2].id(),
+        ];
 
         app.add_background_project(
             test_config_named("delta"),
@@ -2278,24 +2301,29 @@ mod tests {
 
         app.sidebar.as_mut().unwrap().selected = 3;
         handle_sidebar(&mut app, Action::SidebarToggleSwimlane);
-        assert_eq!(app.sidebar.as_ref().unwrap().swimlane_indices.len(), 3);
+        assert_eq!(app.sidebar.as_ref().unwrap().swimlanes.len(), 3);
         assert!(app.message.is_some());
     }
 
     #[test]
     fn sidebar_toggle_swimlane_cant_remove_last() {
         let mut app = test_multi_app();
-        app.sidebar.as_mut().unwrap().swimlane_indices = vec![0];
+        let alpha_id = app.projects[0].id();
+        app.sidebar.as_mut().unwrap().swimlanes = vec![alpha_id.clone()];
         app.sidebar.as_mut().unwrap().selected = 0;
 
         handle_sidebar(&mut app, Action::SidebarToggleSwimlane);
-        assert_eq!(app.sidebar.as_ref().unwrap().swimlane_indices, vec![0]);
+        assert_eq!(app.sidebar.as_ref().unwrap().swimlanes, vec![alpha_id]);
     }
 
     #[test]
     fn next_prev_swimlane_wraps() {
         let mut app = test_multi_app();
-        app.sidebar.as_mut().unwrap().swimlane_indices = vec![0, 1, 2];
+        app.sidebar.as_mut().unwrap().swimlanes = vec![
+            app.projects[0].id(),
+            app.projects[1].id(),
+            app.projects[2].id(),
+        ];
         app.focused_swimlane = 0;
 
         act(&mut app, Action::NextSwimlane);

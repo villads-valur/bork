@@ -30,7 +30,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
-use app::{App, InputMode};
+use app::{App, InputMode, ProjectId};
 use handler::{ActionResult, PostAction};
 use input::map_key_to_action;
 use types::{AgentKind, AgentStatusInfo};
@@ -422,12 +422,14 @@ fn spawn_project_workers(project: &app::Project) -> ProjectWorkers {
 
 const ACTIVITY_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
-fn spawn_activity_poller(projects: Vec<(usize, PathBuf)>) -> mpsc::Receiver<HashMap<usize, bool>> {
+fn spawn_activity_poller(
+    projects: Vec<(ProjectId, PathBuf)>,
+) -> mpsc::Receiver<HashMap<ProjectId, bool>> {
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || loop {
-        let mut activity: HashMap<usize, bool> = HashMap::new();
-        for (idx, root) in &projects {
+        let mut activity: HashMap<ProjectId, bool> = HashMap::new();
+        for (id, root) in &projects {
             let status_dir = root.join(".bork").join("agent-status");
             let statuses = read_agent_statuses(&status_dir);
             let has_activity = statuses.values().any(|info| {
@@ -440,7 +442,7 @@ fn spawn_activity_poller(projects: Vec<(usize, PathBuf)>) -> mpsc::Receiver<Hash
                         | types::AgentStatus::Error
                 )
             });
-            activity.insert(*idx, has_activity);
+            activity.insert(id.clone(), has_activity);
         }
         if tx.send(activity).is_err() {
             break;
@@ -536,15 +538,14 @@ fn run_tui() -> anyhow::Result<()> {
     // --- Workers ---
     let (action_tx, action_rx) = mpsc::channel::<ActionResult>();
     let mut workers = spawn_project_workers(app.project());
-    let mut swimlane_workers: HashMap<usize, ProjectWorkers> = HashMap::new();
+    let mut swimlane_workers: HashMap<ProjectId, ProjectWorkers> = HashMap::new();
 
     // --- Activity poller for sidebar markers ---
     let activity_rx = if app.sidebar.is_some() {
-        let project_paths: Vec<(usize, PathBuf)> = app
+        let project_paths: Vec<(ProjectId, PathBuf)> = app
             .projects
             .iter()
-            .enumerate()
-            .map(|(i, p)| (i, p.config.project_root.clone()))
+            .map(|p| (p.id(), p.config.project_root.clone()))
             .collect();
         Some(spawn_activity_poller(project_paths))
     } else {
@@ -564,7 +565,7 @@ fn run_tui() -> anyhow::Result<()> {
     });
 
     let mut pending_popup_session: Option<(String, String)> = None;
-    let mut pending_popup_for_launch: Option<(usize, usize, String)> = None; // (issue_index, project_index, popup_title)
+    let mut pending_popup_for_launch: Option<(usize, ProjectId, String)> = None; // (issue_index, project_id, popup_title)
     let mut needs_redraw = true;
 
     // --- Main event loop ---
@@ -623,7 +624,7 @@ fn run_tui() -> anyhow::Result<()> {
                                 popup_title,
                             } => {
                                 pending_popup_for_launch =
-                                    Some((issue_index, app.active_project_index(), popup_title));
+                                    Some((issue_index, app.active_project_id(), popup_title));
                             }
                             PostAction::OpenEditor { initial_content } => {
                                 if let Some(edited) = open_external_editor(
@@ -636,8 +637,8 @@ fn run_tui() -> anyhow::Result<()> {
                                     }
                                 }
                             }
-                            PostAction::SwitchProject { index } => {
-                                if index < app.projects.len() && index != app.focused_project {
+                            PostAction::SwitchProject { id } => {
+                                if app.find_project(&id).is_some() && id != app.focused_project {
                                     app.dialog = None;
                                     app.linear_picker = None;
                                     app.confirm_message = None;
@@ -652,12 +653,12 @@ fn run_tui() -> anyhow::Result<()> {
                                         app.project_mut().state_dirty = false;
                                     }
 
-                                    let old_focused = app.focused_project;
-                                    app.focused_project = index;
+                                    let old_focused = app.focused_project.clone();
+                                    app.focused_project = id.clone();
                                     app.focused_swimlane = 0;
 
                                     let old_workers =
-                                        if let Some(existing) = swimlane_workers.remove(&index) {
+                                        if let Some(existing) = swimlane_workers.remove(&id) {
                                             std::mem::replace(&mut workers, existing)
                                         } else {
                                             std::mem::replace(
@@ -672,7 +673,7 @@ fn run_tui() -> anyhow::Result<()> {
                                     let still_swimlane = app
                                         .sidebar
                                         .as_ref()
-                                        .is_some_and(|s| s.swimlane_indices.contains(&old_focused));
+                                        .is_some_and(|s| s.swimlanes.contains(&old_focused));
                                     if still_swimlane {
                                         swimlane_workers.insert(old_focused, old_workers);
                                     }
@@ -720,16 +721,18 @@ fn run_tui() -> anyhow::Result<()> {
             if let Some(session_name) = result.session_to_open {
                 if let Some(popup_title) = result.popup_title {
                     pending_popup_session = Some((session_name, popup_title));
-                } else if let Some((launch_idx, proj_idx, popup_title)) =
+                } else if let Some((launch_idx, proj_id, popup_title)) =
                     pending_popup_for_launch.take()
                 {
-                    if proj_idx < app.projects.len()
-                        && launch_idx < app.projects[proj_idx].issues.len()
-                    {
-                        if app.projects[proj_idx].issues[launch_idx].column == types::Column::Todo {
-                            app.projects[proj_idx].issues[launch_idx].column =
-                                types::Column::InProgress;
-                            app.projects[proj_idx].mark_dirty();
+                    if let Some(proj_pos) = app.projects.iter().position(|p| p.id() == proj_id) {
+                        if launch_idx < app.projects[proj_pos].issues.len() {
+                            if app.projects[proj_pos].issues[launch_idx].column
+                                == types::Column::Todo
+                            {
+                                app.projects[proj_pos].issues[launch_idx].column =
+                                    types::Column::InProgress;
+                                app.projects[proj_pos].mark_dirty();
+                            }
                         }
                     }
                     pending_popup_session = Some((session_name, popup_title));
@@ -756,22 +759,24 @@ fn run_tui() -> anyhow::Result<()> {
 
         // --- Sync swimlane workers ---
         if let Some(ref sidebar) = app.sidebar {
-            let active_swimlanes: HashSet<usize> = sidebar
-                .swimlane_indices
+            let active_swimlanes: HashSet<ProjectId> = sidebar
+                .swimlanes
                 .iter()
-                .filter(|&&idx| idx != app.focused_project)
-                .copied()
+                .filter(|id| **id != app.focused_project)
+                .cloned()
                 .collect();
-            for &idx in &active_swimlanes {
-                if !swimlane_workers.contains_key(&idx) && idx < app.projects.len() {
-                    let linear = app.projects[idx].linear_available;
-                    swimlane_workers.insert(
-                        idx,
-                        spawn_project_workers_with_linear(&app.projects[idx], linear),
-                    );
+            for id in &active_swimlanes {
+                if !swimlane_workers.contains_key(id) {
+                    if let Some(project) = app.find_project(id) {
+                        let linear = project.linear_available;
+                        swimlane_workers.insert(
+                            id.clone(),
+                            spawn_project_workers_with_linear(project, linear),
+                        );
+                    }
                 }
             }
-            swimlane_workers.retain(|idx, _| active_swimlanes.contains(idx));
+            swimlane_workers.retain(|id, _| active_swimlanes.contains(id));
         } else {
             swimlane_workers.clear();
         }
@@ -833,7 +838,7 @@ fn run_tui() -> anyhow::Result<()> {
                 live.github_user = pr_result.github_user;
             }
 
-            let p = &mut app.projects[app.focused_project];
+            let p = app.project_mut();
             let pr_titles: Vec<(u32, String)> = p
                 .live
                 .pr_statuses
@@ -905,7 +910,7 @@ fn run_tui() -> anyhow::Result<()> {
             while let Ok(result) = rx.try_recv() {
                 needs_redraw = true;
                 app.project_mut().live.linear_issues = result.issues;
-                let p = &mut app.projects[app.focused_project];
+                let p = app.project_mut();
                 let linear_titles: Vec<(String, String)> = p
                     .live
                     .linear_issues
@@ -926,13 +931,17 @@ fn run_tui() -> anyhow::Result<()> {
         }
 
         // --- Drain swimlane workers ---
-        for (&proj_idx, sw) in &swimlane_workers {
-            if proj_idx >= app.projects.len() {
+        let sw_ids: Vec<ProjectId> = swimlane_workers.keys().cloned().collect();
+        for proj_id in &sw_ids {
+            let Some(sw) = swimlane_workers.get(proj_id) else {
                 continue;
-            }
+            };
+            let Some(proj_pos) = app.projects.iter().position(|p| p.id() == *proj_id) else {
+                continue;
+            };
             while let Ok(poll) = sw.session_rx.try_recv() {
                 needs_redraw = true;
-                let live = &mut app.projects[proj_idx].live;
+                let live = &mut app.projects[proj_pos].live;
                 live.active_sessions = poll.sessions;
                 live.agent_statuses = poll.agent_statuses;
                 if let Ok(mut shared) = sw.port_sessions.lock() {
@@ -940,32 +949,32 @@ fn run_tui() -> anyhow::Result<()> {
                 }
             }
             while let Ok(port_result) = sw.port_rx.try_recv() {
-                app.projects[proj_idx].live.listening_ports = port_result.ports;
+                app.projects[proj_pos].live.listening_ports = port_result.ports;
             }
             let mut sw_git_changed = false;
             while let Ok(git_result) = sw.git_rx.try_recv() {
                 needs_redraw = true;
                 sw_git_changed = true;
-                let live = &mut app.projects[proj_idx].live;
+                let live = &mut app.projects[proj_pos].live;
                 live.worktree_statuses = git_result.statuses;
                 live.worktree_branches = git_result.branches;
                 live.git_poll_done = true;
             }
             if sw_git_changed {
-                let changed = app.projects[proj_idx].auto_assign_worktrees();
-                let stale = app.projects[proj_idx].clear_stale_worktrees();
+                let changed = app.projects[proj_pos].auto_assign_worktrees();
+                let stale = app.projects[proj_pos].clear_stale_worktrees();
                 if changed || stale {
-                    app.projects[proj_idx].mark_dirty();
+                    app.projects[proj_pos].mark_dirty();
                 }
                 if let Ok(mut skip) = sw.git_skip_set.lock() {
-                    *skip = app.projects[proj_idx].done_worktree_names();
+                    *skip = app.projects[proj_pos].done_worktree_names();
                 }
             }
             let mut sw_pr_changed = false;
             while let Ok(pr_result) = sw.pr_rx.try_recv() {
                 needs_redraw = true;
                 sw_pr_changed = true;
-                let live = &mut app.projects[proj_idx].live;
+                let live = &mut app.projects[proj_pos].live;
                 live.pr_statuses = pr_result.prs;
                 live.user_prs = pr_result.user_prs;
                 if pr_result.github_user.is_some() {
@@ -973,18 +982,18 @@ fn run_tui() -> anyhow::Result<()> {
                 }
             }
             if sw_pr_changed {
-                let (changed, msg) = app.projects[proj_idx].sync_prs_as_issues();
+                let (changed, msg) = app.projects[proj_pos].sync_prs_as_issues();
                 if let Some(m) = msg {
                     app.set_message(m);
                 }
                 if changed {
-                    app.projects[proj_idx].mark_dirty();
+                    app.projects[proj_pos].mark_dirty();
                 }
             }
             if let Some(ref rx) = sw.linear_rx {
                 while let Ok(result) = rx.try_recv() {
                     needs_redraw = true;
-                    app.projects[proj_idx].live.linear_issues = result.issues;
+                    app.projects[proj_pos].live.linear_issues = result.issues;
                 }
             }
         }

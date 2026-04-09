@@ -13,6 +13,8 @@ use crate::types::{
 };
 use crate::ui::styles;
 
+pub type ProjectId = PathBuf;
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -86,6 +88,11 @@ impl Project {
             live: LiveState::default(),
             state_dirty: false,
         }
+    }
+
+    pub fn id(&self) -> ProjectId {
+        std::fs::canonicalize(&self.config.project_root)
+            .unwrap_or_else(|_| self.config.project_root.clone())
     }
 
     pub fn mark_dirty(&mut self) {
@@ -697,8 +704,8 @@ pub struct SidebarState {
     pub visible: bool,
     pub focused: bool,
     pub selected: usize,
-    pub activity: HashMap<usize, bool>,
-    pub swimlane_indices: Vec<usize>,
+    pub activity: HashMap<ProjectId, bool>,
+    pub swimlanes: Vec<ProjectId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -718,11 +725,11 @@ pub struct LinearPickerState {
 pub enum ConfirmAction {
     KillSession {
         session_name: String,
-        project_index: usize,
+        project_id: ProjectId,
     },
     DeleteIssue {
         issue_index: usize,
-        project_index: usize,
+        project_id: ProjectId,
     },
 }
 
@@ -1102,7 +1109,7 @@ fn clear_to_start(text: &mut String, cursor: &mut usize) {
 
 pub struct App {
     pub projects: Vec<Project>,
-    pub focused_project: usize,
+    pub focused_project: ProjectId,
     pub focused_swimlane: usize,
     pub sidebar: Option<SidebarState>,
     pub input_mode: InputMode,
@@ -1124,9 +1131,10 @@ pub struct App {
 impl App {
     pub fn new(config: AppConfig, state: AppState) -> Self {
         let project = Project::new(config, state);
+        let focused_id = project.id();
         App {
             projects: vec![project],
-            focused_project: 0,
+            focused_project: focused_id,
             focused_swimlane: 0,
             sidebar: None,
             input_mode: InputMode::Normal,
@@ -1157,7 +1165,7 @@ impl App {
                 focused: false,
                 selected: 0,
                 activity: HashMap::new(),
-                swimlane_indices: vec![self.focused_project],
+                swimlanes: vec![self.focused_project.clone()],
             });
         }
     }
@@ -1165,14 +1173,7 @@ impl App {
     pub fn reload_projects(&mut self) {
         crate::global_config::prune_stale_projects();
 
-        let known_roots: HashSet<PathBuf> = self
-            .projects
-            .iter()
-            .map(|p| {
-                std::fs::canonicalize(&p.config.project_root)
-                    .unwrap_or_else(|_| p.config.project_root.clone())
-            })
-            .collect();
+        let known_roots: HashSet<ProjectId> = self.projects.iter().map(|p| p.id()).collect();
 
         for entry in &crate::global_config::load_global_config().projects {
             if !entry.path.join(".bork").join("config.toml").exists() {
@@ -1193,59 +1194,75 @@ impl App {
         }
     }
 
+    pub fn find_project(&self, id: &ProjectId) -> Option<&Project> {
+        self.projects.iter().find(|p| p.id() == *id)
+    }
+
+    pub fn find_project_mut(&mut self, id: &ProjectId) -> Option<&mut Project> {
+        self.projects.iter_mut().find(|p| p.id() == *id)
+    }
+
+    pub(crate) fn project_index(&self, id: &ProjectId) -> Option<usize> {
+        self.projects.iter().position(|p| p.id() == *id)
+    }
+
     pub fn project(&self) -> &Project {
-        &self.projects[self.focused_project]
+        self.find_project(&self.focused_project)
+            .expect("focused project not found")
     }
 
     pub fn project_mut(&mut self) -> &mut Project {
-        &mut self.projects[self.focused_project]
+        let id = self.focused_project.clone();
+        self.find_project_mut(&id)
+            .expect("focused project not found")
     }
 
-    pub fn active_project_index(&self) -> usize {
+    pub fn active_project_id(&self) -> ProjectId {
         let lanes = self.visible_swimlanes();
-        let idx = lanes
+        let id = lanes
             .get(self.focused_swimlane)
-            .copied()
-            .unwrap_or(self.focused_project);
+            .cloned()
+            .unwrap_or_else(|| self.focused_project.clone());
         debug_assert!(
-            idx < self.projects.len(),
-            "active project index {} out of bounds ({})",
-            idx,
-            self.projects.len()
+            self.find_project(&id).is_some(),
+            "active project {:?} not found",
+            id
         );
-        idx
+        id
     }
 
     pub fn active_project(&self) -> &Project {
-        &self.projects[self.active_project_index()]
+        let id = self.active_project_id();
+        self.find_project(&id).expect("active project not found")
     }
 
     pub fn active_project_mut(&mut self) -> &mut Project {
-        let idx = self.active_project_index();
-        &mut self.projects[idx]
+        let id = self.active_project_id();
+        self.find_project_mut(&id)
+            .expect("active project not found")
     }
 
-    pub fn visible_swimlanes(&self) -> Vec<usize> {
+    pub fn visible_swimlanes(&self) -> Vec<ProjectId> {
         if let Some(ref sidebar) = self.sidebar {
-            if !sidebar.swimlane_indices.is_empty() {
+            if !sidebar.swimlanes.is_empty() {
                 return sidebar
-                    .swimlane_indices
+                    .swimlanes
                     .iter()
-                    .filter(|&&idx| idx < self.projects.len())
-                    .copied()
+                    .filter(|id| self.find_project(id).is_some())
+                    .cloned()
                     .collect();
             }
         }
-        vec![self.focused_project]
+        vec![self.focused_project.clone()]
     }
 
     pub fn visible_swimlane_count(&self) -> usize {
         if let Some(ref sidebar) = self.sidebar {
-            if !sidebar.swimlane_indices.is_empty() {
+            if !sidebar.swimlanes.is_empty() {
                 return sidebar
-                    .swimlane_indices
+                    .swimlanes
                     .iter()
-                    .filter(|&&idx| idx < self.projects.len())
+                    .filter(|id| self.find_project(id).is_some())
                     .count();
             }
         }
@@ -3542,62 +3559,73 @@ mod tests {
     fn visible_swimlanes_default_single() {
         let app = test_multi_app();
         let lanes = app.visible_swimlanes();
-        assert_eq!(lanes, vec![0]);
+        assert_eq!(lanes, vec![app.projects[0].id()]);
     }
 
     #[test]
-    fn visible_swimlanes_with_indices() {
+    fn visible_swimlanes_with_ids() {
         let mut app = test_multi_app();
-        app.sidebar.as_mut().unwrap().swimlane_indices = vec![0, 1];
+        let ids: Vec<ProjectId> = vec![app.projects[0].id(), app.projects[1].id()];
+        app.sidebar.as_mut().unwrap().swimlanes = ids.clone();
         let lanes = app.visible_swimlanes();
-        assert_eq!(lanes, vec![0, 1]);
+        assert_eq!(lanes, ids);
     }
 
     #[test]
     fn visible_swimlanes_filters_invalid() {
         let mut app = test_multi_app();
-        app.sidebar.as_mut().unwrap().swimlane_indices = vec![0, 99];
+        let valid_id = app.projects[0].id();
+        let bogus_id = PathBuf::from("/tmp/nonexistent");
+        app.sidebar.as_mut().unwrap().swimlanes = vec![valid_id.clone(), bogus_id];
         let lanes = app.visible_swimlanes();
-        assert_eq!(lanes, vec![0]);
+        assert_eq!(lanes, vec![valid_id]);
     }
 
     #[test]
     fn visible_swimlane_count_matches_vec() {
         let mut app = test_multi_app();
         assert_eq!(app.visible_swimlane_count(), app.visible_swimlanes().len());
-        app.sidebar.as_mut().unwrap().swimlane_indices = vec![0, 2];
+        app.sidebar.as_mut().unwrap().swimlanes = vec![app.projects[0].id(), app.projects[2].id()];
         assert_eq!(app.visible_swimlane_count(), app.visible_swimlanes().len());
-        app.sidebar.as_mut().unwrap().swimlane_indices = vec![0, 1, 2];
+        app.sidebar.as_mut().unwrap().swimlanes = vec![
+            app.projects[0].id(),
+            app.projects[1].id(),
+            app.projects[2].id(),
+        ];
         assert_eq!(app.visible_swimlane_count(), app.visible_swimlanes().len());
     }
 
     #[test]
-    fn active_project_index_default() {
+    fn active_project_id_default() {
         let app = test_multi_app();
-        assert_eq!(app.active_project_index(), 0);
+        assert_eq!(app.active_project_id(), app.projects[0].id());
         assert_eq!(app.active_project().config.project_name, "alpha");
     }
 
     #[test]
-    fn active_project_index_with_swimlanes() {
+    fn active_project_id_with_swimlanes() {
         let mut app = test_multi_app();
-        app.sidebar.as_mut().unwrap().swimlane_indices = vec![0, 1, 2];
+        app.sidebar.as_mut().unwrap().swimlanes = vec![
+            app.projects[0].id(),
+            app.projects[1].id(),
+            app.projects[2].id(),
+        ];
         app.focused_swimlane = 0;
-        assert_eq!(app.active_project_index(), 0);
+        assert_eq!(app.active_project_id(), app.projects[0].id());
         app.focused_swimlane = 1;
-        assert_eq!(app.active_project_index(), 1);
+        assert_eq!(app.active_project_id(), app.projects[1].id());
         assert_eq!(app.active_project().config.project_name, "beta");
         app.focused_swimlane = 2;
-        assert_eq!(app.active_project_index(), 2);
+        assert_eq!(app.active_project_id(), app.projects[2].id());
         assert_eq!(app.active_project().config.project_name, "gamma");
     }
 
     #[test]
-    fn active_project_index_out_of_range_fallback() {
+    fn active_project_id_out_of_range_fallback() {
         let mut app = test_multi_app();
-        app.sidebar.as_mut().unwrap().swimlane_indices = vec![0];
+        app.sidebar.as_mut().unwrap().swimlanes = vec![app.projects[0].id()];
         app.focused_swimlane = 5;
-        assert_eq!(app.active_project_index(), app.focused_project);
+        assert_eq!(app.active_project_id(), app.focused_project);
     }
 
     #[test]
@@ -3605,10 +3633,14 @@ mod tests {
         let mut app = test_multi_app();
         assert_eq!(app.card_size(), CardSize::Full);
 
-        app.sidebar.as_mut().unwrap().swimlane_indices = vec![0, 1];
+        app.sidebar.as_mut().unwrap().swimlanes = vec![app.projects[0].id(), app.projects[1].id()];
         assert_eq!(app.card_size(), CardSize::Medium);
 
-        app.sidebar.as_mut().unwrap().swimlane_indices = vec![0, 1, 2];
+        app.sidebar.as_mut().unwrap().swimlanes = vec![
+            app.projects[0].id(),
+            app.projects[1].id(),
+            app.projects[2].id(),
+        ];
         assert_eq!(app.card_size(), CardSize::Compact);
     }
 
@@ -3635,15 +3667,15 @@ mod tests {
     #[test]
     fn project_switch_updates_focused() {
         let mut app = test_multi_app();
-        assert_eq!(app.focused_project, 0);
-        app.focused_project = 2;
+        assert_eq!(app.focused_project, app.projects[0].id());
+        app.focused_project = app.projects[2].id();
         assert_eq!(app.project().config.project_name, "gamma");
     }
 
     #[test]
     fn active_project_mut_modifies_correct_project() {
         let mut app = test_multi_app();
-        app.sidebar.as_mut().unwrap().swimlane_indices = vec![0, 1];
+        app.sidebar.as_mut().unwrap().swimlanes = vec![app.projects[0].id(), app.projects[1].id()];
         app.focused_swimlane = 1;
         app.active_project_mut()
             .issues
