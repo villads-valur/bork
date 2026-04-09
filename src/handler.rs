@@ -2172,4 +2172,154 @@ mod tests {
         act(&mut app, Action::KillSession);
         assert_eq!(app.input_mode, InputMode::Confirm);
     }
+
+    // --- Multi-project / sidebar tests ---
+
+    fn test_config_named(name: &str) -> AppConfig {
+        AppConfig {
+            project_name: name.to_string(),
+            project_root: PathBuf::from(format!("/tmp/test-{}", name)),
+            agent_kind: crate::types::AgentKind::OpenCode,
+            default_prompt: None,
+            done_session_ttl: DEFAULT_DONE_SESSION_TTL,
+            debug: false,
+        }
+    }
+
+    fn test_multi_app() -> App {
+        let mut app = App::new(
+            test_config_named("alpha"),
+            crate::config::AppState {
+                issues: vec![test_issue("alpha-1", Column::Todo)],
+            },
+        );
+        app.add_background_project(
+            test_config_named("beta"),
+            crate::config::AppState {
+                issues: vec![test_issue("beta-1", Column::InProgress)],
+            },
+        );
+        app.add_background_project(
+            test_config_named("gamma"),
+            crate::config::AppState {
+                issues: vec![test_issue("gamma-1", Column::Todo)],
+            },
+        );
+        app.enable_sidebar();
+        app
+    }
+
+    #[test]
+    fn sidebar_toggle_opens_and_closes() {
+        let mut app = test_multi_app();
+        assert_eq!(app.input_mode, InputMode::Normal);
+
+        let post = handle_sidebar(&mut app, Action::ToggleSidebar);
+        assert!(matches!(post, PostAction::None));
+    }
+
+    #[test]
+    fn sidebar_navigation_bounds() {
+        let mut app = test_multi_app();
+        app.sidebar.as_mut().unwrap().focused = true;
+        app.input_mode = InputMode::Sidebar;
+
+        handle_sidebar(&mut app, Action::SidebarUp);
+        assert_eq!(app.sidebar.as_ref().unwrap().selected, 0);
+
+        handle_sidebar(&mut app, Action::SidebarDown);
+        assert_eq!(app.sidebar.as_ref().unwrap().selected, 1);
+
+        handle_sidebar(&mut app, Action::SidebarDown);
+        assert_eq!(app.sidebar.as_ref().unwrap().selected, 2);
+
+        handle_sidebar(&mut app, Action::SidebarDown);
+        assert_eq!(app.sidebar.as_ref().unwrap().selected, 2);
+    }
+
+    #[test]
+    fn sidebar_select_returns_switch_project() {
+        let mut app = test_multi_app();
+        app.sidebar.as_mut().unwrap().selected = 1;
+
+        let post = handle_sidebar(&mut app, Action::SidebarSelect);
+        assert!(matches!(post, PostAction::SwitchProject { index: 1 }));
+        assert_eq!(app.sidebar.as_ref().unwrap().swimlane_indices, vec![1]);
+    }
+
+    #[test]
+    fn sidebar_select_same_project_no_switch() {
+        let mut app = test_multi_app();
+        app.sidebar.as_mut().unwrap().selected = 0;
+
+        let post = handle_sidebar(&mut app, Action::SidebarSelect);
+        assert!(matches!(post, PostAction::None));
+    }
+
+    #[test]
+    fn sidebar_toggle_swimlane_add_remove() {
+        let mut app = test_multi_app();
+        app.sidebar.as_mut().unwrap().selected = 1;
+
+        handle_sidebar(&mut app, Action::SidebarToggleSwimlane);
+        assert!(app.sidebar.as_ref().unwrap().swimlane_indices.contains(&1));
+
+        app.sidebar.as_mut().unwrap().selected = 1;
+        handle_sidebar(&mut app, Action::SidebarToggleSwimlane);
+        assert!(!app.sidebar.as_ref().unwrap().swimlane_indices.contains(&1));
+    }
+
+    #[test]
+    fn sidebar_toggle_swimlane_max_three() {
+        let mut app = test_multi_app();
+        app.sidebar.as_mut().unwrap().swimlane_indices = vec![0, 1, 2];
+
+        app.add_background_project(
+            test_config_named("delta"),
+            crate::config::AppState { issues: vec![] },
+        );
+
+        app.sidebar.as_mut().unwrap().selected = 3;
+        handle_sidebar(&mut app, Action::SidebarToggleSwimlane);
+        assert_eq!(app.sidebar.as_ref().unwrap().swimlane_indices.len(), 3);
+        assert!(app.message.is_some());
+    }
+
+    #[test]
+    fn sidebar_toggle_swimlane_cant_remove_last() {
+        let mut app = test_multi_app();
+        app.sidebar.as_mut().unwrap().swimlane_indices = vec![0];
+        app.sidebar.as_mut().unwrap().selected = 0;
+
+        handle_sidebar(&mut app, Action::SidebarToggleSwimlane);
+        assert_eq!(app.sidebar.as_ref().unwrap().swimlane_indices, vec![0]);
+    }
+
+    #[test]
+    fn next_prev_swimlane_wraps() {
+        let mut app = test_multi_app();
+        app.sidebar.as_mut().unwrap().swimlane_indices = vec![0, 1, 2];
+        app.focused_swimlane = 0;
+
+        act(&mut app, Action::NextSwimlane);
+        assert_eq!(app.focused_swimlane, 1);
+
+        act(&mut app, Action::NextSwimlane);
+        assert_eq!(app.focused_swimlane, 2);
+
+        act(&mut app, Action::NextSwimlane);
+        assert_eq!(app.focused_swimlane, 0);
+
+        act(&mut app, Action::PrevSwimlane);
+        assert_eq!(app.focused_swimlane, 2);
+    }
+
+    #[test]
+    fn next_swimlane_noop_single() {
+        let mut app = test_multi_app();
+        app.focused_swimlane = 0;
+
+        act(&mut app, Action::NextSwimlane);
+        assert_eq!(app.focused_swimlane, 0);
+    }
 }

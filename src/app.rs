@@ -1208,7 +1208,16 @@ impl App {
     }
 
     pub fn visible_swimlane_count(&self) -> usize {
-        self.visible_swimlanes().len()
+        if let Some(ref sidebar) = self.sidebar {
+            if !sidebar.swimlane_indices.is_empty() {
+                return sidebar
+                    .swimlane_indices
+                    .iter()
+                    .filter(|&&idx| idx < self.projects.len())
+                    .count();
+            }
+        }
+        1
     }
 
     pub fn card_size(&self) -> CardSize {
@@ -3456,5 +3465,158 @@ mod tests {
         let filtered = app.filtered_linear_issues();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].identifier, "DOC-99");
+    }
+
+    // --- Multi-project tests ---
+
+    fn test_config_named(name: &str) -> AppConfig {
+        AppConfig {
+            project_name: name.into(),
+            project_root: PathBuf::from(format!("/tmp/test-{}", name)),
+            agent_kind: AgentKind::OpenCode,
+            default_prompt: None,
+            done_session_ttl: DEFAULT_DONE_SESSION_TTL,
+            debug: false,
+        }
+    }
+
+    fn test_multi_app() -> App {
+        let mut app = App::new(
+            test_config_named("alpha"),
+            AppState {
+                issues: vec![test_issue("alpha-1", Column::Todo)],
+            },
+        );
+        app.add_background_project(
+            test_config_named("beta"),
+            AppState {
+                issues: vec![
+                    test_issue("beta-1", Column::Todo),
+                    test_issue("beta-2", Column::InProgress),
+                ],
+            },
+        );
+        app.add_background_project(
+            test_config_named("gamma"),
+            AppState {
+                issues: vec![test_issue("gamma-1", Column::CodeReview)],
+            },
+        );
+        app.enable_sidebar();
+        app
+    }
+
+    #[test]
+    fn visible_swimlanes_default_single() {
+        let app = test_multi_app();
+        let lanes = app.visible_swimlanes();
+        assert_eq!(lanes, vec![0]);
+    }
+
+    #[test]
+    fn visible_swimlanes_with_indices() {
+        let mut app = test_multi_app();
+        app.sidebar.as_mut().unwrap().swimlane_indices = vec![0, 1];
+        let lanes = app.visible_swimlanes();
+        assert_eq!(lanes, vec![0, 1]);
+    }
+
+    #[test]
+    fn visible_swimlanes_filters_invalid() {
+        let mut app = test_multi_app();
+        app.sidebar.as_mut().unwrap().swimlane_indices = vec![0, 99];
+        let lanes = app.visible_swimlanes();
+        assert_eq!(lanes, vec![0]);
+    }
+
+    #[test]
+    fn visible_swimlane_count_matches_vec() {
+        let mut app = test_multi_app();
+        assert_eq!(app.visible_swimlane_count(), app.visible_swimlanes().len());
+        app.sidebar.as_mut().unwrap().swimlane_indices = vec![0, 2];
+        assert_eq!(app.visible_swimlane_count(), app.visible_swimlanes().len());
+        app.sidebar.as_mut().unwrap().swimlane_indices = vec![0, 1, 2];
+        assert_eq!(app.visible_swimlane_count(), app.visible_swimlanes().len());
+    }
+
+    #[test]
+    fn active_project_index_default() {
+        let app = test_multi_app();
+        assert_eq!(app.active_project_index(), 0);
+        assert_eq!(app.active_project().config.project_name, "alpha");
+    }
+
+    #[test]
+    fn active_project_index_with_swimlanes() {
+        let mut app = test_multi_app();
+        app.sidebar.as_mut().unwrap().swimlane_indices = vec![0, 1, 2];
+        app.focused_swimlane = 0;
+        assert_eq!(app.active_project_index(), 0);
+        app.focused_swimlane = 1;
+        assert_eq!(app.active_project_index(), 1);
+        assert_eq!(app.active_project().config.project_name, "beta");
+        app.focused_swimlane = 2;
+        assert_eq!(app.active_project_index(), 2);
+        assert_eq!(app.active_project().config.project_name, "gamma");
+    }
+
+    #[test]
+    fn active_project_index_out_of_range_fallback() {
+        let mut app = test_multi_app();
+        app.sidebar.as_mut().unwrap().swimlane_indices = vec![0];
+        app.focused_swimlane = 5;
+        assert_eq!(app.active_project_index(), app.focused_project);
+    }
+
+    #[test]
+    fn card_size_by_swimlane_count() {
+        let mut app = test_multi_app();
+        assert_eq!(app.card_size(), CardSize::Full);
+
+        app.sidebar.as_mut().unwrap().swimlane_indices = vec![0, 1];
+        assert_eq!(app.card_size(), CardSize::Medium);
+
+        app.sidebar.as_mut().unwrap().swimlane_indices = vec![0, 1, 2];
+        assert_eq!(app.card_size(), CardSize::Compact);
+    }
+
+    #[test]
+    fn add_background_project() {
+        let mut app = test_app(vec![test_issue("a-1", Column::Todo)]);
+        assert_eq!(app.projects.len(), 1);
+        app.add_background_project(test_config_named("other"), AppState { issues: vec![] });
+        assert_eq!(app.projects.len(), 2);
+        assert_eq!(app.projects[1].config.project_name, "other");
+    }
+
+    #[test]
+    fn enable_sidebar_needs_two_projects() {
+        let mut app = test_app(vec![]);
+        app.enable_sidebar();
+        assert!(app.sidebar.is_none());
+
+        app.add_background_project(test_config_named("b"), AppState { issues: vec![] });
+        app.enable_sidebar();
+        assert!(app.sidebar.is_some());
+    }
+
+    #[test]
+    fn project_switch_updates_focused() {
+        let mut app = test_multi_app();
+        assert_eq!(app.focused_project, 0);
+        app.focused_project = 2;
+        assert_eq!(app.project().config.project_name, "gamma");
+    }
+
+    #[test]
+    fn active_project_mut_modifies_correct_project() {
+        let mut app = test_multi_app();
+        app.sidebar.as_mut().unwrap().swimlane_indices = vec![0, 1];
+        app.focused_swimlane = 1;
+        app.active_project_mut()
+            .issues
+            .push(test_issue("beta-3", Column::Todo));
+        assert_eq!(app.projects[1].issues.len(), 3);
+        assert_eq!(app.projects[0].issues.len(), 1);
     }
 }
