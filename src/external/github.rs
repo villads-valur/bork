@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use crate::types::{ChecksStatus, PrState, PrStatus, ReviewDecision};
 
@@ -27,7 +27,7 @@ const PR_FIELDS: &str = r#"
     }
 "#;
 
-static GITHUB_USER: OnceLock<Option<String>> = OnceLock::new();
+static GITHUB_USER: Mutex<Option<String>> = Mutex::new(None);
 
 fn parse_repo_identity(json_str: &str) -> Option<RepoIdentity> {
     let parsed: serde_json::Value = serde_json::from_str(json_str.trim()).ok()?;
@@ -40,13 +40,17 @@ fn get_repo_identity(main_worktree: &Path) -> Option<RepoIdentity> {
     let canonical =
         std::fs::canonicalize(main_worktree).unwrap_or_else(|_| main_worktree.to_path_buf());
 
-    let mut cache = REPO_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    let map = cache.get_or_insert_with(HashMap::new);
-
-    if let Some(identity) = map.get(&canonical) {
-        return Some(identity.clone());
+    // Check cache (short lock)
+    {
+        let cache = REPO_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(map) = cache.as_ref() {
+            if let Some(identity) = map.get(&canonical) {
+                return Some(identity.clone());
+            }
+        }
     }
 
+    // Cache miss: fetch without holding the lock
     let output = Command::new("gh")
         .args(["repo", "view", "--json", "owner,name"])
         .current_dir(main_worktree)
@@ -59,6 +63,10 @@ fn get_repo_identity(main_worktree: &Path) -> Option<RepoIdentity> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let identity = parse_repo_identity(&stdout)?;
+
+    // Re-acquire lock to insert
+    let mut cache = REPO_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let map = cache.get_or_insert_with(HashMap::new);
     map.insert(canonical, identity.clone());
     Some(identity)
 }
@@ -248,26 +256,28 @@ fn parse_search_response(json_str: &str) -> Vec<PrStatus> {
 }
 
 pub fn fetch_current_user(main_worktree: &Path) -> Option<String> {
-    GITHUB_USER
-        .get_or_init(|| {
-            let output = Command::new("gh")
-                .args(["api", "user", "-q", ".login"])
-                .current_dir(main_worktree)
-                .output()
-                .ok()?;
+    let mut cached = GITHUB_USER.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ref user) = *cached {
+        return Some(user.clone());
+    }
 
-            if !output.status.success() {
-                return None;
-            }
+    let output = Command::new("gh")
+        .args(["api", "user", "-q", ".login"])
+        .current_dir(main_worktree)
+        .output()
+        .ok()?;
 
-            let login = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if login.is_empty() {
-                None
-            } else {
-                Some(login)
-            }
-        })
-        .clone()
+    if !output.status.success() {
+        return None;
+    }
+
+    let login = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if login.is_empty() {
+        return None;
+    }
+
+    *cached = Some(login.clone());
+    Some(login)
 }
 
 pub fn open_pr_in_browser(pr_number: u32, main_worktree: &Path) {

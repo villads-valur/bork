@@ -25,6 +25,8 @@ fn dirs_path() -> PathBuf {
     if let Some(home) = home_dir() {
         return home.join(".config");
     }
+    // Fallback: $HOME and $XDG_CONFIG_HOME both unset (broken environment).
+    // Creates config relative to cwd, which is non-ideal but avoids a hard error.
     PathBuf::from(".config")
 }
 

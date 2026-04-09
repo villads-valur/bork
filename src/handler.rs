@@ -159,7 +159,10 @@ fn handle_normal(
 
             app.start_confirm(
                 format!("Kill session '{}'? (y/n)", session_name),
-                ConfirmAction::KillSession { session_name },
+                ConfirmAction::KillSession {
+                    session_name,
+                    project_index: app.active_project_index(),
+                },
             );
             PostAction::None
         }
@@ -195,7 +198,10 @@ fn handle_normal(
 
             app.start_confirm(
                 format!("Delete {}: {}? (y/n)", issue.id, issue.title),
-                ConfirmAction::DeleteIssue { issue_index: idx },
+                ConfirmAction::DeleteIssue {
+                    issue_index: idx,
+                    project_index: app.active_project_index(),
+                },
             );
             PostAction::None
         }
@@ -1011,11 +1017,16 @@ fn handle_confirm(app: &mut App, action: Action, action_tx: &mpsc::Sender<Action
         Action::ConfirmYes => {
             if let Some(confirm_action) = app.take_confirm_action() {
                 match confirm_action {
-                    ConfirmAction::KillSession { session_name } => {
+                    ConfirmAction::KillSession {
+                        session_name,
+                        project_index,
+                    } => {
                         app.busy_count += 1;
                         let tx = action_tx.clone();
-                        let status_file =
-                            agent_status_file(&app.project().config.project_root, &session_name);
+                        let status_file = agent_status_file(
+                            &app.projects[project_index].config.project_root,
+                            &session_name,
+                        );
 
                         thread::spawn(move || {
                             let message = match tmux::kill_session(&session_name) {
@@ -1033,18 +1044,19 @@ fn handle_confirm(app: &mut App, action: Action, action_tx: &mpsc::Sender<Action
                             });
                         });
                     }
-                    ConfirmAction::DeleteIssue { issue_index } => {
-                        if issue_index < app.project().issues.len() {
-                            let issue = &app.project().issues[issue_index];
-                            let session_name =
-                                issue.session_name(&app.project().config.project_name);
+                    ConfirmAction::DeleteIssue {
+                        issue_index,
+                        project_index,
+                    } => {
+                        let p = &app.projects[project_index];
+                        if issue_index < p.issues.len() {
+                            let issue = &p.issues[issue_index];
+                            let session_name = issue.session_name(&p.config.project_name);
                             let id = issue.id.clone();
-                            let status_file = agent_status_file(
-                                &app.project().config.project_root,
-                                &session_name,
-                            );
+                            let status_file =
+                                agent_status_file(&p.config.project_root, &session_name);
 
-                            if app.project().is_session_alive(&session_name) {
+                            if p.is_session_alive(&session_name) {
                                 let tx = action_tx.clone();
                                 let sn = session_name.clone();
                                 thread::spawn(move || {
@@ -1063,7 +1075,7 @@ fn handle_confirm(app: &mut App, action: Action, action_tx: &mpsc::Sender<Action
                                 app.set_message(format!("Deleted {}", id));
                             }
 
-                            let p = app.project_mut();
+                            let p = &mut app.projects[project_index];
                             p.issues.remove(issue_index);
                             p.clamp_all_rows();
                             p.mark_dirty();

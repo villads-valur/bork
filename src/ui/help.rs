@@ -43,7 +43,7 @@ const SECTIONS: &[Section] = &[
         bindings: &[
             ("h / l", "Focus column"),
             ("j / k", "Move up / down"),
-            ("Tab / S-Tab", "Jump column"),
+            ("\u{2190} / \u{2192}", "Jump column"),
             ("g / G", "Top / bottom"),
         ],
     },

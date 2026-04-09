@@ -715,8 +715,14 @@ pub struct LinearPickerState {
 
 #[derive(Debug, Clone)]
 pub enum ConfirmAction {
-    KillSession { session_name: String },
-    DeleteIssue { issue_index: usize },
+    KillSession {
+        session_name: String,
+        project_index: usize,
+    },
+    DeleteIssue {
+        issue_index: usize,
+        project_index: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
