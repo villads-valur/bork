@@ -66,6 +66,8 @@ pub struct Project {
     pub tuicr_available: bool,
     pub live: LiveState,
     pub state_dirty: bool,
+    pub base_issues: Vec<Issue>,
+    pub last_state_mtime: Option<SystemTime>,
 }
 
 impl Project {
@@ -77,6 +79,8 @@ impl Project {
                 issue.done_at = Some(now);
             }
         }
+        let base_issues = issues.clone();
+        let last_state_mtime = crate::config::state_mtime(&config.project_root);
         Project {
             issues,
             config,
@@ -87,6 +91,8 @@ impl Project {
             tuicr_available: false,
             live: LiveState::default(),
             state_dirty: false,
+            base_issues,
+            last_state_mtime,
         }
     }
 
@@ -103,6 +109,52 @@ impl Project {
         AppState {
             issues: self.issues.clone(),
         }
+    }
+
+    pub fn update_base_snapshot(&mut self) {
+        self.base_issues = self.issues.clone();
+        self.last_state_mtime = crate::config::state_mtime(&self.config.project_root);
+    }
+
+    pub fn merge_external_state(&mut self, file_state: AppState) {
+        let file_issues = file_state.issues;
+
+        if !self.state_dirty {
+            // No local changes pending, safe to fully replace
+            self.issues = file_issues.clone();
+            self.base_issues = file_issues;
+            self.clamp_all_rows();
+            return;
+        }
+
+        // 3-way merge: base (last known disk state) vs memory vs file
+        let file_ids: HashSet<String> = file_issues.iter().map(|i| i.id.clone()).collect();
+        let memory_ids: HashSet<String> = self.issues.iter().map(|i| i.id.clone()).collect();
+
+        // Remove issues that were deleted externally
+        self.issues.retain(|i| file_ids.contains(&i.id));
+
+        // Add issues that were created externally
+        for file_issue in &file_issues {
+            if !memory_ids.contains(&file_issue.id) {
+                self.issues.push(file_issue.clone());
+            }
+        }
+
+        // Field-level merge for issues present in both memory and file
+        for issue in &mut self.issues {
+            let Some(file_issue) = file_issues.iter().find(|f| f.id == issue.id) else {
+                continue;
+            };
+            let Some(base_issue) = self.base_issues.iter().find(|b| b.id == issue.id) else {
+                // No base means this issue was added after last snapshot; keep memory version
+                continue;
+            };
+            merge_issue_fields(issue, base_issue, file_issue);
+        }
+
+        self.base_issues = file_issues;
+        self.clamp_all_rows();
     }
 
     pub fn issues_in_column(&self, column: Column) -> Vec<(usize, &Issue)> {
@@ -1110,6 +1162,33 @@ fn clear_to_start(text: &mut String, cursor: &mut usize) {
     let end_byte = char_to_byte_index(text, *cursor);
     text.drain(0..end_byte);
     *cursor = 0;
+}
+
+/// 3-way field merge: for each field, if file diverged from base but memory didn't,
+/// take the file value. If both diverged, memory wins.
+fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
+    macro_rules! merge_field {
+        ($field:ident) => {
+            if memory.$field == base.$field && file.$field != base.$field {
+                memory.$field = file.$field.clone();
+            }
+        };
+    }
+    merge_field!(title);
+    merge_field!(kind);
+    merge_field!(column);
+    merge_field!(agent_kind);
+    merge_field!(agent_mode);
+    merge_field!(prompt);
+    merge_field!(worktree);
+    merge_field!(done_at);
+    merge_field!(session_id);
+    merge_field!(linear_id);
+    merge_field!(linear_identifier);
+    merge_field!(linear_url);
+    merge_field!(linear_imported);
+    merge_field!(pr_number);
+    merge_field!(pr_imported);
 }
 
 pub struct App {
