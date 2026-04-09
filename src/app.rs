@@ -715,6 +715,11 @@ pub enum CardSize {
     Compact,
 }
 
+#[derive(Debug, Clone)]
+pub struct ActionContext {
+    pub project_id: ProjectId,
+}
+
 #[derive(Debug)]
 pub struct LinearPickerState {
     pub search: String,
@@ -1242,6 +1247,27 @@ impl App {
             .expect("active project not found")
     }
 
+    pub fn action_context(&self) -> ActionContext {
+        ActionContext {
+            project_id: self.active_project_id(),
+        }
+    }
+
+    pub fn context_project(&self, ctx: &ActionContext) -> &Project {
+        self.find_project(&ctx.project_id)
+            .unwrap_or_else(|| self.project())
+    }
+
+    pub fn context_project_mut(&mut self, ctx: &ActionContext) -> &mut Project {
+        let id = ctx.project_id.clone();
+        let has_project = self.find_project(&id).is_some();
+        if has_project {
+            self.find_project_mut(&id).unwrap()
+        } else {
+            self.project_mut()
+        }
+    }
+
     pub fn visible_swimlanes(&self) -> Vec<ProjectId> {
         if let Some(ref sidebar) = self.sidebar {
             if !sidebar.swimlanes.is_empty() {
@@ -1301,12 +1327,12 @@ impl App {
         FRAMES[self.spinner_tick % FRAMES.len()]
     }
 
-    pub fn open_dialog(&mut self) {
-        self.open_dialog_in_column(Column::Todo);
+    pub fn open_dialog(&mut self, ctx: &ActionContext) {
+        self.open_dialog_in_column(Column::Todo, ctx);
     }
 
-    pub fn open_dialog_in_column(&mut self, column: Column) {
-        let p = self.active_project();
+    pub fn open_dialog_in_column(&mut self, column: Column, ctx: &ActionContext) {
+        let p = self.context_project(ctx);
         let github_available = p.has_github_prs();
         let mut state = DialogState::new(p.config.agent_kind, p.linear_available, github_available);
         state.target_column = Some(column);
@@ -1314,8 +1340,8 @@ impl App {
         self.input_mode = InputMode::Dialog;
     }
 
-    pub fn open_edit_dialog(&mut self, issue: &Issue, index: usize) {
-        let p = self.active_project();
+    pub fn open_edit_dialog(&mut self, issue: &Issue, index: usize, ctx: &ActionContext) {
+        let p = self.context_project(ctx);
         let github_available = p.has_github_prs();
         let live = &p.live;
         self.dialog = Some(DialogState::from_issue(
@@ -1334,12 +1360,16 @@ impl App {
         self.input_mode = InputMode::Normal;
     }
 
-    pub fn open_import_picker(&mut self) {
-        self.open_import_picker_with_context(LinearPickerContext::Import);
+    pub fn open_import_picker(&mut self, ctx: &ActionContext) {
+        self.open_import_picker_with_context(LinearPickerContext::Import, ctx);
     }
 
-    pub fn open_import_picker_with_context(&mut self, context: LinearPickerContext) {
-        let p = self.active_project();
+    pub fn open_import_picker_with_context(
+        &mut self,
+        context: LinearPickerContext,
+        ctx: &ActionContext,
+    ) {
+        let p = self.context_project(ctx);
         let has_linear = !p.live.linear_issues.is_empty();
         let has_github = p.has_github_prs();
 
@@ -1367,12 +1397,16 @@ impl App {
     }
 
     #[cfg(test)]
-    pub fn open_linear_picker(&mut self) {
-        self.open_import_picker_with_context(LinearPickerContext::Import);
+    pub fn open_linear_picker(&mut self, ctx: &ActionContext) {
+        self.open_import_picker_with_context(LinearPickerContext::Import, ctx);
     }
 
-    pub fn open_linear_picker_with_context(&mut self, context: LinearPickerContext) {
-        self.open_import_picker_with_context(context);
+    pub fn open_linear_picker_with_context(
+        &mut self,
+        context: LinearPickerContext,
+        ctx: &ActionContext,
+    ) {
+        self.open_import_picker_with_context(context, ctx);
     }
 
     pub fn close_linear_picker(&mut self) {
@@ -1450,19 +1484,19 @@ impl App {
         self.input_mode = InputMode::Search;
     }
 
-    pub fn search_push_char(&mut self, c: char) {
-        let p = self.active_project_mut();
+    pub fn search_push_char(&mut self, c: char, ctx: &ActionContext) {
+        let p = self.context_project_mut(ctx);
         p.search_query.push(c);
         p.clamp_all_rows();
         p.focus_first_match();
     }
 
-    pub fn search_delete_char(&mut self) {
-        if self.active_project().search_query.is_empty() {
-            self.cancel_search();
+    pub fn search_delete_char(&mut self, ctx: &ActionContext) {
+        if self.context_project(ctx).search_query.is_empty() {
+            self.cancel_search(ctx);
             return;
         }
-        let p = self.active_project_mut();
+        let p = self.context_project_mut(ctx);
         p.search_query.pop();
         p.clamp_all_rows();
         p.focus_first_match();
@@ -1472,15 +1506,15 @@ impl App {
         self.input_mode = InputMode::Normal;
     }
 
-    pub fn cancel_search(&mut self) {
-        let p = self.active_project_mut();
+    pub fn cancel_search(&mut self, ctx: &ActionContext) {
+        let p = self.context_project_mut(ctx);
         p.search_query.clear();
         p.clamp_all_rows();
         self.input_mode = InputMode::Normal;
     }
 
-    pub fn clear_search(&mut self) {
-        let p = self.active_project_mut();
+    pub fn clear_search(&mut self, ctx: &ActionContext) {
+        let p = self.context_project_mut(ctx);
         if !p.search_query.is_empty() {
             p.search_query.clear();
             p.clamp_all_rows();
@@ -3031,8 +3065,9 @@ mod tests {
     #[test]
     fn confirm_search_returns_to_normal_with_filter_active() {
         let mut app = test_app(vec![test_issue_titled("bork-1", "Fix login", Column::Todo)]);
+        let ctx = app.action_context();
         app.start_search();
-        app.search_push_char('f');
+        app.search_push_char('f', &ctx);
         app.confirm_search();
         assert_eq!(app.input_mode, InputMode::Normal);
         assert_eq!(
@@ -3049,10 +3084,11 @@ mod tests {
     #[test]
     fn cancel_search_clears_query_and_returns_to_normal() {
         let mut app = test_app(vec![]);
+        let ctx = app.action_context();
         app.start_search();
-        app.search_push_char('f');
-        app.search_push_char('i');
-        app.cancel_search();
+        app.search_push_char('f', &ctx);
+        app.search_push_char('i', &ctx);
+        app.cancel_search(&ctx);
         assert_eq!(app.input_mode, InputMode::Normal);
         assert!(app.project_mut().search_query.is_empty());
     }
@@ -3070,7 +3106,8 @@ mod tests {
         app.project_mut().search_query = "fix".to_string();
         assert_eq!(app.project().issues_in_column(Column::Todo).len(), 1);
 
-        app.clear_search();
+        let ctx = app.action_context();
+        app.clear_search(&ctx);
         assert!(app.project_mut().search_query.is_empty());
         assert_eq!(app.project().issues_in_column(Column::Todo).len(), 2);
     }
@@ -3078,7 +3115,8 @@ mod tests {
     #[test]
     fn clear_search_noop_when_no_filter() {
         let mut app = test_app(vec![test_issue("bork-1", Column::Todo)]);
-        app.clear_search();
+        let ctx = app.action_context();
+        app.clear_search(&ctx);
         assert!(app.project_mut().search_query.is_empty());
         assert_eq!(app.project().issues_in_column(Column::Todo).len(), 1);
     }
@@ -3090,6 +3128,7 @@ mod tests {
     #[test]
     fn has_active_search_false_when_empty() {
         let app = test_app(vec![]);
+        let ctx = app.action_context();
         assert!(!app.has_active_search());
     }
 
@@ -3097,6 +3136,7 @@ mod tests {
     fn has_active_search_true_when_query_set() {
         let mut app = test_app(vec![]);
         app.project_mut().search_query = "test".to_string();
+        let ctx = app.action_context();
         assert!(app.has_active_search());
     }
 
@@ -3107,12 +3147,13 @@ mod tests {
     #[test]
     fn search_push_char_appends_to_query() {
         let mut app = test_app(vec![test_issue_titled("bork-1", "Fix bug", Column::Todo)]);
+        let ctx = app.action_context();
         app.start_search();
-        app.search_push_char('f');
+        app.search_push_char('f', &ctx);
         assert_eq!(app.project_mut().search_query, "f");
-        app.search_push_char('i');
+        app.search_push_char('i', &ctx);
         assert_eq!(app.project_mut().search_query, "fi");
-        app.search_push_char('x');
+        app.search_push_char('x', &ctx);
         assert_eq!(app.project_mut().search_query, "fix");
     }
 
@@ -3122,11 +3163,12 @@ mod tests {
             test_issue_titled("bork-1", "Add feature", Column::Todo),
             test_issue_titled("bork-2", "Fix bug", Column::InProgress),
         ]);
+        let ctx = app.action_context();
         app.project_mut().selected_column = 0;
         app.start_search();
-        app.search_push_char('f');
-        app.search_push_char('i');
-        app.search_push_char('x');
+        app.search_push_char('f', &ctx);
+        app.search_push_char('i', &ctx);
+        app.search_push_char('x', &ctx);
 
         assert_eq!(
             app.project_mut().selected_column,
@@ -3142,10 +3184,11 @@ mod tests {
             test_issue_titled("bork-1", "Add feature", Column::Todo),
             test_issue_titled("bork-2", "Deploy fix", Column::Done),
         ]);
+        let ctx = app.action_context();
         app.project_mut().selected_column = 0;
         app.start_search();
-        app.search_push_char('d');
-        app.search_push_char('e');
+        app.search_push_char('d', &ctx);
+        app.search_push_char('e', &ctx);
 
         assert_eq!(
             app.project_mut().selected_column,
@@ -3160,9 +3203,10 @@ mod tests {
             test_issue_titled("bork-1", "Fix login", Column::Todo),
             test_issue_titled("bork-2", "Fix crash", Column::InProgress),
         ]);
+        let ctx = app.action_context();
         app.project_mut().selected_column = 0;
         app.start_search();
-        app.search_push_char('f');
+        app.search_push_char('f', &ctx);
 
         assert_eq!(
             app.project_mut().selected_column,
@@ -3178,21 +3222,23 @@ mod tests {
     #[test]
     fn search_delete_char_removes_last_char() {
         let mut app = test_app(vec![test_issue_titled("bork-1", "Fix bug", Column::Todo)]);
+        let ctx = app.action_context();
         app.start_search();
-        app.search_push_char('f');
-        app.search_push_char('i');
-        app.search_push_char('x');
-        app.search_delete_char();
+        app.search_push_char('f', &ctx);
+        app.search_push_char('i', &ctx);
+        app.search_push_char('x', &ctx);
+        app.search_delete_char(&ctx);
         assert_eq!(app.project_mut().search_query, "fi");
     }
 
     #[test]
     fn search_backspace_on_empty_cancels_search() {
         let mut app = test_app(vec![]);
+        let ctx = app.action_context();
         app.start_search();
         assert_eq!(app.input_mode, InputMode::Search);
 
-        app.search_delete_char();
+        app.search_delete_char(&ctx);
         assert_eq!(app.input_mode, InputMode::Normal);
         assert!(app.project_mut().search_query.is_empty());
     }
@@ -3200,9 +3246,10 @@ mod tests {
     #[test]
     fn search_backspace_on_single_char_stays_in_search() {
         let mut app = test_app(vec![test_issue_titled("bork-1", "Fix bug", Column::Todo)]);
+        let ctx = app.action_context();
         app.start_search();
-        app.search_push_char('f');
-        app.search_delete_char();
+        app.search_push_char('f', &ctx);
+        app.search_delete_char(&ctx);
 
         assert_eq!(app.input_mode, InputMode::Search);
         assert!(app.project_mut().search_query.is_empty());
@@ -3214,15 +3261,16 @@ mod tests {
             test_issue_titled("bork-1", "Add feature", Column::Todo),
             test_issue_titled("bork-2", "Add dark mode", Column::InProgress),
         ]);
+        let ctx = app.action_context();
         app.start_search();
         // Type "add f" — only matches "Add feature" in Todo
         for c in "add f".chars() {
-            app.search_push_char(c);
+            app.search_push_char(c, &ctx);
         }
         assert_eq!(app.project().selected_column, 0);
 
         // Delete "f" — now "add" matches both columns
-        app.search_delete_char();
+        app.search_delete_char(&ctx);
         assert_eq!(
             app.project().selected_column,
             0,
@@ -3241,13 +3289,14 @@ mod tests {
             test_issue_titled("bork-2", "Fix crash", Column::Todo),
             test_issue_titled("bork-3", "Add feature", Column::Todo),
         ]);
+        let ctx = app.action_context();
         app.project_mut().selected_column = 0;
         app.project_mut().selected_row[0] = 2; // selecting "Add feature"
 
         app.start_search();
-        app.search_push_char('f');
-        app.search_push_char('i');
-        app.search_push_char('x');
+        app.search_push_char('f', &ctx);
+        app.search_push_char('i', &ctx);
+        app.search_push_char('x', &ctx);
 
         // Only 2 results remain (bork-1 and bork-2), row 2 is out of bounds
         let count = app.project().issues_in_column(Column::Todo).len();
@@ -3261,12 +3310,13 @@ mod tests {
     #[test]
     fn search_clamps_row_to_zero_when_column_empty() {
         let mut app = test_app(vec![test_issue_titled("bork-1", "Fix login", Column::Todo)]);
+        let ctx = app.action_context();
         app.project_mut().selected_column = 0;
         app.project_mut().selected_row[0] = 0;
 
         app.start_search();
-        app.search_push_char('z');
-        app.search_push_char('z');
+        app.search_push_char('z', &ctx);
+        app.search_push_char('z', &ctx);
 
         assert_eq!(app.project().issues_in_column(Column::Todo).len(), 0);
         assert_eq!(app.project().selected_row[0], 0);
@@ -3282,15 +3332,16 @@ mod tests {
             test_issue_titled("bork-1", "Fix login", Column::Todo),
             test_issue_titled("bork-2", "Add feature", Column::InProgress),
         ]);
+        let ctx = app.action_context();
 
         // Start search
         app.start_search();
         assert_eq!(app.input_mode, InputMode::Search);
 
         // Type query
-        app.search_push_char('f');
-        app.search_push_char('i');
-        app.search_push_char('x');
+        app.search_push_char('f', &ctx);
+        app.search_push_char('i', &ctx);
+        app.search_push_char('x', &ctx);
         assert_eq!(app.project().issues_in_column(Column::Todo).len(), 1);
         assert_eq!(app.project().issues_in_column(Column::InProgress).len(), 0);
 
@@ -3301,7 +3352,7 @@ mod tests {
         assert_eq!(app.project().issues_in_column(Column::Todo).len(), 1);
 
         // Clear — all issues visible again
-        app.clear_search();
+        app.clear_search(&ctx);
         assert!(app.project_mut().search_query.is_empty());
         assert_eq!(app.project().issues_in_column(Column::Todo).len(), 1);
         assert_eq!(app.project().issues_in_column(Column::InProgress).len(), 1);
@@ -3313,14 +3364,15 @@ mod tests {
             test_issue_titled("bork-1", "Fix login", Column::Todo),
             test_issue_titled("bork-2", "Add feature", Column::Todo),
         ]);
+        let ctx = app.action_context();
 
         app.start_search();
-        app.search_push_char('f');
-        app.search_push_char('i');
+        app.search_push_char('f', &ctx);
+        app.search_push_char('i', &ctx);
         assert_eq!(app.project().issues_in_column(Column::Todo).len(), 1);
 
         // Cancel — clears query, all issues back
-        app.cancel_search();
+        app.cancel_search(&ctx);
         assert_eq!(app.input_mode, InputMode::Normal);
         assert!(app.project_mut().search_query.is_empty());
         assert_eq!(app.project().issues_in_column(Column::Todo).len(), 2);
@@ -3332,27 +3384,28 @@ mod tests {
             test_issue_titled("bork-1", "Fix login bug", Column::Todo),
             test_issue_titled("bork-2", "Fix logout crash", Column::Todo),
         ]);
+        let ctx = app.action_context();
 
         // First search: "fix"
         app.start_search();
-        app.search_push_char('f');
-        app.search_push_char('i');
-        app.search_push_char('x');
+        app.search_push_char('f', &ctx);
+        app.search_push_char('i', &ctx);
+        app.search_push_char('x', &ctx);
         app.confirm_search();
         assert_eq!(app.project().issues_in_column(Column::Todo).len(), 2);
 
         // Re-enter: query still "fix", refine to "fix log"
         app.start_search();
         assert_eq!(app.project_mut().search_query, "fix");
-        app.search_push_char(' ');
-        app.search_push_char('l');
-        app.search_push_char('o');
-        app.search_push_char('g');
+        app.search_push_char(' ', &ctx);
+        app.search_push_char('l', &ctx);
+        app.search_push_char('o', &ctx);
+        app.search_push_char('g', &ctx);
         assert_eq!(app.project().issues_in_column(Column::Todo).len(), 2);
 
         // Refine further to "fix login"
-        app.search_push_char('i');
-        app.search_push_char('n');
+        app.search_push_char('i', &ctx);
+        app.search_push_char('n', &ctx);
         assert_eq!(app.project().issues_in_column(Column::Todo).len(), 1);
         assert_eq!(
             app.project().issues_in_column(Column::Todo)[0].1.id,
@@ -3432,7 +3485,8 @@ mod tests {
         app.project_mut().linear_available = true;
         app.project_mut().live.linear_issues = vec![];
 
-        app.open_linear_picker();
+        let ctx = app.action_context();
+        app.open_linear_picker(&ctx);
         assert_eq!(app.input_mode, InputMode::Normal);
         assert!(app.linear_picker.is_none());
     }
@@ -3444,7 +3498,8 @@ mod tests {
         app.project_mut().live.linear_issues =
             vec![test_linear_issue("uuid-1", "TEST-1", "First issue")];
 
-        app.open_linear_picker();
+        let ctx = app.action_context();
+        app.open_linear_picker(&ctx);
         assert_eq!(app.input_mode, InputMode::LinearPicker);
         assert!(app.linear_picker.is_some());
     }
@@ -3456,7 +3511,8 @@ mod tests {
         app.project_mut().live.linear_issues =
             vec![test_linear_issue("uuid-1", "TEST-1", "First issue")];
 
-        app.open_linear_picker();
+        let ctx = app.action_context();
+        app.open_linear_picker(&ctx);
         app.close_linear_picker();
         assert_eq!(app.input_mode, InputMode::Normal);
         assert!(app.linear_picker.is_none());
@@ -3472,7 +3528,8 @@ mod tests {
             test_linear_issue("uuid-1", "TEST-1", "Already imported"),
             test_linear_issue("uuid-2", "TEST-2", "Not imported"),
         ];
-        app.open_linear_picker();
+        let ctx = app.action_context();
+        app.open_linear_picker(&ctx);
 
         let filtered = app.filtered_linear_issues();
         assert_eq!(filtered.len(), 2);
@@ -3486,7 +3543,8 @@ mod tests {
             test_linear_issue("uuid-2", "TEST-2", "Fix dashboard bug"),
             test_linear_issue("uuid-3", "TEST-3", "Add logout button"),
         ];
-        app.open_linear_picker();
+        let ctx = app.action_context();
+        app.open_linear_picker(&ctx);
 
         if let Some(ref mut picker) = app.linear_picker {
             picker.search = "add".to_string();
@@ -3505,7 +3563,8 @@ mod tests {
             test_linear_issue("uuid-1", "TEST-1", "First"),
             test_linear_issue("uuid-2", "DOC-99", "Second"),
         ];
-        app.open_linear_picker();
+        let ctx = app.action_context();
+        app.open_linear_picker(&ctx);
 
         if let Some(ref mut picker) = app.linear_picker {
             picker.search = "doc".to_string();

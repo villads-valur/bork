@@ -3,7 +3,9 @@ use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
 
-use crate::app::{App, ConfirmAction, ImportSource, InputMode, LinearPickerContext, ProjectId};
+use crate::app::{
+    ActionContext, App, ConfirmAction, ImportSource, InputMode, LinearPickerContext, ProjectId,
+};
 use crate::config::{self, AppConfig};
 use crate::external::{github, opencode, tmux, tuicr};
 use crate::input::Action;
@@ -42,6 +44,7 @@ pub enum PostAction {
 pub fn handle_action(
     app: &mut App,
     action: Action,
+    ctx: &ActionContext,
     action_tx: &mpsc::Sender<ActionResult>,
     pr_wake_tx: &PrWakeTx,
     linear_wake_tx: &LinearWakeTx,
@@ -49,16 +52,16 @@ pub fn handle_action(
 ) -> PostAction {
     match app.input_mode {
         InputMode::Confirm => {
-            handle_confirm(app, action, action_tx);
+            handle_confirm(app, action, ctx, action_tx);
             PostAction::None
         }
-        InputMode::Dialog => handle_dialog(app, action),
+        InputMode::Dialog => handle_dialog(app, action, ctx),
         InputMode::Search => {
-            handle_search(app, action);
+            handle_search(app, action, ctx);
             PostAction::None
         }
         InputMode::LinearPicker => {
-            handle_linear_picker(app, action, linear_wake_tx, pr_wake_tx);
+            handle_linear_picker(app, action, ctx, linear_wake_tx, pr_wake_tx);
             PostAction::None
         }
         InputMode::Help => {
@@ -69,7 +72,7 @@ pub fn handle_action(
             handle_debug_inspector(app, action);
             PostAction::None
         }
-        InputMode::Normal => handle_normal(app, action, action_tx, pr_wake_tx, git_wake_tx),
+        InputMode::Normal => handle_normal(app, action, ctx, action_tx, pr_wake_tx, git_wake_tx),
         InputMode::Sidebar => handle_sidebar(app, action),
     }
 }
@@ -77,6 +80,7 @@ pub fn handle_action(
 fn handle_normal(
     app: &mut App,
     action: Action,
+    ctx: &ActionContext,
     action_tx: &mpsc::Sender<ActionResult>,
     pr_wake_tx: &PrWakeTx,
     git_wake_tx: &GitWakeTx,
@@ -88,71 +92,71 @@ fn handle_normal(
         }
 
         Action::MoveUp => {
-            app.active_project_mut().move_selection_up();
+            app.context_project_mut(ctx).move_selection_up();
             PostAction::None
         }
         Action::MoveDown => {
-            app.active_project_mut().move_selection_down();
+            app.context_project_mut(ctx).move_selection_down();
             PostAction::None
         }
         Action::FocusLeft => {
-            app.active_project_mut().focus_left();
+            app.context_project_mut(ctx).focus_left();
             PostAction::None
         }
         Action::FocusRight => {
-            app.active_project_mut().focus_right();
+            app.context_project_mut(ctx).focus_right();
             PostAction::None
         }
         Action::JumpColumnLeft => {
-            app.active_project_mut().jump_column_left();
+            app.context_project_mut(ctx).jump_column_left();
             PostAction::None
         }
         Action::JumpColumnRight => {
-            app.active_project_mut().jump_column_right();
+            app.context_project_mut(ctx).jump_column_right();
             PostAction::None
         }
 
         Action::ScrollToTop => {
-            app.active_project_mut().scroll_to_top();
+            app.context_project_mut(ctx).scroll_to_top();
             PostAction::None
         }
         Action::ScrollToBottom => {
-            app.active_project_mut().scroll_to_bottom();
+            app.context_project_mut(ctx).scroll_to_bottom();
             PostAction::None
         }
 
         Action::MoveIssueRight => {
-            let p = app.active_project_mut();
+            let p = app.context_project_mut(ctx);
             p.move_issue_right();
             p.mark_dirty();
             PostAction::None
         }
         Action::MoveIssueLeft => {
-            let p = app.active_project_mut();
+            let p = app.context_project_mut(ctx);
             p.move_issue_left();
             p.mark_dirty();
             PostAction::None
         }
         Action::MoveToDone => {
-            let p = app.active_project_mut();
+            let p = app.context_project_mut(ctx);
             p.move_to_done();
             p.mark_dirty();
             PostAction::None
         }
         Action::MoveToTodo => {
-            let p = app.active_project_mut();
+            let p = app.context_project_mut(ctx);
             p.move_to_todo();
             p.mark_dirty();
             PostAction::None
         }
 
         Action::KillSession => {
-            let Some(issue) = app.active_project().selected_issue() else {
+            let Some(issue) = app.context_project(ctx).selected_issue() else {
                 return PostAction::None;
             };
 
-            let session_name = issue.session_name(&app.active_project().config.project_name);
-            if !app.active_project().is_session_alive(&session_name) {
+            let session_name = issue.session_name(&app.context_project(ctx).config.project_name);
+            if !app.context_project(ctx).is_session_alive(&session_name) {
                 app.set_message("No active session to kill");
                 return PostAction::None;
             }
@@ -161,38 +165,38 @@ fn handle_normal(
                 format!("Kill session '{}'? (y/n)", session_name),
                 ConfirmAction::KillSession {
                     session_name,
-                    project_id: app.active_project_id(),
+                    project_id: ctx.project_id.clone(),
                 },
             );
             PostAction::None
         }
 
         Action::CreateIssue => {
-            app.open_dialog();
+            app.open_dialog(ctx);
             PostAction::None
         }
 
         Action::AddIssue => {
-            let column =
-                Column::from_index(app.active_project().selected_column).unwrap_or(Column::Todo);
-            app.open_dialog_in_column(column);
+            let column = Column::from_index(app.context_project(ctx).selected_column)
+                .unwrap_or(Column::Todo);
+            app.open_dialog_in_column(column, ctx);
             PostAction::None
         }
 
         Action::EditIssue => {
-            let Some(idx) = app.active_project().selected_issue_index() else {
+            let Some(idx) = app.context_project(ctx).selected_issue_index() else {
                 return PostAction::None;
             };
-            let issue = app.active_project().issues[idx].clone();
-            app.open_edit_dialog(&issue, idx);
+            let issue = app.context_project(ctx).issues[idx].clone();
+            app.open_edit_dialog(&issue, idx, ctx);
             PostAction::None
         }
 
         Action::DeleteIssue => {
-            let Some(issue) = app.active_project().selected_issue() else {
+            let Some(issue) = app.context_project(ctx).selected_issue() else {
                 return PostAction::None;
             };
-            let Some(idx) = app.active_project().selected_issue_index() else {
+            let Some(idx) = app.context_project(ctx).selected_issue_index() else {
                 return PostAction::None;
             };
 
@@ -200,14 +204,14 @@ fn handle_normal(
                 format!("Delete {}: {}? (y/n)", issue.id, issue.title),
                 ConfirmAction::DeleteIssue {
                     issue_index: idx,
-                    project_id: app.active_project_id(),
+                    project_id: ctx.project_id.clone(),
                 },
             );
             PostAction::None
         }
 
         Action::OpenLinearPicker => {
-            app.open_import_picker();
+            app.open_import_picker(ctx);
             PostAction::None
         }
 
@@ -251,10 +255,10 @@ fn handle_normal(
         }
 
         Action::OpenTerminal => {
-            let session_name = format!("{}-terminal", app.active_project().config.project_name);
+            let session_name = format!("{}-terminal", app.context_project(ctx).config.project_name);
             let popup_title = "Terminal".to_string();
 
-            if app.active_project().is_session_alive(&session_name) {
+            if app.context_project(ctx).is_session_alive(&session_name) {
                 return PostAction::OpenTmuxPopup {
                     session_name,
                     popup_title,
@@ -264,7 +268,7 @@ fn handle_normal(
             app.busy_count += 1;
             app.set_message("Opening terminal...");
             let tx = action_tx.clone();
-            let project_root = app.active_project().config.project_root.clone();
+            let project_root = app.context_project(ctx).config.project_root.clone();
 
             thread::spawn(move || {
                 let result = match tmux::create_session(&session_name, &project_root) {
@@ -288,20 +292,20 @@ fn handle_normal(
         }
 
         Action::OpenSession => {
-            let Some(idx) = app.active_project().selected_issue_index() else {
+            let Some(idx) = app.context_project(ctx).selected_issue_index() else {
                 return PostAction::None;
             };
-            let issue = app.active_project().issues[idx].clone();
+            let issue = app.context_project(ctx).issues[idx].clone();
 
             if issue.kind == IssueKind::NonAgentic {
-                app.open_edit_dialog(&issue, idx);
+                app.open_edit_dialog(&issue, idx, ctx);
                 return PostAction::None;
             }
 
-            let session_name = issue.session_name(&app.active_project().config.project_name);
+            let session_name = issue.session_name(&app.context_project(ctx).config.project_name);
             let popup_title = format!("{}: {}", issue.id, issue.title);
 
-            if app.active_project().is_session_alive(&session_name) {
+            if app.context_project(ctx).is_session_alive(&session_name) {
                 return PostAction::OpenTmuxPopup {
                     session_name,
                     popup_title,
@@ -311,7 +315,7 @@ fn handle_normal(
             app.busy_count += 1;
             app.set_message("Launching session...");
 
-            let config = app.active_project().config.clone();
+            let config = app.context_project(ctx).config.clone();
             let tx = action_tx.clone();
 
             thread::spawn(move || {
@@ -326,24 +330,24 @@ fn handle_normal(
         }
 
         Action::OpenReview | Action::OpenReviewPR => {
-            if !app.active_project().tuicr_available {
+            if !app.context_project(ctx).tuicr_available {
                 return PostAction::None;
             }
-            let Some(issue) = app.active_project().selected_issue() else {
+            let Some(issue) = app.context_project(ctx).selected_issue() else {
                 return PostAction::None;
             };
             let Some(wt) = issue.worktree.clone() else {
                 app.set_message("No worktree assigned");
                 return PostAction::None;
             };
-            let session_name = issue.session_name(&app.active_project().config.project_name);
-            if !app.active_project().is_session_alive(&session_name) {
+            let session_name = issue.session_name(&app.context_project(ctx).config.project_name);
+            if !app.context_project(ctx).is_session_alive(&session_name) {
                 app.set_message("No active session");
                 return PostAction::None;
             }
             let pr_mode = action == Action::OpenReviewPR;
             let popup_title = format!("{}: {}", issue.id, issue.title);
-            let worktree_path = app.active_project().config.project_root.join(&wt);
+            let worktree_path = app.context_project(ctx).config.project_root.join(&wt);
             let tx = action_tx.clone();
             app.busy_count += 1;
             app.set_message(if pr_mode {
@@ -380,15 +384,15 @@ fn handle_normal(
         }
 
         Action::OpenPR => {
-            let Some(issue) = app.active_project().selected_issue() else {
+            let Some(issue) = app.context_project(ctx).selected_issue() else {
                 return PostAction::None;
             };
-            let Some(pr) = app.active_project().pr_for(issue) else {
+            let Some(pr) = app.context_project(ctx).pr_for(issue) else {
                 app.set_message("No PR found for this issue");
                 return PostAction::None;
             };
             let pr_number = pr.number;
-            let main_worktree = app.active_project().config.project_root.join("main");
+            let main_worktree = app.context_project(ctx).config.project_root.join("main");
             thread::spawn(move || {
                 github::open_pr_in_browser(pr_number, &main_worktree);
             });
@@ -396,7 +400,7 @@ fn handle_normal(
         }
 
         Action::OpenLinear => {
-            let Some(issue) = app.active_project().selected_issue() else {
+            let Some(issue) = app.context_project(ctx).selected_issue() else {
                 return PostAction::None;
             };
             let Some(url) = issue.linear_url.clone() else {
@@ -410,21 +414,21 @@ fn handle_normal(
         }
 
         Action::AssignWorktree => {
-            let Some(idx) = app.active_project().selected_issue_index() else {
+            let Some(idx) = app.context_project(ctx).selected_issue_index() else {
                 return PostAction::None;
             };
-            if let Some(old) = app.active_project_mut().issues[idx].worktree.take() {
+            if let Some(old) = app.context_project_mut(ctx).issues[idx].worktree.take() {
                 app.set_message(format!("Cleared worktree '{old}', re-detecting..."));
             } else {
                 app.set_message("No worktree assigned, re-detecting...");
             }
-            if app.active_project_mut().auto_assign_worktrees() {
-                if let Some(wt) = app.active_project().issues[idx].worktree.as_ref() {
+            if app.context_project_mut(ctx).auto_assign_worktrees() {
+                if let Some(wt) = app.context_project(ctx).issues[idx].worktree.as_ref() {
                     app.set_message(format!("Assigned worktree: {wt}"));
                 }
             }
             let _ = git_wake_tx.send(());
-            app.active_project_mut().mark_dirty();
+            app.context_project_mut(ctx).mark_dirty();
             PostAction::None
         }
 
@@ -434,26 +438,26 @@ fn handle_normal(
         }
 
         Action::ClearSearch => {
-            app.clear_search();
+            app.clear_search(ctx);
             PostAction::None
         }
 
         Action::DebugReset => {
-            if !app.active_project().config.debug {
+            if !app.context_project(ctx).config.debug {
                 return PostAction::None;
             }
-            lock::release_lock(&app.active_project().config.project_root);
-            let session_name = app.active_project().config.project_name.clone();
+            lock::release_lock(&app.context_project(ctx).config.project_root);
+            let session_name = app.context_project(ctx).config.project_name.clone();
             let _ = tmux::kill_session(&session_name);
             app.should_quit = true;
             PostAction::None
         }
 
         Action::DebugInspect => {
-            if !app.active_project().config.debug {
+            if !app.context_project(ctx).config.debug {
                 return PostAction::None;
             }
-            let Some(issue) = app.active_project().selected_issue().cloned() else {
+            let Some(issue) = app.context_project(ctx).selected_issue().cloned() else {
                 app.set_message("No issue selected");
                 return PostAction::None;
             };
@@ -466,12 +470,12 @@ fn handle_normal(
     }
 }
 
-fn handle_search(app: &mut App, action: Action) {
+fn handle_search(app: &mut App, action: Action, ctx: &ActionContext) {
     match action {
-        Action::SearchChar(c) => app.search_push_char(c),
-        Action::SearchBackspace => app.search_delete_char(),
+        Action::SearchChar(c) => app.search_push_char(c, ctx),
+        Action::SearchBackspace => app.search_delete_char(ctx),
         Action::SearchConfirm => app.confirm_search(),
-        Action::SearchCancel => app.cancel_search(),
+        Action::SearchCancel => app.cancel_search(ctx),
         _ => {}
     }
 }
@@ -509,7 +513,7 @@ fn handle_debug_inspector(app: &mut App, action: Action) {
     }
 }
 
-fn handle_dialog(app: &mut App, action: Action) -> PostAction {
+fn handle_dialog(app: &mut App, action: Action, ctx: &ActionContext) -> PostAction {
     let on_linear = app.dialog.as_ref().is_some_and(|d| d.is_on_linear_field());
     let on_github = app.dialog.as_ref().is_some_and(|d| d.is_on_github_field());
 
@@ -517,11 +521,11 @@ fn handle_dialog(app: &mut App, action: Action) -> PostAction {
         match action {
             Action::DialogChar(' ') => {
                 app.picker_tab = ImportSource::Linear;
-                app.open_linear_picker_with_context(LinearPickerContext::Attach);
+                app.open_linear_picker_with_context(LinearPickerContext::Attach, ctx);
                 return PostAction::None;
             }
             Action::DialogNextField => {
-                submit_dialog(app);
+                submit_dialog(app, ctx);
                 return PostAction::None;
             }
             Action::DialogBackspace | Action::DialogDelete => {
@@ -540,11 +544,11 @@ fn handle_dialog(app: &mut App, action: Action) -> PostAction {
         match action {
             Action::DialogChar(' ') => {
                 app.picker_tab = ImportSource::GitHub;
-                app.open_import_picker_with_context(LinearPickerContext::Attach);
+                app.open_import_picker_with_context(LinearPickerContext::Attach, ctx);
                 return PostAction::None;
             }
             Action::DialogNextField => {
-                submit_dialog(app);
+                submit_dialog(app, ctx);
                 return PostAction::None;
             }
             Action::DialogBackspace | Action::DialogDelete => {
@@ -561,7 +565,7 @@ fn handle_dialog(app: &mut App, action: Action) -> PostAction {
 
     match action {
         Action::DialogSubmit => {
-            submit_dialog(app);
+            submit_dialog(app, ctx);
             return PostAction::None;
         }
         Action::DialogCancel => {
@@ -609,7 +613,7 @@ fn handle_dialog(app: &mut App, action: Action) -> PostAction {
     PostAction::None
 }
 
-fn submit_dialog(app: &mut App) {
+fn submit_dialog(app: &mut App, ctx: &ActionContext) {
     let dialog = match app.dialog.take() {
         Some(d) => d,
         None => return,
@@ -630,7 +634,7 @@ fn submit_dialog(app: &mut App) {
         Some(prompt_text)
     };
 
-    let proj_id = app.active_project_id();
+    let proj_id = ctx.project_id.clone();
 
     if let Some(idx) = dialog.editing_index {
         let p = app.find_project_mut(&proj_id).unwrap();
@@ -718,6 +722,7 @@ fn apply_pr_fields(issue: &mut Issue, dialog: &crate::app::DialogState) {
 fn handle_linear_picker(
     app: &mut App,
     action: Action,
+    ctx: &ActionContext,
     linear_wake_tx: &LinearWakeTx,
     pr_wake_tx: &PrWakeTx,
 ) {
@@ -726,8 +731,8 @@ fn handle_linear_picker(
             app.close_linear_picker();
         }
         Action::PickerSwitchTab => {
-            let has_linear = !app.active_project().live.linear_issues.is_empty();
-            let has_github = app.active_project().has_github_prs();
+            let has_linear = !app.context_project(ctx).live.linear_issues.is_empty();
+            let has_github = app.context_project(ctx).has_github_prs();
             if has_linear && has_github {
                 app.picker_tab = match app.picker_tab {
                     ImportSource::Linear => ImportSource::GitHub,
@@ -769,10 +774,14 @@ fn handle_linear_picker(
             }
         }
         Action::LinearPickerSelect => match (app.linear_picker_context, app.picker_tab) {
-            (LinearPickerContext::Attach, ImportSource::Linear) => attach_linear_to_dialog(app),
-            (LinearPickerContext::Attach, ImportSource::GitHub) => attach_github_to_dialog(app),
-            (_, ImportSource::Linear) => import_linear_issue(app),
-            (_, ImportSource::GitHub) => import_github_pr(app),
+            (LinearPickerContext::Attach, ImportSource::Linear) => {
+                attach_linear_to_dialog(app, ctx)
+            }
+            (LinearPickerContext::Attach, ImportSource::GitHub) => {
+                attach_github_to_dialog(app, ctx)
+            }
+            (_, ImportSource::Linear) => import_linear_issue(app, ctx),
+            (_, ImportSource::GitHub) => import_github_pr(app, ctx),
         },
         Action::LinearPickerRefresh => match app.picker_tab {
             ImportSource::Linear => {
@@ -788,7 +797,7 @@ fn handle_linear_picker(
     }
 }
 
-fn attach_linear_to_dialog(app: &mut App) {
+fn attach_linear_to_dialog(app: &mut App, ctx: &ActionContext) {
     let filtered = app.filtered_linear_issues();
     let selected_idx = app.linear_picker.as_ref().map(|p| p.selected).unwrap_or(0);
 
@@ -807,7 +816,7 @@ fn attach_linear_to_dialog(app: &mut App) {
     }
 }
 
-fn import_linear_issue(app: &mut App) {
+fn import_linear_issue(app: &mut App, ctx: &ActionContext) {
     let filtered = app.filtered_linear_issues();
     let selected_idx = app.linear_picker.as_ref().map(|p| p.selected).unwrap_or(0);
 
@@ -818,7 +827,7 @@ fn import_linear_issue(app: &mut App) {
 
     let id = linear_issue.identifier.to_lowercase();
 
-    let proj_id = app.active_project_id();
+    let proj_id = ctx.project_id.clone();
 
     if app
         .find_project(&proj_id)
@@ -868,7 +877,7 @@ fn import_linear_issue(app: &mut App) {
     app.close_linear_picker();
 }
 
-fn import_github_pr(app: &mut App) {
+fn import_github_pr(app: &mut App, ctx: &ActionContext) {
     let filtered = app.filtered_github_prs();
     let selected_idx = app.linear_picker.as_ref().map(|p| p.selected).unwrap_or(0);
 
@@ -877,7 +886,7 @@ fn import_github_pr(app: &mut App) {
         None => return,
     };
 
-    let proj_id = app.active_project_id();
+    let proj_id = ctx.project_id.clone();
 
     if app
         .find_project(&proj_id)
@@ -925,7 +934,7 @@ fn import_github_pr(app: &mut App) {
     app.close_linear_picker();
 }
 
-fn attach_github_to_dialog(app: &mut App) {
+fn attach_github_to_dialog(app: &mut App, ctx: &ActionContext) {
     let filtered = app.filtered_github_prs();
     let selected_idx = app.linear_picker.as_ref().map(|p| p.selected).unwrap_or(0);
 
@@ -1022,7 +1031,12 @@ fn handle_sidebar(app: &mut App, action: Action) -> PostAction {
     }
 }
 
-fn handle_confirm(app: &mut App, action: Action, action_tx: &mpsc::Sender<ActionResult>) {
+fn handle_confirm(
+    app: &mut App,
+    action: Action,
+    _ctx: &ActionContext,
+    action_tx: &mpsc::Sender<ActionResult>,
+) {
     match action {
         Action::ConfirmYes => {
             if let Some(confirm_action) = app.take_confirm_action() {
@@ -1188,12 +1202,14 @@ mod tests {
     #[test]
     fn dialog_next_field_does_not_auto_fill_prompt() {
         let mut app = test_app();
-        app.open_dialog();
+        let ctx = app.action_context();
+        app.open_dialog(&ctx);
 
         // Type a title (starts on Title field = 2 for Agentic, no linear)
         handle_action(
             &mut app,
             Action::DialogChar('H'),
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1202,6 +1218,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::DialogChar('i'),
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1212,6 +1229,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::DialogNextField,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1230,12 +1248,14 @@ mod tests {
     #[test]
     fn dialog_next_field_preserves_user_typed_prompt() {
         let mut app = test_app();
-        app.open_dialog();
+        let ctx = app.action_context();
+        app.open_dialog(&ctx);
 
         // Move to prompt field
         handle_action(
             &mut app,
             Action::DialogNextField,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1246,6 +1266,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::DialogChar('g'),
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1254,6 +1275,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::DialogChar('o'),
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1267,7 +1289,8 @@ mod tests {
     #[test]
     fn dialog_next_field_advances_through_all_fields() {
         let mut app = test_app();
-        app.open_dialog();
+        let ctx = app.action_context();
+        app.open_dialog(&ctx);
 
         // Agentic, no linear: Kind(0), Mode(1), Title(2), Prompt(3)
         // Starts on Title (field 2)
@@ -1277,6 +1300,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::DialogNextField,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1288,6 +1312,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::DialogNextField,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1299,12 +1324,14 @@ mod tests {
     #[test]
     fn dialog_prev_field_goes_back() {
         let mut app = test_app();
-        app.open_dialog();
+        let ctx = app.action_context();
+        app.open_dialog(&ctx);
 
         // Starts on Title (field 2). Advance to Prompt (field 3)
         handle_action(
             &mut app,
             Action::DialogNextField,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1316,6 +1343,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::DialogPrevField,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1327,13 +1355,15 @@ mod tests {
     #[test]
     fn dialog_prev_field_wraps_to_last_field() {
         let mut app = test_app();
-        app.open_dialog();
+        let ctx = app.action_context();
+        app.open_dialog(&ctx);
 
         // Agentic, no linear: Kind(0), Mode(1), Title(2), Prompt(3)
         // Starts on Title (field 2). Two Shift+Tabs -> Kind(0)
         handle_action(
             &mut app,
             Action::DialogPrevField,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1343,6 +1373,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::DialogPrevField,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1354,6 +1385,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::DialogPrevField,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1365,12 +1397,14 @@ mod tests {
     #[test]
     fn dialog_space_char_appended_to_prompt() {
         let mut app = test_app();
-        app.open_dialog();
+        let ctx = app.action_context();
+        app.open_dialog(&ctx);
 
         // Move to prompt field
         handle_action(
             &mut app,
             Action::DialogNextField,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1380,6 +1414,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::DialogChar('a'),
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1388,6 +1423,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::DialogChar(' '),
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1396,6 +1432,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::DialogChar('b'),
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1408,12 +1445,14 @@ mod tests {
     #[test]
     fn dialog_cancel_closes_dialog() {
         let mut app = test_app();
-        app.open_dialog();
+        let ctx = app.action_context();
+        app.open_dialog(&ctx);
         assert!(app.dialog.is_some());
 
         handle_action(
             &mut app,
             Action::DialogCancel,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1444,9 +1483,11 @@ mod tests {
             pr_imported: false,
         });
 
+        let ctx = app.action_context();
         let post = handle_action(
             &mut app,
             Action::OpenSession,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1485,13 +1526,15 @@ mod tests {
         });
 
         // Open edit dialog
+        let ctx = app.action_context();
         let issue = app.project().issues[0].clone();
-        app.open_edit_dialog(&issue, 0);
+        app.open_edit_dialog(&issue, 0, &ctx);
 
         // Move from title to prompt
         handle_action(
             &mut app,
             Action::DialogNextField,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1534,12 +1577,14 @@ mod tests {
         app.project_mut().live.linear_issues =
             vec![test_linear_issue("uuid-1", "TEST-1", "First issue")];
 
-        app.open_linear_picker();
+        let ctx = app.action_context();
+        app.open_linear_picker(&ctx);
         assert_eq!(app.input_mode, crate::app::InputMode::LinearPicker);
 
         handle_action(
             &mut app,
             Action::LinearPickerSelect,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1568,11 +1613,14 @@ mod tests {
         app.project_mut().live.linear_issues =
             vec![test_linear_issue("uuid-1", "TEST-1", "First issue")];
 
+        let ctx = app.action_context();
+
         // Import once
-        app.open_linear_picker();
+        app.open_linear_picker(&ctx);
         handle_action(
             &mut app,
             Action::LinearPickerSelect,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1581,7 +1629,7 @@ mod tests {
         assert_eq!(app.project().issues.len(), 1);
 
         // Try to import again (should show issue but reject the import)
-        app.open_linear_picker();
+        app.open_linear_picker(&ctx);
 
         // The picker should still show the issue (visible but marked as imported)
         let filtered = app.filtered_linear_issues();
@@ -1591,6 +1639,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::LinearPickerSelect,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1608,12 +1657,14 @@ mod tests {
             test_linear_issue("uuid-2", "TEST-2", "Dashboard bug"),
         ];
 
-        app.open_linear_picker();
+        let ctx = app.action_context();
+        app.open_linear_picker(&ctx);
 
         // Type search
         handle_action(
             &mut app,
             Action::LinearPickerChar('l'),
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1622,6 +1673,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::LinearPickerChar('o'),
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1630,6 +1682,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::LinearPickerChar('g'),
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1651,12 +1704,14 @@ mod tests {
             test_linear_issue("uuid-3", "TEST-3", "Third"),
         ];
 
-        app.open_linear_picker();
+        let ctx = app.action_context();
+        app.open_linear_picker(&ctx);
         assert_eq!(app.linear_picker.as_ref().unwrap().selected, 0);
 
         handle_action(
             &mut app,
             Action::LinearPickerDown,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1667,6 +1722,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::LinearPickerDown,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1678,6 +1734,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::LinearPickerDown,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1688,6 +1745,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::LinearPickerUp,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1702,10 +1760,12 @@ mod tests {
         app.project_mut().linear_available = true;
         app.project_mut().live.linear_issues = vec![test_linear_issue("uuid-1", "TEST-1", "First")];
 
-        app.open_linear_picker();
+        let ctx = app.action_context();
+        app.open_linear_picker(&ctx);
         handle_action(
             &mut app,
             Action::LinearPickerClose,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1745,8 +1805,9 @@ mod tests {
             pr_imported: false,
         });
 
+        let ctx = app.action_context();
         let issue = app.project().issues[0].clone();
-        app.open_edit_dialog(&issue, 0);
+        app.open_edit_dialog(&issue, 0, &ctx);
 
         // Agentic + linear: Kind(0), Mode(1), Linear(2), Title(3), Prompt(4)
         // Should start on Title (field 3)
@@ -1757,6 +1818,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::DialogNextField,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1768,6 +1830,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::DialogNextField,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1802,14 +1865,16 @@ mod tests {
             pr_imported: false,
         });
 
+        let ctx = app.action_context();
         let issue = app.project().issues[0].clone();
-        app.open_edit_dialog(&issue, 0);
+        app.open_edit_dialog(&issue, 0, &ctx);
 
         // Agentic + linear: Kind(0), Mode(1), Linear(2), Title(3), Prompt(4)
         // Starts on Title(3). Tab to Prompt(4), then tab wraps.
         handle_action(
             &mut app,
             Action::DialogNextField,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1821,6 +1886,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::DialogNextField,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1853,8 +1919,9 @@ mod tests {
             pr_imported: false,
         });
 
+        let ctx = app.action_context();
         let issue = app.project().issues[0].clone();
-        app.open_edit_dialog(&issue, 0);
+        app.open_edit_dialog(&issue, 0, &ctx);
 
         // Starts on Title(3). Shift+Enter should submit from any field.
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 3);
@@ -1862,6 +1929,7 @@ mod tests {
         handle_action(
             &mut app,
             Action::DialogSubmit,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),
@@ -1890,9 +1958,11 @@ mod tests {
     }
 
     fn act(app: &mut App, action: Action) -> PostAction {
+        let ctx = app.action_context();
         handle_action(
             app,
             action,
+            &ctx,
             &mpsc::channel().0,
             &pr_wake_tx(),
             &linear_wake_tx(),

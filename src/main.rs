@@ -589,9 +589,11 @@ fn run_tui() -> anyhow::Result<()> {
                             dialog_field,
                             app.visible_swimlane_count(),
                         );
+                        let ctx = app.action_context();
                         let post_action = handler::handle_action(
                             &mut app,
                             action,
+                            &ctx,
                             &action_tx,
                             &workers.pr_wake_tx,
                             &workers.linear_wake_tx,
