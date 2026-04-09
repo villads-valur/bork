@@ -32,6 +32,7 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 
 use app::{App, InputMode, ProjectId};
+use global_config::ReloadResult;
 use handler::{ActionResult, PostAction};
 use input::map_key_to_action;
 use types::{AgentKind, AgentStatusInfo};
@@ -539,6 +540,7 @@ fn run_tui() -> anyhow::Result<()> {
 
     // --- Workers ---
     let (action_tx, action_rx) = mpsc::channel::<ActionResult>();
+    let (reload_tx, reload_rx) = mpsc::channel::<ReloadResult>();
     let mut shared = spawn_shared_workers();
     let mut workers = spawn_project_workers(app.project(), &shared.shutdown);
     let mut swimlane_workers: HashMap<ProjectId, ProjectWorkers> = HashMap::new();
@@ -602,15 +604,14 @@ fn run_tui() -> anyhow::Result<()> {
                             app.visible_swimlane_count(),
                         );
                         let ctx = app.action_context();
-                        let post_action = handler::handle_action(
-                            &mut app,
-                            action,
-                            &ctx,
-                            &action_tx,
-                            &workers.pr_wake_tx,
-                            &shared.linear_wake_tx,
-                            &workers.git_wake_tx,
-                        );
+                        let ch = handler::ActionChannels {
+                            action_tx: &action_tx,
+                            pr_wake_tx: &workers.pr_wake_tx,
+                            linear_wake_tx: &shared.linear_wake_tx,
+                            git_wake_tx: &workers.git_wake_tx,
+                            reload_tx: &reload_tx,
+                        };
+                        let post_action = handler::handle_action(&mut app, action, &ctx, &ch);
 
                         match post_action {
                             PostAction::None => {}
@@ -1011,6 +1012,13 @@ fn run_tui() -> anyhow::Result<()> {
                         needs_redraw = true;
                     }
                 }
+            }
+        }
+
+        while let Ok(result) = reload_rx.try_recv() {
+            if !result.new_projects.is_empty() {
+                app.apply_reload_result(result);
+                needs_redraw = true;
             }
         }
 

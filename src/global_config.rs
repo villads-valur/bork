@@ -1,7 +1,11 @@
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+use crate::app::ProjectId;
+use crate::config::{AppConfig, AppState};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectEntry {
@@ -160,6 +164,30 @@ pub fn prune_stale_projects() {
 
 pub fn list_projects() -> Vec<ProjectEntry> {
     load_global_config().projects
+}
+
+pub struct ReloadResult {
+    pub new_projects: Vec<(AppConfig, AppState)>,
+}
+
+pub fn discover_new_projects(known_roots: HashSet<ProjectId>) -> ReloadResult {
+    prune_stale_projects();
+
+    let mut new_projects = Vec::new();
+    for entry in &load_global_config().projects {
+        if !entry.path.join(".bork").join("config.toml").exists() {
+            continue;
+        }
+        let canonical = fs::canonicalize(&entry.path).unwrap_or_else(|_| entry.path.clone());
+        if known_roots.contains(&canonical) {
+            continue;
+        }
+        let proj_config = crate::config::load_config_from(&entry.path);
+        let proj_state = crate::config::load_state(&entry.path);
+        new_projects.push((proj_config, proj_state));
+    }
+
+    ReloadResult { new_projects }
 }
 
 #[cfg(test)]
