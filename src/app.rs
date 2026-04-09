@@ -1151,6 +1151,13 @@ fn clear_to_start(text: &mut String, cursor: &mut usize) {
     *cursor = 0;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageKind {
+    Info,
+    Warning,
+    Error,
+}
+
 pub struct App {
     pub projects: Vec<Project>,
     pub focused_project: ProjectId,
@@ -1161,7 +1168,7 @@ pub struct App {
     pub pending_confirm: Option<ConfirmAction>,
     pub dialog: Option<DialogState>,
     pub should_quit: bool,
-    pub message: Option<String>,
+    pub message: Option<(String, MessageKind)>,
     pub message_set_at: Option<Instant>,
     pub busy_count: usize,
     pub spinner_tick: usize,
@@ -1342,9 +1349,21 @@ impl App {
         }
     }
 
-    pub fn set_message(&mut self, msg: impl Into<String>) {
-        self.message = Some(msg.into());
+    pub fn show_message(&mut self, msg: impl Into<String>, kind: MessageKind) {
+        self.message = Some((msg.into(), kind));
         self.message_set_at = Some(Instant::now());
+    }
+
+    pub fn set_message(&mut self, msg: impl Into<String>) {
+        self.show_message(msg, MessageKind::Info);
+    }
+
+    pub fn set_warning(&mut self, msg: impl Into<String>) {
+        self.show_message(msg, MessageKind::Warning);
+    }
+
+    pub fn set_error(&mut self, msg: impl Into<String>) {
+        self.show_message(msg, MessageKind::Error);
     }
 
     pub fn clear_expired_message(&mut self) -> bool {
@@ -1414,9 +1433,9 @@ impl App {
 
         if !has_linear && !has_github {
             if p.linear_available {
-                self.set_message("No issues loaded yet");
+                self.set_warning("No issues loaded yet");
             } else {
-                self.set_message("No import sources available");
+                self.set_warning("No import sources available");
             }
             return;
         }
@@ -3912,5 +3931,80 @@ mod tests {
         };
         let project = app.context_project_mut(&bogus_ctx);
         assert_eq!(project.config.project_name, "alpha");
+    }
+
+    // ================================================================
+    // Message severity
+    // ================================================================
+
+    #[test]
+    fn set_message_stores_info_kind() {
+        let mut app = test_app(vec![]);
+        app.set_message("hello");
+        let (msg, kind) = app.message.as_ref().unwrap();
+        assert_eq!(msg, "hello");
+        assert_eq!(*kind, MessageKind::Info);
+        assert!(app.message_set_at.is_some());
+    }
+
+    #[test]
+    fn set_warning_stores_warning_kind() {
+        let mut app = test_app(vec![]);
+        app.set_warning("careful");
+        let (msg, kind) = app.message.as_ref().unwrap();
+        assert_eq!(msg, "careful");
+        assert_eq!(*kind, MessageKind::Warning);
+    }
+
+    #[test]
+    fn set_error_stores_error_kind() {
+        let mut app = test_app(vec![]);
+        app.set_error("boom");
+        let (msg, kind) = app.message.as_ref().unwrap();
+        assert_eq!(msg, "boom");
+        assert_eq!(*kind, MessageKind::Error);
+    }
+
+    #[test]
+    fn show_message_accepts_kind() {
+        let mut app = test_app(vec![]);
+        app.show_message("test", MessageKind::Warning);
+        let (msg, kind) = app.message.as_ref().unwrap();
+        assert_eq!(msg, "test");
+        assert_eq!(*kind, MessageKind::Warning);
+    }
+
+    #[test]
+    fn message_overwrites_previous() {
+        let mut app = test_app(vec![]);
+        app.set_error("first");
+        app.set_message("second");
+        let (msg, kind) = app.message.as_ref().unwrap();
+        assert_eq!(msg, "second");
+        assert_eq!(*kind, MessageKind::Info);
+    }
+
+    #[test]
+    fn clear_expired_message_before_timeout() {
+        let mut app = test_app(vec![]);
+        app.set_message("fresh");
+        assert!(!app.clear_expired_message());
+        assert!(app.message.is_some());
+    }
+
+    #[test]
+    fn clear_expired_message_after_timeout() {
+        let mut app = test_app(vec![]);
+        app.set_message("old");
+        app.message_set_at = Some(Instant::now() - std::time::Duration::from_secs(4));
+        assert!(app.clear_expired_message());
+        assert!(app.message.is_none());
+        assert!(app.message_set_at.is_none());
+    }
+
+    #[test]
+    fn clear_expired_message_noop_when_no_message() {
+        let mut app = test_app(vec![]);
+        assert!(!app.clear_expired_message());
     }
 }
