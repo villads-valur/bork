@@ -722,8 +722,8 @@ fn handle_linear_picker(
             app.close_linear_picker();
         }
         Action::PickerSwitchTab => {
-            let has_linear = !app.project().live.linear_issues.is_empty();
-            let has_github = app.project().has_github_prs();
+            let has_linear = !app.active_project().live.linear_issues.is_empty();
+            let has_github = app.active_project().has_github_prs();
             if has_linear && has_github {
                 app.picker_tab = match app.picker_tab {
                     ImportSource::Linear => ImportSource::GitHub,
@@ -983,8 +983,10 @@ fn handle_sidebar(app: &mut App, action: Action) -> PostAction {
                         if idx == app.focused_project {
                             app.focused_project = sidebar.swimlane_indices[0];
                         }
-                        if app.focused_swimlane >= sidebar.swimlane_indices.len() {
-                            app.focused_swimlane = 0;
+                        if app.focused_swimlane == pos {
+                            app.focused_swimlane = pos.min(sidebar.swimlane_indices.len() - 1);
+                        } else if app.focused_swimlane > pos {
+                            app.focused_swimlane -= 1;
                         }
                     }
                 } else if lane_count < 3 {

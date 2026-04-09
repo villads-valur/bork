@@ -159,13 +159,19 @@ fn map_linear_picker_key(key: KeyEvent) -> Action {
 }
 
 fn map_help_key(key: KeyEvent) -> Action {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        return Action::Quit;
+    }
     match key.code {
-        KeyCode::Esc => Action::CloseHelp,
+        KeyCode::Esc | KeyCode::Char('q') => Action::CloseHelp,
         _ => Action::Noop,
     }
 }
 
 fn map_debug_inspector_key(key: KeyEvent) -> Action {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        return Action::Quit;
+    }
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => Action::DebugInspectorClose,
         KeyCode::Char('j') | KeyCode::Down => Action::DebugInspectorScrollDown,
