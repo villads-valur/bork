@@ -1163,6 +1163,8 @@ impl App {
     }
 
     pub fn reload_projects(&mut self) {
+        crate::global_config::prune_stale_projects();
+
         let known_roots: HashSet<PathBuf> = self
             .projects
             .iter()

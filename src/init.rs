@@ -325,6 +325,24 @@ pub fn run_init(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Serialize tests that call run_init (which writes to global config)
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_isolated_config(tmp: &Path, test: impl FnOnce()) {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let config_dir = tmp.join("xdg-config");
+        let _ = fs::create_dir_all(&config_dir);
+        let old = std::env::var("XDG_CONFIG_HOME").ok();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &config_dir) };
+        test();
+        if let Some(v) = old {
+            unsafe { std::env::set_var("XDG_CONFIG_HOME", v) };
+        } else {
+            unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        }
+    }
 
     // --- normalize_repo_url ---
 
@@ -453,23 +471,24 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
 
-        // Create a local bare repo so we don't need network access
-        let bare_repo = tmp.join("test-repo.git");
-        fs::create_dir_all(&bare_repo).unwrap();
-        let output = Command::new("git")
-            .args(["init", "--bare"])
-            .current_dir(&bare_repo)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "Failed to create bare repo");
+        with_isolated_config(&tmp, || {
+            let bare_repo = tmp.join("test-repo.git");
+            fs::create_dir_all(&bare_repo).unwrap();
+            let output = Command::new("git")
+                .args(["init", "--bare"])
+                .current_dir(&bare_repo)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "Failed to create bare repo");
 
-        let result = run_init(
-            bare_repo.to_str().unwrap(),
-            Some("my-project"),
-            AgentKind::OpenCode,
-            Some(&tmp),
-        );
-        assert!(result.is_ok(), "run_init failed: {:?}", result.err());
+            let result = run_init(
+                bare_repo.to_str().unwrap(),
+                Some("my-project"),
+                AgentKind::OpenCode,
+                Some(&tmp),
+            );
+            assert!(result.is_ok(), "run_init failed: {:?}", result.err());
+        });
 
         let container = tmp.join("my-project");
 
@@ -560,21 +579,23 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
 
-        let bare_repo = tmp.join("test-repo.git");
-        fs::create_dir_all(&bare_repo).unwrap();
-        Command::new("git")
-            .args(["init", "--bare"])
-            .current_dir(&bare_repo)
-            .output()
-            .unwrap();
+        with_isolated_config(&tmp, || {
+            let bare_repo = tmp.join("test-repo.git");
+            fs::create_dir_all(&bare_repo).unwrap();
+            Command::new("git")
+                .args(["init", "--bare"])
+                .current_dir(&bare_repo)
+                .output()
+                .unwrap();
 
-        let result = run_init(
-            bare_repo.to_str().unwrap(),
-            Some("claude-project"),
-            AgentKind::Claude,
-            Some(&tmp),
-        );
-        assert!(result.is_ok(), "run_init failed: {:?}", result.err());
+            let result = run_init(
+                bare_repo.to_str().unwrap(),
+                Some("claude-project"),
+                AgentKind::Claude,
+                Some(&tmp),
+            );
+            assert!(result.is_ok(), "run_init failed: {:?}", result.err());
+        });
 
         let config = fs::read_to_string(tmp.join("claude-project/.bork/config.toml")).unwrap();
         assert!(config.contains("agent_kind = \"claude\""));
@@ -589,24 +610,24 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
 
-        let bare_repo = tmp.join("cool-project.git");
-        fs::create_dir_all(&bare_repo).unwrap();
-        Command::new("git")
-            .args(["init", "--bare"])
-            .current_dir(&bare_repo)
-            .output()
-            .unwrap();
+        with_isolated_config(&tmp, || {
+            let bare_repo = tmp.join("cool-project.git");
+            fs::create_dir_all(&bare_repo).unwrap();
+            Command::new("git")
+                .args(["init", "--bare"])
+                .current_dir(&bare_repo)
+                .output()
+                .unwrap();
 
-        // Pass the bare repo path as the repo arg (no directory override)
-        let result = run_init(
-            bare_repo.to_str().unwrap(),
-            None,
-            AgentKind::OpenCode,
-            Some(&tmp),
-        );
-        assert!(result.is_ok(), "run_init failed: {:?}", result.err());
+            let result = run_init(
+                bare_repo.to_str().unwrap(),
+                None,
+                AgentKind::OpenCode,
+                Some(&tmp),
+            );
+            assert!(result.is_ok(), "run_init failed: {:?}", result.err());
+        });
 
-        // Should have created a directory named "cool-project" (stripped .git)
         assert!(
             tmp.join("cool-project/main").exists(),
             "Should create directory from repo name"
