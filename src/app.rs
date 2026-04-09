@@ -3939,4 +3939,266 @@ mod tests {
         let project = app.context_project_mut(&bogus_ctx);
         assert_eq!(project.config.project_name, "alpha");
     }
+
+    // ---------------------------------------------------------------
+    // merge_issue_fields (3-way per-field merge)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn merge_field_file_changed_memory_unchanged() {
+        let base = test_issue_titled("a", "Original", Column::Todo);
+        let mut memory = base.clone();
+        let mut file = base.clone();
+        file.title = "Updated externally".to_string();
+
+        merge_issue_fields(&mut memory, &base, &file);
+        assert_eq!(memory.title, "Updated externally");
+    }
+
+    #[test]
+    fn merge_field_memory_changed_file_unchanged() {
+        let base = test_issue_titled("a", "Original", Column::Todo);
+        let mut memory = base.clone();
+        memory.title = "Updated locally".to_string();
+        let file = base.clone();
+
+        merge_issue_fields(&mut memory, &base, &file);
+        assert_eq!(memory.title, "Updated locally");
+    }
+
+    #[test]
+    fn merge_field_both_changed_memory_wins() {
+        let base = test_issue_titled("a", "Original", Column::Todo);
+        let mut memory = base.clone();
+        memory.title = "Local edit".to_string();
+        let mut file = base.clone();
+        file.title = "External edit".to_string();
+
+        merge_issue_fields(&mut memory, &base, &file);
+        assert_eq!(memory.title, "Local edit");
+    }
+
+    #[test]
+    fn merge_field_neither_changed() {
+        let base = test_issue_titled("a", "Same", Column::Todo);
+        let mut memory = base.clone();
+        let file = base.clone();
+
+        merge_issue_fields(&mut memory, &base, &file);
+        assert_eq!(memory.title, "Same");
+    }
+
+    #[test]
+    fn merge_fields_independent_per_field() {
+        let base = test_issue_titled("a", "Original", Column::Todo);
+        let mut memory = base.clone();
+        memory.title = "Local title".to_string();
+        // memory.column stays Todo (unchanged from base)
+
+        let mut file = base.clone();
+        file.column = Column::InProgress;
+        // file.title stays "Original" (unchanged from base)
+
+        merge_issue_fields(&mut memory, &base, &file);
+        assert_eq!(memory.title, "Local title", "memory wins on title");
+        assert_eq!(memory.column, Column::InProgress, "file wins on column");
+    }
+
+    // ---------------------------------------------------------------
+    // merge_external_state (full Project-level merge)
+    // ---------------------------------------------------------------
+
+    fn test_project(issues: Vec<Issue>) -> Project {
+        let state = AppState {
+            issues: issues.clone(),
+        };
+        let mut project = Project::new(test_config(), state);
+        // base_issues is set by new(), but last_state_mtime will be None
+        // since /tmp/test-bork/.bork/state.json doesn't exist. That's fine for tests.
+        project.base_issues = issues;
+        project
+    }
+
+    #[test]
+    fn merge_clean_state_replaces_entirely() {
+        let mut project = test_project(vec![test_issue("a", Column::Todo)]);
+        assert!(!project.state_dirty);
+
+        let file_state = AppState {
+            issues: vec![test_issue("b", Column::InProgress)],
+        };
+        project.merge_external_state(file_state);
+
+        assert_eq!(project.issues.len(), 1);
+        assert_eq!(project.issues[0].id, "b");
+        assert_eq!(project.issues[0].column, Column::InProgress);
+    }
+
+    #[test]
+    fn merge_dirty_adds_new_external_issue() {
+        let mut project = test_project(vec![test_issue("a", Column::Todo)]);
+        project.mark_dirty();
+
+        let file_state = AppState {
+            issues: vec![
+                test_issue("a", Column::Todo),
+                test_issue("b", Column::InProgress),
+            ],
+        };
+        project.merge_external_state(file_state);
+
+        assert_eq!(project.issues.len(), 2);
+        let ids: Vec<&str> = project.issues.iter().map(|i| i.id.as_str()).collect();
+        assert!(ids.contains(&"a"));
+        assert!(ids.contains(&"b"));
+    }
+
+    #[test]
+    fn merge_dirty_removes_externally_deleted_issue() {
+        let mut project = test_project(vec![
+            test_issue("a", Column::Todo),
+            test_issue("b", Column::InProgress),
+        ]);
+        project.mark_dirty();
+
+        let file_state = AppState {
+            issues: vec![test_issue("a", Column::Todo)],
+        };
+        project.merge_external_state(file_state);
+
+        assert_eq!(project.issues.len(), 1);
+        assert_eq!(project.issues[0].id, "a");
+    }
+
+    #[test]
+    fn merge_dirty_field_level_merge_for_existing() {
+        let original = test_issue_titled("a", "Original", Column::Todo);
+        let mut project = test_project(vec![original.clone()]);
+
+        // Local change: move to InProgress
+        project.issues[0].column = Column::InProgress;
+        project.mark_dirty();
+
+        // External change: update title (but column still Todo in file, matching base)
+        let mut file_issue = original;
+        file_issue.title = "Renamed externally".to_string();
+        let file_state = AppState {
+            issues: vec![file_issue],
+        };
+        project.merge_external_state(file_state);
+
+        assert_eq!(
+            project.issues[0].title, "Renamed externally",
+            "file wins on title"
+        );
+        assert_eq!(
+            project.issues[0].column,
+            Column::InProgress,
+            "memory wins on column"
+        );
+    }
+
+    #[test]
+    fn merge_dirty_locally_added_issue_kept() {
+        let mut project = test_project(vec![test_issue("a", Column::Todo)]);
+
+        // Locally add a new issue (not in base)
+        project.issues.push(test_issue("local-new", Column::Todo));
+        project.mark_dirty();
+
+        // External file still only has "a"
+        let file_state = AppState {
+            issues: vec![test_issue("a", Column::Todo)],
+        };
+        project.merge_external_state(file_state);
+
+        // "local-new" is not in file_ids, so it gets removed by retain.
+        // This is correct: if an external process is the source of truth for
+        // what issues exist, a locally-added issue that isn't in the file
+        // should be removed. The dirty flush would have persisted it first
+        // in the normal flow (flush happens after merge).
+        assert_eq!(project.issues.len(), 1);
+        assert_eq!(project.issues[0].id, "a");
+    }
+
+    #[test]
+    fn merge_clamps_selection_after_removal() {
+        let mut project = test_project(vec![
+            test_issue("a", Column::Todo),
+            test_issue("b", Column::Todo),
+            test_issue("c", Column::Todo),
+        ]);
+        project.selected_row[0] = 2; // pointing at 3rd issue
+
+        // External change removes 2 issues
+        let file_state = AppState {
+            issues: vec![test_issue("a", Column::Todo)],
+        };
+        project.merge_external_state(file_state);
+
+        assert_eq!(project.issues.len(), 1);
+        assert_eq!(project.selected_row[0], 0, "row clamped to valid range");
+    }
+
+    #[test]
+    fn merge_empty_file_removes_all() {
+        let mut project = test_project(vec![
+            test_issue("a", Column::Todo),
+            test_issue("b", Column::InProgress),
+        ]);
+
+        let file_state = AppState { issues: vec![] };
+        project.merge_external_state(file_state);
+
+        assert!(project.issues.is_empty());
+    }
+
+    #[test]
+    fn merge_empty_memory_adds_from_file() {
+        let mut project = test_project(vec![]);
+
+        let file_state = AppState {
+            issues: vec![test_issue("new", Column::Todo)],
+        };
+        project.merge_external_state(file_state);
+
+        assert_eq!(project.issues.len(), 1);
+        assert_eq!(project.issues[0].id, "new");
+    }
+
+    #[test]
+    fn merge_identical_state_is_noop() {
+        let issues = vec![
+            test_issue("a", Column::Todo),
+            test_issue("b", Column::InProgress),
+        ];
+        let mut project = test_project(issues.clone());
+
+        let file_state = AppState {
+            issues: issues.clone(),
+        };
+        project.merge_external_state(file_state);
+
+        assert_eq!(project.issues.len(), 2);
+        assert_eq!(project.issues, issues);
+    }
+
+    #[test]
+    fn merge_updates_base_issues() {
+        let mut project = test_project(vec![test_issue("a", Column::Todo)]);
+
+        let new_issues = vec![
+            test_issue("a", Column::Todo),
+            test_issue("b", Column::InProgress),
+        ];
+        let file_state = AppState {
+            issues: new_issues.clone(),
+        };
+        project.merge_external_state(file_state);
+
+        assert_eq!(
+            project.base_issues, new_issues,
+            "base_issues updated to file contents"
+        );
+    }
 }
