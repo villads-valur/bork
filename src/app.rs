@@ -1112,6 +1112,13 @@ fn clear_to_start(text: &mut String, cursor: &mut usize) {
     *cursor = 0;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageKind {
+    Info,
+    Warning,
+    Error,
+}
+
 pub struct App {
     pub projects: Vec<Project>,
     pub focused_project: ProjectId,
@@ -1122,7 +1129,7 @@ pub struct App {
     pub pending_confirm: Option<ConfirmAction>,
     pub dialog: Option<DialogState>,
     pub should_quit: bool,
-    pub message: Option<String>,
+    pub message: Option<(String, MessageKind)>,
     pub message_set_at: Option<Instant>,
     pub busy_count: usize,
     pub spinner_tick: usize,
@@ -1303,9 +1310,21 @@ impl App {
         }
     }
 
-    pub fn set_message(&mut self, msg: impl Into<String>) {
-        self.message = Some(msg.into());
+    pub fn show_message(&mut self, msg: impl Into<String>, kind: MessageKind) {
+        self.message = Some((msg.into(), kind));
         self.message_set_at = Some(Instant::now());
+    }
+
+    pub fn set_message(&mut self, msg: impl Into<String>) {
+        self.show_message(msg, MessageKind::Info);
+    }
+
+    pub fn set_warning(&mut self, msg: impl Into<String>) {
+        self.show_message(msg, MessageKind::Warning);
+    }
+
+    pub fn set_error(&mut self, msg: impl Into<String>) {
+        self.show_message(msg, MessageKind::Error);
     }
 
     pub fn clear_expired_message(&mut self) -> bool {
@@ -1375,9 +1394,9 @@ impl App {
 
         if !has_linear && !has_github {
             if p.linear_available {
-                self.set_message("No issues loaded yet");
+                self.set_warning("No issues loaded yet");
             } else {
-                self.set_message("No import sources available");
+                self.set_warning("No import sources available");
             }
             return;
         }

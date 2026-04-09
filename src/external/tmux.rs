@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::error::AppError;
 
@@ -48,6 +48,7 @@ pub fn ensure_bork_session(project_name: &str) -> Result<EnsureResult, AppError>
                 session_name,
                 exe.to_str().unwrap_or("bork"),
             ])
+            .stderr(Stdio::null())
             .status()
             .map_err(|e| {
                 AppError::Tmux(format!("failed to create session '{session_name}': {e}"))
@@ -62,11 +63,13 @@ pub fn ensure_bork_session(project_name: &str) -> Result<EnsureResult, AppError>
         // Hide the tmux status bar so our ratatui footer is the only chrome
         let _ = Command::new("tmux")
             .args(["set-option", "-t", session_name, "status", "off"])
+            .stderr(Stdio::null())
             .status();
 
         // Forward terminal title changes to the outer terminal (e.g. Ghostty tab title)
         let _ = Command::new("tmux")
             .args(["set-option", "-t", session_name, "set-titles", "on"])
+            .stderr(Stdio::null())
             .status();
         let _ = Command::new("tmux")
             .args([
@@ -76,11 +79,13 @@ pub fn ensure_bork_session(project_name: &str) -> Result<EnsureResult, AppError>
                 "set-titles-string",
                 "#{pane_title}",
             ])
+            .stderr(Stdio::null())
             .status();
 
         // Bind Ctrl+q to detach (scoped to this tmux server, not the user's outer tmux)
         let _ = Command::new("tmux")
             .args(["bind-key", "-n", "C-q", "detach-client"])
+            .stderr(Stdio::null())
             .status();
     }
 
@@ -158,6 +163,7 @@ pub fn create_session(name: &str, cwd: &Path) -> Result<(), AppError> {
             "-c",
             cwd.to_str().unwrap_or("."),
         ])
+        .stderr(Stdio::null())
         .status()
         .map_err(|e| AppError::Tmux(format!("failed to create session '{name}': {e}")))?;
 
@@ -170,6 +176,7 @@ pub fn create_session(name: &str, cwd: &Path) -> Result<(), AppError> {
     // Show a minimal status bar with detach hint
     let _ = Command::new("tmux")
         .args(["set-option", "-t", name, "status", "on"])
+        .stderr(Stdio::null())
         .status();
     let _ = Command::new("tmux")
         .args([
@@ -179,9 +186,11 @@ pub fn create_session(name: &str, cwd: &Path) -> Result<(), AppError> {
             "status-style",
             "bg=default,fg=colour8",
         ])
+        .stderr(Stdio::null())
         .status();
     let _ = Command::new("tmux")
         .args(["set-option", "-t", name, "status-left", ""])
+        .stderr(Stdio::null())
         .status();
     let _ = Command::new("tmux")
         .args([
@@ -191,6 +200,7 @@ pub fn create_session(name: &str, cwd: &Path) -> Result<(), AppError> {
             "status-right",
             " Ctrl+q: back to board ",
         ])
+        .stderr(Stdio::null())
         .status();
     let _ = Command::new("tmux")
         .args([
@@ -200,9 +210,11 @@ pub fn create_session(name: &str, cwd: &Path) -> Result<(), AppError> {
             "status-right-style",
             "bg=default,fg=colour8",
         ])
+        .stderr(Stdio::null())
         .status();
     let _ = Command::new("tmux")
         .args(["set-option", "-t", name, "status-justify", "right"])
+        .stderr(Stdio::null())
         .status();
 
     Ok(())
@@ -211,7 +223,7 @@ pub fn create_session(name: &str, cwd: &Path) -> Result<(), AppError> {
 pub fn kill_session(name: &str) -> Result<(), AppError> {
     let _ = Command::new("tmux")
         .args(["kill-session", "-t", name])
-        .stderr(std::process::Stdio::null())
+        .stderr(Stdio::null())
         .status();
     Ok(())
 }
@@ -219,6 +231,7 @@ pub fn kill_session(name: &str) -> Result<(), AppError> {
 pub fn send_keys(session: &str, keys: &str) -> Result<(), AppError> {
     let status = Command::new("tmux")
         .args(["send-keys", "-t", session, keys, "Enter"])
+        .stderr(Stdio::null())
         .status()
         .map_err(|e| AppError::Tmux(format!("failed to send keys to '{session}': {e}")))?;
 
@@ -241,6 +254,7 @@ pub fn create_window(session: &str, window_name: &str, cwd: &Path) -> Result<(),
             "-c",
             cwd.to_str().unwrap_or("."),
         ])
+        .stderr(Stdio::null())
         .status()
         .map_err(|e| {
             AppError::Tmux(format!(
@@ -257,6 +271,7 @@ pub fn create_window(session: &str, window_name: &str, cwd: &Path) -> Result<(),
     // Switch back to the first window so the agent is visible when opening the popup
     let _ = Command::new("tmux")
         .args(["select-window", "-t", &format!("{session}:0")])
+        .stderr(Stdio::null())
         .status();
 
     Ok(())
@@ -269,6 +284,7 @@ pub fn open_popup(session: &str, title: &str) -> Result<(), AppError> {
         // Fallback: just attach directly
         let _ = Command::new("tmux")
             .args(["attach", "-t", session])
+            .stderr(Stdio::null())
             .status();
         return Ok(());
     }
@@ -288,6 +304,7 @@ pub fn open_popup(session: &str, title: &str) -> Result<(), AppError> {
             &popup_title,
             &attach_cmd,
         ])
+        .stderr(Stdio::null())
         .status()
         .map_err(|e| AppError::Tmux(format!("failed to open popup for '{session}': {e}")))?;
 

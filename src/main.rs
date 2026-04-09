@@ -719,7 +719,7 @@ fn run_tui() -> anyhow::Result<()> {
         while let Ok(result) = action_rx.try_recv() {
             needs_redraw = true;
             app.busy_count = app.busy_count.saturating_sub(1);
-            app.set_message(result.message);
+            app.show_message(result.message, result.message_kind);
 
             if let Some((issue_id, agent_sid)) = result.session_id {
                 for project in &mut app.projects {

@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::app::{App, InputMode};
+use crate::app::{App, InputMode, MessageKind};
 use crate::ui::styles;
 
 pub fn render_header(frame: &mut Frame, app: &App, area: Rect) {
@@ -105,11 +105,13 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     // Temporary message
-    if let Some(ref msg) = app.message {
-        let line = Line::from(Span::styled(
-            format!(" {msg}"),
-            Style::default().fg(ratatui::style::Color::Yellow),
-        ));
+    if let Some((ref msg, kind)) = app.message {
+        let color = match kind {
+            MessageKind::Info => styles::DIM,
+            MessageKind::Warning => ratatui::style::Color::Yellow,
+            MessageKind::Error => ratatui::style::Color::Red,
+        };
+        let line = Line::from(Span::styled(format!(" {msg}"), Style::default().fg(color)));
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
