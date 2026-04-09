@@ -48,6 +48,7 @@ pub struct LiveState {
     pub user_prs: Vec<PrStatus>,
     pub github_user: Option<String>,
     pub git_poll_done: bool,
+    pub pr_poll_done: bool,
 }
 
 impl LiveState {
@@ -452,7 +453,34 @@ impl Project {
     }
 
     pub fn sync_prs_as_issues(&mut self) -> (bool, Option<String>) {
+        if !self.live.pr_poll_done {
+            return (false, None);
+        }
+
+        let live_pr_numbers: HashSet<u32> = self.live.user_prs.iter().map(|pr| pr.number).collect();
+
+        // Remove pr_imported issues whose PR is no longer in the live set
+        // (closed, merged, or from a stale/wrong repo identity)
+        let before = self.issues.len();
+        self.issues.retain(|issue| {
+            !issue.pr_imported
+                || issue
+                    .pr_number
+                    .is_some_and(|n| live_pr_numbers.contains(&n))
+        });
+        let removed = before - self.issues.len();
+
         if self.live.user_prs.is_empty() {
+            if removed > 0 {
+                return (
+                    true,
+                    Some(format!(
+                        "Removed {} stale PR{}",
+                        removed,
+                        if removed == 1 { "" } else { "s" }
+                    )),
+                );
+            }
             return (false, None);
         }
 
@@ -523,18 +551,29 @@ impl Project {
             });
         }
 
-        if new_issues.is_empty() {
+        let added = new_issues.len();
+        self.issues.append(&mut new_issues);
+
+        if added == 0 && removed == 0 {
             return (false, None);
         }
 
-        let count = new_issues.len();
-        self.issues.append(&mut new_issues);
-        let msg = format!(
-            "Imported {} PR{} from GitHub",
-            count,
-            if count == 1 { "" } else { "s" }
-        );
-        (true, Some(msg))
+        let mut parts: Vec<String> = Vec::new();
+        if added > 0 {
+            parts.push(format!(
+                "Imported {} PR{}",
+                added,
+                if added == 1 { "" } else { "s" }
+            ));
+        }
+        if removed > 0 {
+            parts.push(format!(
+                "Removed {} stale PR{}",
+                removed,
+                if removed == 1 { "" } else { "s" }
+            ));
+        }
+        (true, Some(parts.join(", ")))
     }
 
     pub fn done_worktree_names(&self) -> HashSet<String> {
@@ -2110,6 +2149,7 @@ mod tests {
     fn sync_prs_imports_open_pr_as_issue() {
         let mut app = test_app(vec![]);
         app.project_mut().live.user_prs = vec![test_pr(1, "feature/new")];
+        app.project_mut().live.pr_poll_done = true;
 
         assert!(app.project_mut().sync_prs_as_issues().0);
         assert_eq!(app.project().issues.len(), 1);
@@ -2132,6 +2172,7 @@ mod tests {
         let mut pr = test_pr(1, "feature/new");
         pr.is_draft = true;
         app.project_mut().live.user_prs = vec![pr];
+        app.project_mut().live.pr_poll_done = true;
 
         assert!(!app.project_mut().sync_prs_as_issues().0);
         assert!(app.project().issues.is_empty());
@@ -2143,6 +2184,7 @@ mod tests {
         let mut pr = test_pr(1, "feature/new");
         pr.state = PrState::Closed;
         app.project_mut().live.user_prs = vec![pr];
+        app.project_mut().live.pr_poll_done = true;
 
         assert!(!app.project_mut().sync_prs_as_issues().0);
         assert!(app.project().issues.is_empty());
@@ -2154,6 +2196,7 @@ mod tests {
         let mut pr = test_pr(1, "feature/new");
         pr.state = PrState::Merged;
         app.project_mut().live.user_prs = vec![pr];
+        app.project_mut().live.pr_poll_done = true;
 
         assert!(!app.project_mut().sync_prs_as_issues().0);
         assert!(app.project().issues.is_empty());
@@ -2163,6 +2206,7 @@ mod tests {
     fn sync_prs_skips_main_branch() {
         let mut app = test_app(vec![]);
         app.project_mut().live.user_prs = vec![test_pr(1, "main")];
+        app.project_mut().live.pr_poll_done = true;
 
         assert!(!app.project_mut().sync_prs_as_issues().0);
         assert!(app.project().issues.is_empty());
@@ -2178,6 +2222,7 @@ mod tests {
             .worktree_branches
             .insert("bork-1".into(), "feature/thing".into());
         app.project_mut().live.user_prs = vec![test_pr(1, "feature/thing")];
+        app.project_mut().live.pr_poll_done = true;
 
         assert!(!app.project_mut().sync_prs_as_issues().0);
         assert_eq!(app.project().issues.len(), 1);
@@ -2188,6 +2233,7 @@ mod tests {
         let issue = test_issue("bork-5", Column::InProgress);
         let mut app = test_app(vec![issue]);
         app.project_mut().live.user_prs = vec![test_pr(1, "bork-5/follow-up")];
+        app.project_mut().live.pr_poll_done = true;
 
         assert!(!app.project_mut().sync_prs_as_issues().0);
         assert_eq!(app.project().issues.len(), 1);
@@ -2199,6 +2245,7 @@ mod tests {
         issue.pr_number = Some(42);
         let mut app = test_app(vec![issue]);
         app.project_mut().live.user_prs = vec![test_pr(42, "some/branch")];
+        app.project_mut().live.pr_poll_done = true;
 
         assert!(!app.project_mut().sync_prs_as_issues().0);
         assert_eq!(app.project().issues.len(), 1);
@@ -2208,6 +2255,7 @@ mod tests {
     fn sync_prs_reimports_after_delete() {
         let mut app = test_app(vec![]);
         app.project_mut().live.user_prs = vec![test_pr(42, "feature/new")];
+        app.project_mut().live.pr_poll_done = true;
 
         assert!(app.project_mut().sync_prs_as_issues().0);
         assert_eq!(app.project().issues.len(), 1);
@@ -2228,6 +2276,7 @@ mod tests {
             test_pr(2, "feature/b"),
             test_pr(3, "feature/c"),
         ];
+        app.project_mut().live.pr_poll_done = true;
 
         assert!(app.project_mut().sync_prs_as_issues().0);
         assert_eq!(app.project().issues.len(), 3);
@@ -2245,6 +2294,7 @@ mod tests {
     fn sync_prs_no_duplicate_on_second_call() {
         let mut app = test_app(vec![]);
         app.project_mut().live.user_prs = vec![test_pr(1, "feature/new")];
+        app.project_mut().live.pr_poll_done = true;
 
         assert!(app.project_mut().sync_prs_as_issues().0);
         assert_eq!(app.project().issues.len(), 1);
@@ -2258,6 +2308,7 @@ mod tests {
         let issue = test_issue("doc-1917", Column::InProgress);
         let mut app = test_app(vec![issue]);
         app.project_mut().live.user_prs = vec![test_pr(1, "DOC-1917-attachment-selection-search")];
+        app.project_mut().live.pr_poll_done = true;
 
         assert!(!app.project_mut().sync_prs_as_issues().0);
         assert_eq!(app.project().issues.len(), 1);
@@ -2269,6 +2320,7 @@ mod tests {
         let issue = test_issue("bork-1", Column::InProgress);
         let mut app = test_app(vec![issue]);
         app.project_mut().live.user_prs = vec![test_pr(1, "bork-10/something")];
+        app.project_mut().live.pr_poll_done = true;
 
         assert!(app.project_mut().sync_prs_as_issues().0);
         assert_eq!(app.project().issues.len(), 2); // new issue created
@@ -2279,6 +2331,7 @@ mod tests {
         let issue = test_issue("BORK-5", Column::InProgress);
         let mut app = test_app(vec![issue]);
         app.project_mut().live.user_prs = vec![test_pr(1, "bork-5/fix")];
+        app.project_mut().live.pr_poll_done = true;
 
         assert!(!app.project_mut().sync_prs_as_issues().0);
         assert_eq!(app.project().issues.len(), 1);
