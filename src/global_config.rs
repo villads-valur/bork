@@ -1,4 +1,4 @@
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -63,11 +63,31 @@ pub fn save_global_config(config: &GlobalConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn lock_config_file() -> Option<File> {
+    let dir = global_config_dir();
+    let _ = fs::create_dir_all(&dir);
+    let lock_path = dir.join("projects.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .ok()?;
+    let fd = std::os::unix::io::AsRawFd::as_raw_fd(&file);
+    let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
+    if ret != 0 {
+        return None;
+    }
+    Some(file)
+}
+
 fn normalize_path(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 pub fn register_project(name: &str, path: &Path) -> anyhow::Result<()> {
+    let _lock = lock_config_file();
     let canonical = normalize_path(path);
     let mut config = load_global_config();
 
@@ -89,6 +109,7 @@ pub fn register_project(name: &str, path: &Path) -> anyhow::Result<()> {
 }
 
 pub fn register_if_absent(name: &str, path: &Path) -> anyhow::Result<()> {
+    let _lock = lock_config_file();
     let canonical = normalize_path(path);
     let config = load_global_config();
 
@@ -98,12 +119,18 @@ pub fn register_if_absent(name: &str, path: &Path) -> anyhow::Result<()> {
         .any(|e| normalize_path(&e.path) == canonical);
 
     if !already_registered {
-        return register_project(name, path);
+        let mut config = config;
+        config.projects.push(ProjectEntry {
+            name: name.to_string(),
+            path: canonical,
+        });
+        save_global_config(&config)?;
     }
     Ok(())
 }
 
 pub fn unregister_project(path: &Path) -> anyhow::Result<bool> {
+    let _lock = lock_config_file();
     let canonical = normalize_path(path);
     let mut config = load_global_config();
     let before = config.projects.len();
@@ -120,6 +147,7 @@ pub fn unregister_project(path: &Path) -> anyhow::Result<bool> {
 }
 
 pub fn prune_stale_projects() {
+    let _lock = lock_config_file();
     let mut config = load_global_config();
     let before = config.projects.len();
     config

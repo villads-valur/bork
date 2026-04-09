@@ -997,6 +997,10 @@ fn handle_sidebar(app: &mut App, action: Action) -> PostAction {
             }
             PostAction::None
         }
+        Action::ShowHelp => {
+            app.open_help();
+            PostAction::None
+        }
         Action::Quit => {
             app.should_quit = true;
             PostAction::None
