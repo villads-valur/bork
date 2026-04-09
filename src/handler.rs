@@ -2269,6 +2269,51 @@ mod tests {
         assert_eq!(app.input_mode, InputMode::Confirm);
     }
 
+    // ================================================================
+    // Warning messages for missing prerequisites
+    // ================================================================
+
+    #[test]
+    fn open_pr_no_pr_shows_warning() {
+        let mut app = app_with_issues();
+        act(&mut app, Action::OpenPR);
+        let (msg, kind) = app.message.as_ref().unwrap();
+        assert!(msg.contains("No PR found"));
+        assert_eq!(*kind, MessageKind::Warning);
+    }
+
+    #[test]
+    fn open_linear_no_url_shows_warning() {
+        let mut app = app_with_issues();
+        act(&mut app, Action::OpenLinear);
+        let (msg, kind) = app.message.as_ref().unwrap();
+        assert!(msg.contains("No Linear issue linked"));
+        assert_eq!(*kind, MessageKind::Warning);
+    }
+
+    #[test]
+    fn debug_inspect_no_issue_shows_warning() {
+        let mut app = test_app();
+        app.project_mut().config.debug = true;
+        act(&mut app, Action::DebugInspect);
+        let (msg, kind) = app.message.as_ref().unwrap();
+        assert!(msg.contains("No issue selected"));
+        assert_eq!(*kind, MessageKind::Warning);
+    }
+
+    #[test]
+    fn submit_empty_title_shows_warning() {
+        let mut app = test_app();
+        let ctx = app.action_context();
+        app.open_dialog(&ctx);
+        // Title is empty by default, submit immediately
+        act(&mut app, Action::DialogSubmit);
+        assert_eq!(app.input_mode, InputMode::Normal);
+        let (msg, kind) = app.message.as_ref().unwrap();
+        assert!(msg.contains("Title cannot be empty"));
+        assert_eq!(*kind, MessageKind::Warning);
+    }
+
     // --- Multi-project / sidebar tests ---
 
     fn test_config_named(name: &str) -> AppConfig {
