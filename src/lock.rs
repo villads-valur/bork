@@ -26,8 +26,8 @@ extern "C" fn signal_handler(_sig: libc::c_int) {
     SIGNAL_RECEIVED.store(true, Ordering::Relaxed);
 }
 
-fn lock_path(project_root: &Path) -> PathBuf {
-    project_root.join(".bork").join("bork.pid")
+fn lock_path(lock_dir: &Path) -> PathBuf {
+    lock_dir.join("bork.pid")
 }
 
 /// Acquire an exclusive file lock (flock) on the PID file.

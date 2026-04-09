@@ -14,7 +14,7 @@ pub struct GlobalConfig {
     pub projects: Vec<ProjectEntry>,
 }
 
-fn global_config_dir() -> PathBuf {
+pub fn global_config_dir() -> PathBuf {
     dirs_path().join("bork")
 }
 

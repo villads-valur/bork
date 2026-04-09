@@ -486,14 +486,15 @@ fn run_tui() -> anyhow::Result<()> {
         }
     }
 
-    // --- Single-instance lock ---
-    lock::acquire_lock(&config.project_root)?;
+    // --- Single-instance lock (global, not per-project) ---
+    let lock_root = global_config::global_config_dir();
+    lock::acquire_lock(&lock_root)?;
 
     // --- Panic hook ---
-    let panic_project_root = config.project_root.clone();
+    let panic_lock_root = lock_root.clone();
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
-        lock::release_lock(&panic_project_root);
+        lock::release_lock(&panic_lock_root);
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen, SetTitle(""));
         original_hook(panic_info);
@@ -563,7 +564,7 @@ fn run_tui() -> anyhow::Result<()> {
     });
 
     let mut pending_popup_session: Option<(String, String)> = None;
-    let mut pending_popup_for_launch: Option<(usize, String)> = None;
+    let mut pending_popup_for_launch: Option<(usize, usize, String)> = None; // (issue_index, project_index, popup_title)
     let mut needs_redraw = true;
 
     // --- Main event loop ---
@@ -621,7 +622,8 @@ fn run_tui() -> anyhow::Result<()> {
                                 issue_index,
                                 popup_title,
                             } => {
-                                pending_popup_for_launch = Some((issue_index, popup_title));
+                                pending_popup_for_launch =
+                                    Some((issue_index, app.active_project_index(), popup_title));
                             }
                             PostAction::OpenEditor { initial_content } => {
                                 if let Some(edited) = open_external_editor(
@@ -706,24 +708,29 @@ fn run_tui() -> anyhow::Result<()> {
             app.set_message(result.message);
 
             if let Some((issue_id, agent_sid)) = result.session_id {
-                if let Some(issue) = app
-                    .project_mut()
-                    .issues
-                    .iter_mut()
-                    .find(|i| i.id == issue_id)
-                {
-                    issue.session_id = Some(agent_sid);
+                for project in &mut app.projects {
+                    if let Some(issue) = project.issues.iter_mut().find(|i| i.id == issue_id) {
+                        issue.session_id = Some(agent_sid);
+                        project.mark_dirty();
+                        break;
+                    }
                 }
             }
 
             if let Some(session_name) = result.session_to_open {
                 if let Some(popup_title) = result.popup_title {
-                    // Direct popup (e.g. OpenTerminal)
                     pending_popup_session = Some((session_name, popup_title));
-                } else if let Some((launch_idx, popup_title)) = pending_popup_for_launch.take() {
-                    // Agent session launch
-                    if app.project().issues[launch_idx].column == types::Column::Todo {
-                        app.project_mut().issues[launch_idx].column = types::Column::InProgress;
+                } else if let Some((launch_idx, proj_idx, popup_title)) =
+                    pending_popup_for_launch.take()
+                {
+                    if proj_idx < app.projects.len()
+                        && launch_idx < app.projects[proj_idx].issues.len()
+                    {
+                        if app.projects[proj_idx].issues[launch_idx].column == types::Column::Todo {
+                            app.projects[proj_idx].issues[launch_idx].column =
+                                types::Column::InProgress;
+                            app.projects[proj_idx].mark_dirty();
+                        }
                     }
                     pending_popup_session = Some((session_name, popup_title));
                 }
@@ -1016,7 +1023,7 @@ fn run_tui() -> anyhow::Result<()> {
             let _ = config::save_state(&project.to_state(), &project.config.project_root);
         }
     }
-    lock::release_lock(&app.project().config.project_root);
+    lock::release_lock(&lock_root);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, SetTitle(""))?;
