@@ -3742,4 +3742,122 @@ mod tests {
         assert_eq!(app.projects[1].issues.len(), 3);
         assert_eq!(app.projects[0].issues.len(), 1);
     }
+
+    // --- High-impact multi-project tests ---
+
+    #[test]
+    fn action_context_survives_swimlane_switch() {
+        let mut app = test_multi_app();
+        let beta_id = app.projects[1].id();
+        app.sidebar.as_mut().unwrap().swimlanes =
+            vec![app.projects[0].id(), beta_id.clone(), app.projects[2].id()];
+        app.focused_swimlane = 1;
+
+        let ctx = app.action_context();
+        assert_eq!(ctx.project_id, beta_id);
+
+        app.focused_swimlane = 0;
+        assert_eq!(
+            ctx.project_id, beta_id,
+            "context should still point to beta after swimlane switch"
+        );
+
+        let resolved = app.context_project(&ctx);
+        assert_eq!(resolved.config.project_name, "beta");
+    }
+
+    #[test]
+    fn find_project_with_unknown_id_returns_none() {
+        let app = test_multi_app();
+        let bogus = PathBuf::from("/nonexistent/path");
+        assert!(app.find_project(&bogus).is_none());
+    }
+
+    #[test]
+    fn focused_project_id_stable_after_adding_projects() {
+        let mut app = test_multi_app();
+        let original_focused = app.focused_project.clone();
+
+        app.add_background_project(test_config_named("delta"), AppState { issues: vec![] });
+
+        assert_eq!(app.focused_project, original_focused);
+        assert_eq!(app.project().config.project_name, "alpha");
+    }
+
+    #[test]
+    fn visible_swimlanes_filters_bogus_ids() {
+        let mut app = test_multi_app();
+        let bogus = PathBuf::from("/nonexistent/path");
+        app.sidebar.as_mut().unwrap().swimlanes =
+            vec![app.projects[0].id(), bogus, app.projects[1].id()];
+
+        let lanes = app.visible_swimlanes();
+        assert_eq!(lanes.len(), 2);
+        assert_eq!(lanes[0], app.projects[0].id());
+        assert_eq!(lanes[1], app.projects[1].id());
+    }
+
+    #[test]
+    fn swimlane_toggle_roundtrip() {
+        let mut app = test_multi_app();
+        let beta_id = app.projects[1].id();
+
+        assert_eq!(app.sidebar.as_ref().unwrap().swimlanes.len(), 1);
+
+        app.sidebar
+            .as_mut()
+            .unwrap()
+            .swimlanes
+            .push(beta_id.clone());
+        assert_eq!(app.visible_swimlane_count(), 2);
+
+        let pos = app
+            .sidebar
+            .as_ref()
+            .unwrap()
+            .swimlanes
+            .iter()
+            .position(|id| *id == beta_id)
+            .unwrap();
+        app.sidebar.as_mut().unwrap().swimlanes.remove(pos);
+        assert_eq!(app.visible_swimlane_count(), 1);
+
+        app.sidebar
+            .as_mut()
+            .unwrap()
+            .swimlanes
+            .push(beta_id.clone());
+        assert_eq!(app.visible_swimlane_count(), 2);
+        assert!(app.find_project(&beta_id).is_some());
+    }
+
+    #[test]
+    fn search_is_per_project() {
+        let mut app = test_multi_app();
+        let alpha_id = app.projects[0].id();
+        let beta_id = app.projects[1].id();
+        app.sidebar.as_mut().unwrap().swimlanes = vec![alpha_id.clone(), beta_id.clone()];
+
+        app.focused_swimlane = 0;
+        let ctx = app.action_context();
+        app.search_push_char('x', &ctx);
+        assert_eq!(app.projects[0].search_query, "x");
+        assert_eq!(app.projects[1].search_query, "");
+
+        app.focused_swimlane = 1;
+        let ctx = app.action_context();
+        app.search_push_char('y', &ctx);
+        assert_eq!(app.projects[0].search_query, "x");
+        assert_eq!(app.projects[1].search_query, "y");
+    }
+
+    #[test]
+    fn context_project_mut_falls_back_to_focused() {
+        let mut app = test_multi_app();
+        let bogus_ctx = ActionContext {
+            project_id: PathBuf::from("/nonexistent"),
+        };
+        let project = app.context_project_mut(&bogus_ctx);
+        assert_eq!(project.config.project_name, "alpha");
+    }
 }

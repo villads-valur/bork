@@ -2417,4 +2417,159 @@ mod tests {
         act(&mut app, Action::NextSwimlane);
         assert_eq!(app.focused_swimlane, 0);
     }
+
+    // --- High-impact multi-project tests ---
+
+    #[test]
+    fn create_issue_on_swimlane_goes_to_correct_project() {
+        let mut app = test_multi_app();
+        let alpha_id = app.projects[0].id();
+        let beta_id = app.projects[1].id();
+        app.sidebar.as_mut().unwrap().swimlanes = vec![alpha_id, beta_id];
+        app.focused_swimlane = 1; // focus beta
+
+        let ctx = app.action_context();
+        assert_eq!(ctx.project_id, app.projects[1].id());
+
+        // Open dialog on beta
+        app.open_dialog(&ctx);
+        assert_eq!(app.input_mode, InputMode::Dialog);
+
+        if let Some(ref mut dialog) = app.dialog {
+            dialog.title = "Beta issue".to_string();
+        }
+
+        submit_dialog(&mut app, &ctx);
+
+        // Verify issue is in beta (projects[1]), not alpha (projects[0])
+        assert_eq!(
+            app.projects[0].issues.len(),
+            1,
+            "alpha should still have 1 issue"
+        );
+        assert_eq!(
+            app.projects[1].issues.len(),
+            2,
+            "beta should now have 2 issues"
+        );
+        assert!(
+            app.projects[1]
+                .issues
+                .last()
+                .unwrap()
+                .id
+                .starts_with("beta-"),
+            "new issue should have beta prefix"
+        );
+    }
+
+    #[test]
+    fn delete_on_swimlane_deletes_from_correct_project() {
+        let mut app = test_multi_app();
+        let alpha_id = app.projects[0].id();
+        let beta_id = app.projects[1].id();
+        app.sidebar.as_mut().unwrap().swimlanes = vec![alpha_id.clone(), beta_id.clone()];
+        app.focused_swimlane = 1; // focus beta
+
+        let ctx = app.action_context();
+        // Select first issue in beta
+        app.context_project_mut(&ctx).selected_column = 1; // InProgress
+        app.context_project_mut(&ctx).selected_row[1] = 0;
+
+        act(&mut app, Action::DeleteIssue);
+        assert_eq!(app.input_mode, InputMode::Confirm);
+
+        // Verify ConfirmAction has beta's project_id
+        match app.pending_confirm.as_ref().unwrap() {
+            ConfirmAction::DeleteIssue { project_id, .. } => {
+                assert_eq!(*project_id, beta_id);
+            }
+            _ => panic!("expected DeleteIssue"),
+        }
+    }
+
+    #[test]
+    fn enter_collapses_to_single_swimlane() {
+        let mut app = test_multi_app();
+        let alpha_id = app.projects[0].id();
+        let beta_id = app.projects[1].id();
+        let gamma_id = app.projects[2].id();
+        app.sidebar.as_mut().unwrap().swimlanes = vec![alpha_id, beta_id.clone(), gamma_id];
+
+        assert_eq!(app.visible_swimlane_count(), 3);
+
+        // Select beta in sidebar and press Enter
+        app.sidebar.as_mut().unwrap().selected = 1;
+        app.sidebar.as_mut().unwrap().focused = true;
+        app.input_mode = InputMode::Sidebar;
+
+        let post = handle_sidebar(&mut app, Action::SidebarSelect);
+        match post {
+            PostAction::SwitchProject { id } => {
+                assert_eq!(id, beta_id);
+            }
+            _ => panic!("expected SwitchProject"),
+        }
+
+        // Swimlanes should be collapsed to just beta
+        assert_eq!(app.sidebar.as_ref().unwrap().swimlanes, vec![beta_id]);
+        assert_eq!(app.focused_swimlane, 0);
+    }
+
+    #[test]
+    fn remove_middle_swimlane_adjusts_focus() {
+        let mut app = test_multi_app();
+        let alpha_id = app.projects[0].id();
+        let beta_id = app.projects[1].id();
+        let gamma_id = app.projects[2].id();
+        app.sidebar.as_mut().unwrap().swimlanes =
+            vec![alpha_id.clone(), beta_id.clone(), gamma_id.clone()];
+        app.focused_swimlane = 2; // focused on gamma (index 2)
+
+        // Remove beta (index 1) via sidebar
+        app.sidebar.as_mut().unwrap().selected = 1;
+        handle_sidebar(&mut app, Action::SidebarToggleSwimlane);
+
+        // Beta should be gone
+        assert_eq!(app.sidebar.as_ref().unwrap().swimlanes.len(), 2);
+        assert!(!app.sidebar.as_ref().unwrap().swimlanes.contains(&beta_id));
+
+        // focused_swimlane was 2, removed at position 1, so it should shift to 1
+        assert_eq!(app.focused_swimlane, 1);
+
+        // Gamma should still be accessible
+        let lanes = app.visible_swimlanes();
+        assert_eq!(lanes[1], gamma_id);
+    }
+
+    #[test]
+    fn pr_data_stays_per_project() {
+        let mut app = test_multi_app();
+
+        // Simulate PR data arriving for alpha only
+        let pr = crate::types::PrStatus {
+            number: 42,
+            title: "Alpha PR".to_string(),
+            url: "https://github.com/test/alpha/pull/42".to_string(),
+            author: "testuser".to_string(),
+            state: crate::types::PrState::Open,
+            is_draft: false,
+            checks: None,
+            review: None,
+            additions: 10,
+            deletions: 5,
+            head_branch: "feature".to_string(),
+        };
+        app.projects[0]
+            .live
+            .pr_statuses
+            .insert("feature".to_string(), pr);
+
+        // Alpha should have PR data
+        assert_eq!(app.projects[0].live.pr_statuses.len(), 1);
+
+        // Beta and gamma should NOT
+        assert_eq!(app.projects[1].live.pr_statuses.len(), 0);
+        assert_eq!(app.projects[2].live.pr_statuses.len(), 0);
+    }
 }

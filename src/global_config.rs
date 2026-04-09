@@ -278,4 +278,47 @@ mod tests {
             let _ = fs::remove_dir_all(&dir2);
         });
     }
+
+    #[test]
+    fn register_if_absent_does_not_overwrite_name() {
+        with_temp_config("if-absent", || {
+            let dir = make_temp_dir("if-absent-proj");
+
+            register_project("original-name", &dir).unwrap();
+            register_if_absent("different-name", &dir).unwrap();
+
+            let projects = list_projects();
+            assert_eq!(projects.len(), 1);
+            assert_eq!(
+                projects[0].name, "original-name",
+                "register_if_absent should not overwrite existing name"
+            );
+
+            let _ = fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn prune_removes_entries_without_config_toml() {
+        with_temp_config("prune-config", || {
+            let dir = make_temp_dir("prune-proj");
+            let bork_dir = dir.join(".bork");
+            let _ = fs::create_dir_all(&bork_dir);
+            fs::write(bork_dir.join("config.toml"), "project_name = \"test\"\n").unwrap();
+
+            register_project("test", &dir).unwrap();
+            assert_eq!(list_projects().len(), 1);
+
+            // Remove config.toml but keep .bork/
+            let _ = fs::remove_file(bork_dir.join("config.toml"));
+            prune_stale_projects();
+            assert_eq!(
+                list_projects().len(),
+                0,
+                "prune should remove entries without config.toml"
+            );
+
+            let _ = fs::remove_dir_all(&dir);
+        });
+    }
 }
