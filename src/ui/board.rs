@@ -6,11 +6,10 @@ use ratatui::Frame;
 
 use crate::app::{App, CardSize, Project};
 use crate::types::Column;
-use crate::ui::card::{self, CARD_HEIGHT};
+use crate::ui::card::{self, CARD_HEIGHT, CARD_HEIGHT_COMPACT, CARD_HEIGHT_MEDIUM};
 use crate::ui::styles;
 
-const CARD_HEIGHT_MEDIUM: u16 = 5;
-const CARD_HEIGHT_COMPACT: u16 = 4;
+const MIN_SWIMLANE_HEIGHT: u16 = 3;
 
 fn effective_card_height(card_size: CardSize) -> u16 {
     match card_size {
@@ -31,7 +30,7 @@ pub fn render_board(
     let swimlane_count = app.visible_swimlane_count();
 
     if swimlane_count > 1 {
-        if area.height < 3 {
+        if area.height < MIN_SWIMLANE_HEIGHT {
             return;
         }
         let header_area = Rect::new(area.x, area.y, area.width, 1);

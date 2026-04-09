@@ -9,6 +9,8 @@ use crate::types::{AgentStatus, Issue, IssueKind, PrState, PrStatus, WorktreeSta
 use crate::ui::styles;
 
 pub const CARD_HEIGHT: u16 = 7;
+pub const CARD_HEIGHT_MEDIUM: u16 = 5;
+pub const CARD_HEIGHT_COMPACT: u16 = 4;
 
 pub struct CardContext<'a> {
     pub issue: &'a Issue,

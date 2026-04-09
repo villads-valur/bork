@@ -776,7 +776,7 @@ fn run_tui() -> anyhow::Result<()> {
 
         while let Ok(poll) = workers.session_rx.try_recv() {
             needs_redraw = true;
-            let live = app.project_mut().live_mut();
+            let live = &mut app.project_mut().live;
             live.active_sessions = poll.sessions;
             live.agent_statuses = poll.agent_statuses;
             // Update shared sessions set for the port poll worker
@@ -786,7 +786,7 @@ fn run_tui() -> anyhow::Result<()> {
         }
 
         while let Ok(port_result) = workers.port_rx.try_recv() {
-            app.project_mut().live_mut().listening_ports = port_result.ports;
+            app.project_mut().live.listening_ports = port_result.ports;
         }
 
         // --- Auto-kill Done sessions past TTL ---
@@ -802,10 +802,7 @@ fn run_tui() -> anyhow::Result<()> {
             let status_file = config::agent_status_dir(&app.project().config.project_root)
                 .join(format!("{}.json", session_name));
             let sn = session_name.clone();
-            app.project_mut()
-                .live_mut()
-                .active_sessions
-                .remove(&session_name);
+            app.project_mut().live.active_sessions.remove(&session_name);
             thread::spawn(move || {
                 let _ = external::tmux::kill_session(&sn);
                 let _ = std::fs::remove_file(&status_file);
@@ -817,7 +814,7 @@ fn run_tui() -> anyhow::Result<()> {
         while let Ok(git_result) = workers.git_rx.try_recv() {
             needs_redraw = true;
             git_data_changed = true;
-            let live = app.project_mut().live_mut();
+            let live = &mut app.project_mut().live;
             live.worktree_statuses = git_result.statuses;
             live.worktree_branches = git_result.branches;
             live.git_poll_done = true;
@@ -827,7 +824,7 @@ fn run_tui() -> anyhow::Result<()> {
         while let Ok(pr_result) = workers.pr_rx.try_recv() {
             needs_redraw = true;
             pr_data_changed = true;
-            let live = app.project_mut().live_mut();
+            let live = &mut app.project_mut().live;
             live.pr_statuses = pr_result.prs;
             live.user_prs = pr_result.user_prs;
             if pr_result.github_user.is_some() {
@@ -836,7 +833,7 @@ fn run_tui() -> anyhow::Result<()> {
 
             let p = &mut app.projects[app.focused_project];
             let pr_titles: Vec<(u32, String)> = p
-                .live()
+                .live
                 .pr_statuses
                 .values()
                 .map(|pr| (pr.number, pr.title.clone()))
@@ -905,10 +902,10 @@ fn run_tui() -> anyhow::Result<()> {
         if let Some(ref rx) = workers.linear_rx {
             while let Ok(result) = rx.try_recv() {
                 needs_redraw = true;
-                app.project_mut().live_mut().linear_issues = result.issues;
+                app.project_mut().live.linear_issues = result.issues;
                 let p = &mut app.projects[app.focused_project];
                 let linear_titles: Vec<(String, String)> = p
-                    .live()
+                    .live
                     .linear_issues
                     .iter()
                     .map(|i| (i.id.clone(), i.title.clone()))
@@ -933,7 +930,7 @@ fn run_tui() -> anyhow::Result<()> {
             }
             while let Ok(poll) = sw.session_rx.try_recv() {
                 needs_redraw = true;
-                let live = app.projects[proj_idx].live_mut();
+                let live = &mut app.projects[proj_idx].live;
                 live.active_sessions = poll.sessions;
                 live.agent_statuses = poll.agent_statuses;
                 if let Ok(mut shared) = sw.port_sessions.lock() {
@@ -941,13 +938,13 @@ fn run_tui() -> anyhow::Result<()> {
                 }
             }
             while let Ok(port_result) = sw.port_rx.try_recv() {
-                app.projects[proj_idx].live_mut().listening_ports = port_result.ports;
+                app.projects[proj_idx].live.listening_ports = port_result.ports;
             }
             let mut sw_git_changed = false;
             while let Ok(git_result) = sw.git_rx.try_recv() {
                 needs_redraw = true;
                 sw_git_changed = true;
-                let live = app.projects[proj_idx].live_mut();
+                let live = &mut app.projects[proj_idx].live;
                 live.worktree_statuses = git_result.statuses;
                 live.worktree_branches = git_result.branches;
                 live.git_poll_done = true;
@@ -966,7 +963,7 @@ fn run_tui() -> anyhow::Result<()> {
             while let Ok(pr_result) = sw.pr_rx.try_recv() {
                 needs_redraw = true;
                 sw_pr_changed = true;
-                let live = app.projects[proj_idx].live_mut();
+                let live = &mut app.projects[proj_idx].live;
                 live.pr_statuses = pr_result.prs;
                 live.user_prs = pr_result.user_prs;
                 if pr_result.github_user.is_some() {
@@ -985,7 +982,7 @@ fn run_tui() -> anyhow::Result<()> {
             if let Some(ref rx) = sw.linear_rx {
                 while let Ok(result) = rx.try_recv() {
                     needs_redraw = true;
-                    app.projects[proj_idx].live_mut().linear_issues = result.issues;
+                    app.projects[proj_idx].live.linear_issues = result.issues;
                 }
             }
         }

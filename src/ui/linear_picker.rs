@@ -19,7 +19,7 @@ pub fn render_import_picker(frame: &mut Frame, app: &App) {
         None => return,
     };
 
-    let has_linear = !app.project().live().linear_issues.is_empty();
+    let has_linear = !app.project().live.linear_issues.is_empty();
     let has_github = app.project().has_github_prs();
     let show_tabs = has_linear && has_github;
 
@@ -215,7 +215,7 @@ fn render_linear_list(
 
     if count == 0 {
         let empty_area = Rect::new(inner.x + 1, list_start_y, inner.width - 2, 1);
-        let msg = if app.project().live().linear_issues.is_empty() {
+        let msg = if app.project().live.linear_issues.is_empty() {
             "No issues loaded"
         } else {
             "No matching issues"
@@ -320,7 +320,7 @@ fn render_github_list(
 
     if count == 0 {
         let empty_area = Rect::new(inner.x + 1, list_start_y, inner.width - 2, 1);
-        let msg = if app.project().live().pr_statuses.is_empty() {
+        let msg = if app.project().live.pr_statuses.is_empty() {
             "No PRs loaded"
         } else {
             "No matching PRs"

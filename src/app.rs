@@ -61,7 +61,7 @@ pub struct Project {
     pub search_query: String,
     pub linear_available: bool,
     pub tuicr_available: bool,
-    pub live: Option<LiveState>,
+    pub live: LiveState,
     pub state_dirty: bool,
 }
 
@@ -82,17 +82,9 @@ impl Project {
             search_query: String::new(),
             linear_available: false,
             tuicr_available: false,
-            live: Some(LiveState::default()),
+            live: LiveState::default(),
             state_dirty: false,
         }
-    }
-
-    pub fn live(&self) -> &LiveState {
-        self.live.as_ref().expect("live state not initialized")
-    }
-
-    pub fn live_mut(&mut self) -> &mut LiveState {
-        self.live.as_mut().expect("live state not initialized")
     }
 
     pub fn mark_dirty(&mut self) {
@@ -291,12 +283,12 @@ impl Project {
     }
 
     pub fn is_session_alive(&self, session_name: &str) -> bool {
-        self.live().active_sessions.contains(session_name)
+        self.live.active_sessions.contains(session_name)
     }
 
     pub fn resolved_agent_status(&self, issue: &Issue) -> AgentStatus {
         let session_name = issue.session_name(&self.config.project_name);
-        let live = self.live();
+        let live = &self.live;
 
         if let Some(info) = live.agent_statuses.get(&session_name) {
             if !live.active_sessions.contains(&session_name) {
@@ -314,7 +306,7 @@ impl Project {
 
     pub fn resolved_activity(&self, issue: &Issue) -> Option<&str> {
         let session_name = issue.session_name(&self.config.project_name);
-        self.live()
+        self.live
             .agent_statuses
             .get(&session_name)
             .and_then(|info| info.activity.as_deref())
@@ -322,7 +314,7 @@ impl Project {
 
     pub fn listening_ports_for(&self, issue: &Issue) -> Option<&Vec<u16>> {
         let session_name = issue.session_name(&self.config.project_name);
-        self.live().listening_ports.get(&session_name)
+        self.live.listening_ports.get(&session_name)
     }
 
     pub fn worktree_for<'a>(&self, issue: &'a Issue) -> Option<&'a str> {
@@ -333,7 +325,7 @@ impl Project {
     /// Shortest match wins (e.g. `bork-1` preferred over `bork-1-extended`).
     pub(crate) fn detect_worktree(&self, issue: &Issue) -> Option<String> {
         let issue_id_lower = issue.id.to_lowercase();
-        let live = self.live();
+        let live = &self.live;
 
         let mut best: Option<&str> = None;
         let all_keys = live
@@ -376,7 +368,7 @@ impl Project {
     }
 
     pub fn clear_stale_worktrees(&mut self) -> bool {
-        let live = self.live();
+        let live = &self.live;
         let live_branches = &live.worktree_branches;
         let frozen_branches = &live.frozen_worktree_branches;
         let stale: Vec<usize> = self
@@ -406,7 +398,7 @@ impl Project {
 
     pub fn worktree_status_for(&self, issue: &Issue) -> Option<&WorktreeStatus> {
         let wt = self.worktree_for(issue)?;
-        let live = self.live();
+        let live = &self.live;
         if issue.column == Column::Done {
             if let Some(frozen) = live.frozen_worktree_statuses.get(wt) {
                 return Some(frozen);
@@ -416,7 +408,7 @@ impl Project {
     }
 
     pub fn branch_for(&self, issue: &Issue) -> Option<&str> {
-        let live = self.live();
+        let live = &self.live;
         if let Some(wt) = self.worktree_for(issue) {
             if issue.column == Column::Done {
                 if let Some(frozen) = live.frozen_worktree_branches.get(wt) {
@@ -438,7 +430,7 @@ impl Project {
     }
 
     pub fn pr_for(&self, issue: &Issue) -> Option<&PrStatus> {
-        let live = self.live();
+        let live = &self.live;
         if let Some(branch) = self.branch_for(issue) {
             if let Some(pr) = live.pr_statuses.get(branch) {
                 return Some(pr);
@@ -452,7 +444,7 @@ impl Project {
     }
 
     pub fn sync_prs_as_issues(&mut self) -> (bool, Option<String>) {
-        if self.live().user_prs.is_empty() {
+        if self.live.user_prs.is_empty() {
             return (false, None);
         }
 
@@ -472,7 +464,7 @@ impl Project {
 
         let mut new_issues: Vec<Issue> = Vec::new();
 
-        for pr in &self.live().user_prs {
+        for pr in &self.live.user_prs {
             if pr.state != PrState::Open {
                 continue;
             }
@@ -546,21 +538,21 @@ impl Project {
     }
 
     pub fn freeze_worktree_status(&mut self, worktree: &str) {
-        let live = self.live_mut();
-        if let Some(status) = live.worktree_statuses.get(worktree) {
-            live.frozen_worktree_statuses
+        if let Some(status) = self.live.worktree_statuses.get(worktree) {
+            self.live
+                .frozen_worktree_statuses
                 .insert(worktree.to_string(), status.clone());
         }
-        if let Some(branch) = live.worktree_branches.get(worktree).cloned() {
-            live.frozen_worktree_branches
+        if let Some(branch) = self.live.worktree_branches.get(worktree).cloned() {
+            self.live
+                .frozen_worktree_branches
                 .insert(worktree.to_string(), branch);
         }
     }
 
     pub fn unfreeze_worktree_status(&mut self, worktree: &str) {
-        let live = self.live_mut();
-        live.frozen_worktree_statuses.remove(worktree);
-        live.frozen_worktree_branches.remove(worktree);
+        self.live.frozen_worktree_statuses.remove(worktree);
+        self.live.frozen_worktree_branches.remove(worktree);
     }
 
     pub fn issues_needing_session_cleanup(&self, now: u64) -> Vec<usize> {
@@ -585,7 +577,7 @@ impl Project {
     }
 
     pub fn has_github_prs(&self) -> bool {
-        self.live().has_github_prs()
+        self.live.has_github_prs()
     }
 
     pub fn filtered_linear_issues<'a>(
@@ -593,7 +585,7 @@ impl Project {
         picker: &LinearPickerState,
     ) -> Vec<&'a LinearIssue> {
         let query = picker.search.to_lowercase();
-        self.live()
+        self.live
             .linear_issues
             .iter()
             .filter(|i| {
@@ -607,7 +599,7 @@ impl Project {
 
     pub fn filtered_github_prs<'a>(&'a self, picker: &LinearPickerState) -> Vec<&'a PrStatus> {
         let query = picker.search.to_lowercase();
-        let live = self.live();
+        let live = &self.live;
 
         let mut seen: HashSet<u32> = HashSet::new();
         let mut prs: Vec<&PrStatus> = Vec::new();
@@ -1173,10 +1165,17 @@ impl App {
 
     pub fn active_project_index(&self) -> usize {
         let lanes = self.visible_swimlanes();
-        lanes
+        let idx = lanes
             .get(self.focused_swimlane)
             .copied()
-            .unwrap_or(self.focused_project)
+            .unwrap_or(self.focused_project);
+        debug_assert!(
+            idx < self.projects.len(),
+            "active project index {} out of bounds ({})",
+            idx,
+            self.projects.len()
+        );
+        idx
     }
 
     pub fn active_project(&self) -> &Project {
@@ -1254,7 +1253,7 @@ impl App {
     pub fn open_edit_dialog(&mut self, issue: &Issue, index: usize) {
         let p = self.active_project();
         let github_available = p.has_github_prs();
-        let live = p.live();
+        let live = &p.live;
         self.dialog = Some(DialogState::from_issue(
             issue,
             index,
@@ -1277,7 +1276,7 @@ impl App {
 
     pub fn open_import_picker_with_context(&mut self, context: LinearPickerContext) {
         let p = self.active_project();
-        let has_linear = !p.live().linear_issues.is_empty();
+        let has_linear = !p.live.linear_issues.is_empty();
         let has_github = p.has_github_prs();
 
         if !has_linear && !has_github {
@@ -1510,7 +1509,7 @@ mod tests {
     fn test_detect_worktree_exact_match() {
         let mut app = test_app(vec![test_issue("bork-8", Column::InProgress)]);
         app.project_mut()
-            .live_mut()
+            .live
             .worktree_branches
             .insert("bork-8".into(), "bork-8/init-cli".into());
         assert_eq!(
@@ -1524,7 +1523,7 @@ mod tests {
     fn test_detect_worktree_prefix_match() {
         let mut app = test_app(vec![test_issue("bork-12", Column::InProgress)]);
         app.project_mut()
-            .live_mut()
+            .live
             .worktree_branches
             .insert("bork-12-pr-status".into(), "bork-12/pr-status".into());
         assert_eq!(
@@ -1538,7 +1537,7 @@ mod tests {
     fn test_detect_worktree_no_false_prefix() {
         let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
         app.project_mut()
-            .live_mut()
+            .live
             .worktree_branches
             .insert("bork-10".into(), "bork-10/something".into());
         assert_eq!(
@@ -1552,7 +1551,7 @@ mod tests {
     fn test_detect_worktree_no_match() {
         let mut app = test_app(vec![test_issue("bork-99", Column::InProgress)]);
         app.project_mut()
-            .live_mut()
+            .live
             .worktree_branches
             .insert("bork-8".into(), "bork-8/init-cli".into());
         assert_eq!(
@@ -1566,15 +1565,15 @@ mod tests {
     fn test_detect_worktree_shortest_prefix_wins() {
         let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
         app.project_mut()
-            .live_mut()
+            .live
             .worktree_branches
             .insert("bork-1-abc".into(), "bork-1/abc".into());
         app.project_mut()
-            .live_mut()
+            .live
             .worktree_branches
             .insert("bork-1-a".into(), "bork-1/a".into());
         app.project_mut()
-            .live_mut()
+            .live
             .worktree_branches
             .insert("bork-1-abcdef".into(), "bork-1/abcdef".into());
         assert_eq!(
@@ -1588,11 +1587,11 @@ mod tests {
     fn test_detect_worktree_exact_preferred_over_prefix() {
         let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
         app.project_mut()
-            .live_mut()
+            .live
             .worktree_branches
             .insert("bork-1".into(), "bork-1/feature".into());
         app.project_mut()
-            .live_mut()
+            .live
             .worktree_branches
             .insert("bork-1-extended".into(), "bork-1/extended".into());
         assert_eq!(
@@ -1606,7 +1605,7 @@ mod tests {
     fn test_detect_worktree_case_insensitive() {
         let mut app = test_app(vec![test_issue("BORK-8", Column::InProgress)]);
         app.project_mut()
-            .live_mut()
+            .live
             .worktree_branches
             .insert("bork-8".into(), "bork-8/feature".into());
         assert_eq!(
@@ -1620,7 +1619,7 @@ mod tests {
     fn test_detect_worktree_searches_frozen_keys() {
         let mut app = test_app(vec![test_issue("bork-1", Column::Done)]);
         app.project_mut()
-            .live_mut()
+            .live
             .frozen_worktree_branches
             .insert("bork-1".into(), "bork-1/feature".into());
         assert_eq!(
@@ -1633,7 +1632,7 @@ mod tests {
     #[test]
     fn test_detect_worktree_project_prefixed_dir() {
         let mut app = test_app(vec![test_issue("doc-1929", Column::InProgress)]);
-        app.project_mut().live_mut().worktree_branches.insert(
+        app.project_mut().live.worktree_branches.insert(
             "legora-doc-1929-show-hidden-data".into(),
             "doc-1929/show-hidden-data".into(),
         );
@@ -1648,7 +1647,7 @@ mod tests {
     fn test_detect_worktree_project_prefixed_no_slug() {
         let mut app = test_app(vec![test_issue("doc-1929", Column::InProgress)]);
         app.project_mut()
-            .live_mut()
+            .live
             .worktree_branches
             .insert("legora-doc-1929".into(), "doc-1929/feature".into());
         assert_eq!(
@@ -1662,7 +1661,7 @@ mod tests {
     fn test_detect_worktree_no_false_substring_match() {
         let mut app = test_app(vec![test_issue("doc-1", Column::InProgress)]);
         app.project_mut()
-            .live_mut()
+            .live
             .worktree_branches
             .insert("legora-doc-12-something".into(), "doc-12/something".into());
         assert_eq!(
@@ -1676,11 +1675,11 @@ mod tests {
     fn test_detect_worktree_exact_preferred_over_substring() {
         let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
         app.project_mut()
-            .live_mut()
+            .live
             .worktree_branches
             .insert("bork-1".into(), "bork-1/feature".into());
         app.project_mut()
-            .live_mut()
+            .live
             .worktree_branches
             .insert("legora-bork-1-extended".into(), "bork-1/extended".into());
         assert_eq!(
@@ -1694,7 +1693,7 @@ mod tests {
     fn test_detect_worktree_id_with_slug_suffix() {
         let mut app = test_app(vec![test_issue("bork-14", Column::InProgress)]);
         app.project_mut()
-            .live_mut()
+            .live
             .worktree_branches
             .insert("bork-14-fix-auth".into(), "bork-14/fix-auth".into());
         assert_eq!(
@@ -1707,7 +1706,7 @@ mod tests {
     #[test]
     fn test_detect_worktree_linear_id_with_slug_suffix() {
         let mut app = test_app(vec![test_issue("vil-123", Column::InProgress)]);
-        app.project_mut().live_mut().worktree_branches.insert(
+        app.project_mut().live.worktree_branches.insert(
             "vil-123-fix-auth-flow".into(),
             "vil-123/fix-auth-flow".into(),
         );
@@ -1722,7 +1721,7 @@ mod tests {
     fn test_detect_worktree_slug_suffix_no_false_positive() {
         let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
         app.project_mut()
-            .live_mut()
+            .live
             .worktree_branches
             .insert("bork-14-fix-auth".into(), "bork-14/fix-auth".into());
         assert_eq!(
@@ -1740,7 +1739,7 @@ mod tests {
     fn test_auto_assign_sets_worktree_on_none() {
         let mut app = test_app(vec![test_issue("bork-8", Column::InProgress)]);
         app.project_mut()
-            .live_mut()
+            .live
             .worktree_branches
             .insert("bork-8".into(), "bork-8/init-cli".into());
         assert!(app.project().issues[0].worktree.is_none());
@@ -1755,7 +1754,7 @@ mod tests {
         issue.worktree = Some("bork-8".into());
         let mut app = test_app(vec![issue]);
         app.project_mut()
-            .live_mut()
+            .live
             .worktree_branches
             .insert("bork-8".into(), "bork-8/init-cli".into());
         let changed = app.project_mut().auto_assign_worktrees();
@@ -1766,7 +1765,7 @@ mod tests {
     fn test_auto_assign_returns_false_when_no_match() {
         let mut app = test_app(vec![test_issue("bork-99", Column::InProgress)]);
         app.project_mut()
-            .live_mut()
+            .live
             .worktree_branches
             .insert("bork-8".into(), "bork-8/init-cli".into());
         let changed = app.project_mut().auto_assign_worktrees();
@@ -1791,7 +1790,7 @@ mod tests {
         issue.worktree = Some("bork-1".into());
         let mut app = test_app(vec![issue]);
         app.project_mut()
-            .live_mut()
+            .live
             .worktree_branches
             .insert("bork-1".into(), "bork-1/feature".into());
         let changed = app.project_mut().clear_stale_worktrees();
@@ -1806,7 +1805,7 @@ mod tests {
         let mut app = test_app(vec![issue]);
         // Not in worktree_branches, but in frozen
         app.project_mut()
-            .live_mut()
+            .live
             .frozen_worktree_branches
             .insert("bork-1".into(), "bork-1/feature".into());
         let changed = app.project_mut().clear_stale_worktrees();
@@ -1818,10 +1817,10 @@ mod tests {
     fn test_auto_assign_freezes_done_issues() {
         let mut app = test_app(vec![test_issue("bork-1", Column::Done)]);
         app.project_mut()
-            .live_mut()
+            .live
             .worktree_branches
             .insert("bork-1".into(), "bork-1/feature".into());
-        app.project_mut().live_mut().worktree_statuses.insert(
+        app.project_mut().live.worktree_statuses.insert(
             "bork-1".into(),
             WorktreeStatus {
                 staged: 3,
@@ -1834,23 +1833,23 @@ mod tests {
         // Should have frozen the worktree data
         assert!(app
             .project()
-            .live()
+            .live
             .frozen_worktree_branches
             .contains_key("bork-1"));
         assert_eq!(
             app.project_mut()
-                .live_mut()
+                .live
                 .frozen_worktree_branches
                 .get("bork-1"),
             Some(&"bork-1/feature".into())
         );
         assert!(app
             .project()
-            .live()
+            .live
             .frozen_worktree_statuses
             .contains_key("bork-1"));
         assert_eq!(
-            app.project().live().frozen_worktree_statuses["bork-1"].staged,
+            app.project().live.frozen_worktree_statuses["bork-1"].staged,
             3
         );
     }
@@ -1859,12 +1858,12 @@ mod tests {
     fn test_auto_assign_does_not_freeze_non_done_issues() {
         let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
         app.project_mut()
-            .live_mut()
+            .live
             .worktree_branches
             .insert("bork-1".into(), "bork-1/feature".into());
         app.project_mut().auto_assign_worktrees();
-        assert!(app.project().live().frozen_worktree_branches.is_empty());
-        assert!(app.project().live().frozen_worktree_statuses.is_empty());
+        assert!(app.project().live.frozen_worktree_branches.is_empty());
+        assert!(app.project().live.frozen_worktree_statuses.is_empty());
     }
 
     #[test]
@@ -1872,7 +1871,7 @@ mod tests {
         let mut app = test_app(vec![test_issue("bork-1", Column::Done)]);
         // Not in worktree_branches (git worker skips Done), but in frozen
         app.project_mut()
-            .live_mut()
+            .live
             .frozen_worktree_branches
             .insert("bork-1".into(), "bork-1/feature".into());
         let changed = app.project_mut().auto_assign_worktrees();
@@ -1888,11 +1887,11 @@ mod tests {
             test_issue("bork-99", Column::InProgress),
         ]);
         app.project_mut()
-            .live_mut()
+            .live
             .worktree_branches
             .insert("bork-1".into(), "bork-1/feat".into());
         app.project_mut()
-            .live_mut()
+            .live
             .worktree_branches
             .insert("bork-2".into(), "bork-2/feat".into());
         let changed = app.project_mut().auto_assign_worktrees();
@@ -1936,7 +1935,7 @@ mod tests {
         issue.worktree = Some("bork-8".into());
         let mut app = test_app(vec![issue]);
         app.project_mut()
-            .live_mut()
+            .live
             .worktree_branches
             .insert("bork-8".into(), "bork-8/init-cli".into());
         assert_eq!(
@@ -1957,11 +1956,11 @@ mod tests {
         issue.worktree = Some("bork-1".into());
         let mut app = test_app(vec![issue]);
         app.project_mut()
-            .live_mut()
+            .live
             .worktree_branches
             .insert("bork-1".into(), "bork-1/my-feature".into());
         app.project_mut()
-            .live_mut()
+            .live
             .pr_statuses
             .insert("bork-1/my-feature".into(), test_pr(42, "bork-1/my-feature"));
         let pr = app
@@ -1985,19 +1984,19 @@ mod tests {
         issue2.worktree = Some("bork-2".into());
         let mut app = test_app(vec![issue1, issue2]);
         app.project_mut()
-            .live_mut()
+            .live
             .worktree_branches
             .insert("bork-1".into(), "branch-a".into());
         app.project_mut()
-            .live_mut()
+            .live
             .worktree_branches
             .insert("bork-2".into(), "branch-b".into());
         app.project_mut()
-            .live_mut()
+            .live
             .pr_statuses
             .insert("branch-a".into(), test_pr(10, "branch-a"));
         app.project_mut()
-            .live_mut()
+            .live
             .pr_statuses
             .insert("branch-b".into(), test_pr(20, "branch-b"));
         let issues = app.project_mut().issues.clone();
@@ -2012,7 +2011,7 @@ mod tests {
     #[test]
     fn sync_prs_imports_open_pr_as_issue() {
         let mut app = test_app(vec![]);
-        app.project_mut().live_mut().user_prs = vec![test_pr(1, "feature/new")];
+        app.project_mut().live.user_prs = vec![test_pr(1, "feature/new")];
 
         assert!(app.project_mut().sync_prs_as_issues().0);
         assert_eq!(app.project().issues.len(), 1);
@@ -2034,7 +2033,7 @@ mod tests {
         let mut app = test_app(vec![]);
         let mut pr = test_pr(1, "feature/new");
         pr.is_draft = true;
-        app.project_mut().live_mut().user_prs = vec![pr];
+        app.project_mut().live.user_prs = vec![pr];
 
         assert!(!app.project_mut().sync_prs_as_issues().0);
         assert!(app.project().issues.is_empty());
@@ -2045,7 +2044,7 @@ mod tests {
         let mut app = test_app(vec![]);
         let mut pr = test_pr(1, "feature/new");
         pr.state = PrState::Closed;
-        app.project_mut().live_mut().user_prs = vec![pr];
+        app.project_mut().live.user_prs = vec![pr];
 
         assert!(!app.project_mut().sync_prs_as_issues().0);
         assert!(app.project().issues.is_empty());
@@ -2056,7 +2055,7 @@ mod tests {
         let mut app = test_app(vec![]);
         let mut pr = test_pr(1, "feature/new");
         pr.state = PrState::Merged;
-        app.project_mut().live_mut().user_prs = vec![pr];
+        app.project_mut().live.user_prs = vec![pr];
 
         assert!(!app.project_mut().sync_prs_as_issues().0);
         assert!(app.project().issues.is_empty());
@@ -2065,7 +2064,7 @@ mod tests {
     #[test]
     fn sync_prs_skips_main_branch() {
         let mut app = test_app(vec![]);
-        app.project_mut().live_mut().user_prs = vec![test_pr(1, "main")];
+        app.project_mut().live.user_prs = vec![test_pr(1, "main")];
 
         assert!(!app.project_mut().sync_prs_as_issues().0);
         assert!(app.project().issues.is_empty());
@@ -2077,10 +2076,10 @@ mod tests {
         issue.worktree = Some("bork-1".into());
         let mut app = test_app(vec![issue]);
         app.project_mut()
-            .live_mut()
+            .live
             .worktree_branches
             .insert("bork-1".into(), "feature/thing".into());
-        app.project_mut().live_mut().user_prs = vec![test_pr(1, "feature/thing")];
+        app.project_mut().live.user_prs = vec![test_pr(1, "feature/thing")];
 
         assert!(!app.project_mut().sync_prs_as_issues().0);
         assert_eq!(app.project().issues.len(), 1);
@@ -2090,7 +2089,7 @@ mod tests {
     fn sync_prs_dedup_by_issue_id_prefix() {
         let issue = test_issue("bork-5", Column::InProgress);
         let mut app = test_app(vec![issue]);
-        app.project_mut().live_mut().user_prs = vec![test_pr(1, "bork-5/follow-up")];
+        app.project_mut().live.user_prs = vec![test_pr(1, "bork-5/follow-up")];
 
         assert!(!app.project_mut().sync_prs_as_issues().0);
         assert_eq!(app.project().issues.len(), 1);
@@ -2101,7 +2100,7 @@ mod tests {
         let mut issue = test_issue("bork-1", Column::CodeReview);
         issue.pr_number = Some(42);
         let mut app = test_app(vec![issue]);
-        app.project_mut().live_mut().user_prs = vec![test_pr(42, "some/branch")];
+        app.project_mut().live.user_prs = vec![test_pr(42, "some/branch")];
 
         assert!(!app.project_mut().sync_prs_as_issues().0);
         assert_eq!(app.project().issues.len(), 1);
@@ -2110,7 +2109,7 @@ mod tests {
     #[test]
     fn sync_prs_reimports_after_delete() {
         let mut app = test_app(vec![]);
-        app.project_mut().live_mut().user_prs = vec![test_pr(42, "feature/new")];
+        app.project_mut().live.user_prs = vec![test_pr(42, "feature/new")];
 
         assert!(app.project_mut().sync_prs_as_issues().0);
         assert_eq!(app.project().issues.len(), 1);
@@ -2126,7 +2125,7 @@ mod tests {
     #[test]
     fn sync_prs_multiple_prs_get_unique_ids() {
         let mut app = test_app(vec![]);
-        app.project_mut().live_mut().user_prs = vec![
+        app.project_mut().live.user_prs = vec![
             test_pr(1, "feature/a"),
             test_pr(2, "feature/b"),
             test_pr(3, "feature/c"),
@@ -2147,7 +2146,7 @@ mod tests {
     #[test]
     fn sync_prs_no_duplicate_on_second_call() {
         let mut app = test_app(vec![]);
-        app.project_mut().live_mut().user_prs = vec![test_pr(1, "feature/new")];
+        app.project_mut().live.user_prs = vec![test_pr(1, "feature/new")];
 
         assert!(app.project_mut().sync_prs_as_issues().0);
         assert_eq!(app.project().issues.len(), 1);
@@ -2160,8 +2159,7 @@ mod tests {
     fn sync_prs_dedup_by_issue_id_prefix_with_dash() {
         let issue = test_issue("doc-1917", Column::InProgress);
         let mut app = test_app(vec![issue]);
-        app.project_mut().live_mut().user_prs =
-            vec![test_pr(1, "DOC-1917-attachment-selection-search")];
+        app.project_mut().live.user_prs = vec![test_pr(1, "DOC-1917-attachment-selection-search")];
 
         assert!(!app.project_mut().sync_prs_as_issues().0);
         assert_eq!(app.project().issues.len(), 1);
@@ -2172,7 +2170,7 @@ mod tests {
         // Issue "bork-1" should NOT match branch "bork-10/something"
         let issue = test_issue("bork-1", Column::InProgress);
         let mut app = test_app(vec![issue]);
-        app.project_mut().live_mut().user_prs = vec![test_pr(1, "bork-10/something")];
+        app.project_mut().live.user_prs = vec![test_pr(1, "bork-10/something")];
 
         assert!(app.project_mut().sync_prs_as_issues().0);
         assert_eq!(app.project().issues.len(), 2); // new issue created
@@ -2182,7 +2180,7 @@ mod tests {
     fn sync_prs_prefix_match_is_case_insensitive() {
         let issue = test_issue("BORK-5", Column::InProgress);
         let mut app = test_app(vec![issue]);
-        app.project_mut().live_mut().user_prs = vec![test_pr(1, "bork-5/fix")];
+        app.project_mut().live.user_prs = vec![test_pr(1, "bork-5/fix")];
 
         assert!(!app.project_mut().sync_prs_as_issues().0);
         assert_eq!(app.project().issues.len(), 1);
@@ -2428,7 +2426,7 @@ mod tests {
         let mut app = test_app(vec![issue]);
         app.project_mut().config.done_session_ttl = 300;
         app.project_mut()
-            .live_mut()
+            .live
             .active_sessions
             .insert("bork-bork-1".to_string());
 
@@ -2450,7 +2448,7 @@ mod tests {
         let mut app = test_app(vec![issue]);
         app.project_mut().config.done_session_ttl = 300;
         app.project_mut()
-            .live_mut()
+            .live
             .active_sessions
             .insert("bork-bork-1".to_string());
 
@@ -2487,7 +2485,7 @@ mod tests {
 
         let mut app = test_app(vec![issue]);
         app.project_mut()
-            .live_mut()
+            .live
             .active_sessions
             .insert("bork-bork-1".to_string());
 
@@ -2503,7 +2501,7 @@ mod tests {
 
         let mut app = test_app(vec![issue]);
         app.project_mut()
-            .live_mut()
+            .live
             .active_sessions
             .insert("bork-bork-1".to_string());
 
@@ -2528,11 +2526,11 @@ mod tests {
         let mut app = test_app(vec![expired, not_expired, in_progress]);
         app.project_mut().config.done_session_ttl = 300;
         app.project_mut()
-            .live_mut()
+            .live
             .active_sessions
             .insert("bork-bork-1".to_string());
         app.project_mut()
-            .live_mut()
+            .live
             .active_sessions
             .insert("bork-bork-2".to_string());
 
@@ -2590,7 +2588,7 @@ mod tests {
         let mut issue = test_issue("bork-1", Column::Done);
         issue.worktree = Some("bork-1".into());
         let mut app = test_app(vec![issue]);
-        app.project_mut().live_mut().worktree_statuses.insert(
+        app.project_mut().live.worktree_statuses.insert(
             "bork-1".to_string(),
             WorktreeStatus {
                 staged: 3,
@@ -2598,7 +2596,7 @@ mod tests {
             },
         );
         app.project_mut()
-            .live_mut()
+            .live
             .worktree_branches
             .insert("bork-1".to_string(), "feature/test".to_string());
 
@@ -2606,15 +2604,15 @@ mod tests {
 
         assert!(app
             .project()
-            .live()
+            .live
             .frozen_worktree_statuses
             .contains_key("bork-1"));
-        let frozen = &app.project().live().frozen_worktree_statuses["bork-1"];
+        let frozen = &app.project().live.frozen_worktree_statuses["bork-1"];
         assert_eq!(frozen.staged, 3);
         assert_eq!(frozen.unstaged, 5);
         assert_eq!(
             app.project_mut()
-                .live_mut()
+                .live
                 .frozen_worktree_branches
                 .get("bork-1"),
             Some(&"feature/test".to_string())
@@ -2624,18 +2622,15 @@ mod tests {
     #[test]
     fn unfreeze_worktree_removes_from_frozen() {
         let mut app = test_app(vec![]);
+        app.project_mut().live.frozen_worktree_statuses.insert(
+            "bork-1".to_string(),
+            WorktreeStatus {
+                staged: 1,
+                unstaged: 2,
+            },
+        );
         app.project_mut()
-            .live_mut()
-            .frozen_worktree_statuses
-            .insert(
-                "bork-1".to_string(),
-                WorktreeStatus {
-                    staged: 1,
-                    unstaged: 2,
-                },
-            );
-        app.project_mut()
-            .live_mut()
+            .live
             .frozen_worktree_branches
             .insert("bork-1".to_string(), "main".to_string());
 
@@ -2643,12 +2638,12 @@ mod tests {
 
         assert!(!app
             .project()
-            .live()
+            .live
             .frozen_worktree_statuses
             .contains_key("bork-1"));
         assert!(!app
             .project()
-            .live()
+            .live
             .frozen_worktree_branches
             .contains_key("bork-1"));
     }
@@ -2659,16 +2654,13 @@ mod tests {
         issue.worktree = Some("bork-1".into());
         let mut app = test_app(vec![issue]);
 
-        app.project_mut()
-            .live_mut()
-            .frozen_worktree_statuses
-            .insert(
-                "bork-1".to_string(),
-                WorktreeStatus {
-                    staged: 2,
-                    unstaged: 4,
-                },
-            );
+        app.project_mut().live.frozen_worktree_statuses.insert(
+            "bork-1".to_string(),
+            WorktreeStatus {
+                staged: 2,
+                unstaged: 4,
+            },
+        );
 
         let status = app
             .project()
@@ -2685,23 +2677,20 @@ mod tests {
         issue.worktree = Some("bork-1".into());
         let mut app = test_app(vec![issue]);
 
-        app.project_mut().live_mut().worktree_statuses.insert(
+        app.project_mut().live.worktree_statuses.insert(
             "bork-1".to_string(),
             WorktreeStatus {
                 staged: 1,
                 unstaged: 0,
             },
         );
-        app.project_mut()
-            .live_mut()
-            .frozen_worktree_statuses
-            .insert(
-                "bork-1".to_string(),
-                WorktreeStatus {
-                    staged: 99,
-                    unstaged: 99,
-                },
-            );
+        app.project_mut().live.frozen_worktree_statuses.insert(
+            "bork-1".to_string(),
+            WorktreeStatus {
+                staged: 99,
+                unstaged: 99,
+            },
+        );
 
         let status = app
             .project()
@@ -2721,7 +2710,7 @@ mod tests {
         let mut app = test_app(vec![issue]);
 
         app.project_mut()
-            .live_mut()
+            .live
             .frozen_worktree_branches
             .insert("bork-1".to_string(), "feature/done".to_string());
 
@@ -2742,10 +2731,10 @@ mod tests {
         let issue = test_issue("bork-1", Column::InProgress);
         let mut app = test_app(vec![issue.clone()]);
         app.project_mut()
-            .live_mut()
+            .live
             .active_sessions
             .insert("bork-bork-1".to_string());
-        app.project_mut().live_mut().agent_statuses.insert(
+        app.project_mut().live.agent_statuses.insert(
             "bork-bork-1".to_string(),
             AgentStatusInfo {
                 status: AgentStatus::Busy,
@@ -2764,7 +2753,7 @@ mod tests {
         let issue = test_issue("bork-1", Column::InProgress);
         let mut app = test_app(vec![issue.clone()]);
         // Status file says Busy but session is not alive
-        app.project_mut().live_mut().agent_statuses.insert(
+        app.project_mut().live.agent_statuses.insert(
             "bork-bork-1".to_string(),
             AgentStatusInfo {
                 status: AgentStatus::Busy,
@@ -2783,7 +2772,7 @@ mod tests {
         let issue = test_issue("bork-1", Column::InProgress);
         let mut app = test_app(vec![issue.clone()]);
         app.project_mut()
-            .live_mut()
+            .live
             .active_sessions
             .insert("bork-bork-1".to_string());
         assert_eq!(
@@ -3377,7 +3366,7 @@ mod tests {
     fn open_linear_picker_requires_issues() {
         let mut app = test_app(vec![]);
         app.project_mut().linear_available = true;
-        app.project_mut().live_mut().linear_issues = vec![];
+        app.project_mut().live.linear_issues = vec![];
 
         app.open_linear_picker();
         assert_eq!(app.input_mode, InputMode::Normal);
@@ -3388,7 +3377,7 @@ mod tests {
     fn open_linear_picker_with_issues() {
         let mut app = test_app(vec![]);
         app.project_mut().linear_available = true;
-        app.project_mut().live_mut().linear_issues =
+        app.project_mut().live.linear_issues =
             vec![test_linear_issue("uuid-1", "TEST-1", "First issue")];
 
         app.open_linear_picker();
@@ -3400,7 +3389,7 @@ mod tests {
     fn close_linear_picker_restores_normal_mode() {
         let mut app = test_app(vec![]);
         app.project_mut().linear_available = true;
-        app.project_mut().live_mut().linear_issues =
+        app.project_mut().live.linear_issues =
             vec![test_linear_issue("uuid-1", "TEST-1", "First issue")];
 
         app.open_linear_picker();
@@ -3415,7 +3404,7 @@ mod tests {
         issue.linear_id = Some("uuid-1".to_string());
         let mut app = test_app(vec![issue]);
 
-        app.project_mut().live_mut().linear_issues = vec![
+        app.project_mut().live.linear_issues = vec![
             test_linear_issue("uuid-1", "TEST-1", "Already imported"),
             test_linear_issue("uuid-2", "TEST-2", "Not imported"),
         ];
@@ -3428,7 +3417,7 @@ mod tests {
     #[test]
     fn filtered_linear_issues_filters_by_search() {
         let mut app = test_app(vec![]);
-        app.project_mut().live_mut().linear_issues = vec![
+        app.project_mut().live.linear_issues = vec![
             test_linear_issue("uuid-1", "TEST-1", "Add login page"),
             test_linear_issue("uuid-2", "TEST-2", "Fix dashboard bug"),
             test_linear_issue("uuid-3", "TEST-3", "Add logout button"),
@@ -3448,7 +3437,7 @@ mod tests {
     #[test]
     fn filtered_linear_issues_matches_identifier() {
         let mut app = test_app(vec![]);
-        app.project_mut().live_mut().linear_issues = vec![
+        app.project_mut().live.linear_issues = vec![
             test_linear_issue("uuid-1", "TEST-1", "First"),
             test_linear_issue("uuid-2", "DOC-99", "Second"),
         ];

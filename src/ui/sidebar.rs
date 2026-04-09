@@ -7,6 +7,9 @@ use ratatui::Frame;
 use crate::app::App;
 use crate::ui::styles;
 
+pub const SIDEBAR_WIDTH: u16 = 22;
+const SIDEBAR_NAME_PADDING: u16 = 5;
+
 pub fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     let sidebar = match &app.sidebar {
         Some(s) => s,
@@ -54,7 +57,7 @@ pub fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
             };
 
             let name = &project.config.project_name;
-            let max_name = area.width.saturating_sub(5) as usize;
+            let max_name = area.width.saturating_sub(SIDEBAR_NAME_PADDING) as usize;
             let display_name = styles::truncate(name, max_name);
 
             let name_style = if is_focused {

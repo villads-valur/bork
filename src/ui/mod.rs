@@ -27,8 +27,11 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     let sidebar_visible = app.sidebar.as_ref().is_some_and(|s| s.visible);
     let board_area = if sidebar_visible {
-        let horizontal =
-            Layout::horizontal([Constraint::Length(22), Constraint::Min(1)]).split(vertical[1]);
+        let horizontal = Layout::horizontal([
+            Constraint::Length(sidebar::SIDEBAR_WIDTH),
+            Constraint::Min(1),
+        ])
+        .split(vertical[1]);
         sidebar::render_sidebar(frame, app, horizontal[0]);
         horizontal[1]
     } else {

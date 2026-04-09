@@ -715,7 +715,7 @@ fn handle_linear_picker(
             app.close_linear_picker();
         }
         Action::PickerSwitchTab => {
-            let has_linear = !app.project().live().linear_issues.is_empty();
+            let has_linear = !app.project().live.linear_issues.is_empty();
             let has_github = app.project().has_github_prs();
             if has_linear && has_github {
                 app.picker_tab = match app.picker_tab {
@@ -1510,7 +1510,7 @@ mod tests {
     fn linear_picker_import_creates_issue_in_todo() {
         let mut app = test_app();
         app.project_mut().linear_available = true;
-        app.project_mut().live_mut().linear_issues =
+        app.project_mut().live.linear_issues =
             vec![test_linear_issue("uuid-1", "TEST-1", "First issue")];
 
         app.open_linear_picker();
@@ -1544,7 +1544,7 @@ mod tests {
     fn linear_picker_import_rejects_duplicate() {
         let mut app = test_app();
         app.project_mut().linear_available = true;
-        app.project_mut().live_mut().linear_issues =
+        app.project_mut().live.linear_issues =
             vec![test_linear_issue("uuid-1", "TEST-1", "First issue")];
 
         // Import once
@@ -1582,7 +1582,7 @@ mod tests {
     fn linear_picker_search_filters_issues() {
         let mut app = test_app();
         app.project_mut().linear_available = true;
-        app.project_mut().live_mut().linear_issues = vec![
+        app.project_mut().live.linear_issues = vec![
             test_linear_issue("uuid-1", "TEST-1", "Login page"),
             test_linear_issue("uuid-2", "TEST-2", "Dashboard bug"),
         ];
@@ -1624,7 +1624,7 @@ mod tests {
     fn linear_picker_navigation() {
         let mut app = test_app();
         app.project_mut().linear_available = true;
-        app.project_mut().live_mut().linear_issues = vec![
+        app.project_mut().live.linear_issues = vec![
             test_linear_issue("uuid-1", "TEST-1", "First"),
             test_linear_issue("uuid-2", "TEST-2", "Second"),
             test_linear_issue("uuid-3", "TEST-3", "Third"),
@@ -1679,8 +1679,7 @@ mod tests {
     fn linear_picker_close_restores_normal() {
         let mut app = test_app();
         app.project_mut().linear_available = true;
-        app.project_mut().live_mut().linear_issues =
-            vec![test_linear_issue("uuid-1", "TEST-1", "First")];
+        app.project_mut().live.linear_issues = vec![test_linear_issue("uuid-1", "TEST-1", "First")];
 
         app.open_linear_picker();
         handle_action(
@@ -1761,7 +1760,7 @@ mod tests {
         let mut app = test_app();
         app.project_mut().linear_available = true;
         // No linear issues loaded
-        app.project_mut().live_mut().linear_issues = vec![];
+        app.project_mut().live.linear_issues = vec![];
 
         app.project_mut().issues.push(crate::types::Issue {
             id: "bork-1".to_string(),
@@ -2155,7 +2154,7 @@ mod tests {
     fn kill_session_with_active_session_opens_confirm() {
         let mut app = app_with_issues();
         app.project_mut()
-            .live_mut()
+            .live
             .active_sessions
             .insert("bork-bork-1".to_string());
         act(&mut app, Action::KillSession);
