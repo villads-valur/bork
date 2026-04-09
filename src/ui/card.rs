@@ -10,7 +10,6 @@ use crate::ui::styles;
 
 pub const CARD_HEIGHT: u16 = 7;
 pub const CARD_HEIGHT_MEDIUM: u16 = 5;
-pub const CARD_HEIGHT_COMPACT: u16 = 4;
 
 pub struct CardContext<'a> {
     pub issue: &'a Issue,
@@ -49,7 +48,6 @@ pub fn render_card(frame: &mut Frame, ctx: &CardContext, area: Rect, card_size: 
     match card_size {
         CardSize::Full => render_full(frame, ctx, inner, max_width, title_style),
         CardSize::Medium => render_medium(frame, ctx, inner, max_width, title_style),
-        CardSize::Compact => render_compact(frame, ctx, inner, max_width, title_style),
     }
 }
 
@@ -98,56 +96,6 @@ fn render_medium(
     let mut lines = vec![title_line, status_line];
     if inner.height > 2 {
         lines.push(pr_line);
-    }
-
-    frame.render_widget(Paragraph::new(lines), inner);
-}
-
-fn render_compact(
-    frame: &mut Frame,
-    ctx: &CardContext,
-    inner: Rect,
-    max_width: usize,
-    title_style: Style,
-) {
-    let title_text = styles::truncate(&ctx.issue.title, max_width);
-    let title_line = Line::from(Span::styled(title_text, title_style));
-
-    let mut status_spans = Vec::new();
-    if ctx.issue.kind != IssueKind::NonAgentic {
-        let status_color = styles::agent_status_color(&ctx.agent_status);
-        if ctx.session_alive {
-            status_spans.push(Span::styled("▶", styles::session_alive_style()));
-            status_spans.push(Span::raw(" "));
-        }
-        status_spans.push(Span::styled(
-            ctx.agent_status.symbol(),
-            Style::default().fg(status_color),
-        ));
-
-        let git_spans = format_git_status(ctx.git_status);
-        if !git_spans.is_empty() {
-            status_spans.push(Span::raw(" "));
-            status_spans.extend(git_spans);
-        }
-    }
-
-    if let Some(branch) = ctx.branch {
-        if !status_spans.is_empty() {
-            status_spans.push(Span::raw("  "));
-        }
-        status_spans.push(Span::styled("\u{1f33f}", Style::default().fg(Color::Green)));
-        let max_branch = max_width.saturating_sub(12);
-        status_spans.push(Span::styled(
-            styles::truncate(branch, max_branch),
-            styles::dim_style(),
-        ));
-    }
-
-    let status_line = Line::from(status_spans);
-    let mut lines = vec![title_line];
-    if inner.height > 1 {
-        lines.push(status_line);
     }
 
     frame.render_widget(Paragraph::new(lines), inner);

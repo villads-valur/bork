@@ -4,7 +4,8 @@ use std::sync::mpsc;
 use std::thread;
 
 use crate::app::{
-    ActionContext, App, ConfirmAction, ImportSource, InputMode, LinearPickerContext, ProjectId,
+    ActionContext, App, ConfirmAction, ImportSource, InputMode, LinearPickerContext, MessageKind,
+    ProjectId,
 };
 use crate::config::{self, AppConfig};
 use crate::external::{github, opencode, tmux, tuicr};
@@ -18,6 +19,7 @@ pub type GitWakeTx = mpsc::Sender<()>;
 
 pub struct ActionResult {
     pub message: String,
+    pub message_kind: MessageKind,
     pub session_to_open: Option<String>,
     pub popup_title: Option<String>,
     pub session_id: Option<(String, String)>,
@@ -157,7 +159,7 @@ fn handle_normal(
 
             let session_name = issue.session_name(&app.context_project(ctx).config.project_name);
             if !app.context_project(ctx).is_session_alive(&session_name) {
-                app.set_message("No active session to kill");
+                app.set_warning("No active session to kill");
                 return PostAction::None;
             }
 
@@ -274,12 +276,14 @@ fn handle_normal(
                 let result = match tmux::create_session(&session_name, &project_root) {
                     Ok(()) => ActionResult {
                         message: format!("Terminal session '{}' ready", session_name),
+                        message_kind: MessageKind::Info,
                         session_to_open: Some(session_name),
                         popup_title: Some(popup_title),
                         session_id: None,
                     },
                     Err(e) => ActionResult {
                         message: format!("Failed to open terminal: {e}"),
+                        message_kind: MessageKind::Error,
                         session_to_open: None,
                         popup_title: None,
                         session_id: None,
@@ -337,12 +341,12 @@ fn handle_normal(
                 return PostAction::None;
             };
             let Some(wt) = issue.worktree.clone() else {
-                app.set_message("No worktree assigned");
+                app.set_warning("No worktree assigned");
                 return PostAction::None;
             };
             let session_name = issue.session_name(&app.context_project(ctx).config.project_name);
             if !app.context_project(ctx).is_session_alive(&session_name) {
-                app.set_message("No active session");
+                app.set_warning("No active session");
                 return PostAction::None;
             }
             let pr_mode = action == Action::OpenReviewPR;
@@ -360,12 +364,14 @@ fn handle_normal(
                 let result = match tuicr::open_in_session(&session_name, &worktree_path, pr_mode) {
                     Ok(()) => ActionResult {
                         message: "tuicr ready".to_string(),
+                        message_kind: MessageKind::Info,
                         session_to_open: Some(session_name),
                         popup_title: Some(popup_title),
                         session_id: None,
                     },
                     Err(e) => ActionResult {
                         message: format!("Failed to open tuicr: {e}"),
+                        message_kind: MessageKind::Error,
                         session_to_open: None,
                         popup_title: None,
                         session_id: None,
@@ -388,7 +394,7 @@ fn handle_normal(
                 return PostAction::None;
             };
             let Some(pr) = app.context_project(ctx).pr_for(issue) else {
-                app.set_message("No PR found for this issue");
+                app.set_warning("No PR found for this issue");
                 return PostAction::None;
             };
             let pr_number = pr.number;
@@ -404,7 +410,7 @@ fn handle_normal(
                 return PostAction::None;
             };
             let Some(url) = issue.linear_url.clone() else {
-                app.set_message("No Linear issue linked");
+                app.set_warning("No Linear issue linked");
                 return PostAction::None;
             };
             thread::spawn(move || {
@@ -458,7 +464,7 @@ fn handle_normal(
                 return PostAction::None;
             }
             let Some(issue) = app.context_project(ctx).selected_issue().cloned() else {
-                app.set_message("No issue selected");
+                app.set_warning("No issue selected");
                 return PostAction::None;
             };
             let json = serde_json::to_string_pretty(&issue).unwrap_or_else(|e| format!("{e}"));
@@ -623,7 +629,7 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
 
     let title = dialog.title.trim().to_string();
     if title.is_empty() {
-        app.set_message("Title cannot be empty");
+        app.set_warning("Title cannot be empty");
         return;
     }
 
@@ -895,7 +901,7 @@ fn import_github_pr(app: &mut App, ctx: &ActionContext) {
         .iter()
         .any(|i| i.pr_number == Some(pr.number))
     {
-        app.set_message(format!("PR #{} is already on the board", pr.number));
+        app.set_warning(format!("PR #{} is already on the board", pr.number));
         app.close_linear_picker();
         return;
     }
@@ -1014,7 +1020,7 @@ fn handle_sidebar(app: &mut App, action: Action) -> PostAction {
                 } else if lane_count < 3 {
                     sidebar.swimlanes.push(proj_id);
                 } else {
-                    app.set_message("Maximum 3 projects visible");
+                    app.set_warning("Maximum 3 projects visible");
                 }
             }
             PostAction::None
@@ -1052,15 +1058,21 @@ fn handle_confirm(
                             agent_status_file(&project.config.project_root, &session_name);
 
                         thread::spawn(move || {
-                            let message = match tmux::kill_session(&session_name) {
+                            let (message, message_kind) = match tmux::kill_session(&session_name) {
                                 Ok(()) => {
                                     let _ = std::fs::remove_file(&status_file);
-                                    format!("Session '{}' killed", session_name)
+                                    (
+                                        format!("Session '{}' killed", session_name),
+                                        MessageKind::Info,
+                                    )
                                 }
-                                Err(e) => format!("Failed to kill session: {e}"),
+                                Err(e) => {
+                                    (format!("Failed to kill session: {e}"), MessageKind::Error)
+                                }
                             };
                             let _ = tx.send(ActionResult {
                                 message,
+                                message_kind,
                                 session_to_open: None,
                                 popup_title: None,
                                 session_id: None,
@@ -1087,6 +1099,7 @@ fn handle_confirm(
                                     let _ = std::fs::remove_file(&status_file);
                                     let _ = tx.send(ActionResult {
                                         message: format!("Deleted {} and killed session", id),
+                                        message_kind: MessageKind::Info,
                                         session_to_open: None,
                                         popup_title: None,
                                         session_id: None,
@@ -1118,12 +1131,14 @@ fn launch_and_report(issue: Issue, config: AppConfig) -> ActionResult {
     match opencode::launch_session(&issue, &config) {
         Ok((session_name, agent_sid)) => ActionResult {
             message: format!("Session '{}' started", session_name),
+            message_kind: MessageKind::Info,
             session_to_open: Some(session_name),
             popup_title: None,
             session_id: agent_sid.map(|sid| (issue.id.clone(), sid)),
         },
         Err(e) => ActionResult {
             message: format!("Failed to launch: {e}"),
+            message_kind: MessageKind::Error,
             session_to_open: None,
             popup_title: None,
             session_id: None,
@@ -2238,7 +2253,9 @@ mod tests {
         act(&mut app, Action::KillSession);
         // No active session, so it just sets a message
         assert_eq!(app.input_mode, InputMode::Normal);
-        assert!(app.message.as_ref().unwrap().contains("No active session"));
+        let (msg, kind) = app.message.as_ref().unwrap();
+        assert!(msg.contains("No active session"));
+        assert_eq!(*kind, MessageKind::Warning);
     }
 
     #[test]
@@ -2250,6 +2267,51 @@ mod tests {
             .insert("bork-bork-1".to_string());
         act(&mut app, Action::KillSession);
         assert_eq!(app.input_mode, InputMode::Confirm);
+    }
+
+    // ================================================================
+    // Warning messages for missing prerequisites
+    // ================================================================
+
+    #[test]
+    fn open_pr_no_pr_shows_warning() {
+        let mut app = app_with_issues();
+        act(&mut app, Action::OpenPR);
+        let (msg, kind) = app.message.as_ref().unwrap();
+        assert!(msg.contains("No PR found"));
+        assert_eq!(*kind, MessageKind::Warning);
+    }
+
+    #[test]
+    fn open_linear_no_url_shows_warning() {
+        let mut app = app_with_issues();
+        act(&mut app, Action::OpenLinear);
+        let (msg, kind) = app.message.as_ref().unwrap();
+        assert!(msg.contains("No Linear issue linked"));
+        assert_eq!(*kind, MessageKind::Warning);
+    }
+
+    #[test]
+    fn debug_inspect_no_issue_shows_warning() {
+        let mut app = test_app();
+        app.project_mut().config.debug = true;
+        act(&mut app, Action::DebugInspect);
+        let (msg, kind) = app.message.as_ref().unwrap();
+        assert!(msg.contains("No issue selected"));
+        assert_eq!(*kind, MessageKind::Warning);
+    }
+
+    #[test]
+    fn submit_empty_title_shows_warning() {
+        let mut app = test_app();
+        let ctx = app.action_context();
+        app.open_dialog(&ctx);
+        // Title is empty by default, submit immediately
+        act(&mut app, Action::DialogSubmit);
+        assert_eq!(app.input_mode, InputMode::Normal);
+        let (msg, kind) = app.message.as_ref().unwrap();
+        assert!(msg.contains("Title cannot be empty"));
+        assert_eq!(*kind, MessageKind::Warning);
     }
 
     // --- Multi-project / sidebar tests ---

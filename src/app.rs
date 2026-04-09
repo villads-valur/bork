@@ -48,6 +48,7 @@ pub struct LiveState {
     pub user_prs: Vec<PrStatus>,
     pub github_user: Option<String>,
     pub git_poll_done: bool,
+    pub pr_poll_done: bool,
 }
 
 impl LiveState {
@@ -504,7 +505,34 @@ impl Project {
     }
 
     pub fn sync_prs_as_issues(&mut self) -> (bool, Option<String>) {
+        if !self.live.pr_poll_done {
+            return (false, None);
+        }
+
+        let live_pr_numbers: HashSet<u32> = self.live.user_prs.iter().map(|pr| pr.number).collect();
+
+        // Remove pr_imported issues whose PR is no longer in the live set
+        // (closed, merged, or from a stale/wrong repo identity)
+        let before = self.issues.len();
+        self.issues.retain(|issue| {
+            !issue.pr_imported
+                || issue
+                    .pr_number
+                    .is_some_and(|n| live_pr_numbers.contains(&n))
+        });
+        let removed = before - self.issues.len();
+
         if self.live.user_prs.is_empty() {
+            if removed > 0 {
+                return (
+                    true,
+                    Some(format!(
+                        "Removed {} stale PR{}",
+                        removed,
+                        if removed == 1 { "" } else { "s" }
+                    )),
+                );
+            }
             return (false, None);
         }
 
@@ -575,18 +603,29 @@ impl Project {
             });
         }
 
-        if new_issues.is_empty() {
+        let added = new_issues.len();
+        self.issues.append(&mut new_issues);
+
+        if added == 0 && removed == 0 {
             return (false, None);
         }
 
-        let count = new_issues.len();
-        self.issues.append(&mut new_issues);
-        let msg = format!(
-            "Imported {} PR{} from GitHub",
-            count,
-            if count == 1 { "" } else { "s" }
-        );
-        (true, Some(msg))
+        let mut parts: Vec<String> = Vec::new();
+        if added > 0 {
+            parts.push(format!(
+                "Imported {} PR{}",
+                added,
+                if added == 1 { "" } else { "s" }
+            ));
+        }
+        if removed > 0 {
+            parts.push(format!(
+                "Removed {} stale PR{}",
+                removed,
+                if removed == 1 { "" } else { "s" }
+            ));
+        }
+        (true, Some(parts.join(", ")))
     }
 
     pub fn done_worktree_names(&self) -> HashSet<String> {
@@ -764,7 +803,6 @@ pub struct SidebarState {
 pub enum CardSize {
     Full,
     Medium,
-    Compact,
 }
 
 #[derive(Debug, Clone)]
@@ -1191,6 +1229,13 @@ fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
     merge_field!(pr_imported);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageKind {
+    Info,
+    Warning,
+    Error,
+}
+
 pub struct App {
     pub projects: Vec<Project>,
     pub focused_project: ProjectId,
@@ -1201,7 +1246,7 @@ pub struct App {
     pub pending_confirm: Option<ConfirmAction>,
     pub dialog: Option<DialogState>,
     pub should_quit: bool,
-    pub message: Option<String>,
+    pub message: Option<(String, MessageKind)>,
     pub message_set_at: Option<Instant>,
     pub busy_count: usize,
     pub spinner_tick: usize,
@@ -1376,15 +1421,26 @@ impl App {
 
     pub fn card_size(&self) -> CardSize {
         match self.visible_swimlane_count() {
-            2 => CardSize::Medium,
-            n if n >= 3 => CardSize::Compact,
+            n if n >= 3 => CardSize::Medium,
             _ => CardSize::Full,
         }
     }
 
-    pub fn set_message(&mut self, msg: impl Into<String>) {
-        self.message = Some(msg.into());
+    pub fn show_message(&mut self, msg: impl Into<String>, kind: MessageKind) {
+        self.message = Some((msg.into(), kind));
         self.message_set_at = Some(Instant::now());
+    }
+
+    pub fn set_message(&mut self, msg: impl Into<String>) {
+        self.show_message(msg, MessageKind::Info);
+    }
+
+    pub fn set_warning(&mut self, msg: impl Into<String>) {
+        self.show_message(msg, MessageKind::Warning);
+    }
+
+    pub fn set_error(&mut self, msg: impl Into<String>) {
+        self.show_message(msg, MessageKind::Error);
     }
 
     pub fn clear_expired_message(&mut self) -> bool {
@@ -1454,9 +1510,9 @@ impl App {
 
         if !has_linear && !has_github {
             if p.linear_available {
-                self.set_message("No issues loaded yet");
+                self.set_warning("No issues loaded yet");
             } else {
-                self.set_message("No import sources available");
+                self.set_warning("No import sources available");
             }
             return;
         }
@@ -2189,6 +2245,7 @@ mod tests {
     fn sync_prs_imports_open_pr_as_issue() {
         let mut app = test_app(vec![]);
         app.project_mut().live.user_prs = vec![test_pr(1, "feature/new")];
+        app.project_mut().live.pr_poll_done = true;
 
         assert!(app.project_mut().sync_prs_as_issues().0);
         assert_eq!(app.project().issues.len(), 1);
@@ -2211,6 +2268,7 @@ mod tests {
         let mut pr = test_pr(1, "feature/new");
         pr.is_draft = true;
         app.project_mut().live.user_prs = vec![pr];
+        app.project_mut().live.pr_poll_done = true;
 
         assert!(!app.project_mut().sync_prs_as_issues().0);
         assert!(app.project().issues.is_empty());
@@ -2222,6 +2280,7 @@ mod tests {
         let mut pr = test_pr(1, "feature/new");
         pr.state = PrState::Closed;
         app.project_mut().live.user_prs = vec![pr];
+        app.project_mut().live.pr_poll_done = true;
 
         assert!(!app.project_mut().sync_prs_as_issues().0);
         assert!(app.project().issues.is_empty());
@@ -2233,6 +2292,7 @@ mod tests {
         let mut pr = test_pr(1, "feature/new");
         pr.state = PrState::Merged;
         app.project_mut().live.user_prs = vec![pr];
+        app.project_mut().live.pr_poll_done = true;
 
         assert!(!app.project_mut().sync_prs_as_issues().0);
         assert!(app.project().issues.is_empty());
@@ -2242,6 +2302,7 @@ mod tests {
     fn sync_prs_skips_main_branch() {
         let mut app = test_app(vec![]);
         app.project_mut().live.user_prs = vec![test_pr(1, "main")];
+        app.project_mut().live.pr_poll_done = true;
 
         assert!(!app.project_mut().sync_prs_as_issues().0);
         assert!(app.project().issues.is_empty());
@@ -2257,6 +2318,7 @@ mod tests {
             .worktree_branches
             .insert("bork-1".into(), "feature/thing".into());
         app.project_mut().live.user_prs = vec![test_pr(1, "feature/thing")];
+        app.project_mut().live.pr_poll_done = true;
 
         assert!(!app.project_mut().sync_prs_as_issues().0);
         assert_eq!(app.project().issues.len(), 1);
@@ -2267,6 +2329,7 @@ mod tests {
         let issue = test_issue("bork-5", Column::InProgress);
         let mut app = test_app(vec![issue]);
         app.project_mut().live.user_prs = vec![test_pr(1, "bork-5/follow-up")];
+        app.project_mut().live.pr_poll_done = true;
 
         assert!(!app.project_mut().sync_prs_as_issues().0);
         assert_eq!(app.project().issues.len(), 1);
@@ -2278,6 +2341,7 @@ mod tests {
         issue.pr_number = Some(42);
         let mut app = test_app(vec![issue]);
         app.project_mut().live.user_prs = vec![test_pr(42, "some/branch")];
+        app.project_mut().live.pr_poll_done = true;
 
         assert!(!app.project_mut().sync_prs_as_issues().0);
         assert_eq!(app.project().issues.len(), 1);
@@ -2287,6 +2351,7 @@ mod tests {
     fn sync_prs_reimports_after_delete() {
         let mut app = test_app(vec![]);
         app.project_mut().live.user_prs = vec![test_pr(42, "feature/new")];
+        app.project_mut().live.pr_poll_done = true;
 
         assert!(app.project_mut().sync_prs_as_issues().0);
         assert_eq!(app.project().issues.len(), 1);
@@ -2307,6 +2372,7 @@ mod tests {
             test_pr(2, "feature/b"),
             test_pr(3, "feature/c"),
         ];
+        app.project_mut().live.pr_poll_done = true;
 
         assert!(app.project_mut().sync_prs_as_issues().0);
         assert_eq!(app.project().issues.len(), 3);
@@ -2324,6 +2390,7 @@ mod tests {
     fn sync_prs_no_duplicate_on_second_call() {
         let mut app = test_app(vec![]);
         app.project_mut().live.user_prs = vec![test_pr(1, "feature/new")];
+        app.project_mut().live.pr_poll_done = true;
 
         assert!(app.project_mut().sync_prs_as_issues().0);
         assert_eq!(app.project().issues.len(), 1);
@@ -2337,6 +2404,7 @@ mod tests {
         let issue = test_issue("doc-1917", Column::InProgress);
         let mut app = test_app(vec![issue]);
         app.project_mut().live.user_prs = vec![test_pr(1, "DOC-1917-attachment-selection-search")];
+        app.project_mut().live.pr_poll_done = true;
 
         assert!(!app.project_mut().sync_prs_as_issues().0);
         assert_eq!(app.project().issues.len(), 1);
@@ -2348,6 +2416,7 @@ mod tests {
         let issue = test_issue("bork-1", Column::InProgress);
         let mut app = test_app(vec![issue]);
         app.project_mut().live.user_prs = vec![test_pr(1, "bork-10/something")];
+        app.project_mut().live.pr_poll_done = true;
 
         assert!(app.project_mut().sync_prs_as_issues().0);
         assert_eq!(app.project().issues.len(), 2); // new issue created
@@ -2358,6 +2427,7 @@ mod tests {
         let issue = test_issue("BORK-5", Column::InProgress);
         let mut app = test_app(vec![issue]);
         app.project_mut().live.user_prs = vec![test_pr(1, "bork-5/fix")];
+        app.project_mut().live.pr_poll_done = true;
 
         assert!(!app.project_mut().sync_prs_as_issues().0);
         assert_eq!(app.project().issues.len(), 1);
@@ -3772,14 +3842,14 @@ mod tests {
         assert_eq!(app.card_size(), CardSize::Full);
 
         app.sidebar.as_mut().unwrap().swimlanes = vec![app.projects[0].id(), app.projects[1].id()];
-        assert_eq!(app.card_size(), CardSize::Medium);
+        assert_eq!(app.card_size(), CardSize::Full);
 
         app.sidebar.as_mut().unwrap().swimlanes = vec![
             app.projects[0].id(),
             app.projects[1].id(),
             app.projects[2].id(),
         ];
-        assert_eq!(app.card_size(), CardSize::Compact);
+        assert_eq!(app.card_size(), CardSize::Medium);
     }
 
     #[test]
@@ -4200,5 +4270,80 @@ mod tests {
             project.base_issues, new_issues,
             "base_issues updated to file contents"
         );
+    }
+
+    // ================================================================
+    // Message severity
+    // ================================================================
+
+    #[test]
+    fn set_message_stores_info_kind() {
+        let mut app = test_app(vec![]);
+        app.set_message("hello");
+        let (msg, kind) = app.message.as_ref().unwrap();
+        assert_eq!(msg, "hello");
+        assert_eq!(*kind, MessageKind::Info);
+        assert!(app.message_set_at.is_some());
+    }
+
+    #[test]
+    fn set_warning_stores_warning_kind() {
+        let mut app = test_app(vec![]);
+        app.set_warning("careful");
+        let (msg, kind) = app.message.as_ref().unwrap();
+        assert_eq!(msg, "careful");
+        assert_eq!(*kind, MessageKind::Warning);
+    }
+
+    #[test]
+    fn set_error_stores_error_kind() {
+        let mut app = test_app(vec![]);
+        app.set_error("boom");
+        let (msg, kind) = app.message.as_ref().unwrap();
+        assert_eq!(msg, "boom");
+        assert_eq!(*kind, MessageKind::Error);
+    }
+
+    #[test]
+    fn show_message_accepts_kind() {
+        let mut app = test_app(vec![]);
+        app.show_message("test", MessageKind::Warning);
+        let (msg, kind) = app.message.as_ref().unwrap();
+        assert_eq!(msg, "test");
+        assert_eq!(*kind, MessageKind::Warning);
+    }
+
+    #[test]
+    fn message_overwrites_previous() {
+        let mut app = test_app(vec![]);
+        app.set_error("first");
+        app.set_message("second");
+        let (msg, kind) = app.message.as_ref().unwrap();
+        assert_eq!(msg, "second");
+        assert_eq!(*kind, MessageKind::Info);
+    }
+
+    #[test]
+    fn clear_expired_message_before_timeout() {
+        let mut app = test_app(vec![]);
+        app.set_message("fresh");
+        assert!(!app.clear_expired_message());
+        assert!(app.message.is_some());
+    }
+
+    #[test]
+    fn clear_expired_message_after_timeout() {
+        let mut app = test_app(vec![]);
+        app.set_message("old");
+        app.message_set_at = Some(Instant::now() - std::time::Duration::from_secs(4));
+        assert!(app.clear_expired_message());
+        assert!(app.message.is_none());
+        assert!(app.message_set_at.is_none());
+    }
+
+    #[test]
+    fn clear_expired_message_noop_when_no_message() {
+        let mut app = test_app(vec![]);
+        assert!(!app.clear_expired_message());
     }
 }

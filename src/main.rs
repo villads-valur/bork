@@ -723,7 +723,7 @@ fn run_tui() -> anyhow::Result<()> {
         while let Ok(result) = action_rx.try_recv() {
             needs_redraw = true;
             app.busy_count = app.busy_count.saturating_sub(1);
-            app.set_message(result.message);
+            app.show_message(result.message, result.message_kind);
 
             if let Some((issue_id, agent_sid)) = result.session_id {
                 for project in &mut app.projects {
@@ -849,6 +849,7 @@ fn run_tui() -> anyhow::Result<()> {
             let live = &mut app.project_mut().live;
             live.pr_statuses = pr_result.prs;
             live.user_prs = pr_result.user_prs;
+            live.pr_poll_done = true;
             if pr_result.github_user.is_some() {
                 live.github_user = pr_result.github_user;
             }
@@ -983,6 +984,7 @@ fn run_tui() -> anyhow::Result<()> {
                 let live = &mut app.projects[proj_pos].live;
                 live.pr_statuses = pr_result.prs;
                 live.user_prs = pr_result.user_prs;
+                live.pr_poll_done = true;
                 if pr_result.github_user.is_some() {
                     live.github_user = pr_result.github_user;
                 }
