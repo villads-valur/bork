@@ -328,9 +328,9 @@ fn run_project_command(command: ProjectCommand) -> anyhow::Result<()> {
                 Some(p) => PathBuf::from(p),
                 None => std::env::current_dir()?,
             };
-            if !target.join(".bork").is_dir() {
+            if !target.join(".bork").join("config.toml").exists() {
                 anyhow::bail!(
-                    "No .bork/ directory found in {}. Run 'bork init' first.",
+                    "No bork project found in {}. Run 'bork init' first.",
                     target.display()
                 );
             }
@@ -503,7 +503,8 @@ fn run_tui() -> anyhow::Result<()> {
         std::fs::canonicalize(&current_root).unwrap_or_else(|_| current_root.clone());
     for entry in &global_config::load_global_config().projects {
         let canonical = std::fs::canonicalize(&entry.path).unwrap_or_else(|_| entry.path.clone());
-        if canonical == current_canonical || !entry.path.join(".bork").is_dir() {
+        if canonical == current_canonical || !entry.path.join(".bork").join("config.toml").exists()
+        {
             continue;
         }
         let proj_config = config::load_config_from(&entry.path);
