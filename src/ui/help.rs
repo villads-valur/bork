@@ -41,9 +41,8 @@ const SECTIONS: &[Section] = &[
     Section {
         title: "Navigation",
         bindings: &[
-            ("h / l", "Focus column"),
-            ("j / k", "Move up / down"),
-            ("\u{2190} / \u{2192}", "Jump column"),
+            ("h / l / \u{2190}\u{2192}", "Jump column"),
+            ("j / k / \u{2191}\u{2193}", "Move up / down"),
             ("g / G", "Top / bottom"),
         ],
     },

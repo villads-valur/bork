@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use ratatui::style::{Modifier, Style};
@@ -1158,6 +1159,35 @@ impl App {
                 activity: HashMap::new(),
                 swimlane_indices: vec![self.focused_project],
             });
+        }
+    }
+
+    pub fn reload_projects(&mut self) {
+        let known_roots: HashSet<PathBuf> = self
+            .projects
+            .iter()
+            .map(|p| {
+                std::fs::canonicalize(&p.config.project_root)
+                    .unwrap_or_else(|_| p.config.project_root.clone())
+            })
+            .collect();
+
+        for entry in &crate::global_config::load_global_config().projects {
+            if !entry.path.join(".bork").join("config.toml").exists() {
+                continue;
+            }
+            let canonical =
+                std::fs::canonicalize(&entry.path).unwrap_or_else(|_| entry.path.clone());
+            if known_roots.contains(&canonical) {
+                continue;
+            }
+            let proj_config = crate::config::load_config_from(&entry.path);
+            let proj_state = crate::config::load_state(&entry.path);
+            self.add_background_project(proj_config, proj_state);
+        }
+
+        if self.projects.len() > 1 && self.sidebar.is_none() {
+            self.enable_sidebar();
         }
     }
 

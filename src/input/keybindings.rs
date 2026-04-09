@@ -43,10 +43,8 @@ fn map_normal_key(key: KeyEvent, swimlane_count: usize) -> Action {
 
         KeyCode::Char('j') | KeyCode::Down => Action::MoveDown,
         KeyCode::Char('k') | KeyCode::Up => Action::MoveUp,
-        KeyCode::Char('h') => Action::FocusLeft,
-        KeyCode::Char('l') => Action::FocusRight,
-        KeyCode::Left => Action::JumpColumnLeft,
-        KeyCode::Right => Action::JumpColumnRight,
+        KeyCode::Char('h') | KeyCode::Left => Action::JumpColumnLeft,
+        KeyCode::Char('l') | KeyCode::Right => Action::JumpColumnRight,
 
         KeyCode::Tab if swimlane_count > 1 => Action::NextSwimlane,
         KeyCode::BackTab if swimlane_count > 1 => Action::PrevSwimlane,
@@ -268,7 +266,7 @@ mod tests {
         assert_eq!(map_normal_key(key(KeyCode::Up), 1), Action::MoveUp);
         assert_eq!(
             map_normal_key(key(KeyCode::Char('h')), 1),
-            Action::FocusLeft
+            Action::JumpColumnLeft
         );
         assert_eq!(
             map_normal_key(key(KeyCode::Left), 1),
@@ -276,7 +274,7 @@ mod tests {
         );
         assert_eq!(
             map_normal_key(key(KeyCode::Char('l')), 1),
-            Action::FocusRight
+            Action::JumpColumnRight
         );
         assert_eq!(
             map_normal_key(key(KeyCode::Right), 1),

@@ -217,6 +217,7 @@ fn handle_normal(
         }
 
         Action::ToggleSidebar => {
+            app.reload_projects();
             if let Some(ref mut sidebar) = app.sidebar {
                 sidebar.visible = true;
                 sidebar.focused = true;
