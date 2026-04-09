@@ -97,12 +97,12 @@ fn map_sidebar_key(key: KeyEvent) -> Action {
     }
 
     match key.code {
-        KeyCode::Char('q') => Action::Quit,
+        KeyCode::Char('q') | KeyCode::Esc => Action::ToggleSidebar,
         KeyCode::Char('j') | KeyCode::Down => Action::SidebarDown,
         KeyCode::Char('k') | KeyCode::Up => Action::SidebarUp,
         KeyCode::Enter => Action::SidebarSelect,
         KeyCode::Char(' ') => Action::SidebarToggleSwimlane,
-        KeyCode::Esc => Action::ToggleSidebar,
+        KeyCode::Char('?') => Action::ShowHelp,
         _ => Action::Noop,
     }
 }

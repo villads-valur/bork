@@ -373,6 +373,19 @@ struct ProjectWorkers {
     linear_wake_rx: Option<mpsc::Receiver<()>>,
 }
 
+fn spawn_project_workers_with_linear(
+    project: &app::Project,
+    linear_available: bool,
+) -> ProjectWorkers {
+    let mut workers = spawn_project_workers(project);
+    if linear_available {
+        if let Some(wake_rx) = workers.linear_wake_rx.take() {
+            workers.linear_rx = Some(spawn_linear_worker(wake_rx));
+        }
+    }
+    workers
+}
+
 fn spawn_project_workers(project: &app::Project) -> ProjectWorkers {
     let project_root = project.config.project_root.clone();
 
@@ -485,7 +498,7 @@ fn run_tui() -> anyhow::Result<()> {
     // --- Register current project and load others for multi-project sidebar ---
     global_config::prune_stale_projects();
     let current_root = app.project().config.project_root.clone();
-    let _ = global_config::register_project(&app.project().config.project_name, &current_root);
+    let _ = global_config::register_if_absent(&app.project().config.project_name, &current_root);
     let current_canonical =
         std::fs::canonicalize(&current_root).unwrap_or_else(|_| current_root.clone());
     for entry in &global_config::load_global_config().projects {
@@ -617,13 +630,34 @@ fn run_tui() -> anyhow::Result<()> {
                                         app.project_mut().state_dirty = false;
                                     }
 
+                                    let old_focused = app.focused_project;
                                     app.focused_project = index;
                                     app.focused_swimlane = 0;
 
-                                    if let Some(existing) = swimlane_workers.remove(&index) {
-                                        workers = existing;
-                                    } else {
-                                        workers = spawn_project_workers(app.project());
+                                    let old_workers =
+                                        if let Some(existing) = swimlane_workers.remove(&index) {
+                                            let stashed = std::mem::replace(&mut workers, existing);
+                                            Some(stashed)
+                                        } else {
+                                            let stashed = std::mem::replace(
+                                                &mut workers,
+                                                spawn_project_workers_with_linear(
+                                                    app.project(),
+                                                    app.project().linear_available,
+                                                ),
+                                            );
+                                            Some(stashed)
+                                        };
+                                    // Stash old workers if old project is still a swimlane
+                                    if let Some(old_w) = old_workers {
+                                        let still_swimlane = app
+                                            .sidebar
+                                            .as_ref()
+                                            .map(|s| s.swimlane_indices.contains(&old_focused))
+                                            .unwrap_or(false);
+                                        if still_swimlane {
+                                            swimlane_workers.insert(old_focused, old_w);
+                                        }
                                     }
                                     let _ = execute!(
                                         terminal.backend_mut(),
@@ -708,7 +742,11 @@ fn run_tui() -> anyhow::Result<()> {
                 .collect();
             for &idx in &active_swimlanes {
                 if !swimlane_workers.contains_key(&idx) && idx < app.projects.len() {
-                    swimlane_workers.insert(idx, spawn_project_workers(&app.projects[idx]));
+                    let linear = app.projects[idx].linear_available;
+                    swimlane_workers.insert(
+                        idx,
+                        spawn_project_workers_with_linear(&app.projects[idx], linear),
+                    );
                 }
             }
             swimlane_workers.retain(|idx, _| active_swimlanes.contains(idx));
@@ -885,25 +923,43 @@ fn run_tui() -> anyhow::Result<()> {
             while let Ok(port_result) = sw.port_rx.try_recv() {
                 app.projects[proj_idx].live_mut().listening_ports = port_result.ports;
             }
+            let mut sw_git_changed = false;
             while let Ok(git_result) = sw.git_rx.try_recv() {
                 needs_redraw = true;
+                sw_git_changed = true;
                 let live = app.projects[proj_idx].live_mut();
                 live.worktree_statuses = git_result.statuses;
                 live.worktree_branches = git_result.branches;
                 live.git_poll_done = true;
+            }
+            if sw_git_changed {
                 let changed = app.projects[proj_idx].auto_assign_worktrees();
                 let stale = app.projects[proj_idx].clear_stale_worktrees();
                 if changed || stale {
                     app.projects[proj_idx].mark_dirty();
                 }
+                if let Ok(mut skip) = sw.git_skip_set.lock() {
+                    *skip = app.projects[proj_idx].done_worktree_names();
+                }
             }
+            let mut sw_pr_changed = false;
             while let Ok(pr_result) = sw.pr_rx.try_recv() {
                 needs_redraw = true;
+                sw_pr_changed = true;
                 let live = app.projects[proj_idx].live_mut();
                 live.pr_statuses = pr_result.prs;
                 live.user_prs = pr_result.user_prs;
                 if pr_result.github_user.is_some() {
                     live.github_user = pr_result.github_user;
+                }
+            }
+            if sw_pr_changed {
+                let (changed, msg) = app.projects[proj_idx].sync_prs_as_issues();
+                if let Some(m) = msg {
+                    app.set_message(m);
+                }
+                if changed {
+                    app.projects[proj_idx].mark_dirty();
                 }
             }
             if let Some(ref rx) = sw.linear_rx {
@@ -931,12 +987,11 @@ fn run_tui() -> anyhow::Result<()> {
         }
 
         // --- Flush dirty state to disk (once per tick, not per action) ---
-        if app.project().state_dirty {
-            let _ = config::save_state(
-                &app.project().to_state(),
-                &app.project().config.project_root,
-            );
-            app.project_mut().state_dirty = false;
+        for project in &mut app.projects {
+            if project.state_dirty {
+                let _ = config::save_state(&project.to_state(), &project.config.project_root);
+                project.state_dirty = false;
+            }
         }
 
         if app.clear_expired_message() {
@@ -944,10 +999,11 @@ fn run_tui() -> anyhow::Result<()> {
         }
     }
 
-    let _ = config::save_state(
-        &app.project().to_state(),
-        &app.project().config.project_root,
-    );
+    for project in &app.projects {
+        if project.state_dirty {
+            let _ = config::save_state(&project.to_state(), &project.config.project_root);
+        }
+    }
     lock::release_lock(&app.project().config.project_root);
 
     disable_raw_mode()?;

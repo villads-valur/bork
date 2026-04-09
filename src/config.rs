@@ -22,8 +22,13 @@ pub const DEFAULT_PROMPT_FALLBACK: &str = "The source code is in main/. Use `bor
 impl Default for AppConfig {
     fn default() -> Self {
         let project_root = find_project_root();
+        let project_name = project_root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("project")
+            .to_string();
         Self {
-            project_name: "bork".to_string(),
+            project_name,
             project_root,
             agent_kind: AgentKind::OpenCode,
             default_prompt: None,
@@ -96,7 +101,13 @@ pub fn load_config_from(project_root: &Path) -> AppConfig {
         }
     }
 
+    let name = project_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("project")
+        .to_string();
     AppConfig {
+        project_name: name,
         project_root: project_root.to_path_buf(),
         ..AppConfig::default()
     }

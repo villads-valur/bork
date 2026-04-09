@@ -54,8 +54,7 @@ pub fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
             };
 
             let name = &project.config.project_name;
-            let swimlane_tag = "";
-            let max_name = area.width.saturating_sub(7) as usize;
+            let max_name = area.width.saturating_sub(5) as usize;
             let display_name = styles::truncate(name, max_name);
 
             let name_style = if is_focused {
@@ -68,22 +67,16 @@ pub fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::DarkGray)
             };
 
-            let tag_style = Style::default().fg(styles::ACCENT);
-
             let mut style = Style::default();
             if sidebar.focused && i == sidebar.selected {
                 style = style.add_modifier(Modifier::REVERSED);
             }
 
-            let mut spans = vec![
+            ListItem::new(Line::from(vec![
                 Span::styled(format!(" {} ", marker), marker_style),
                 Span::styled(display_name, name_style),
-            ];
-            if !swimlane_tag.is_empty() {
-                spans.push(Span::styled(swimlane_tag, tag_style));
-            }
-
-            ListItem::new(Line::from(spans)).style(style)
+            ]))
+            .style(style)
         })
         .collect();
 

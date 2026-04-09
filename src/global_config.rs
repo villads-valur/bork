@@ -86,6 +86,21 @@ pub fn register_project(name: &str, path: &Path) -> anyhow::Result<()> {
     save_global_config(&config)
 }
 
+pub fn register_if_absent(name: &str, path: &Path) -> anyhow::Result<()> {
+    let canonical = normalize_path(path);
+    let config = load_global_config();
+
+    let already_registered = config
+        .projects
+        .iter()
+        .any(|e| normalize_path(&e.path) == canonical);
+
+    if !already_registered {
+        return register_project(name, path);
+    }
+    Ok(())
+}
+
 pub fn unregister_project(path: &Path) -> anyhow::Result<bool> {
     let canonical = normalize_path(path);
     let mut config = load_global_config();

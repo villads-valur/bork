@@ -619,8 +619,10 @@ fn submit_dialog(app: &mut App) {
         Some(prompt_text)
     };
 
+    let proj_idx = app.active_project_index();
+
     if let Some(idx) = dialog.editing_index {
-        let p = &mut app.projects[app.focused_project];
+        let p = &mut app.projects[proj_idx];
         if idx < p.issues.len() {
             p.issues[idx].title = title;
             p.issues[idx].prompt = prompt;
@@ -630,16 +632,13 @@ fn submit_dialog(app: &mut App) {
             apply_linear_fields(&mut p.issues[idx], &dialog);
             apply_pr_fields(&mut p.issues[idx], &dialog);
 
-            app.set_message(format!(
-                "Updated {}",
-                app.projects[app.focused_project].issues[idx].id
-            ));
-            app.project_mut().mark_dirty();
+            app.set_message(format!("Updated {}", app.projects[proj_idx].issues[idx].id));
+            app.projects[proj_idx].mark_dirty();
         }
         return;
     }
 
-    let id = app.project().next_issue_id();
+    let id = app.projects[proj_idx].next_issue_id();
     let column = dialog.target_column.unwrap_or(Column::Todo);
     let column_index = column.index();
 
@@ -648,7 +647,7 @@ fn submit_dialog(app: &mut App) {
         title,
         kind: dialog.kind,
         column,
-        agent_kind: app.project().config.agent_kind,
+        agent_kind: app.projects[proj_idx].config.agent_kind,
         agent_mode: dialog.agent_mode,
         prompt,
         worktree: None,
@@ -665,11 +664,11 @@ fn submit_dialog(app: &mut App) {
     apply_linear_fields(&mut issue, &dialog);
     apply_pr_fields(&mut issue, &dialog);
 
-    let p = &mut app.projects[app.focused_project];
+    let p = &mut app.projects[proj_idx];
     p.issues.push(issue);
     app.set_message(format!("Created {}", id));
 
-    let p = &mut app.projects[app.focused_project];
+    let p = &mut app.projects[proj_idx];
     p.selected_column = column_index;
     let count = p.issues_in_column(column).len();
     if count > 0 {
@@ -808,7 +807,9 @@ fn import_linear_issue(app: &mut App) {
 
     let id = linear_issue.identifier.to_lowercase();
 
-    if app.project().issues.iter().any(|i| i.id == id) {
+    let proj_idx = app.active_project_index();
+
+    if app.projects[proj_idx].issues.iter().any(|i| i.id == id) {
         app.set_message(format!(
             "{} is already on the board",
             linear_issue.identifier
@@ -822,7 +823,7 @@ fn import_linear_issue(app: &mut App) {
         title: linear_issue.title.clone(),
         kind: IssueKind::Agentic,
         column: Column::Todo,
-        agent_kind: app.project().config.agent_kind,
+        agent_kind: app.projects[proj_idx].config.agent_kind,
         agent_mode: crate::types::AgentMode::Plan,
         prompt: None,
         worktree: None,
@@ -836,11 +837,11 @@ fn import_linear_issue(app: &mut App) {
         pr_imported: false,
     };
 
-    app.project_mut().issues.push(issue);
+    app.projects[proj_idx].issues.push(issue);
     app.set_message(format!("Imported {}", linear_issue.identifier));
     app.close_linear_picker();
 
-    let p = &mut app.projects[app.focused_project];
+    let p = &mut app.projects[proj_idx];
     let count = p.issues_in_column(Column::Todo).len();
     if count > 0 {
         p.selected_column = 0;
@@ -859,8 +860,9 @@ fn import_github_pr(app: &mut App) {
         None => return,
     };
 
-    if app
-        .project()
+    let proj_idx = app.active_project_index();
+
+    if app.projects[proj_idx]
         .issues
         .iter()
         .any(|i| i.pr_number == Some(pr.number))
@@ -870,13 +872,13 @@ fn import_github_pr(app: &mut App) {
         return;
     }
 
-    let id = app.project().next_issue_id();
+    let id = app.projects[proj_idx].next_issue_id();
     let issue = Issue {
         id,
         title: pr.title.clone(),
         kind: IssueKind::Agentic,
         column: Column::CodeReview,
-        agent_kind: app.project().config.agent_kind,
+        agent_kind: app.projects[proj_idx].config.agent_kind,
         agent_mode: AgentMode::Plan,
         prompt: None,
         worktree: None,
@@ -890,11 +892,11 @@ fn import_github_pr(app: &mut App) {
         pr_imported: true,
     };
 
-    app.project_mut().issues.push(issue);
+    app.projects[proj_idx].issues.push(issue);
     app.set_message(format!("Imported PR #{}", pr.number));
     app.close_linear_picker();
 
-    let p = &mut app.projects[app.focused_project];
+    let p = &mut app.projects[proj_idx];
     let count = p.issues_in_column(Column::CodeReview).len();
     if count > 0 {
         p.selected_column = Column::CodeReview.index();

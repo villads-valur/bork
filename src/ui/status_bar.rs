@@ -8,21 +8,25 @@ use crate::app::{App, InputMode};
 use crate::ui::styles;
 
 pub fn render_header(frame: &mut Frame, app: &App, area: Rect) {
-    let mut title_spans = vec![
-        Span::styled(
-            " BORK ",
-            Style::default()
-                .fg(styles::ACCENT)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("- {} ", app.project().config.project_name),
+    let has_swimlanes = app.visible_swimlane_count() > 1;
+    let mut title_spans = vec![Span::styled(
+        " BORK ",
+        Style::default()
+            .fg(styles::ACCENT)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if !has_swimlanes {
+        title_spans.push(Span::styled(
+            format!("- {} ", app.active_project().config.project_name),
             Style::default().fg(styles::TEXT),
-        ),
-        Span::styled(concat!("v", env!("CARGO_PKG_VERSION")), styles::dim_style()),
-    ];
+        ));
+    }
+    title_spans.push(Span::styled(
+        concat!("v", env!("CARGO_PKG_VERSION")),
+        styles::dim_style(),
+    ));
 
-    if app.project().config.debug {
+    if app.active_project().config.debug {
         title_spans.push(Span::styled(
             " [DEBUG]",
             Style::default()
