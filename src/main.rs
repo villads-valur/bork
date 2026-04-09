@@ -656,28 +656,23 @@ fn run_tui() -> anyhow::Result<()> {
 
                                     let old_workers =
                                         if let Some(existing) = swimlane_workers.remove(&index) {
-                                            let stashed = std::mem::replace(&mut workers, existing);
-                                            Some(stashed)
+                                            std::mem::replace(&mut workers, existing)
                                         } else {
-                                            let stashed = std::mem::replace(
+                                            std::mem::replace(
                                                 &mut workers,
                                                 spawn_project_workers_with_linear(
                                                     app.project(),
                                                     app.project().linear_available,
                                                 ),
-                                            );
-                                            Some(stashed)
+                                            )
                                         };
-                                    // Stash old workers if old project is still a swimlane
-                                    if let Some(old_w) = old_workers {
-                                        let still_swimlane = app
-                                            .sidebar
-                                            .as_ref()
-                                            .map(|s| s.swimlane_indices.contains(&old_focused))
-                                            .unwrap_or(false);
-                                        if still_swimlane {
-                                            swimlane_workers.insert(old_focused, old_w);
-                                        }
+
+                                    let still_swimlane = app
+                                        .sidebar
+                                        .as_ref()
+                                        .is_some_and(|s| s.swimlane_indices.contains(&old_focused));
+                                    if still_swimlane {
+                                        swimlane_workers.insert(old_focused, old_workers);
                                     }
                                     let _ = execute!(
                                         terminal.backend_mut(),

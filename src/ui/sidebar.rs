@@ -46,9 +46,7 @@ pub fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
                 " "
             };
 
-            let marker_style = if is_focused {
-                Style::default().fg(styles::ACCENT)
-            } else if is_swimlane {
+            let marker_style = if is_focused || is_swimlane {
                 Style::default().fg(styles::ACCENT)
             } else if has_activity {
                 Style::default().fg(Color::Yellow)
