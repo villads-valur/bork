@@ -844,6 +844,7 @@ fn run_tui() -> anyhow::Result<()> {
             let live = &mut app.project_mut().live;
             live.pr_statuses = pr_result.prs;
             live.user_prs = pr_result.user_prs;
+            live.pr_poll_done = true;
             if pr_result.github_user.is_some() {
                 live.github_user = pr_result.github_user;
             }
@@ -978,6 +979,7 @@ fn run_tui() -> anyhow::Result<()> {
                 let live = &mut app.projects[proj_pos].live;
                 live.pr_statuses = pr_result.prs;
                 live.user_prs = pr_result.user_prs;
+                live.pr_poll_done = true;
                 if pr_result.github_user.is_some() {
                     live.github_user = pr_result.github_user;
                 }
