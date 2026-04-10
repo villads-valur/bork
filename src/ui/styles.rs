@@ -46,6 +46,10 @@ pub fn card_title_style(selected: bool) -> Style {
     }
 }
 
+pub fn search_highlight_style() -> Style {
+    Style::default().fg(Color::Yellow)
+}
+
 pub fn agent_status_color(status: &AgentStatus) -> Color {
     match status {
         AgentStatus::Stopped => Color::Gray,
