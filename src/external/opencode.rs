@@ -510,6 +510,7 @@ mod tests {
             linear_imported: false,
             pr_number: None,
             pr_imported: false,
+            pr_import_source: None,
         }
     }
 

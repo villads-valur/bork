@@ -240,6 +240,63 @@ pub fn fetch_user_prs(main_worktree: &Path) -> Vec<PrStatus> {
     parse_search_response(&stdout)
 }
 
+pub fn fetch_review_requested_prs(main_worktree: &Path) -> Vec<PrStatus> {
+    let Some(repo) = get_repo_identity(main_worktree) else {
+        return Vec::new();
+    };
+    let Some(user) = fetch_current_user(main_worktree) else {
+        return Vec::new();
+    };
+
+    let graphql_query = format!(
+        r#"query($search: String!) {{
+            search(query: $search, type: ISSUE, first: 50) {{
+                nodes {{
+                    ... on PullRequest {{
+                        {PR_FIELDS}
+                    }}
+                }}
+            }}
+        }}"#
+    );
+
+    // involves:<user> covers review-requested, assigned, reviewed-by, and
+    // mentioned - matching GitHub's "Involved" filter exactly.
+    // Authored PRs are included but deduped by sync_prs_as_issues() since
+    // user_prs is processed first.
+    let search_query = format!(
+        "repo:{}/{} is:pr is:open involves:{}",
+        repo.owner, repo.name, user
+    );
+
+    fetch_search_query(main_worktree, &graphql_query, &search_query)
+}
+
+fn fetch_search_query(main_worktree: &Path, graphql_query: &str, search: &str) -> Vec<PrStatus> {
+    let output = Command::new("gh")
+        .args([
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={graphql_query}"),
+            "-f",
+            &format!("search={search}"),
+        ])
+        .current_dir(main_worktree)
+        .output();
+
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_search_response(&stdout)
+}
+
 fn parse_search_response(json_str: &str) -> Vec<PrStatus> {
     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) else {
         return Vec::new();

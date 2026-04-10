@@ -137,6 +137,21 @@ impl fmt::Display for AgentMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PrImportSource {
+    Authored,
+    ReviewRequested,
+}
+
+impl fmt::Display for PrImportSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PrImportSource::Authored => write!(f, "authored"),
+            PrImportSource::ReviewRequested => write!(f, "review"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IssueKind {
     #[default]
@@ -239,6 +254,8 @@ pub struct Issue {
     /// When true, issue was auto-imported from a GitHub PR and title syncs from PR data.
     #[serde(default, alias = "github_imported")]
     pub pr_imported: bool,
+    #[serde(default)]
+    pub pr_import_source: Option<PrImportSource>,
 }
 
 impl Issue {
@@ -318,6 +335,7 @@ mod tests {
             linear_imported: false,
             pr_number: None,
             pr_imported: false,
+            pr_import_source: None,
         }
     }
 

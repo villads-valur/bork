@@ -79,6 +79,7 @@ fn run_worktree_in(
             linear_imported: false,
             pr_number: None,
             pr_imported: false,
+            pr_import_source: None,
         };
         state.issues.push(issue);
     } else {

@@ -5,7 +5,9 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::app::CardSize;
-use crate::types::{AgentStatus, Issue, IssueKind, PrState, PrStatus, WorktreeStatus};
+use crate::types::{
+    AgentStatus, Issue, IssueKind, PrImportSource, PrState, PrStatus, WorktreeStatus,
+};
 use crate::ui::styles;
 
 pub const CARD_HEIGHT: u16 = 7;
@@ -140,6 +142,13 @@ fn format_status_line(ctx: &CardContext) -> Line<'static> {
         return Line::from(vec![
             Span::raw("  "),
             Span::styled("Todo", styles::dim_style()),
+        ]);
+    }
+
+    if ctx.issue.pr_import_source == Some(PrImportSource::ReviewRequested) {
+        return Line::from(vec![
+            Span::raw("  "),
+            Span::styled("review", Style::default().fg(Color::Yellow)),
         ]);
     }
 
