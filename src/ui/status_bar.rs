@@ -67,7 +67,7 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     if app.input_mode == InputMode::Search {
         let line = Line::from(vec![
             Span::styled(
-                format!(" /{}", app.active_project().search_query),
+                format!(" /{}", app.search_query),
                 Style::default()
                     .fg(styles::TEXT)
                     .add_modifier(Modifier::BOLD),
@@ -120,7 +120,7 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     if app.has_active_search() {
         let line = Line::from(vec![
             Span::styled(
-                format!(" /{}", app.active_project().search_query),
+                format!(" /{}", app.search_query),
                 Style::default().fg(styles::ACCENT),
             ),
             Span::raw("  "),

@@ -62,7 +62,6 @@ pub struct Project {
     pub config: AppConfig,
     pub selected_column: usize,
     pub selected_row: [usize; 4],
-    pub search_query: String,
     pub linear_available: bool,
     pub tuicr_available: bool,
     pub live: LiveState,
@@ -87,7 +86,6 @@ impl Project {
             config,
             selected_column: 0,
             selected_row: [0; 4],
-            search_query: String::new(),
             linear_available: false,
             tuicr_available: false,
             live: LiveState::default(),
@@ -124,7 +122,7 @@ impl Project {
             // No local changes pending, safe to fully replace
             self.issues = file_issues.clone();
             self.base_issues = file_issues;
-            self.clamp_all_rows();
+            self.clamp_all_rows("");
             return;
         }
 
@@ -155,37 +153,45 @@ impl Project {
         }
 
         self.base_issues = file_issues;
-        self.clamp_all_rows();
+        self.clamp_all_rows("");
     }
 
-    pub fn issues_in_column(&self, column: Column) -> Vec<(usize, &Issue)> {
-        let query = self.search_query.to_lowercase();
+    pub fn issues_in_column(&self, column: Column, query: &str) -> Vec<(usize, &Issue)> {
+        let query = query.to_lowercase();
         self.issues
             .iter()
             .enumerate()
             .filter(|(_, issue)| {
-                if issue.column != column {
-                    return false;
-                }
-                if query.is_empty() {
-                    return true;
-                }
-                issue.title.to_lowercase().contains(&query)
-                    || issue.id.to_lowercase().contains(&query)
+                issue.column == column && (query.is_empty() || self.issue_matches(issue, &query))
             })
             .collect()
     }
 
-    pub fn selected_issue(&self) -> Option<&Issue> {
+    fn issue_matches(&self, issue: &Issue, query: &str) -> bool {
+        issue.title.to_lowercase().contains(query)
+            || issue.id.to_lowercase().contains(query)
+            || issue
+                .linear_identifier
+                .as_ref()
+                .is_some_and(|li| li.to_lowercase().contains(query))
+            || self
+                .branch_for(issue)
+                .is_some_and(|b| b.to_lowercase().contains(query))
+            || self
+                .pr_for(issue)
+                .is_some_and(|pr| pr.title.to_lowercase().contains(query))
+    }
+
+    pub fn selected_issue(&self, query: &str) -> Option<&Issue> {
         let column = Column::from_index(self.selected_column)?;
-        let items = self.issues_in_column(column);
+        let items = self.issues_in_column(column, query);
         let row = self.selected_row[self.selected_column];
         items.get(row).map(|(_, issue)| *issue)
     }
 
-    pub fn selected_issue_index(&self) -> Option<usize> {
+    pub fn selected_issue_index(&self, query: &str) -> Option<usize> {
         let column = Column::from_index(self.selected_column)?;
-        let items = self.issues_in_column(column);
+        let items = self.issues_in_column(column, query);
         let row = self.selected_row[self.selected_column];
         items.get(row).map(|(idx, _)| *idx)
     }
@@ -197,33 +203,33 @@ impl Project {
         }
     }
 
-    pub fn move_selection_down(&mut self) {
+    pub fn move_selection_down(&mut self, query: &str) {
         let column = match Column::from_index(self.selected_column) {
             Some(c) => c,
             None => return,
         };
-        let count = self.issues_in_column(column).len();
+        let count = self.issues_in_column(column, query).len();
         let row = &mut self.selected_row[self.selected_column];
         if count > 0 && *row < count - 1 {
             *row += 1;
         }
     }
 
-    pub fn jump_column_left(&mut self) {
+    pub fn jump_column_left(&mut self, query: &str) {
         if self.selected_column > 0 {
             self.selected_column -= 1;
-            self.clamp_row();
+            self.clamp_row(query);
         }
     }
 
-    pub fn jump_column_right(&mut self) {
+    pub fn jump_column_right(&mut self, query: &str) {
         if self.selected_column < 3 {
             self.selected_column += 1;
-            self.clamp_row();
+            self.clamp_row(query);
         }
     }
 
-    pub fn focus_left(&mut self) {
+    pub fn focus_left(&mut self, query: &str) {
         let row = self.selected_row[self.selected_column];
         if row > 0 {
             self.selected_row[self.selected_column] = row - 1;
@@ -231,7 +237,7 @@ impl Project {
             let mut col = self.selected_column;
             while col > 0 {
                 col -= 1;
-                let count = self.column_count(col);
+                let count = self.column_count(col, query);
                 if count > 0 {
                     self.selected_column = col;
                     self.selected_row[col] = count - 1;
@@ -241,12 +247,12 @@ impl Project {
         }
     }
 
-    pub fn focus_right(&mut self) {
+    pub fn focus_right(&mut self, query: &str) {
         let column = match Column::from_index(self.selected_column) {
             Some(c) => c,
             None => return,
         };
-        let count = self.issues_in_column(column).len();
+        let count = self.issues_in_column(column, query).len();
         let row = self.selected_row[self.selected_column];
 
         if count > 0 && row < count - 1 {
@@ -255,7 +261,7 @@ impl Project {
             let mut col = self.selected_column;
             while col < 3 {
                 col += 1;
-                let count = self.column_count(col);
+                let count = self.column_count(col, query);
                 if count > 0 {
                     self.selected_column = col;
                     self.selected_row[col] = 0;
@@ -265,9 +271,9 @@ impl Project {
         }
     }
 
-    fn column_count(&self, col_index: usize) -> usize {
+    fn column_count(&self, col_index: usize, query: &str) -> usize {
         match Column::from_index(col_index) {
-            Some(c) => self.issues_in_column(c).len(),
+            Some(c) => self.issues_in_column(c, query).len(),
             None => 0,
         }
     }
@@ -276,19 +282,19 @@ impl Project {
         self.selected_row[self.selected_column] = 0;
     }
 
-    pub fn scroll_to_bottom(&mut self) {
+    pub fn scroll_to_bottom(&mut self, query: &str) {
         let column = match Column::from_index(self.selected_column) {
             Some(c) => c,
             None => return,
         };
-        let count = self.issues_in_column(column).len();
+        let count = self.issues_in_column(column, query).len();
         if count > 0 {
             self.selected_row[self.selected_column] = count - 1;
         }
     }
 
-    pub fn move_issue_right(&mut self) {
-        let Some(idx) = self.selected_issue_index() else {
+    pub fn move_issue_right(&mut self, query: &str) {
+        let Some(idx) = self.selected_issue_index(query) else {
             return;
         };
         let Some(next) = self.issues[idx].column.next() else {
@@ -297,8 +303,8 @@ impl Project {
         self.move_issue_to_column(idx, next);
     }
 
-    pub fn move_issue_left(&mut self) {
-        let Some(idx) = self.selected_issue_index() else {
+    pub fn move_issue_left(&mut self, query: &str) {
+        let Some(idx) = self.selected_issue_index(query) else {
             return;
         };
         let Some(prev) = self.issues[idx].column.prev() else {
@@ -307,15 +313,15 @@ impl Project {
         self.move_issue_to_column(idx, prev);
     }
 
-    pub fn move_to_done(&mut self) {
-        let Some(idx) = self.selected_issue_index() else {
+    pub fn move_to_done(&mut self, query: &str) {
+        let Some(idx) = self.selected_issue_index(query) else {
             return;
         };
         self.move_issue_to_column(idx, Column::Done);
     }
 
-    pub fn move_to_todo(&mut self) {
-        let Some(idx) = self.selected_issue_index() else {
+    pub fn move_to_todo(&mut self, query: &str) {
+        let Some(idx) = self.selected_issue_index(query) else {
             return;
         };
         self.move_issue_to_column(idx, Column::Todo);
@@ -751,13 +757,9 @@ impl Project {
         format!("{}-{}", prefix, max_num + 1 + offset)
     }
 
-    pub fn has_active_search(&self) -> bool {
-        !self.search_query.is_empty()
-    }
-
-    pub fn clamp_all_rows(&mut self) {
+    pub fn clamp_all_rows(&mut self, query: &str) {
         for col in 0..4 {
-            let count = self.column_count(col);
+            let count = self.column_count(col, query);
             if count == 0 {
                 self.selected_row[col] = 0;
             } else if self.selected_row[col] >= count {
@@ -766,12 +768,12 @@ impl Project {
         }
     }
 
-    fn clamp_row(&mut self) {
+    fn clamp_row(&mut self, query: &str) {
         let column = match Column::from_index(self.selected_column) {
             Some(c) => c,
             None => return,
         };
-        let count = self.issues_in_column(column).len();
+        let count = self.issues_in_column(column, query).len();
         let row = &mut self.selected_row[self.selected_column];
         if count == 0 {
             *row = 0;
@@ -780,9 +782,9 @@ impl Project {
         }
     }
 
-    fn focus_first_match(&mut self) {
+    fn focus_first_match(&mut self, query: &str) {
         for col in 0..4 {
-            if self.column_count(col) > 0 {
+            if self.column_count(col, query) > 0 {
                 self.selected_column = col;
                 self.selected_row[col] = 0;
                 return;
@@ -1242,6 +1244,7 @@ pub struct App {
     pub focused_swimlane: usize,
     pub sidebar: Option<SidebarState>,
     pub input_mode: InputMode,
+    pub search_query: String,
     pub confirm_message: Option<String>,
     pub pending_confirm: Option<ConfirmAction>,
     pub dialog: Option<DialogState>,
@@ -1267,6 +1270,7 @@ impl App {
             focused_swimlane: 0,
             sidebar: None,
             input_mode: InputMode::Normal,
+            search_query: String::new(),
             confirm_message: None,
             pending_confirm: None,
             dialog: None,
@@ -1609,44 +1613,48 @@ impl App {
     }
 
     pub fn search_push_char(&mut self, c: char, ctx: &ActionContext) {
+        self.search_query.push(c);
+        let query = self.search_query.clone();
         let p = self.context_project_mut(ctx);
-        p.search_query.push(c);
-        p.clamp_all_rows();
-        p.focus_first_match();
+        p.clamp_all_rows(&query);
+        p.focus_first_match(&query);
     }
 
     pub fn search_delete_char(&mut self, ctx: &ActionContext) {
-        if self.context_project(ctx).search_query.is_empty() {
+        if self.search_query.is_empty() {
             self.cancel_search(ctx);
             return;
         }
+        self.search_query.pop();
+        let query = self.search_query.clone();
         let p = self.context_project_mut(ctx);
-        p.search_query.pop();
-        p.clamp_all_rows();
-        p.focus_first_match();
+        p.clamp_all_rows(&query);
+        p.focus_first_match(&query);
     }
 
     pub fn confirm_search(&mut self) {
         self.input_mode = InputMode::Normal;
     }
 
-    pub fn cancel_search(&mut self, ctx: &ActionContext) {
-        let p = self.context_project_mut(ctx);
-        p.search_query.clear();
-        p.clamp_all_rows();
+    pub fn cancel_search(&mut self, _ctx: &ActionContext) {
+        self.search_query.clear();
+        for project in &mut self.projects {
+            project.clamp_all_rows("");
+        }
         self.input_mode = InputMode::Normal;
     }
 
-    pub fn clear_search(&mut self, ctx: &ActionContext) {
-        let p = self.context_project_mut(ctx);
-        if !p.search_query.is_empty() {
-            p.search_query.clear();
-            p.clamp_all_rows();
+    pub fn clear_search(&mut self, _ctx: &ActionContext) {
+        if !self.search_query.is_empty() {
+            self.search_query.clear();
+            for project in &mut self.projects {
+                project.clamp_all_rows("");
+            }
         }
     }
 
     pub fn has_active_search(&self) -> bool {
-        self.active_project().has_active_search()
+        !self.search_query.is_empty()
     }
 }
 
@@ -2537,7 +2545,7 @@ mod tests {
     fn move_issue_right_from_todo_goes_to_in_progress() {
         let mut app = test_app(vec![test_issue("bork-1", Column::Todo)]);
         app.project_mut().selected_column = 0;
-        app.project_mut().move_issue_right();
+        app.project_mut().move_issue_right("");
         assert_eq!(app.project().issues[0].column, Column::InProgress);
     }
 
@@ -2545,7 +2553,7 @@ mod tests {
     fn move_issue_right_from_done_stays_in_done() {
         let mut app = test_app(vec![test_issue("bork-1", Column::Done)]);
         app.project_mut().selected_column = 3;
-        app.project_mut().move_issue_right();
+        app.project_mut().move_issue_right("");
         assert_eq!(app.project().issues[0].column, Column::Done);
     }
 
@@ -2553,7 +2561,7 @@ mod tests {
     fn move_issue_left_from_in_progress_goes_to_todo() {
         let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
         app.project_mut().selected_column = 1;
-        app.project_mut().move_issue_left();
+        app.project_mut().move_issue_left("");
         assert_eq!(app.project().issues[0].column, Column::Todo);
     }
 
@@ -2561,7 +2569,7 @@ mod tests {
     fn move_issue_to_done_sets_done_at() {
         let mut app = test_app(vec![test_issue("bork-1", Column::CodeReview)]);
         app.project_mut().selected_column = 2;
-        app.project_mut().move_issue_right();
+        app.project_mut().move_issue_right("");
         assert_eq!(app.project().issues[0].column, Column::Done);
         assert!(app.project().issues[0].done_at.is_some());
     }
@@ -2572,7 +2580,7 @@ mod tests {
         issue.done_at = Some(1700000000);
         let mut app = test_app(vec![issue]);
         app.project_mut().selected_column = 3;
-        app.project_mut().move_issue_left();
+        app.project_mut().move_issue_left("");
         assert_eq!(app.project().issues[0].column, Column::CodeReview);
         assert_eq!(app.project().issues[0].done_at, None);
     }
@@ -2581,10 +2589,10 @@ mod tests {
     fn move_issue_within_non_done_columns_keeps_done_at_none() {
         let mut app = test_app(vec![test_issue("bork-1", Column::Todo)]);
         app.project_mut().selected_column = 0;
-        app.project_mut().move_issue_right(); // Todo -> InProgress
+        app.project_mut().move_issue_right(""); // Todo -> InProgress
         assert_eq!(app.project().issues[0].done_at, None);
         app.project_mut().selected_column = 1;
-        app.project_mut().move_issue_right(); // InProgress -> CodeReview
+        app.project_mut().move_issue_right(""); // InProgress -> CodeReview
         assert_eq!(app.project().issues[0].done_at, None);
     }
 
@@ -2636,7 +2644,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        app.project_mut().move_issue_right(); // -> Done
+        app.project_mut().move_issue_right(""); // -> Done
         let after = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -3057,7 +3065,7 @@ mod tests {
             test_issue("bork-2", Column::InProgress),
             test_issue("bork-3", Column::Todo),
         ]);
-        let todo = app.project().issues_in_column(Column::Todo);
+        let todo = app.project().issues_in_column(Column::Todo, "");
         assert_eq!(todo.len(), 2);
         assert_eq!(todo[0].1.id, "bork-1");
         assert_eq!(todo[1].1.id, "bork-3");
@@ -3074,8 +3082,9 @@ mod tests {
             test_issue_titled("bork-2", "Add dark mode", Column::Todo),
             test_issue_titled("bork-3", "Fix logout crash", Column::Todo),
         ]);
-        app.project_mut().search_query = "fix".to_string();
-        let results = app.project().issues_in_column(Column::Todo);
+        app.search_query = "fix".to_string();
+        let q = app.search_query.clone();
+        let results = app.project().issues_in_column(Column::Todo, &q);
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].1.id, "bork-1");
         assert_eq!(results[1].1.id, "bork-3");
@@ -3088,11 +3097,13 @@ mod tests {
             "Fix Login Bug",
             Column::Todo,
         )]);
-        app.project_mut().search_query = "fix login".to_string();
-        assert_eq!(app.project().issues_in_column(Column::Todo).len(), 1);
+        app.search_query = "fix login".to_string();
+        let q = app.search_query.clone();
+        assert_eq!(app.project().issues_in_column(Column::Todo, &q).len(), 1);
 
-        app.project_mut().search_query = "FIX LOGIN".to_string();
-        assert_eq!(app.project().issues_in_column(Column::Todo).len(), 1);
+        app.search_query = "FIX LOGIN".to_string();
+        let q = app.search_query.clone();
+        assert_eq!(app.project().issues_in_column(Column::Todo, &q).len(), 1);
     }
 
     #[test]
@@ -3101,8 +3112,9 @@ mod tests {
             test_issue_titled("bork-1", "Fix login bug", Column::Todo),
             test_issue_titled("bork-2", "Add dark mode", Column::Todo),
         ]);
-        app.project_mut().search_query = "bork-2".to_string();
-        let results = app.project().issues_in_column(Column::Todo);
+        app.search_query = "bork-2".to_string();
+        let q = app.search_query.clone();
+        let results = app.project().issues_in_column(Column::Todo, &q);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].1.id, "bork-2");
     }
@@ -3113,8 +3125,9 @@ mod tests {
             test_issue_titled("bork-1", "Fix login", Column::Todo),
             test_issue_titled("bork-12", "Add feature", Column::Todo),
         ]);
-        app.project_mut().search_query = "bork-1".to_string();
-        let results = app.project().issues_in_column(Column::Todo);
+        app.search_query = "bork-1".to_string();
+        let q = app.search_query.clone();
+        let results = app.project().issues_in_column(Column::Todo, &q);
         assert_eq!(results.len(), 2, "bork-1 and bork-12 both contain 'bork-1'");
     }
 
@@ -3124,8 +3137,8 @@ mod tests {
             test_issue("bork-1", Column::Todo),
             test_issue("bork-2", Column::Todo),
         ]);
-        app.project_mut().search_query = String::new();
-        assert_eq!(app.project().issues_in_column(Column::Todo).len(), 2);
+        app.search_query = String::new();
+        assert_eq!(app.project().issues_in_column(Column::Todo, "").len(), 2);
     }
 
     #[test]
@@ -3135,8 +3148,9 @@ mod tests {
             "Fix login bug",
             Column::Todo,
         )]);
-        app.project_mut().search_query = "zzzzz".to_string();
-        assert_eq!(app.project().issues_in_column(Column::Todo).len(), 0);
+        app.search_query = "zzzzz".to_string();
+        let q = app.search_query.clone();
+        assert_eq!(app.project().issues_in_column(Column::Todo, &q).len(), 0);
     }
 
     #[test]
@@ -3147,11 +3161,18 @@ mod tests {
             test_issue_titled("bork-3", "Add feature", Column::Todo),
             test_issue_titled("bork-4", "Fix timeout", Column::Done),
         ]);
-        app.project_mut().search_query = "fix".to_string();
-        assert_eq!(app.project().issues_in_column(Column::Todo).len(), 1);
-        assert_eq!(app.project().issues_in_column(Column::InProgress).len(), 1);
-        assert_eq!(app.project().issues_in_column(Column::CodeReview).len(), 0);
-        assert_eq!(app.project().issues_in_column(Column::Done).len(), 1);
+        app.search_query = "fix".to_string();
+        let q = app.search_query.clone();
+        assert_eq!(app.project().issues_in_column(Column::Todo, &q).len(), 1);
+        assert_eq!(
+            app.project().issues_in_column(Column::InProgress, &q).len(),
+            1
+        );
+        assert_eq!(
+            app.project().issues_in_column(Column::CodeReview, &q).len(),
+            0
+        );
+        assert_eq!(app.project().issues_in_column(Column::Done, &q).len(), 1);
     }
 
     #[test]
@@ -3161,8 +3182,9 @@ mod tests {
             test_issue_titled("bork-2", "Fix bug", Column::Todo),
             test_issue_titled("bork-3", "Fix crash", Column::Todo),
         ]);
-        app.project_mut().search_query = "fix".to_string();
-        let results = app.project().issues_in_column(Column::Todo);
+        app.search_query = "fix".to_string();
+        let q = app.search_query.clone();
+        let results = app.project().issues_in_column(Column::Todo, &q);
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0, 1, "global index of bork-2 should be 1");
         assert_eq!(results[1].0, 2, "global index of bork-3 should be 2");
@@ -3183,17 +3205,13 @@ mod tests {
     #[test]
     fn start_search_preserves_existing_query() {
         let mut app = test_app(vec![]);
-        app.project_mut().search_query = "fix".to_string();
+        app.search_query = "fix".to_string();
         app.confirm_search();
         assert_eq!(app.input_mode, InputMode::Normal);
 
         app.start_search();
         assert_eq!(app.input_mode, InputMode::Search);
-        assert_eq!(
-            app.project_mut().search_query,
-            "fix",
-            "/ should preserve existing query"
-        );
+        assert_eq!(app.search_query, "fix", "/ should preserve existing query");
     }
 
     // ================================================================
@@ -3208,11 +3226,7 @@ mod tests {
         app.search_push_char('f', &ctx);
         app.confirm_search();
         assert_eq!(app.input_mode, InputMode::Normal);
-        assert_eq!(
-            app.project_mut().search_query,
-            "f",
-            "filter should remain after confirm"
-        );
+        assert_eq!(app.search_query, "f", "filter should remain after confirm");
     }
 
     // ================================================================
@@ -3228,7 +3242,7 @@ mod tests {
         app.search_push_char('i', &ctx);
         app.cancel_search(&ctx);
         assert_eq!(app.input_mode, InputMode::Normal);
-        assert!(app.project_mut().search_query.is_empty());
+        assert!(app.search_query.is_empty());
     }
 
     // ================================================================
@@ -3241,13 +3255,14 @@ mod tests {
             test_issue_titled("bork-1", "Fix login", Column::Todo),
             test_issue_titled("bork-2", "Add feature", Column::Todo),
         ]);
-        app.project_mut().search_query = "fix".to_string();
-        assert_eq!(app.project().issues_in_column(Column::Todo).len(), 1);
+        app.search_query = "fix".to_string();
+        let q = app.search_query.clone();
+        assert_eq!(app.project().issues_in_column(Column::Todo, &q).len(), 1);
 
         let ctx = app.action_context();
         app.clear_search(&ctx);
-        assert!(app.project_mut().search_query.is_empty());
-        assert_eq!(app.project().issues_in_column(Column::Todo).len(), 2);
+        assert!(app.search_query.is_empty());
+        assert_eq!(app.project().issues_in_column(Column::Todo, "").len(), 2);
     }
 
     #[test]
@@ -3255,8 +3270,8 @@ mod tests {
         let mut app = test_app(vec![test_issue("bork-1", Column::Todo)]);
         let ctx = app.action_context();
         app.clear_search(&ctx);
-        assert!(app.project_mut().search_query.is_empty());
-        assert_eq!(app.project().issues_in_column(Column::Todo).len(), 1);
+        assert!(app.search_query.is_empty());
+        assert_eq!(app.project().issues_in_column(Column::Todo, "").len(), 1);
     }
 
     // ================================================================
@@ -3266,15 +3281,13 @@ mod tests {
     #[test]
     fn has_active_search_false_when_empty() {
         let app = test_app(vec![]);
-        let ctx = app.action_context();
         assert!(!app.has_active_search());
     }
 
     #[test]
     fn has_active_search_true_when_query_set() {
         let mut app = test_app(vec![]);
-        app.project_mut().search_query = "test".to_string();
-        let ctx = app.action_context();
+        app.search_query = "test".to_string();
         assert!(app.has_active_search());
     }
 
@@ -3288,11 +3301,11 @@ mod tests {
         let ctx = app.action_context();
         app.start_search();
         app.search_push_char('f', &ctx);
-        assert_eq!(app.project_mut().search_query, "f");
+        assert_eq!(app.search_query, "f");
         app.search_push_char('i', &ctx);
-        assert_eq!(app.project_mut().search_query, "fi");
+        assert_eq!(app.search_query, "fi");
         app.search_push_char('x', &ctx);
-        assert_eq!(app.project_mut().search_query, "fix");
+        assert_eq!(app.search_query, "fix");
     }
 
     #[test]
@@ -3366,7 +3379,7 @@ mod tests {
         app.search_push_char('i', &ctx);
         app.search_push_char('x', &ctx);
         app.search_delete_char(&ctx);
-        assert_eq!(app.project_mut().search_query, "fi");
+        assert_eq!(app.search_query, "fi");
     }
 
     #[test]
@@ -3378,7 +3391,7 @@ mod tests {
 
         app.search_delete_char(&ctx);
         assert_eq!(app.input_mode, InputMode::Normal);
-        assert!(app.project_mut().search_query.is_empty());
+        assert!(app.search_query.is_empty());
     }
 
     #[test]
@@ -3390,7 +3403,7 @@ mod tests {
         app.search_delete_char(&ctx);
 
         assert_eq!(app.input_mode, InputMode::Search);
-        assert!(app.project_mut().search_query.is_empty());
+        assert!(app.search_query.is_empty());
     }
 
     #[test]
@@ -3437,7 +3450,8 @@ mod tests {
         app.search_push_char('x', &ctx);
 
         // Only 2 results remain (bork-1 and bork-2), row 2 is out of bounds
-        let count = app.project().issues_in_column(Column::Todo).len();
+        let q = app.search_query.clone();
+        let count = app.project().issues_in_column(Column::Todo, &q).len();
         assert_eq!(count, 2);
         assert!(
             app.project_mut().selected_row[0] < count,
@@ -3456,7 +3470,8 @@ mod tests {
         app.search_push_char('z', &ctx);
         app.search_push_char('z', &ctx);
 
-        assert_eq!(app.project().issues_in_column(Column::Todo).len(), 0);
+        let q = app.search_query.clone();
+        assert_eq!(app.project().issues_in_column(Column::Todo, &q).len(), 0);
         assert_eq!(app.project().selected_row[0], 0);
     }
 
@@ -3480,20 +3495,28 @@ mod tests {
         app.search_push_char('f', &ctx);
         app.search_push_char('i', &ctx);
         app.search_push_char('x', &ctx);
-        assert_eq!(app.project().issues_in_column(Column::Todo).len(), 1);
-        assert_eq!(app.project().issues_in_column(Column::InProgress).len(), 0);
+        let q = app.search_query.clone();
+        assert_eq!(app.project().issues_in_column(Column::Todo, &q).len(), 1);
+        assert_eq!(
+            app.project().issues_in_column(Column::InProgress, &q).len(),
+            0
+        );
 
         // Confirm — filter stays, back to normal
         app.confirm_search();
         assert_eq!(app.input_mode, InputMode::Normal);
-        assert_eq!(app.project_mut().search_query, "fix");
-        assert_eq!(app.project().issues_in_column(Column::Todo).len(), 1);
+        assert_eq!(app.search_query, "fix");
+        let q = app.search_query.clone();
+        assert_eq!(app.project().issues_in_column(Column::Todo, &q).len(), 1);
 
         // Clear — all issues visible again
         app.clear_search(&ctx);
-        assert!(app.project_mut().search_query.is_empty());
-        assert_eq!(app.project().issues_in_column(Column::Todo).len(), 1);
-        assert_eq!(app.project().issues_in_column(Column::InProgress).len(), 1);
+        assert!(app.search_query.is_empty());
+        assert_eq!(app.project().issues_in_column(Column::Todo, "").len(), 1);
+        assert_eq!(
+            app.project().issues_in_column(Column::InProgress, "").len(),
+            1
+        );
     }
 
     #[test]
@@ -3507,13 +3530,14 @@ mod tests {
         app.start_search();
         app.search_push_char('f', &ctx);
         app.search_push_char('i', &ctx);
-        assert_eq!(app.project().issues_in_column(Column::Todo).len(), 1);
+        let q = app.search_query.clone();
+        assert_eq!(app.project().issues_in_column(Column::Todo, &q).len(), 1);
 
         // Cancel — clears query, all issues back
         app.cancel_search(&ctx);
         assert_eq!(app.input_mode, InputMode::Normal);
-        assert!(app.project_mut().search_query.is_empty());
-        assert_eq!(app.project().issues_in_column(Column::Todo).len(), 2);
+        assert!(app.search_query.is_empty());
+        assert_eq!(app.project().issues_in_column(Column::Todo, "").len(), 2);
     }
 
     #[test]
@@ -3530,23 +3554,26 @@ mod tests {
         app.search_push_char('i', &ctx);
         app.search_push_char('x', &ctx);
         app.confirm_search();
-        assert_eq!(app.project().issues_in_column(Column::Todo).len(), 2);
+        let q = app.search_query.clone();
+        assert_eq!(app.project().issues_in_column(Column::Todo, &q).len(), 2);
 
         // Re-enter: query still "fix", refine to "fix log"
         app.start_search();
-        assert_eq!(app.project_mut().search_query, "fix");
+        assert_eq!(app.search_query, "fix");
         app.search_push_char(' ', &ctx);
         app.search_push_char('l', &ctx);
         app.search_push_char('o', &ctx);
         app.search_push_char('g', &ctx);
-        assert_eq!(app.project().issues_in_column(Column::Todo).len(), 2);
+        let q = app.search_query.clone();
+        assert_eq!(app.project().issues_in_column(Column::Todo, &q).len(), 2);
 
         // Refine further to "fix login"
         app.search_push_char('i', &ctx);
         app.search_push_char('n', &ctx);
-        assert_eq!(app.project().issues_in_column(Column::Todo).len(), 1);
+        let q = app.search_query.clone();
+        assert_eq!(app.project().issues_in_column(Column::Todo, &q).len(), 1);
         assert_eq!(
-            app.project().issues_in_column(Column::Todo)[0].1.id,
+            app.project().issues_in_column(Column::Todo, &q)[0].1.id,
             "bork-1"
         );
     }
@@ -3560,20 +3587,23 @@ mod tests {
         ]);
         app.project_mut().selected_column = 0;
 
-        app.project_mut().search_query = "fix".to_string();
-        app.project_mut().clamp_all_rows();
+        app.search_query = "fix".to_string();
+        let q = app.search_query.clone();
+        app.project_mut().clamp_all_rows(&q);
         app.project_mut().selected_row[0] = 0;
 
+        let q = app.search_query.clone();
         let issue = app
             .project()
-            .selected_issue()
+            .selected_issue(&q)
             .expect("should have selected issue");
         assert_eq!(issue.id, "bork-2", "first filtered result should be bork-2");
 
         app.project_mut().selected_row[0] = 1;
+        let q = app.search_query.clone();
         let issue = app
             .project()
-            .selected_issue()
+            .selected_issue(&q)
             .expect("should have selected issue");
         assert_eq!(
             issue.id, "bork-3",
@@ -3589,15 +3619,395 @@ mod tests {
         ]);
         app.project_mut().selected_column = 0;
 
-        app.project_mut().search_query = "fix".to_string();
-        app.project_mut().clamp_all_rows();
+        app.search_query = "fix".to_string();
+        let q = app.search_query.clone();
+        app.project_mut().clamp_all_rows(&q);
         app.project_mut().selected_row[0] = 0;
 
+        let q = app.search_query.clone();
         let idx = app
             .project()
-            .selected_issue_index()
+            .selected_issue_index(&q)
             .expect("should have index");
         assert_eq!(idx, 1, "global index of 'Fix bug' is 1, not 0");
+    }
+
+    // ================================================================
+    // Search: expanded field matching (linear, branch, PR title)
+    // ================================================================
+
+    #[test]
+    fn search_matches_linear_identifier() {
+        let mut issue = test_issue_titled("bork-1", "Some feature", Column::Todo);
+        issue.linear_identifier = Some("VIL-123".to_string());
+        let app = test_app(vec![issue]);
+        let results = app.project().issues_in_column(Column::Todo, "vil-123");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1.id, "bork-1");
+    }
+
+    #[test]
+    fn search_matches_partial_linear_identifier() {
+        let mut issue = test_issue_titled("bork-1", "Some feature", Column::Todo);
+        issue.linear_identifier = Some("VIL-123".to_string());
+        let app = test_app(vec![issue]);
+        let results = app.project().issues_in_column(Column::Todo, "vil");
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn search_linear_identifier_case_insensitive() {
+        let mut issue = test_issue_titled("bork-1", "Some feature", Column::Todo);
+        issue.linear_identifier = Some("VIL-123".to_string());
+        let app = test_app(vec![issue]);
+        assert_eq!(app.project().issues_in_column(Column::Todo, "VIL").len(), 1);
+        assert_eq!(app.project().issues_in_column(Column::Todo, "vil").len(), 1);
+    }
+
+    #[test]
+    fn search_skips_none_linear_identifier() {
+        let issue = test_issue_titled("bork-1", "Some feature", Column::Todo);
+        assert!(issue.linear_identifier.is_none());
+        let app = test_app(vec![issue]);
+        let results = app.project().issues_in_column(Column::Todo, "vil");
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn search_matches_branch_name() {
+        let mut issue = test_issue_titled("bork-5", "Dark mode", Column::Todo);
+        issue.worktree = Some("bork-5-dark-mode".to_string());
+        let mut app = test_app(vec![issue]);
+        app.project_mut().live.worktree_branches.insert(
+            "bork-5-dark-mode".to_string(),
+            "bork-5/dark-mode".to_string(),
+        );
+        let results = app.project().issues_in_column(Column::Todo, "dark-mode");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1.id, "bork-5");
+    }
+
+    #[test]
+    fn search_matches_partial_branch_name() {
+        let mut issue = test_issue_titled("bork-5", "Add feature", Column::Todo);
+        issue.worktree = Some("bork-5-feat".to_string());
+        let mut app = test_app(vec![issue]);
+        app.project_mut().live.worktree_branches.insert(
+            "bork-5-feat".to_string(),
+            "bork-5/feature-dark-mode".to_string(),
+        );
+        let results = app.project().issues_in_column(Column::Todo, "feat");
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn search_matches_pr_title() {
+        let mut issue = test_issue_titled("bork-1", "Some task", Column::InProgress);
+        issue.worktree = Some("bork-1-task".to_string());
+        let mut app = test_app(vec![issue]);
+        app.project_mut()
+            .live
+            .worktree_branches
+            .insert("bork-1-task".to_string(), "bork-1/task".to_string());
+        app.project_mut()
+            .live
+            .pr_statuses
+            .insert("bork-1/task".to_string(), test_pr(42, "bork-1/task"));
+        // PR title from test_pr is "PR #42", search for it
+        let results = app.project().issues_in_column(Column::InProgress, "PR #42");
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn search_matches_partial_pr_title() {
+        let mut issue = test_issue_titled("bork-1", "Some task", Column::InProgress);
+        issue.worktree = Some("bork-1-wt".to_string());
+        issue.pr_number = Some(7);
+        let mut app = test_app(vec![issue]);
+        let custom_pr = PrStatus {
+            number: 7,
+            title: "Refactor auth module".into(),
+            url: "https://github.com/test/repo/pull/7".into(),
+            author: "testuser".into(),
+            state: PrState::Open,
+            is_draft: false,
+            checks: None,
+            review: None,
+            additions: 0,
+            deletions: 0,
+            head_branch: "bork-1/task".into(),
+        };
+        app.project_mut()
+            .live
+            .pr_statuses
+            .insert("bork-1/task".to_string(), custom_pr);
+        app.project_mut()
+            .live
+            .worktree_branches
+            .insert("bork-1-wt".to_string(), "bork-1/task".to_string());
+        let results = app.project().issues_in_column(Column::InProgress, "refact");
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn search_matches_across_any_field() {
+        let mut issue = test_issue_titled("bork-1", "Add feature", Column::Todo);
+        issue.linear_identifier = Some("VIL-99".to_string());
+        let app = test_app(vec![issue]);
+        // "vil" doesn't match title or id, but matches linear_identifier
+        let results = app.project().issues_in_column(Column::Todo, "vil");
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn search_no_duplicate_when_multiple_fields_match() {
+        let mut issue = test_issue_titled("bork-fix", "Fix something", Column::Todo);
+        issue.linear_identifier = Some("FIX-1".to_string());
+        let app = test_app(vec![issue]);
+        // "fix" matches both title, id, and linear_identifier
+        let results = app.project().issues_in_column(Column::Todo, "fix");
+        assert_eq!(results.len(), 1, "issue should appear exactly once");
+    }
+
+    // ================================================================
+    // Search: global search across swimlanes
+    // ================================================================
+
+    #[test]
+    fn search_filters_all_visible_swimlanes() {
+        let mut app = App::new(
+            test_config_named("alpha"),
+            AppState {
+                issues: vec![
+                    test_issue_titled("alpha-1", "Fix login", Column::Todo),
+                    test_issue_titled("alpha-2", "Add feature", Column::Todo),
+                ],
+            },
+        );
+        app.add_background_project(
+            test_config_named("beta"),
+            AppState {
+                issues: vec![
+                    test_issue_titled("beta-1", "Fix crash", Column::Todo),
+                    test_issue_titled("beta-2", "Dark mode", Column::Todo),
+                ],
+            },
+        );
+        app.enable_sidebar();
+        let alpha_id = app.projects[0].id();
+        let beta_id = app.projects[1].id();
+        app.sidebar.as_mut().unwrap().swimlanes = vec![alpha_id.clone(), beta_id.clone()];
+
+        app.search_query = "fix".to_string();
+
+        let alpha = app.find_project(&alpha_id).unwrap();
+        assert_eq!(
+            alpha
+                .issues_in_column(Column::Todo, &app.search_query)
+                .len(),
+            1
+        );
+
+        let beta = app.find_project(&beta_id).unwrap();
+        assert_eq!(
+            beta.issues_in_column(Column::Todo, &app.search_query).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn search_query_lives_on_app_not_project() {
+        let mut app = test_multi_app();
+        app.search_query = "test".to_string();
+
+        let alpha = &app.projects[0];
+        let beta = &app.projects[1];
+
+        // Both projects use the same query from App
+        let alpha_results = alpha.issues_in_column(Column::Todo, &app.search_query);
+        let beta_results = beta.issues_in_column(Column::Todo, &app.search_query);
+
+        // test_multi_app creates issues with titles like "Test issue alpha-1"
+        // so "test" should match them
+        assert!(alpha_results.len() > 0 || beta_results.len() > 0);
+    }
+
+    #[test]
+    fn search_push_char_affects_all_swimlanes() {
+        let mut app = App::new(
+            test_config_named("alpha"),
+            AppState {
+                issues: vec![
+                    test_issue_titled("alpha-1", "Fix login", Column::Todo),
+                    test_issue_titled("alpha-2", "Add feature", Column::Todo),
+                ],
+            },
+        );
+        app.add_background_project(
+            test_config_named("beta"),
+            AppState {
+                issues: vec![
+                    test_issue_titled("beta-1", "Fix crash", Column::Todo),
+                    test_issue_titled("beta-2", "Dark mode", Column::Todo),
+                ],
+            },
+        );
+        app.enable_sidebar();
+        let alpha_id = app.projects[0].id();
+        let beta_id = app.projects[1].id();
+        app.sidebar.as_mut().unwrap().swimlanes = vec![alpha_id.clone(), beta_id.clone()];
+
+        let ctx = app.action_context();
+        app.start_search();
+        app.search_push_char('f', &ctx);
+        app.search_push_char('i', &ctx);
+        app.search_push_char('x', &ctx);
+
+        let q = &app.search_query;
+        let alpha = app.find_project(&alpha_id).unwrap();
+        assert_eq!(alpha.issues_in_column(Column::Todo, q).len(), 1);
+
+        let beta = app.find_project(&beta_id).unwrap();
+        assert_eq!(beta.issues_in_column(Column::Todo, q).len(), 1);
+    }
+
+    #[test]
+    fn search_cancel_clears_across_swimlanes() {
+        let mut app = App::new(
+            test_config_named("alpha"),
+            AppState {
+                issues: vec![
+                    test_issue_titled("alpha-1", "Fix login", Column::Todo),
+                    test_issue_titled("alpha-2", "Add feature", Column::Todo),
+                ],
+            },
+        );
+        app.add_background_project(
+            test_config_named("beta"),
+            AppState {
+                issues: vec![test_issue_titled("beta-1", "Fix crash", Column::Todo)],
+            },
+        );
+        app.enable_sidebar();
+        let alpha_id = app.projects[0].id();
+        let beta_id = app.projects[1].id();
+        app.sidebar.as_mut().unwrap().swimlanes = vec![alpha_id.clone(), beta_id.clone()];
+
+        let ctx = app.action_context();
+        app.start_search();
+        app.search_push_char('f', &ctx);
+        app.search_push_char('i', &ctx);
+        app.search_push_char('x', &ctx);
+        app.cancel_search(&ctx);
+
+        assert!(app.search_query.is_empty());
+        let alpha = app.find_project(&alpha_id).unwrap();
+        assert_eq!(alpha.issues_in_column(Column::Todo, "").len(), 2);
+        let beta = app.find_project(&beta_id).unwrap();
+        assert_eq!(beta.issues_in_column(Column::Todo, "").len(), 1);
+    }
+
+    #[test]
+    fn search_clear_clears_across_swimlanes() {
+        let mut app = App::new(
+            test_config_named("alpha"),
+            AppState {
+                issues: vec![
+                    test_issue_titled("alpha-1", "Fix login", Column::Todo),
+                    test_issue_titled("alpha-2", "Add feature", Column::Todo),
+                ],
+            },
+        );
+        app.add_background_project(
+            test_config_named("beta"),
+            AppState {
+                issues: vec![test_issue_titled("beta-1", "Fix crash", Column::Todo)],
+            },
+        );
+        app.enable_sidebar();
+        let alpha_id = app.projects[0].id();
+        let beta_id = app.projects[1].id();
+        app.sidebar.as_mut().unwrap().swimlanes = vec![alpha_id.clone(), beta_id.clone()];
+
+        app.search_query = "fix".to_string();
+        let ctx = app.action_context();
+        app.clear_search(&ctx);
+
+        assert!(app.search_query.is_empty());
+        let alpha = app.find_project(&alpha_id).unwrap();
+        assert_eq!(alpha.issues_in_column(Column::Todo, "").len(), 2);
+        let beta = app.find_project(&beta_id).unwrap();
+        assert_eq!(beta.issues_in_column(Column::Todo, "").len(), 1);
+    }
+
+    // ================================================================
+    // Search: navigation with active search query
+    // ================================================================
+
+    #[test]
+    fn move_selection_down_respects_search_filter() {
+        let mut app = test_app(vec![
+            test_issue_titled("bork-1", "Fix login", Column::Todo),
+            test_issue_titled("bork-2", "Add feature", Column::Todo),
+            test_issue_titled("bork-3", "Fix crash", Column::Todo),
+        ]);
+        app.project_mut().selected_column = 0;
+        app.project_mut().selected_row[0] = 0;
+        app.search_query = "fix".to_string();
+        let q = app.search_query.clone();
+        app.project_mut().clamp_all_rows(&q);
+
+        // Only 2 "fix" results, move down once
+        let q = app.search_query.clone();
+        app.project_mut().move_selection_down(&q);
+        assert_eq!(app.project().selected_row[0], 1);
+
+        // Moving down again should not go past the filtered count
+        let q = app.search_query.clone();
+        app.project_mut().move_selection_down(&q);
+        assert_eq!(app.project().selected_row[0], 1);
+    }
+
+    #[test]
+    fn scroll_to_bottom_respects_search_filter() {
+        let mut app = test_app(vec![
+            test_issue_titled("bork-1", "Fix login", Column::Todo),
+            test_issue_titled("bork-2", "Add feature", Column::Todo),
+            test_issue_titled("bork-3", "Fix crash", Column::Todo),
+        ]);
+        app.project_mut().selected_column = 0;
+        app.search_query = "fix".to_string();
+        let q = app.search_query.clone();
+        app.project_mut().scroll_to_bottom(&q);
+        assert_eq!(
+            app.project().selected_row[0],
+            1,
+            "should scroll to last filtered item (index 1 of 2 fix results)"
+        );
+    }
+
+    #[test]
+    fn focus_right_with_search_skips_empty_columns() {
+        let mut app = test_app(vec![
+            test_issue_titled("bork-1", "Fix login", Column::Todo),
+            test_issue_titled("bork-2", "Add feature", Column::InProgress),
+            test_issue_titled("bork-3", "Fix crash", Column::Done),
+        ]);
+        app.project_mut().selected_column = 0;
+        app.project_mut().selected_row[0] = 0;
+        app.search_query = "fix".to_string();
+        let q = app.search_query.clone();
+        app.project_mut().clamp_all_rows(&q);
+
+        // focus_right from the only "fix" in Todo should skip InProgress (no fix matches)
+        // and land in Done
+        let q = app.search_query.clone();
+        app.project_mut().focus_right(&q);
+        assert_eq!(
+            app.project().selected_column,
+            3,
+            "should skip InProgress (no fix match) and land in Done"
+        );
     }
 
     // ================================================================
@@ -3970,7 +4380,7 @@ mod tests {
     }
 
     #[test]
-    fn search_is_per_project() {
+    fn search_is_global_on_app() {
         let mut app = test_multi_app();
         let alpha_id = app.projects[0].id();
         let beta_id = app.projects[1].id();
@@ -3979,14 +4389,12 @@ mod tests {
         app.focused_swimlane = 0;
         let ctx = app.action_context();
         app.search_push_char('x', &ctx);
-        assert_eq!(app.projects[0].search_query, "x");
-        assert_eq!(app.projects[1].search_query, "");
+        assert_eq!(app.search_query, "x");
 
         app.focused_swimlane = 1;
         let ctx = app.action_context();
         app.search_push_char('y', &ctx);
-        assert_eq!(app.projects[0].search_query, "x");
-        assert_eq!(app.projects[1].search_query, "y");
+        assert_eq!(app.search_query, "xy");
     }
 
     #[test]

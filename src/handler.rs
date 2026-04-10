@@ -87,6 +87,7 @@ fn handle_normal(
     ctx: &ActionContext,
     ch: &ActionChannels<'_>,
 ) -> PostAction {
+    let q = app.search_query.clone();
     match action {
         Action::Quit => {
             app.should_quit = true;
@@ -98,23 +99,23 @@ fn handle_normal(
             PostAction::None
         }
         Action::MoveDown => {
-            app.context_project_mut(ctx).move_selection_down();
+            app.context_project_mut(ctx).move_selection_down(&q);
             PostAction::None
         }
         Action::FocusLeft => {
-            app.context_project_mut(ctx).focus_left();
+            app.context_project_mut(ctx).focus_left(&q);
             PostAction::None
         }
         Action::FocusRight => {
-            app.context_project_mut(ctx).focus_right();
+            app.context_project_mut(ctx).focus_right(&q);
             PostAction::None
         }
         Action::JumpColumnLeft => {
-            app.context_project_mut(ctx).jump_column_left();
+            app.context_project_mut(ctx).jump_column_left(&q);
             PostAction::None
         }
         Action::JumpColumnRight => {
-            app.context_project_mut(ctx).jump_column_right();
+            app.context_project_mut(ctx).jump_column_right(&q);
             PostAction::None
         }
 
@@ -123,37 +124,37 @@ fn handle_normal(
             PostAction::None
         }
         Action::ScrollToBottom => {
-            app.context_project_mut(ctx).scroll_to_bottom();
+            app.context_project_mut(ctx).scroll_to_bottom(&q);
             PostAction::None
         }
 
         Action::MoveIssueRight => {
             let p = app.context_project_mut(ctx);
-            p.move_issue_right();
+            p.move_issue_right(&q);
             p.mark_dirty();
             PostAction::None
         }
         Action::MoveIssueLeft => {
             let p = app.context_project_mut(ctx);
-            p.move_issue_left();
+            p.move_issue_left(&q);
             p.mark_dirty();
             PostAction::None
         }
         Action::MoveToDone => {
             let p = app.context_project_mut(ctx);
-            p.move_to_done();
+            p.move_to_done(&q);
             p.mark_dirty();
             PostAction::None
         }
         Action::MoveToTodo => {
             let p = app.context_project_mut(ctx);
-            p.move_to_todo();
+            p.move_to_todo(&q);
             p.mark_dirty();
             PostAction::None
         }
 
         Action::KillSession => {
-            let Some(issue) = app.context_project(ctx).selected_issue() else {
+            let Some(issue) = app.context_project(ctx).selected_issue(&q) else {
                 return PostAction::None;
             };
 
@@ -186,7 +187,7 @@ fn handle_normal(
         }
 
         Action::EditIssue => {
-            let Some(idx) = app.context_project(ctx).selected_issue_index() else {
+            let Some(idx) = app.context_project(ctx).selected_issue_index(&q) else {
                 return PostAction::None;
             };
             let issue = app.context_project(ctx).issues[idx].clone();
@@ -195,10 +196,10 @@ fn handle_normal(
         }
 
         Action::DeleteIssue => {
-            let Some(issue) = app.context_project(ctx).selected_issue() else {
+            let Some(issue) = app.context_project(ctx).selected_issue(&q) else {
                 return PostAction::None;
             };
-            let Some(idx) = app.context_project(ctx).selected_issue_index() else {
+            let Some(idx) = app.context_project(ctx).selected_issue_index(&q) else {
                 return PostAction::None;
             };
 
@@ -301,7 +302,7 @@ fn handle_normal(
         }
 
         Action::OpenSession => {
-            let Some(idx) = app.context_project(ctx).selected_issue_index() else {
+            let Some(idx) = app.context_project(ctx).selected_issue_index(&q) else {
                 return PostAction::None;
             };
             let issue = app.context_project(ctx).issues[idx].clone();
@@ -342,7 +343,7 @@ fn handle_normal(
             if !app.context_project(ctx).tuicr_available {
                 return PostAction::None;
             }
-            let Some(issue) = app.context_project(ctx).selected_issue() else {
+            let Some(issue) = app.context_project(ctx).selected_issue(&q) else {
                 return PostAction::None;
             };
             let Some(wt) = issue.worktree.clone() else {
@@ -395,7 +396,7 @@ fn handle_normal(
         }
 
         Action::OpenPR => {
-            let Some(issue) = app.context_project(ctx).selected_issue() else {
+            let Some(issue) = app.context_project(ctx).selected_issue(&q) else {
                 return PostAction::None;
             };
             let Some(pr) = app.context_project(ctx).pr_for(issue) else {
@@ -411,7 +412,7 @@ fn handle_normal(
         }
 
         Action::OpenLinear => {
-            let Some(issue) = app.context_project(ctx).selected_issue() else {
+            let Some(issue) = app.context_project(ctx).selected_issue(&q) else {
                 return PostAction::None;
             };
             let Some(url) = issue.linear_url.clone() else {
@@ -425,7 +426,7 @@ fn handle_normal(
         }
 
         Action::AssignWorktree => {
-            let Some(idx) = app.context_project(ctx).selected_issue_index() else {
+            let Some(idx) = app.context_project(ctx).selected_issue_index(&q) else {
                 return PostAction::None;
             };
             if let Some(old) = app.context_project_mut(ctx).issues[idx].worktree.take() {
@@ -468,7 +469,7 @@ fn handle_normal(
             if !app.context_project(ctx).config.debug {
                 return PostAction::None;
             }
-            let Some(issue) = app.context_project(ctx).selected_issue().cloned() else {
+            let Some(issue) = app.context_project(ctx).selected_issue(&q).cloned() else {
                 app.set_warning("No issue selected");
                 return PostAction::None;
             };
@@ -695,7 +696,7 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
     let p = app.find_project_mut(&proj_id).unwrap();
     p.issues.push(issue);
     p.selected_column = column_index;
-    let count = p.issues_in_column(column).len();
+    let count = p.issues_in_column(column, "").len();
     if count > 0 {
         p.selected_row[column_index] = count - 1;
     }
@@ -877,7 +878,7 @@ fn import_linear_issue(app: &mut App, ctx: &ActionContext) {
 
     let p = app.find_project_mut(&proj_id).unwrap();
     p.issues.push(issue);
-    let count = p.issues_in_column(Column::Todo).len();
+    let count = p.issues_in_column(Column::Todo, "").len();
     if count > 0 {
         p.selected_column = 0;
         p.selected_row[0] = count - 1;
@@ -934,7 +935,7 @@ fn import_github_pr(app: &mut App, ctx: &ActionContext) {
 
     let p = app.find_project_mut(&proj_id).unwrap();
     p.issues.push(issue);
-    let count = p.issues_in_column(Column::CodeReview).len();
+    let count = p.issues_in_column(Column::CodeReview, "").len();
     if count > 0 {
         p.selected_column = Column::CodeReview.index();
         p.selected_row[Column::CodeReview.index()] = count - 1;
@@ -1116,9 +1117,10 @@ fn handle_confirm(
                                 app.set_message(format!("Deleted {}", id));
                             }
 
+                            let q = app.search_query.clone();
                             let p = app.find_project_mut(&project_id).unwrap();
                             p.issues.remove(issue_index);
-                            p.clamp_all_rows();
+                            p.clamp_all_rows(&q);
                             p.mark_dirty();
                         }
                     }
@@ -1935,7 +1937,7 @@ mod tests {
         act(&mut app, Action::SearchStart);
         act(&mut app, Action::SearchChar('a'));
         act(&mut app, Action::SearchChar('b'));
-        assert_eq!(app.project().search_query, "ab");
+        assert_eq!(app.search_query, "ab");
     }
 
     #[test]
@@ -1945,7 +1947,7 @@ mod tests {
         act(&mut app, Action::SearchChar('a'));
         act(&mut app, Action::SearchChar('b'));
         act(&mut app, Action::SearchBackspace);
-        assert_eq!(app.project().search_query, "a");
+        assert_eq!(app.search_query, "a");
     }
 
     #[test]
@@ -1955,7 +1957,7 @@ mod tests {
         act(&mut app, Action::SearchChar('x'));
         act(&mut app, Action::SearchConfirm);
         assert_eq!(app.input_mode, InputMode::Normal);
-        assert_eq!(app.project().search_query, "x"); // query preserved
+        assert_eq!(app.search_query, "x"); // query preserved
     }
 
     #[test]
@@ -1965,7 +1967,7 @@ mod tests {
         act(&mut app, Action::SearchChar('x'));
         act(&mut app, Action::SearchCancel);
         assert_eq!(app.input_mode, InputMode::Normal);
-        assert_eq!(app.project().search_query, ""); // query cleared
+        assert_eq!(app.search_query, ""); // query cleared
     }
 
     // ================================================================

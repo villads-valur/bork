@@ -21,6 +21,7 @@ pub struct CardContext<'a> {
     pub git_status: Option<&'a WorktreeStatus>,
     pub pr: Option<&'a PrStatus>,
     pub ports: Option<&'a Vec<u16>>,
+    pub search_query: &'a str,
 }
 
 pub fn render_card(frame: &mut Frame, ctx: &CardContext, area: Rect, card_size: CardSize) {
@@ -31,10 +32,15 @@ pub fn render_card(frame: &mut Frame, ctx: &CardContext, area: Rect, card_size: 
     let border_style = styles::card_border_style(ctx.selected);
     let title_style = styles::card_title_style(ctx.selected);
 
+    let id_text = format!(" {} ", ctx.issue.id);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
-        .title(Span::styled(format!(" {} ", ctx.issue.id), title_style));
+        .title(Line::from(highlight_spans(
+            &id_text,
+            ctx.search_query,
+            title_style,
+        )));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -59,7 +65,7 @@ fn render_full(
     title_style: Style,
 ) {
     let title_text = styles::truncate(&ctx.issue.title, max_width);
-    let title_line = Line::from(Span::styled(title_text, title_style));
+    let title_line = Line::from(highlight_spans(&title_text, ctx.search_query, title_style));
     let status_line = format_status_line(ctx);
     let pr_line = format_pr_line(ctx.pr);
     let bottom_line = format_bottom_line(ctx.issue, ctx.branch, ctx.ports, max_width);
@@ -89,7 +95,7 @@ fn render_medium(
     title_style: Style,
 ) {
     let title_text = styles::truncate(&ctx.issue.title, max_width);
-    let title_line = Line::from(Span::styled(title_text, title_style));
+    let title_line = Line::from(highlight_spans(&title_text, ctx.search_query, title_style));
     let status_line = format_status_line(ctx);
     let pr_line = format_pr_compact(ctx.pr);
 
@@ -99,6 +105,34 @@ fn render_medium(
     }
 
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Splits `text` into spans, highlighting the first case-insensitive match of
+/// `query` with the search highlight style. Non-matching portions use `base_style`.
+pub fn highlight_spans(text: &str, query: &str, base_style: Style) -> Vec<Span<'static>> {
+    if query.is_empty() {
+        return vec![Span::styled(text.to_string(), base_style)];
+    }
+
+    let text_lower = text.to_lowercase();
+    let query_lower = query.to_lowercase();
+
+    let Some(start) = text_lower.find(&query_lower) else {
+        return vec![Span::styled(text.to_string(), base_style)];
+    };
+
+    let end = start + query_lower.len();
+    let highlight_style = styles::search_highlight_style();
+
+    let mut spans = Vec::with_capacity(3);
+    if start > 0 {
+        spans.push(Span::styled(text[..start].to_string(), base_style));
+    }
+    spans.push(Span::styled(text[start..end].to_string(), highlight_style));
+    if end < text.len() {
+        spans.push(Span::styled(text[end..].to_string(), base_style));
+    }
+    spans
 }
 
 fn format_status_line(ctx: &CardContext) -> Line<'static> {
@@ -308,5 +342,89 @@ fn format_pr_compact(pr: Option<&PrStatus>) -> Line<'static> {
                 Span::styled(review_sym, Style::default().fg(review_color)),
             ])
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::style::Color;
+
+    #[test]
+    fn highlight_spans_no_query_returns_single_span() {
+        let base = Style::default().fg(Color::White);
+        let spans = highlight_spans("Fix login bug", "", base);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content, "Fix login bug");
+    }
+
+    #[test]
+    fn highlight_spans_no_match_returns_single_span() {
+        let base = Style::default().fg(Color::White);
+        let spans = highlight_spans("Fix login bug", "zzz", base);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content, "Fix login bug");
+    }
+
+    #[test]
+    fn highlight_spans_match_at_start() {
+        let base = Style::default().fg(Color::White);
+        let spans = highlight_spans("Fix login bug", "fix", base);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].content, "Fix");
+        assert_eq!(spans[0].style, styles::search_highlight_style());
+        assert_eq!(spans[1].content, " login bug");
+        assert_eq!(spans[1].style, base);
+    }
+
+    #[test]
+    fn highlight_spans_match_at_end() {
+        let base = Style::default().fg(Color::White);
+        let spans = highlight_spans("Fix login bug", "bug", base);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].content, "Fix login ");
+        assert_eq!(spans[0].style, base);
+        assert_eq!(spans[1].content, "bug");
+        assert_eq!(spans[1].style, styles::search_highlight_style());
+    }
+
+    #[test]
+    fn highlight_spans_match_in_middle() {
+        let base = Style::default().fg(Color::White);
+        let spans = highlight_spans("Fix login bug", "log", base);
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].content, "Fix ");
+        assert_eq!(spans[1].content, "log");
+        assert_eq!(spans[1].style, styles::search_highlight_style());
+        assert_eq!(spans[2].content, "in bug");
+    }
+
+    #[test]
+    fn highlight_spans_case_insensitive() {
+        let base = Style::default().fg(Color::White);
+        let spans = highlight_spans("FIX Login", "fix", base);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].content, "FIX");
+        assert_eq!(spans[0].style, styles::search_highlight_style());
+    }
+
+    #[test]
+    fn highlight_spans_full_match() {
+        let base = Style::default().fg(Color::White);
+        let spans = highlight_spans("Fix", "fix", base);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content, "Fix");
+        assert_eq!(spans[0].style, styles::search_highlight_style());
+    }
+
+    #[test]
+    fn highlight_spans_first_occurrence_only() {
+        let base = Style::default().fg(Color::White);
+        let spans = highlight_spans("Fix the fix", "fix", base);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].content, "Fix");
+        assert_eq!(spans[0].style, styles::search_highlight_style());
+        assert_eq!(spans[1].content, " the fix");
+        assert_eq!(spans[1].style, base);
     }
 }

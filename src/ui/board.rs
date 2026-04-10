@@ -27,6 +27,7 @@ pub fn render_board(
     is_focused_lane: bool,
 ) {
     let swimlane_count = app.visible_swimlane_count();
+    let search_query = &app.search_query;
 
     if swimlane_count > 1 {
         if area.height < MIN_SWIMLANE_HEIGHT {
@@ -60,9 +61,23 @@ pub fn render_board(
         ]);
         frame.render_widget(Paragraph::new(header_line), header_area);
 
-        render_columns(frame, project, board_area, card_size, is_focused_lane);
+        render_columns(
+            frame,
+            project,
+            board_area,
+            card_size,
+            is_focused_lane,
+            search_query,
+        );
     } else {
-        render_columns(frame, project, area, card_size, is_focused_lane);
+        render_columns(
+            frame,
+            project,
+            area,
+            card_size,
+            is_focused_lane,
+            search_query,
+        );
     }
 }
 
@@ -72,6 +87,7 @@ fn render_columns(
     area: Rect,
     card_size: CardSize,
     is_focused_lane: bool,
+    search_query: &str,
 ) {
     let columns = Layout::horizontal([
         Constraint::Percentage(25),
@@ -90,6 +106,7 @@ fn render_columns(
             columns[col_idx],
             is_selected_col,
             card_size,
+            search_query,
         );
     }
 }
@@ -101,8 +118,9 @@ fn render_column(
     area: Rect,
     is_selected_col: bool,
     card_size: CardSize,
+    search_query: &str,
 ) {
-    let issues = project.issues_in_column(column);
+    let issues = project.issues_in_column(column, search_query);
     let count = issues.len();
     let selected_row = project.selected_row[column.index()];
     let card_h = effective_card_height(card_size);
@@ -179,6 +197,7 @@ fn render_column(
             git_status: project.worktree_status_for(issue),
             pr: project.pr_for(issue),
             ports: project.listening_ports_for(issue),
+            search_query,
         };
 
         card::render_card(frame, &ctx, card_area, card_size);
