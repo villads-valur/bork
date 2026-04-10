@@ -145,10 +145,10 @@ fn format_bottom_line(
     max_width: usize,
 ) -> Line<'static> {
     let has_linear = issue.linear_identifier.is_some();
-    let has_branch = branch.is_some();
+    let has_missing_branch = branch.is_none();
     let has_ports = ports.is_some_and(|p| !p.is_empty());
 
-    if !has_linear && !has_branch && !has_ports {
+    if !has_linear && !has_missing_branch && !has_ports {
         return Line::from("");
     }
 
@@ -169,16 +169,16 @@ fn format_bottom_line(
         right_width += 2;
     }
 
-    if has_branch {
+    if has_missing_branch {
         if !right_spans.is_empty() {
             right_spans.insert(0, Span::raw(" "));
             right_width += 1;
         }
         right_spans.insert(
             0,
-            Span::styled("\u{1f33f}", Style::default().fg(Color::Green)),
+            Span::styled("\u{00f8}", Style::default().fg(styles::DIM)),
         );
-        right_width += 2;
+        right_width += 1;
     }
 
     if !right_spans.is_empty() {
