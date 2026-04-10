@@ -20,11 +20,11 @@
 
 ## Overview
 
-Bork is a terminal UI for managing multiple AI coding sessions. It gives you a 4-column kanban board where each issue maps to a git worktree and a tmux session running [OpenCode](https://opencode.ai) or [Claude Code](https://docs.anthropic.com/en/docs/claude-code). Switch between sessions with a keypress, see agent status at a glance, and keep your work organized. Register multiple projects and view them side-by-side in stacked swimlanes.
+Bork is a terminal UI for managing multiple AI coding sessions. It gives you a 4-column kanban board where each issue maps to a git worktree and a tmux session running [OpenCode](https://opencode.ai), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), or [Codex](https://developers.openai.com/codex). Switch between sessions with a keypress, see agent status at a glance, and keep your work organized. Register multiple projects and view them side-by-side in stacked swimlanes.
 
 ## Quickstart
 
-You need [tmux](https://github.com/tmux/tmux), [git](https://git-scm.com/), a [Rust toolchain](https://rustup.rs/), and at least one AI coding agent ([OpenCode](https://opencode.ai) or [Claude Code](https://docs.anthropic.com/en/docs/claude-code)).
+You need [tmux](https://github.com/tmux/tmux), [git](https://git-scm.com/), a [Rust toolchain](https://rustup.rs/), and at least one AI coding agent ([OpenCode](https://opencode.ai), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), or [Codex](https://developers.openai.com/codex)).
 
 **1. Install bork**
 
@@ -58,14 +58,14 @@ Press `n` to create an issue, `Enter` to launch an agent session. You're up and 
 ## Features
 
 - **4-column kanban board** &mdash; To Do, In Progress, Code Review, Done
-- **AI agent sessions** &mdash; Launch OpenCode or Claude Code per issue in tmux popups
+- **AI agent sessions** &mdash; Launch OpenCode, Claude Code, or Codex per issue in tmux popups
 - **Session resumption** &mdash; Closing a tmux popup and reopening it continues the same conversation, not a fresh one
 - **Real-time status monitoring** &mdash; See agent state on each card (Idle, Busy, Waiting, Error)
 - **GitHub PR status** &mdash; Background polling shows checks, review status, and diff stats on cards
 - **Dev server detection** &mdash; Automatically detects listening TCP ports per session and shows a 🔌 indicator on the card
 - **Git worktree tracking** &mdash; Live staged/unstaged change counts and branch names
 - **Tmux integration** &mdash; Auto-wraps in tmux, sessions open as 90% screen popups
-- **Plan, Build, and Yolo modes** &mdash; Toggle between modes per issue; Claude also supports Yolo (skips all permission prompts)
+- **Plan, Build, and Yolo modes** &mdash; Toggle between modes per issue; Claude and Codex support Yolo (skips all permission prompts)
 - **Vim-style navigation** &mdash; h/j/k/l, g/G, and familiar modal keybindings
 - **ANSI 16 colors** &mdash; Adapts to any terminal theme, no hardcoded RGB
 - **Linear integration** &mdash; Import and attach Linear issues, sync state bidirectionally, open in Linear with a keypress
@@ -83,7 +83,7 @@ Press `n` to create an issue, `Enter` to launch an agent session. You're up and 
 | [git](https://git-scm.com/) | Worktree status and branch detection |
 | [gh](https://cli.github.com/) | GitHub PR status polling (optional) |
 | [linear](https://linear.app/docs/cli) | Linear issue import and sync (optional) |
-| [OpenCode](https://opencode.ai) or [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | AI coding agent (at least one) |
+| [OpenCode](https://opencode.ai), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), or [Codex](https://developers.openai.com/codex) | AI coding agent (at least one) |
 | [Rust toolchain](https://rustup.rs/) | Building from source |
 
 ## Installation
@@ -135,6 +135,7 @@ bork init git@github.com:owner/repo.git   # SSH URL
 bork init https://github.com/owner/repo   # HTTPS URL
 bork init owner/repo myproject            # Custom directory name
 bork init owner/repo --agent claude       # Use Claude Code instead of OpenCode
+bork init owner/repo --agent codex        # Use Codex instead of OpenCode
 ```
 
 This creates:
@@ -158,6 +159,7 @@ Bork ships with hooks that report agent status (Idle, Busy, Waiting, Error) back
 
 - **OpenCode**: Installs as a plugin
 - **Claude Code**: Adds hooks to `settings.json`
+- **Codex**: Adds hooks to `~/.codex/hooks.json` and enables `features.codex_hooks = true` in `~/.codex/config.toml`
 
 These are installed automatically by `bork init`. Use `bork install` / `bork uninstall` to manage them manually.
 
@@ -237,7 +239,7 @@ Bork looks for a `.bork/` directory by walking up from the current working direc
 
 ```toml
 project_name = "myproject"       # Issue ID prefix (e.g. myproject-1, myproject-2)
-agent_kind = "opencode"          # Default agent: "opencode" or "claude"
+agent_kind = "opencode"          # Default agent: "opencode", "claude", or "codex"
 default_prompt = "Check AGENTS.md for project context and start working on the issue."
 ```
 

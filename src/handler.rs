@@ -653,6 +653,7 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
         if idx < p.issues.len() {
             p.issues[idx].title = title;
             p.issues[idx].prompt = prompt;
+            p.issues[idx].agent_kind = dialog.agent_kind;
             p.issues[idx].agent_mode = dialog.agent_mode;
             p.issues[idx].kind = dialog.kind;
 
@@ -669,14 +670,12 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
     let id = app.find_project(&proj_id).unwrap().next_issue_id();
     let column = dialog.target_column.unwrap_or(Column::Todo);
     let column_index = column.index();
-    let agent_kind = app.find_project(&proj_id).unwrap().config.agent_kind;
-
     let mut issue = Issue {
         id: id.clone(),
         title,
         kind: dialog.kind,
         column,
-        agent_kind,
+        agent_kind: dialog.agent_kind,
         agent_mode: dialog.agent_mode,
         prompt,
         worktree: None,
@@ -1215,15 +1214,15 @@ mod tests {
         let ctx = app.action_context();
         app.open_dialog(&ctx);
 
-        // Type a title (starts on Title field = 2 for Agentic, no linear)
+        // Type a title (starts on Title field = 3 for Agentic with agents, no linear)
         handle_action(&mut app, Action::DialogChar('H'), &ctx, &test_channels());
         handle_action(&mut app, Action::DialogChar('i'), &ctx, &test_channels());
 
-        // Move from title (field 2) to prompt (field 3)
+        // Move from title (field 3) to prompt (field 4)
         handle_action(&mut app, Action::DialogNextField, &ctx, &test_channels());
 
         let dialog = app.dialog.as_ref().unwrap();
-        assert_eq!(dialog.focused_field, 3);
+        assert_eq!(dialog.focused_field, 4);
         assert_eq!(
             dialog.prompt_text(),
             "",
@@ -1254,13 +1253,13 @@ mod tests {
         let ctx = app.action_context();
         app.open_dialog(&ctx);
 
-        // Agentic, no linear: Kind(0), Mode(1), Title(2), Prompt(3)
-        // Starts on Title (field 2)
-        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 2);
-
-        // Tab: Title(2) -> Prompt(3)
-        handle_action(&mut app, Action::DialogNextField, &ctx, &test_channels());
+        // Agentic with agents, no linear: Kind(0), Agent(1), Mode(2), Title(3), Prompt(4)
+        // Starts on Title (field 3)
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 3);
+
+        // Tab: Title(3) -> Prompt(4)
+        handle_action(&mut app, Action::DialogNextField, &ctx, &test_channels());
+        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 4);
 
         // Tab on last field (Prompt) wraps to Kind(0)
         handle_action(&mut app, Action::DialogNextField, &ctx, &test_channels());
@@ -1273,13 +1272,13 @@ mod tests {
         let ctx = app.action_context();
         app.open_dialog(&ctx);
 
-        // Starts on Title (field 2). Advance to Prompt (field 3)
+        // Starts on Title (field 3). Advance to Prompt (field 4)
         handle_action(&mut app, Action::DialogNextField, &ctx, &test_channels());
-        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 3);
+        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 4);
 
-        // Go back to Title (field 2)
+        // Go back to Title (field 3)
         handle_action(&mut app, Action::DialogPrevField, &ctx, &test_channels());
-        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 2);
+        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 3);
     }
 
     #[test]
@@ -1288,16 +1287,17 @@ mod tests {
         let ctx = app.action_context();
         app.open_dialog(&ctx);
 
-        // Agentic, no linear: Kind(0), Mode(1), Title(2), Prompt(3)
-        // Starts on Title (field 2). Two Shift+Tabs -> Kind(0)
+        // Agentic with agents, no linear: Kind(0), Agent(1), Mode(2), Title(3), Prompt(4)
+        // Starts on Title (field 3). Three Shift+Tabs -> Kind(0)
+        handle_action(&mut app, Action::DialogPrevField, &ctx, &test_channels());
         handle_action(&mut app, Action::DialogPrevField, &ctx, &test_channels());
 
         handle_action(&mut app, Action::DialogPrevField, &ctx, &test_channels());
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 0);
 
-        // One more Shift+Tab wraps to last field (Prompt = 3)
+        // One more Shift+Tab wraps to last field (Prompt = 4)
         handle_action(&mut app, Action::DialogPrevField, &ctx, &test_channels());
-        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 3);
+        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 4);
     }
 
     #[test]
@@ -1586,14 +1586,14 @@ mod tests {
         let issue = app.project().issues[0].clone();
         app.open_edit_dialog(&issue, 0, &ctx);
 
-        // Agentic + linear: Kind(0), Mode(1), Linear(2), Title(3), Prompt(4)
-        // Should start on Title (field 3)
-        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 3);
-        assert_eq!(app.dialog.as_ref().unwrap().active_field_count(), 5);
-
-        // Tab: Title(3) -> Prompt(4)
-        handle_action(&mut app, Action::DialogNextField, &ctx, &test_channels());
+        // Agentic + agents + linear: Kind(0), Agent(1), Mode(2), Linear(3), Title(4), Prompt(5)
+        // Should start on Title (field 4)
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 4);
+        assert_eq!(app.dialog.as_ref().unwrap().active_field_count(), 6);
+
+        // Tab: Title(4) -> Prompt(5)
+        handle_action(&mut app, Action::DialogNextField, &ctx, &test_channels());
+        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 5);
 
         // Tab on Prompt (last field) wraps to Kind(0)
         handle_action(&mut app, Action::DialogNextField, &ctx, &test_channels());
@@ -1630,10 +1630,10 @@ mod tests {
         let issue = app.project().issues[0].clone();
         app.open_edit_dialog(&issue, 0, &ctx);
 
-        // Agentic + linear: Kind(0), Mode(1), Linear(2), Title(3), Prompt(4)
-        // Starts on Title(3). Tab to Prompt(4), then tab wraps.
+        // Agentic + agents + linear: Kind(0), Agent(1), Mode(2), Linear(3), Title(4), Prompt(5)
+        // Starts on Title(4). Tab to Prompt(5), then tab wraps.
         handle_action(&mut app, Action::DialogNextField, &ctx, &test_channels());
-        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 4);
+        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 5);
 
         // Tab on Prompt (last field) wraps to Kind(0)
         handle_action(&mut app, Action::DialogNextField, &ctx, &test_channels());
@@ -1668,8 +1668,8 @@ mod tests {
         let issue = app.project().issues[0].clone();
         app.open_edit_dialog(&issue, 0, &ctx);
 
-        // Starts on Title(3). Shift+Enter should submit from any field.
-        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 3);
+        // Starts on Title(4). Shift+Enter should submit from any field.
+        assert_eq!(app.dialog.as_ref().unwrap().focused_field, 4);
 
         handle_action(&mut app, Action::DialogSubmit, &ctx, &test_channels());
         assert_eq!(app.input_mode, crate::app::InputMode::Normal);

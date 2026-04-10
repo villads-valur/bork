@@ -164,6 +164,7 @@ pub(crate) fn toml_parse(contents: &str) -> Result<AppConfig, String> {
                 "agent_kind" => {
                     agent_kind = Some(match value {
                         "claude" => AgentKind::Claude,
+                        "codex" => AgentKind::Codex,
                         _ => AgentKind::OpenCode,
                     });
                 }
@@ -226,6 +227,17 @@ default_prompt = "Do the thing"
         assert_eq!(config.project_name, "bork");
         assert_eq!(config.agent_kind, AgentKind::Claude);
         assert_eq!(config.default_prompt, Some("Do the thing".to_string()));
+    }
+
+    #[test]
+    fn toml_parse_codex_agent_kind() {
+        let contents = r#"
+project_name = "bork"
+agent_kind = "codex"
+"#;
+        let config = toml_parse(contents).unwrap();
+        assert_eq!(config.project_name, "bork");
+        assert_eq!(config.agent_kind, AgentKind::Codex);
     }
 
     #[test]

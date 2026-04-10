@@ -1,5 +1,8 @@
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::config::{self, AppConfig};
 use crate::error::AppError;
@@ -8,7 +11,7 @@ use crate::types::{AgentKind, AgentMode, Issue};
 
 /// Launch an agent session for an issue.
 /// Creates a tmux session with two windows:
-///   1. The agent (opencode/claude) launched at the project root with issue context
+///   1. The agent (opencode/claude/codex) launched at the project root with issue context
 ///   2. A bare terminal
 ///
 /// Exports BORK_SESSION and BORK_STATUS_DIR so hooks/plugins can write status files.
@@ -16,6 +19,7 @@ use crate::types::{AgentKind, AgentMode, Issue};
 /// The agent_session_id is the agent's internal session ID for resuming conversations:
 ///   - Claude: UUID pre-assigned via --session-id
 ///   - OpenCode: ses_xxx detected by polling `opencode session list` after launch
+///   - Codex: UUID detected from newest ~/.codex/sessions rollout transcript
 pub fn launch_session(
     issue: &Issue,
     config: &AppConfig,
@@ -40,10 +44,14 @@ pub fn launch_session(
     // Second window: bare terminal for ad-hoc commands
     tmux::create_window(&session_name, "terminal", cwd)?;
 
-    // For OpenCode, detect the session ID by polling `opencode session list`
+    // For OpenCode/Codex, detect session IDs after launch
     let agent_session_id = match pre_assigned_session_id {
         Some(id) => Some(id),
-        None => detect_opencode_session_id(),
+        None => match issue.agent_kind {
+            AgentKind::OpenCode => detect_opencode_session_id(),
+            AgentKind::Claude => None,
+            AgentKind::Codex => detect_codex_session_id(),
+        },
     };
 
     Ok((session_name, agent_session_id))
@@ -153,6 +161,37 @@ fn build_agent_cmd(
                 }
             }
         }
+        AgentKind::Codex => {
+            let mode_flag = match issue.agent_mode {
+                AgentMode::Plan => " --sandbox read-only --ask-for-approval untrusted",
+                AgentMode::Build => " --full-auto",
+                AgentMode::Yolo => " --dangerously-bypass-approvals-and-sandbox",
+            };
+
+            if let Some(ref sid) = issue.session_id {
+                let escaped_sid = shell_escape_single_quotes(sid);
+                let cmd = format!(
+                    "{} && codex resume '{}'{}",
+                    env_prefix, escaped_sid, mode_flag
+                );
+                (cmd, Some(sid.clone()))
+            } else {
+                let default_prompt = config
+                    .default_prompt
+                    .as_deref()
+                    .unwrap_or(config::DEFAULT_PROMPT_FALLBACK);
+                let prompt = build_prompt(
+                    &issue.id,
+                    &issue.title,
+                    default_prompt,
+                    issue.prompt.as_deref(),
+                    issue.linear_url.as_deref(),
+                );
+                let escaped_prompt = shell_escape_single_quotes(&prompt);
+                let cmd = format!("{} && codex{} '{}'", env_prefix, mode_flag, escaped_prompt);
+                (cmd, None)
+            }
+        }
     }
 }
 
@@ -179,6 +218,94 @@ fn detect_opencode_session_id() -> Option<String> {
         std::thread::sleep(Duration::from_millis(500));
     }
     None
+}
+
+/// Detect a newly created Codex session UUID by scanning ~/.codex/sessions.
+/// Snapshots existing sessions before waiting, then polls for a new one.
+fn detect_codex_session_id() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let sessions_root = PathBuf::from(home).join(".codex").join("sessions");
+
+    let before = collect_codex_session_ids(&sessions_root);
+
+    std::thread::sleep(Duration::from_millis(800));
+
+    for _ in 0..9 {
+        let after = collect_codex_session_ids(&sessions_root);
+        for (id, _) in &after {
+            if !before.contains_key(id) {
+                return Some(id.clone());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    // Fallback: return the newest session if no new one appeared
+    newest_codex_session_id(&sessions_root)
+}
+
+/// Collect all Codex session IDs and their modification times.
+fn collect_codex_session_ids(sessions_root: &Path) -> HashMap<String, SystemTime> {
+    let mut sessions = HashMap::new();
+    let mut stack = vec![sessions_root.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(session_id) = parse_codex_session_id_from_filename(file_name) else {
+                continue;
+            };
+            let modified = fs::metadata(&path)
+                .and_then(|meta| meta.modified())
+                .unwrap_or(UNIX_EPOCH);
+            sessions.insert(session_id, modified);
+        }
+    }
+
+    sessions
+}
+
+fn newest_codex_session_id(sessions_root: &Path) -> Option<String> {
+    collect_codex_session_ids(sessions_root)
+        .into_iter()
+        .max_by_key(|(_, modified)| *modified)
+        .map(|(id, _)| id)
+}
+
+fn parse_codex_session_id_from_filename(file_name: &str) -> Option<String> {
+    let stem = file_name.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
+    if stem.len() < 36 {
+        return None;
+    }
+    let candidate = &stem[stem.len() - 36..];
+    if is_uuid_like(candidate) {
+        Some(candidate.to_string())
+    } else {
+        None
+    }
+}
+
+fn is_uuid_like(value: &str) -> bool {
+    if value.len() != 36 {
+        return false;
+    }
+    value.chars().enumerate().all(|(i, ch)| {
+        if matches!(i, 8 | 13 | 18 | 23) {
+            ch == '-'
+        } else {
+            ch.is_ascii_hexdigit()
+        }
+    })
 }
 
 /// Run `opencode session list` and return the first (newest) session ID found.
@@ -511,6 +638,48 @@ mod tests {
     }
 
     #[test]
+    fn codex_fresh_plan() {
+        let issue = test_issue(AgentKind::Codex, AgentMode::Plan);
+        let config = test_config();
+        let (cmd, sid) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(cmd.contains("codex --sandbox read-only --ask-for-approval untrusted"));
+        assert!(cmd.contains("You are working on bork-1: Fix bug"));
+        assert!(sid.is_none());
+    }
+
+    #[test]
+    fn codex_fresh_build_uses_full_auto() {
+        let issue = test_issue(AgentKind::Codex, AgentMode::Build);
+        let config = test_config();
+        let (cmd, _) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(cmd.contains("codex --full-auto"));
+        assert!(!cmd.contains("--dangerously-bypass-approvals-and-sandbox"));
+    }
+
+    #[test]
+    fn codex_fresh_yolo() {
+        let issue = test_issue(AgentKind::Codex, AgentMode::Yolo);
+        let config = test_config();
+        let (cmd, _) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(cmd.contains("codex --dangerously-bypass-approvals-and-sandbox"));
+        assert!(!cmd.contains("--full-auto"));
+    }
+
+    #[test]
+    fn codex_resume_uses_session_id() {
+        let mut issue = test_issue(AgentKind::Codex, AgentMode::Build);
+        issue.session_id = Some("019d76ad-9734-77c0-8169-a727a5524013".to_string());
+        let config = test_config();
+        let (cmd, sid) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(cmd.contains("codex resume '019d76ad-9734-77c0-8169-a727a5524013' --full-auto"));
+        assert!(!cmd.contains("--prompt"));
+        assert_eq!(
+            sid,
+            Some("019d76ad-9734-77c0-8169-a727a5524013".to_string())
+        );
+    }
+
+    #[test]
     fn cmd_env_prefix() {
         let issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
         let config = test_config();
@@ -556,5 +725,27 @@ mod tests {
     fn parse_newest_session_id_ignores_non_ses_lines() {
         let output = "No sessions found\n";
         assert_eq!(parse_newest_session_id(output), None);
+    }
+
+    #[test]
+    fn parse_codex_session_id_from_filename_extracts_uuid() {
+        let file_name = "rollout-2026-04-10T11-16-21-019d76ad-9734-77c0-8169-a727a5524013.jsonl";
+        assert_eq!(
+            parse_codex_session_id_from_filename(file_name),
+            Some("019d76ad-9734-77c0-8169-a727a5524013".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_codex_session_id_from_filename_rejects_invalid() {
+        let file_name = "rollout-2026-04-10T11-16-21-not-a-uuid.jsonl";
+        assert_eq!(parse_codex_session_id_from_filename(file_name), None);
+    }
+
+    #[test]
+    fn is_uuid_like_validates_expected_shape() {
+        assert!(is_uuid_like("019d76ad-9734-77c0-8169-a727a5524013"));
+        assert!(!is_uuid_like("019d76ad973477c08169a727a5524013"));
+        assert!(!is_uuid_like("not-a-uuid"));
     }
 }

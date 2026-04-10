@@ -66,6 +66,28 @@ impl fmt::Display for Column {
 pub enum AgentKind {
     OpenCode,
     Claude,
+    Codex,
+}
+
+impl AgentKind {
+    pub const ALL: [AgentKind; 3] = [AgentKind::OpenCode, AgentKind::Claude, AgentKind::Codex];
+
+    pub fn command(self) -> &'static str {
+        match self {
+            AgentKind::OpenCode => "opencode",
+            AgentKind::Claude => "claude",
+            AgentKind::Codex => "codex",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "opencode" | "open_code" | "open-code" => Some(AgentKind::OpenCode),
+            "claude" => Some(AgentKind::Claude),
+            "codex" => Some(AgentKind::Codex),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for AgentKind {
@@ -73,6 +95,7 @@ impl fmt::Display for AgentKind {
         match self {
             AgentKind::OpenCode => write!(f, "opencode"),
             AgentKind::Claude => write!(f, "claude"),
+            AgentKind::Codex => write!(f, "codex"),
         }
     }
 }
@@ -81,7 +104,7 @@ impl fmt::Display for AgentKind {
 pub enum AgentMode {
     Plan,
     Build,
-    /// Claude-only: launches with --dangerously-skip-permissions
+    /// Claude/Codex-only: launches with dangerous no-prompt mode
     Yolo,
 }
 
@@ -94,8 +117,8 @@ impl AgentMode {
         }
     }
 
-    /// Cycles Plan → Build → Yolo → Plan (for Claude).
-    pub fn next_for_claude(self) -> Self {
+    /// Cycles Plan → Build → Yolo → Plan (for Claude and Codex).
+    pub fn next_for_yolo_agents(self) -> Self {
         match self {
             AgentMode::Plan => AgentMode::Build,
             AgentMode::Build => AgentMode::Yolo,
@@ -506,10 +529,10 @@ mod tests {
     }
 
     #[test]
-    fn agent_mode_next_for_claude_full_cycle() {
-        assert_eq!(AgentMode::Plan.next_for_claude(), AgentMode::Build);
-        assert_eq!(AgentMode::Build.next_for_claude(), AgentMode::Yolo);
-        assert_eq!(AgentMode::Yolo.next_for_claude(), AgentMode::Plan);
+    fn agent_mode_next_for_yolo_agents_full_cycle() {
+        assert_eq!(AgentMode::Plan.next_for_yolo_agents(), AgentMode::Build);
+        assert_eq!(AgentMode::Build.next_for_yolo_agents(), AgentMode::Yolo);
+        assert_eq!(AgentMode::Yolo.next_for_yolo_agents(), AgentMode::Plan);
     }
 
     #[test]
