@@ -60,6 +60,7 @@ impl LiveState {
 pub struct Project {
     pub issues: Vec<Issue>,
     pub config: AppConfig,
+    pub available_agents: Vec<AgentKind>,
     pub selected_column: usize,
     pub selected_row: [usize; 4],
     pub search_query: String,
@@ -85,6 +86,7 @@ impl Project {
         Project {
             issues,
             config,
+            available_agents: AgentKind::ALL.to_vec(),
             selected_column: 0,
             selected_row: [0; 4],
             search_query: String::new(),
@@ -100,6 +102,38 @@ impl Project {
     pub fn id(&self) -> ProjectId {
         std::fs::canonicalize(&self.config.project_root)
             .unwrap_or_else(|_| self.config.project_root.clone())
+    }
+
+    pub fn set_available_agents(
+        &mut self,
+        available_agents: Vec<AgentKind>,
+        default_agent: Option<AgentKind>,
+    ) {
+        self.available_agents = available_agents;
+        let Some(default_agent) = default_agent else {
+            return;
+        };
+        let Some(index) = self
+            .available_agents
+            .iter()
+            .position(|kind| *kind == default_agent)
+        else {
+            return;
+        };
+        if index > 0 {
+            let kind = self.available_agents.remove(index);
+            self.available_agents.insert(0, kind);
+        }
+    }
+
+    pub fn dialog_default_agent(&self) -> AgentKind {
+        if self.available_agents.contains(&self.config.agent_kind) {
+            return self.config.agent_kind;
+        }
+        self.available_agents
+            .first()
+            .copied()
+            .unwrap_or(self.config.agent_kind)
     }
 
     pub fn mark_dirty(&mut self) {
@@ -843,6 +877,7 @@ pub enum ImportSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DialogField {
     Kind,
+    Agent,
     Mode,
     Linear,
     GithubPr,
@@ -855,6 +890,7 @@ pub struct DialogState {
     pub title: String,
     pub title_cursor: usize,
     pub prompt: TextArea<'static>,
+    pub available_agents: Vec<AgentKind>,
     pub agent_mode: AgentMode,
     pub agent_kind: AgentKind,
     pub focused_field: usize,
@@ -882,16 +918,24 @@ fn make_prompt_textarea(text: &str) -> TextArea<'static> {
 }
 
 impl DialogState {
-    pub fn new(agent_kind: AgentKind, linear_available: bool, github_available: bool) -> Self {
+    pub fn new(
+        agent_kind: AgentKind,
+        available_agents: Vec<AgentKind>,
+        linear_available: bool,
+        github_available: bool,
+    ) -> Self {
         let kind = IssueKind::Agentic;
-        let title_idx = Self::compute_title_index(kind, linear_available, github_available);
+        let resolved_agent = Self::resolve_agent_kind(agent_kind, &available_agents);
+        let title_idx =
+            Self::compute_title_index(kind, &available_agents, linear_available, github_available);
         DialogState {
             kind,
             title: String::new(),
             title_cursor: 0,
             prompt: make_prompt_textarea(""),
+            available_agents,
             agent_mode: AgentMode::Plan,
-            agent_kind,
+            agent_kind: resolved_agent,
             focused_field: title_idx,
             editing_index: None,
             target_column: None,
@@ -907,6 +951,7 @@ impl DialogState {
     pub fn from_issue(
         issue: &Issue,
         index: usize,
+        available_agents: Vec<AgentKind>,
         linear_available: bool,
         github_available: bool,
         all_prs: &HashMap<String, PrStatus>,
@@ -936,14 +981,21 @@ impl DialogState {
         prompt.move_cursor(CursorMove::Bottom);
         prompt.move_cursor(CursorMove::End);
 
-        let title_idx = Self::compute_title_index(issue.kind, linear_available, github_available);
+        let resolved_agent = Self::resolve_agent_kind(issue.agent_kind, &available_agents);
+        let title_idx = Self::compute_title_index(
+            issue.kind,
+            &available_agents,
+            linear_available,
+            github_available,
+        );
         DialogState {
             kind: issue.kind,
             title: issue.title.clone(),
             title_cursor: issue.title.chars().count(),
             prompt,
-            agent_mode: issue.agent_mode,
-            agent_kind: issue.agent_kind,
+            available_agents,
+            agent_mode: Self::normalize_mode_for_agent(issue.agent_mode, resolved_agent),
+            agent_kind: resolved_agent,
             focused_field: title_idx,
             editing_index: Some(index),
             target_column: None,
@@ -954,6 +1006,53 @@ impl DialogState {
             github_pr_cleared: false,
             github_available,
         }
+    }
+
+    fn resolve_agent_kind(preferred: AgentKind, available_agents: &[AgentKind]) -> AgentKind {
+        if available_agents.contains(&preferred) {
+            return preferred;
+        }
+        available_agents.first().copied().unwrap_or(preferred)
+    }
+
+    fn normalize_mode_for_agent(mode: AgentMode, agent_kind: AgentKind) -> AgentMode {
+        if agent_kind == AgentKind::OpenCode && mode == AgentMode::Yolo {
+            AgentMode::Build
+        } else {
+            mode
+        }
+    }
+
+    fn cycle_agent_next(&mut self) {
+        if self.available_agents.is_empty() {
+            return;
+        }
+        let idx = self
+            .available_agents
+            .iter()
+            .position(|kind| *kind == self.agent_kind)
+            .unwrap_or(0);
+        let next = (idx + 1) % self.available_agents.len();
+        self.agent_kind = self.available_agents[next];
+        self.agent_mode = Self::normalize_mode_for_agent(self.agent_mode, self.agent_kind);
+    }
+
+    fn cycle_agent_prev(&mut self) {
+        if self.available_agents.is_empty() {
+            return;
+        }
+        let idx = self
+            .available_agents
+            .iter()
+            .position(|kind| *kind == self.agent_kind)
+            .unwrap_or(0);
+        let prev = if idx == 0 {
+            self.available_agents.len() - 1
+        } else {
+            idx - 1
+        };
+        self.agent_kind = self.available_agents[prev];
+        self.agent_mode = Self::normalize_mode_for_agent(self.agent_mode, self.agent_kind);
     }
 
     pub fn prompt_text(&self) -> String {
@@ -974,7 +1073,10 @@ impl DialogState {
     fn ordered_fields(&self) -> Vec<DialogField> {
         let mut fields = vec![DialogField::Kind];
         if self.kind == IssueKind::Agentic {
-            fields.push(DialogField::Mode);
+            fields.push(DialogField::Agent);
+            if !self.available_agents.is_empty() {
+                fields.push(DialogField::Mode);
+            }
         }
         if self.linear_available {
             fields.push(DialogField::Linear);
@@ -993,12 +1095,16 @@ impl DialogState {
 
     fn compute_title_index(
         kind: IssueKind,
+        available_agents: &[AgentKind],
         linear_available: bool,
         github_available: bool,
     ) -> usize {
         let mut idx = 1; // after kind
         if kind == IssueKind::Agentic {
             idx += 1;
+            if !available_agents.is_empty() {
+                idx += 1;
+            }
         }
         if linear_available {
             idx += 1;
@@ -1050,12 +1156,28 @@ impl DialogState {
                     'l' => self.kind = IssueKind::NonAgentic,
                     _ => {}
                 }
+                if self.kind == IssueKind::Agentic {
+                    self.agent_kind =
+                        Self::resolve_agent_kind(self.agent_kind, &self.available_agents);
+                    self.agent_mode =
+                        Self::normalize_mode_for_agent(self.agent_mode, self.agent_kind);
+                }
                 self.clamp_focused_field();
             }
+            DialogField::Agent => match c {
+                ' ' | 'l' => self.cycle_agent_next(),
+                'h' => self.cycle_agent_prev(),
+                _ => {}
+            },
             DialogField::Mode => {
+                if self.available_agents.is_empty() {
+                    return;
+                }
                 if c == ' ' || c == 'h' || c == 'l' {
                     self.agent_mode = match self.agent_kind {
-                        AgentKind::Claude => self.agent_mode.next_for_claude(),
+                        AgentKind::Claude | AgentKind::Codex => {
+                            self.agent_mode.next_for_yolo_agents()
+                        }
                         AgentKind::OpenCode => self.agent_mode.toggle(),
                     };
                 }
@@ -1287,6 +1409,16 @@ impl App {
         self.projects.push(Project::new(config, state));
     }
 
+    pub fn set_available_agents(
+        &mut self,
+        available_agents: Vec<AgentKind>,
+        default_agent: Option<AgentKind>,
+    ) {
+        for project in &mut self.projects {
+            project.set_available_agents(available_agents.clone(), default_agent);
+        }
+    }
+
     pub fn enable_sidebar(&mut self) {
         if self.projects.len() > 1 {
             self.sidebar = Some(SidebarState {
@@ -1458,7 +1590,12 @@ impl App {
     pub fn open_dialog_in_column(&mut self, column: Column, ctx: &ActionContext) {
         let p = self.context_project(ctx);
         let github_available = p.has_github_prs();
-        let mut state = DialogState::new(p.config.agent_kind, p.linear_available, github_available);
+        let mut state = DialogState::new(
+            p.dialog_default_agent(),
+            p.available_agents.clone(),
+            p.linear_available,
+            github_available,
+        );
         state.target_column = Some(column);
         self.dialog = Some(state);
         self.input_mode = InputMode::Dialog;
@@ -1471,6 +1608,7 @@ impl App {
         self.dialog = Some(DialogState::from_issue(
             issue,
             index,
+            p.available_agents.clone(),
             p.linear_available,
             github_available,
             &live.pr_statuses,
@@ -2427,18 +2565,37 @@ mod tests {
     // ================================================================
 
     fn claude_dialog() -> DialogState {
-        DialogState::new(crate::types::AgentKind::Claude, false, false)
+        DialogState::new(
+            crate::types::AgentKind::Claude,
+            crate::types::AgentKind::ALL.to_vec(),
+            false,
+            false,
+        )
     }
 
     fn opencode_dialog() -> DialogState {
-        DialogState::new(crate::types::AgentKind::OpenCode, false, false)
+        DialogState::new(
+            crate::types::AgentKind::OpenCode,
+            crate::types::AgentKind::ALL.to_vec(),
+            false,
+            false,
+        )
+    }
+
+    fn codex_dialog() -> DialogState {
+        DialogState::new(
+            crate::types::AgentKind::Codex,
+            crate::types::AgentKind::ALL.to_vec(),
+            false,
+            false,
+        )
     }
 
     #[test]
     fn dialog_claude_mode_cycles_plan_build_yolo() {
         let mut d = claude_dialog();
         assert_eq!(d.agent_mode, crate::types::AgentMode::Plan);
-        d.focused_field = 1; // Mode field (Agentic, no linear)
+        d.focused_field = 2; // Mode field (Kind, Agent, Mode)
         d.push_char(' ');
         assert_eq!(d.agent_mode, crate::types::AgentMode::Build);
         d.push_char(' ');
@@ -2450,7 +2607,7 @@ mod tests {
     #[test]
     fn dialog_opencode_mode_cycles_plan_build_only() {
         let mut d = opencode_dialog();
-        d.focused_field = 1; // Mode field (Agentic, no linear)
+        d.focused_field = 2; // Mode field (Kind, Agent, Mode)
         d.push_char(' ');
         assert_eq!(d.agent_mode, crate::types::AgentMode::Build);
         d.push_char(' ');
@@ -2460,9 +2617,21 @@ mod tests {
     }
 
     #[test]
+    fn dialog_codex_mode_cycles_plan_build_yolo() {
+        let mut d = codex_dialog();
+        d.focused_field = 2; // Mode field (Kind, Agent, Mode)
+        d.push_char(' ');
+        assert_eq!(d.agent_mode, crate::types::AgentMode::Build);
+        d.push_char(' ');
+        assert_eq!(d.agent_mode, crate::types::AgentMode::Yolo);
+        d.push_char(' ');
+        assert_eq!(d.agent_mode, crate::types::AgentMode::Plan);
+    }
+
+    #[test]
     fn dialog_mode_toggle_with_h_and_l_keys() {
         let mut d = claude_dialog();
-        d.focused_field = 1; // Mode field (Agentic, no linear)
+        d.focused_field = 2; // Mode field (Kind, Agent, Mode)
         d.push_char('l');
         assert_eq!(d.agent_mode, crate::types::AgentMode::Build);
         d.push_char('h');
@@ -2472,7 +2641,12 @@ mod tests {
     #[test]
     fn dialog_new_uses_config_agent_kind() {
         let config = test_config();
-        let d = DialogState::new(config.agent_kind, false, false);
+        let d = DialogState::new(
+            config.agent_kind,
+            crate::types::AgentKind::ALL.to_vec(),
+            false,
+            false,
+        );
         assert_eq!(d.agent_kind, crate::types::AgentKind::OpenCode);
     }
 
@@ -2484,6 +2658,7 @@ mod tests {
         let d = DialogState::from_issue(
             &issue,
             0,
+            crate::types::AgentKind::ALL.to_vec(),
             false,
             false,
             &std::collections::HashMap::new(),
@@ -2495,17 +2670,27 @@ mod tests {
 
     #[test]
     fn dialog_new_defaults_to_agentic_with_title_focused() {
-        let d = DialogState::new(crate::types::AgentKind::OpenCode, false, false);
+        let d = DialogState::new(
+            crate::types::AgentKind::OpenCode,
+            crate::types::AgentKind::ALL.to_vec(),
+            false,
+            false,
+        );
         assert_eq!(d.kind, IssueKind::Agentic);
-        // Agentic, no linear: Kind(0), Mode(1), Title(2)
-        assert_eq!(d.focused_field, 2);
+        // Agentic, no linear: Kind(0), Agent(1), Mode(2), Title(3)
+        assert_eq!(d.focused_field, 3);
     }
 
     #[test]
     fn dialog_prompt_supports_normal_edit_commands() {
-        let mut d = DialogState::new(crate::types::AgentKind::OpenCode, false, false);
-        // Agentic, no linear: Kind(0), Mode(1), Title(2), Prompt(3)
-        d.focused_field = 3;
+        let mut d = DialogState::new(
+            crate::types::AgentKind::OpenCode,
+            crate::types::AgentKind::ALL.to_vec(),
+            false,
+            false,
+        );
+        // Agentic, no linear: Kind(0), Agent(1), Mode(2), Title(3), Prompt(4)
+        d.focused_field = 4;
 
         for c in "todo note".chars() {
             d.push_char(c);

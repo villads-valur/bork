@@ -1,3 +1,4 @@
+mod agent_config;
 mod app;
 mod config;
 mod error;
@@ -231,7 +232,7 @@ enum Command {
         agent: AgentKindArg,
     },
 
-    /// Install agent status hooks (OpenCode plugin + Claude Code hooks)
+    /// Install agent status hooks (OpenCode plugin + Claude Code/Codex hooks)
     Install,
 
     /// Remove agent status hooks
@@ -279,6 +280,7 @@ enum ProjectCommand {
 enum AgentKindArg {
     Opencode,
     Claude,
+    Codex,
 }
 
 impl From<AgentKindArg> for AgentKind {
@@ -286,6 +288,7 @@ impl From<AgentKindArg> for AgentKind {
         match arg {
             AgentKindArg::Opencode => AgentKind::OpenCode,
             AgentKindArg::Claude => AgentKind::Claude,
+            AgentKindArg::Codex => AgentKind::Codex,
         }
     }
 }
