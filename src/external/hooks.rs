@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const OPENCODE_PLUGIN: &str = include_str!("../../plugins/bork-status.ts");
 
@@ -77,10 +77,8 @@ const CLAUDE_HOOKS: &str = r#"{
   ]
 }"#;
 
-// Codex hooks support fewer lifecycle events than Claude Code. There is no
-// PermissionRequest or Notification event, so WaitingPermission/WaitingInput
-// statuses are not available for Codex sessions. SessionStart sets Idle on
-// launch so the card shows a status immediately.
+// Codex hooks have fewer lifecycle events than Claude (no PermissionRequest or
+// Notification), so WaitingPermission/WaitingInput statuses are unavailable.
 const CODEX_HOOKS: &str = r#"{
   "hooks": {
     "SessionStart": [
@@ -186,142 +184,6 @@ fn claude_settings_path() -> PathBuf {
     PathBuf::from(home).join(".claude").join("settings.json")
 }
 
-fn claude_hooks_already_installed(path: &PathBuf) -> bool {
-    let Ok(contents) = fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(settings) = serde_json::from_str::<serde_json::Value>(&contents) else {
-        return false;
-    };
-    let Some(hooks) = settings.get("hooks").and_then(|v| v.as_object()) else {
-        return false;
-    };
-    let Ok(bork_hooks) = serde_json::from_str::<serde_json::Value>(CLAUDE_HOOKS) else {
-        return false;
-    };
-    let Some(bork_hooks_obj) = bork_hooks.as_object() else {
-        return false;
-    };
-
-    for (event_name, bork_entries) in bork_hooks_obj {
-        let Some(existing) = hooks.get(event_name).and_then(|v| v.as_array()) else {
-            return false;
-        };
-        let Some(expected) = bork_entries.as_array() else {
-            return false;
-        };
-        // Check that every expected bork hook entry exists in the current hooks
-        for entry in expected {
-            if !existing.contains(entry) {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-fn install_claude_hooks() -> anyhow::Result<()> {
-    let path = claude_settings_path();
-
-    if path.exists() && claude_hooks_already_installed(&path) {
-        println!("  Claude Code hooks already installed (skipped)");
-        return Ok(());
-    }
-
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let mut settings: serde_json::Value = if path.exists() {
-        let contents = fs::read_to_string(&path)?;
-        serde_json::from_str(&contents).unwrap_or_else(|_| serde_json::json!({}))
-    } else {
-        serde_json::json!({})
-    };
-
-    let hooks_obj = settings
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("settings.json is not an object"))?;
-
-    if !hooks_obj.contains_key("hooks") {
-        hooks_obj.insert("hooks".to_string(), serde_json::json!({}));
-    }
-
-    let existing_hooks = hooks_obj
-        .get_mut("hooks")
-        .and_then(|v| v.as_object_mut())
-        .ok_or_else(|| anyhow::anyhow!("hooks is not an object"))?;
-
-    let bork_hooks: serde_json::Value = serde_json::from_str(CLAUDE_HOOKS)?;
-    let bork_hooks_obj = bork_hooks.as_object().unwrap();
-
-    for (event_name, bork_entries) in bork_hooks_obj {
-        let bork_entries = bork_entries.as_array().unwrap();
-
-        if let Some(existing_entries) = existing_hooks.get_mut(event_name) {
-            let Some(existing_arr) = existing_entries.as_array_mut() else {
-                continue;
-            };
-
-            // Remove any existing bork hooks (identified by BORK_STATUS_DIR in the command)
-            existing_arr.retain(|entry| !is_bork_hook(entry));
-
-            // Add the new bork hooks
-            for entry in bork_entries {
-                existing_arr.push(entry.clone());
-            }
-        } else {
-            existing_hooks.insert(
-                event_name.clone(),
-                serde_json::Value::Array(bork_entries.clone()),
-            );
-        }
-    }
-
-    let json = serde_json::to_string_pretty(&settings)?;
-    fs::write(&path, format!("{}\n", json))?;
-    println!("  Claude Code hooks installed in {}", path.display());
-    Ok(())
-}
-
-fn uninstall_claude_hooks() -> anyhow::Result<()> {
-    let path = claude_settings_path();
-
-    if !path.exists() {
-        println!("  Claude Code settings not found (already removed)");
-        return Ok(());
-    }
-
-    let contents = fs::read_to_string(&path)?;
-    let mut settings: serde_json::Value =
-        serde_json::from_str(&contents).unwrap_or_else(|_| serde_json::json!({}));
-
-    let Some(hooks_obj) = settings.get_mut("hooks").and_then(|v| v.as_object_mut()) else {
-        println!("  No Claude Code hooks found (already removed)");
-        return Ok(());
-    };
-
-    let mut empty_events = Vec::new();
-
-    for (event_name, entries) in hooks_obj.iter_mut() {
-        if let Some(arr) = entries.as_array_mut() {
-            arr.retain(|entry| !is_bork_hook(entry));
-            if arr.is_empty() {
-                empty_events.push(event_name.clone());
-            }
-        }
-    }
-
-    for event_name in empty_events {
-        hooks_obj.remove(&event_name);
-    }
-
-    let json = serde_json::to_string_pretty(&settings)?;
-    fs::write(&path, format!("{}\n", json))?;
-    println!("  Claude Code hooks removed from {}", path.display());
-    Ok(())
-}
-
 fn codex_hooks_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".codex").join("hooks.json")
@@ -332,7 +194,13 @@ fn codex_config_path() -> PathBuf {
     PathBuf::from(home).join(".codex").join("config.toml")
 }
 
-fn codex_hooks_already_installed(path: &PathBuf) -> bool {
+// --- Shared hooks helpers ---
+
+/// Check whether all expected hook entries are already present in `file[hooks_key]`.
+fn json_hooks_already_installed(
+    path: &PathBuf,
+    expected: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
     let Ok(contents) = fs::read_to_string(path) else {
         return false;
     };
@@ -342,70 +210,49 @@ fn codex_hooks_already_installed(path: &PathBuf) -> bool {
     let Some(hooks) = settings.get("hooks").and_then(|v| v.as_object()) else {
         return false;
     };
-    let Ok(bork_hooks) = serde_json::from_str::<serde_json::Value>(CODEX_HOOKS) else {
-        return false;
-    };
-    let Some(bork_hooks_obj) = bork_hooks.get("hooks").and_then(|v| v.as_object()) else {
-        return false;
-    };
 
-    for (event_name, bork_entries) in bork_hooks_obj {
+    expected.iter().all(|(event_name, bork_entries)| {
         let Some(existing) = hooks.get(event_name).and_then(|v| v.as_array()) else {
             return false;
         };
-        let Some(expected) = bork_entries.as_array() else {
+        let Some(expected_arr) = bork_entries.as_array() else {
             return false;
         };
-        for entry in expected {
-            if !existing.contains(entry) {
-                return false;
-            }
-        }
-    }
-    true
+        expected_arr.iter().all(|entry| existing.contains(entry))
+    })
 }
 
-fn install_codex_hooks() -> anyhow::Result<()> {
-    ensure_codex_hooks_feature_enabled()?;
-
-    let path = codex_hooks_path();
-    if path.exists() && codex_hooks_already_installed(&path) {
-        println!("  Codex hooks already installed (skipped)");
-        return Ok(());
-    }
-
+/// Merge bork hook entries into `file["hooks"]`, replacing any existing bork hooks.
+fn merge_hooks_into_file(
+    path: &Path,
+    expected: &serde_json::Map<String, serde_json::Value>,
+) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
 
     let mut settings: serde_json::Value = if path.exists() {
-        let contents = fs::read_to_string(&path)?;
+        let contents = fs::read_to_string(path)?;
         serde_json::from_str(&contents).unwrap_or_else(|_| serde_json::json!({}))
     } else {
         serde_json::json!({})
     };
 
-    let hooks_obj = settings
+    let root = settings
         .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("hooks.json is not an object"))?;
+        .ok_or_else(|| anyhow::anyhow!("{} is not an object", path.display()))?;
 
-    if !hooks_obj.contains_key("hooks") {
-        hooks_obj.insert("hooks".to_string(), serde_json::json!({}));
+    if !root.contains_key("hooks") {
+        root.insert("hooks".to_string(), serde_json::json!({}));
     }
 
-    let existing_hooks = hooks_obj
+    let existing_hooks: &mut serde_json::Map<String, serde_json::Value> = root
         .get_mut("hooks")
         .and_then(|v| v.as_object_mut())
         .ok_or_else(|| anyhow::anyhow!("hooks is not an object"))?;
 
-    let bork_hooks: serde_json::Value = serde_json::from_str(CODEX_HOOKS)?;
-    let bork_hooks_obj = bork_hooks
-        .get("hooks")
-        .and_then(|v| v.as_object())
-        .ok_or_else(|| anyhow::anyhow!("codex hooks payload is invalid"))?;
-
-    for (event_name, bork_entries) in bork_hooks_obj {
-        let Some(bork_entries) = bork_entries.as_array() else {
+    for (event_name, bork_entries) in expected {
+        let Some(bork_arr) = bork_entries.as_array() else {
             continue;
         };
 
@@ -414,37 +261,34 @@ fn install_codex_hooks() -> anyhow::Result<()> {
                 continue;
             };
             existing_arr.retain(|entry| !is_bork_hook(entry));
-            for entry in bork_entries {
+            for entry in bork_arr {
                 existing_arr.push(entry.clone());
             }
         } else {
             existing_hooks.insert(
                 event_name.clone(),
-                serde_json::Value::Array(bork_entries.clone()),
+                serde_json::Value::Array(bork_arr.clone()),
             );
         }
     }
 
     let json = serde_json::to_string_pretty(&settings)?;
-    fs::write(&path, format!("{}\n", json))?;
-    println!("  Codex hooks installed in {}", path.display());
+    fs::write(path, format!("{}\n", json))?;
     Ok(())
 }
 
-fn uninstall_codex_hooks() -> anyhow::Result<()> {
-    let path = codex_hooks_path();
+/// Remove all bork hook entries from `file["hooks"]`, cleaning up empty events.
+fn remove_hooks_from_file(path: &Path) -> anyhow::Result<bool> {
     if !path.exists() {
-        println!("  Codex hooks not found (already removed)");
-        return Ok(());
+        return Ok(false);
     }
 
-    let contents = fs::read_to_string(&path)?;
+    let contents = fs::read_to_string(path)?;
     let mut settings: serde_json::Value =
         serde_json::from_str(&contents).unwrap_or_else(|_| serde_json::json!({}));
 
     let Some(hooks_obj) = settings.get_mut("hooks").and_then(|v| v.as_object_mut()) else {
-        println!("  No Codex hooks found (already removed)");
-        return Ok(());
+        return Ok(false);
     };
 
     let mut empty_events = Vec::new();
@@ -456,14 +300,84 @@ fn uninstall_codex_hooks() -> anyhow::Result<()> {
             }
         }
     }
-
     for event_name in empty_events {
         hooks_obj.remove(&event_name);
     }
 
     let json = serde_json::to_string_pretty(&settings)?;
-    fs::write(&path, format!("{}\n", json))?;
-    println!("  Codex hooks removed from {}", path.display());
+    fs::write(path, format!("{}\n", json))?;
+    Ok(true)
+}
+
+/// Parse the hooks map from a hook constant, optionally nested under a key.
+fn parse_hook_entries(
+    json_str: &str,
+    nested_key: Option<&str>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) else {
+        return serde_json::Map::new();
+    };
+    let target = match nested_key {
+        Some(key) => value.get(key).cloned().unwrap_or(serde_json::json!({})),
+        None => value,
+    };
+    target
+        .as_object()
+        .cloned()
+        .unwrap_or_else(serde_json::Map::new)
+}
+
+// --- Claude hooks ---
+
+fn install_claude_hooks() -> anyhow::Result<()> {
+    let path = claude_settings_path();
+    let expected = parse_hook_entries(CLAUDE_HOOKS, None);
+
+    if path.exists() && json_hooks_already_installed(&path, &expected) {
+        println!("  Claude Code hooks already installed (skipped)");
+        return Ok(());
+    }
+
+    merge_hooks_into_file(&path, &expected)?;
+    println!("  Claude Code hooks installed in {}", path.display());
+    Ok(())
+}
+
+fn uninstall_claude_hooks() -> anyhow::Result<()> {
+    let path = claude_settings_path();
+    if remove_hooks_from_file(&path)? {
+        println!("  Claude Code hooks removed from {}", path.display());
+    } else {
+        println!("  Claude Code settings not found (already removed)");
+    }
+    Ok(())
+}
+
+// --- Codex hooks ---
+
+fn install_codex_hooks() -> anyhow::Result<()> {
+    ensure_codex_hooks_feature_enabled()?;
+
+    let path = codex_hooks_path();
+    let expected = parse_hook_entries(CODEX_HOOKS, Some("hooks"));
+
+    if path.exists() && json_hooks_already_installed(&path, &expected) {
+        println!("  Codex hooks already installed (skipped)");
+        return Ok(());
+    }
+
+    merge_hooks_into_file(&path, &expected)?;
+    println!("  Codex hooks installed in {}", path.display());
+    Ok(())
+}
+
+fn uninstall_codex_hooks() -> anyhow::Result<()> {
+    let path = codex_hooks_path();
+    if remove_hooks_from_file(&path)? {
+        println!("  Codex hooks removed from {}", path.display());
+    } else {
+        println!("  Codex hooks not found (already removed)");
+    }
     Ok(())
 }
 
@@ -529,16 +443,16 @@ fn ensure_codex_hooks_feature_enabled() -> anyhow::Result<()> {
 }
 
 fn is_bork_hook(entry: &serde_json::Value) -> bool {
-    if let Some(hooks_arr) = entry.get("hooks").and_then(|v| v.as_array()) {
-        for hook in hooks_arr {
-            if let Some(cmd) = hook.get("command").and_then(|v| v.as_str()) {
-                if cmd.contains("BORK_STATUS_DIR") {
-                    return true;
-                }
-            }
-        }
-    }
-    false
+    entry
+        .get("hooks")
+        .and_then(|v| v.as_array())
+        .is_some_and(|hooks| {
+            hooks.iter().any(|hook| {
+                hook.get("command")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|cmd| cmd.contains("BORK_STATUS_DIR"))
+            })
+        })
 }
 
 #[cfg(test)]
@@ -594,9 +508,11 @@ mod tests {
         assert!(!is_bork_hook(&entry));
     }
 
-    // --- claude_hooks_already_installed ---
-    // This function reads from a file, but we can test the JSON logic
-    // by writing temp files.
+    // --- json_hooks_already_installed ---
+
+    fn claude_hook_entries() -> serde_json::Map<String, serde_json::Value> {
+        parse_hook_entries(CLAUDE_HOOKS, None)
+    }
 
     #[test]
     fn hooks_installed_detects_full_match() {
@@ -605,14 +521,14 @@ mod tests {
             "hooks": serde_json::from_str::<serde_json::Value>(CLAUDE_HOOKS).unwrap()
         });
         std::fs::write(&tmp, serde_json::to_string(&settings).unwrap()).unwrap();
-        assert!(claude_hooks_already_installed(&tmp.to_path_buf()));
+        assert!(json_hooks_already_installed(&tmp, &claude_hook_entries()));
         let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn hooks_installed_false_when_no_file() {
         let tmp = std::env::temp_dir().join("bork-test-hooks-nonexistent.json");
-        assert!(!claude_hooks_already_installed(&tmp.to_path_buf()));
+        assert!(!json_hooks_already_installed(&tmp, &claude_hook_entries()));
     }
 
     #[test]
@@ -620,7 +536,7 @@ mod tests {
         let tmp = std::env::temp_dir().join("bork-test-hooks-empty.json");
         let settings = json!({"hooks": {}});
         std::fs::write(&tmp, serde_json::to_string(&settings).unwrap()).unwrap();
-        assert!(!claude_hooks_already_installed(&tmp.to_path_buf()));
+        assert!(!json_hooks_already_installed(&tmp, &claude_hook_entries()));
         let _ = std::fs::remove_file(&tmp);
     }
 
@@ -629,7 +545,7 @@ mod tests {
         let tmp = std::env::temp_dir().join("bork-test-hooks-nokey.json");
         let settings = json!({"other": "stuff"});
         std::fs::write(&tmp, serde_json::to_string(&settings).unwrap()).unwrap();
-        assert!(!claude_hooks_already_installed(&tmp.to_path_buf()));
+        assert!(!json_hooks_already_installed(&tmp, &claude_hook_entries()));
         let _ = std::fs::remove_file(&tmp);
     }
 
@@ -637,7 +553,7 @@ mod tests {
     fn hooks_installed_false_when_invalid_json() {
         let tmp = std::env::temp_dir().join("bork-test-hooks-invalid.json");
         std::fs::write(&tmp, "not json").unwrap();
-        assert!(!claude_hooks_already_installed(&tmp.to_path_buf()));
+        assert!(!json_hooks_already_installed(&tmp, &claude_hook_entries()));
         let _ = std::fs::remove_file(&tmp);
     }
 }

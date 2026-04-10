@@ -276,40 +276,10 @@ fn collect_codex_session_ids(sessions_root: &Path) -> HashMap<String, SystemTime
 }
 
 fn newest_codex_session_id(sessions_root: &Path) -> Option<String> {
-    let mut stack = vec![sessions_root.to_path_buf()];
-    let mut newest: Option<(SystemTime, String)> = None;
-
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-                continue;
-            }
-
-            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            let Some(session_id) = parse_codex_session_id_from_filename(file_name) else {
-                continue;
-            };
-
-            let modified = fs::metadata(&path)
-                .and_then(|meta| meta.modified())
-                .unwrap_or(UNIX_EPOCH);
-
-            match &newest {
-                Some((current_modified, _)) if *current_modified >= modified => {}
-                _ => newest = Some((modified, session_id)),
-            }
-        }
-    }
-
-    newest.map(|(_, id)| id)
+    collect_codex_session_ids(sessions_root)
+        .into_iter()
+        .max_by_key(|(_, modified)| *modified)
+        .map(|(id, _)| id)
 }
 
 fn parse_codex_session_id_from_filename(file_name: &str) -> Option<String> {
@@ -329,17 +299,13 @@ fn is_uuid_like(value: &str) -> bool {
     if value.len() != 36 {
         return false;
     }
-    for (index, ch) in value.chars().enumerate() {
-        let is_hyphen = matches!(index, 8 | 13 | 18 | 23);
-        if is_hyphen {
-            if ch != '-' {
-                return false;
-            }
-        } else if !ch.is_ascii_hexdigit() {
-            return false;
+    value.chars().enumerate().all(|(i, ch)| {
+        if matches!(i, 8 | 13 | 18 | 23) {
+            ch == '-'
+        } else {
+            ch.is_ascii_hexdigit()
         }
-    }
-    true
+    })
 }
 
 /// Run `opencode session list` and return the first (newest) session ID found.
