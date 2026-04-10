@@ -248,12 +248,7 @@ pub fn fetch_review_requested_prs(main_worktree: &Path) -> Vec<PrStatus> {
         return Vec::new();
     };
 
-    let search_query = format!(
-        "repo:{}/{} is:pr is:open review-requested:{} -author:{}",
-        repo.owner, repo.name, user, user
-    );
-
-    let query = format!(
+    let graphql_query = format!(
         r#"query($search: String!) {{
             search(query: $search, type: ISSUE, first: 50) {{
                 nodes {{
@@ -265,14 +260,27 @@ pub fn fetch_review_requested_prs(main_worktree: &Path) -> Vec<PrStatus> {
         }}"#
     );
 
+    // involves:<user> covers review-requested, assigned, reviewed-by, and
+    // mentioned - matching GitHub's "Involved" filter exactly.
+    // Authored PRs are included but deduped by sync_prs_as_issues() since
+    // user_prs is processed first.
+    let search_query = format!(
+        "repo:{}/{} is:pr is:open involves:{}",
+        repo.owner, repo.name, user
+    );
+
+    fetch_search_query(main_worktree, &graphql_query, &search_query)
+}
+
+fn fetch_search_query(main_worktree: &Path, graphql_query: &str, search: &str) -> Vec<PrStatus> {
     let output = Command::new("gh")
         .args([
             "api",
             "graphql",
             "-f",
-            &format!("query={query}"),
+            &format!("query={graphql_query}"),
             "-f",
-            &format!("search={search_query}"),
+            &format!("search={search}"),
         ])
         .current_dir(main_worktree)
         .output();
