@@ -1,31 +1,57 @@
 # Current Work
 
-> Last updated: 2026-03-27
+> Last updated: 2026-04-10
 
 ## Active Task
 
-**Task:** Background PR status polling via `gh api graphql`, match PRs to branches, show PR status on cards
-**Status:** Done
+**Task:** Add assigned GitHub review requests to the Code Review column
+**Status:** Implementation complete, pending review
 
-## Plan
+## Changes
 
-1. Add PR domain types to `types.rs` (PrState, ChecksStatus, ReviewDecision, PrStatus)
-2. Create `external/github.rs` - GraphQL-based PR fetching via `gh api graphql`
-3. Add PR poll worker in `main.rs` (60s interval, wake-up channel for force-sync)
-4. Add `pr_statuses: HashMap<String, PrStatus>` to `App` + `pr_for()` lookup method
-5. Bump `CARD_HEIGHT` from 4 to 5, add dedicated PR line to card rendering
-6. Add PR display helpers in `ui/styles.rs` (checks icon/color, review icon/color)
-7. Pass `PrStatus` through `CardContext` in `board.rs`
-8. Add `SyncPRs` (P) and `OpenPR` (o) actions
-9. Update status bar hints
+### types.rs
+- Added `PrImportSource` enum (`Authored`, `ReviewRequested`) with Display impl
+- Added `pr_import_source: Option<PrImportSource>` field to `Issue`
+
+### external/github.rs
+- Added `fetch_review_requested_prs()` using GitHub search: `is:pr is:open review-requested:<user> -author:<user>`
+
+### main.rs
+- Extended `PrPollResult` with `review_requested_prs` field
+- Added 4th parallel thread in PR poll worker for review-requested PRs
+- Store `review_requested_prs` in live state, include in title sync
+
+### app.rs
+- Extended `LiveState` with `review_requested_prs: Vec<PrStatus>`
+- Updated `has_github_prs()` to include review-requested PRs
+- Updated `branch_for()` and `pr_for()` to search review-requested PRs
+- Rewrote `sync_prs_as_issues()`:
+  - Imports from union of authored + review-requested PRs
+  - Authored imports: removed when PR disappears (existing behavior)
+  - ReviewRequested imports: auto-moved to Done when no longer pending
+  - Review imports get a review-focused default prompt
+- Updated `filtered_github_prs()` to include review-requested PRs in picker
+- Added `pr_import_source` to `merge_issue_fields`
+
+### ui/card.rs
+- Shows yellow "review" badge on status line for ReviewRequested issues
+
+### handler.rs
+- Added `pr_import_source` to all Issue construction sites
+- Manual picker import sets `PrImportSource::Authored`
+- Dialog attach/clear resets `pr_import_source` to None
+
+### worktree.rs, external/opencode.rs
+- Added `pr_import_source: None` to Issue construction in tests/CLI
 
 ## Progress
 
-- [x] Types (PrState, ChecksStatus, ReviewDecision, PrStatus)
-- [x] GitHub module (GraphQL fetch, repo identity caching, browser open)
-- [x] PR poll worker (60s interval with wake-up channel)
-- [x] App state integration (pr_statuses HashMap, pr_for() lookup)
-- [x] Card rendering (CARD_HEIGHT=5, dedicated PR line)
-- [x] Keybindings (P=sync, o=open PR)
-- [x] Status bar hints (contextual "open pr" when PR exists)
-- [x] Build verification (cargo check + clippy + fmt)
+- [x] PrImportSource enum + Issue field
+- [x] fetch_review_requested_prs() in github.rs
+- [x] PR poll worker extended with 4th parallel fetch
+- [x] LiveState + sync_prs_as_issues() rewritten
+- [x] pr_for() / branch_for() / filtered_github_prs() updated
+- [x] Review badge on cards
+- [x] All Issue construction sites updated
+- [x] Build passes (cargo check + clippy + fmt)
+- [x] Tests pass (460/460)

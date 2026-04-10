@@ -8,8 +8,8 @@ use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 use crate::config::{AppConfig, AppState};
 use crate::external::linear::LinearIssue;
 use crate::types::{
-    AgentKind, AgentMode, AgentStatus, AgentStatusInfo, Column, Issue, IssueKind, PrState,
-    PrStatus, WorktreeStatus,
+    AgentKind, AgentMode, AgentStatus, AgentStatusInfo, Column, Issue, IssueKind, PrImportSource,
+    PrState, PrStatus, WorktreeStatus,
 };
 use crate::ui::styles;
 
@@ -46,6 +46,7 @@ pub struct LiveState {
     pub frozen_worktree_branches: HashMap<String, String>,
     pub linear_issues: Vec<LinearIssue>,
     pub user_prs: Vec<PrStatus>,
+    pub review_requested_prs: Vec<PrStatus>,
     pub github_user: Option<String>,
     pub git_poll_done: bool,
     pub pr_poll_done: bool,
@@ -53,7 +54,9 @@ pub struct LiveState {
 
 impl LiveState {
     pub fn has_github_prs(&self) -> bool {
-        !self.pr_statuses.is_empty() || !self.user_prs.is_empty()
+        !self.pr_statuses.is_empty()
+            || !self.user_prs.is_empty()
+            || !self.review_requested_prs.is_empty()
     }
 }
 
@@ -482,7 +485,12 @@ impl Project {
         }
 
         if let Some(pr_num) = issue.pr_number {
-            if let Some(pr) = live.user_prs.iter().find(|p| p.number == pr_num) {
+            if let Some(pr) = live
+                .user_prs
+                .iter()
+                .chain(live.review_requested_prs.iter())
+                .find(|p| p.number == pr_num)
+            {
                 return Some(pr.head_branch.as_str());
             }
         }
@@ -501,6 +509,7 @@ impl Project {
         live.pr_statuses
             .values()
             .chain(live.user_prs.iter())
+            .chain(live.review_requested_prs.iter())
             .find(|p| p.number == pr_num)
     }
 
@@ -509,33 +518,56 @@ impl Project {
             return (false, None);
         }
 
-        let live_pr_numbers: HashSet<u32> = self.live.user_prs.iter().map(|pr| pr.number).collect();
+        let live_authored_numbers: HashSet<u32> =
+            self.live.user_prs.iter().map(|pr| pr.number).collect();
+        let live_review_numbers: HashSet<u32> = self
+            .live
+            .review_requested_prs
+            .iter()
+            .map(|pr| pr.number)
+            .collect();
 
-        // Remove pr_imported issues whose PR is no longer in the live set
-        // (closed, merged, or from a stale/wrong repo identity)
+        // Remove authored pr_imported issues whose PR is no longer in the live set
+        // (closed, merged, or from a stale/wrong repo identity).
+        // Review-requested issues are NOT removed, they get moved to Done instead.
         let before = self.issues.len();
         self.issues.retain(|issue| {
-            !issue.pr_imported
-                || issue
-                    .pr_number
-                    .is_some_and(|n| live_pr_numbers.contains(&n))
+            if !issue.pr_imported {
+                return true;
+            }
+            if issue.pr_import_source == Some(PrImportSource::ReviewRequested) {
+                return true;
+            }
+            issue
+                .pr_number
+                .is_some_and(|n| live_authored_numbers.contains(&n))
         });
         let removed = before - self.issues.len();
 
-        if self.live.user_prs.is_empty() {
-            if removed > 0 {
-                return (
-                    true,
-                    Some(format!(
-                        "Removed {} stale PR{}",
-                        removed,
-                        if removed == 1 { "" } else { "s" }
-                    )),
-                );
+        // Move review-requested issues to Done when no longer pending
+        let now = unix_now();
+        let mut completed = 0usize;
+        for issue in &mut self.issues {
+            if !issue.pr_imported {
+                continue;
             }
-            return (false, None);
+            if issue.pr_import_source != Some(PrImportSource::ReviewRequested) {
+                continue;
+            }
+            if issue.column == Column::Done {
+                continue;
+            }
+            let Some(pr_num) = issue.pr_number else {
+                continue;
+            };
+            if !live_review_numbers.contains(&pr_num) {
+                issue.column = Column::Done;
+                issue.done_at = Some(now);
+                completed += 1;
+            }
         }
 
+        // Build sets of already-claimed PRs for dedup
         let claimed_branches: HashSet<String> = self
             .issues
             .iter()
@@ -552,36 +584,51 @@ impl Project {
 
         let mut new_issues: Vec<Issue> = Vec::new();
 
-        for pr in &self.live.user_prs {
-            if pr.state != PrState::Open {
-                continue;
+        // Helper: check if a PR should be imported
+        let should_import = |pr: &PrStatus,
+                             claimed_branches: &HashSet<String>,
+                             claimed_pr_numbers: &HashSet<u32>,
+                             new_pr_numbers: &HashSet<u32>,
+                             issue_ids: &[String]|
+         -> bool {
+            if pr.state != PrState::Open || pr.is_draft {
+                return false;
             }
-            if pr.is_draft {
-                continue;
-            }
-
             let branch = &pr.head_branch;
             if branch == "main" || branch == "master" {
-                continue;
+                return false;
             }
-
             if claimed_branches.contains(branch) {
-                continue;
+                return false;
             }
-
             let branch_lower = branch.to_lowercase();
             let has_prefix_match = issue_ids.iter().any(|id| {
                 branch_lower.starts_with(&format!("{}/", id))
                     || branch_lower.starts_with(&format!("{}-", id))
             });
             if has_prefix_match {
+                return false;
+            }
+            if claimed_pr_numbers.contains(&pr.number) || new_pr_numbers.contains(&pr.number) {
+                return false;
+            }
+            true
+        };
+
+        let mut new_pr_numbers: HashSet<u32> = HashSet::new();
+
+        // Import authored PRs
+        for pr in &self.live.user_prs {
+            if !should_import(
+                pr,
+                &claimed_branches,
+                &claimed_pr_numbers,
+                &new_pr_numbers,
+                &issue_ids,
+            ) {
                 continue;
             }
-
-            if claimed_pr_numbers.contains(&pr.number) {
-                continue;
-            }
-
+            new_pr_numbers.insert(pr.number);
             let id = self.next_issue_id_after(new_issues.len() as u32);
             new_issues.push(Issue {
                 id,
@@ -600,13 +647,50 @@ impl Project {
                 linear_imported: false,
                 pr_number: Some(pr.number),
                 pr_imported: true,
+                pr_import_source: Some(PrImportSource::Authored),
+            });
+        }
+
+        // Import review-requested PRs
+        for pr in &self.live.review_requested_prs {
+            if !should_import(
+                pr,
+                &claimed_branches,
+                &claimed_pr_numbers,
+                &new_pr_numbers,
+                &issue_ids,
+            ) {
+                continue;
+            }
+            new_pr_numbers.insert(pr.number);
+            let id = self.next_issue_id_after(new_issues.len() as u32);
+            new_issues.push(Issue {
+                id,
+                title: pr.title.clone(),
+                kind: IssueKind::Agentic,
+                column: Column::CodeReview,
+                agent_kind: self.config.agent_kind,
+                agent_mode: AgentMode::Plan,
+                prompt: Some(
+                    "Review this PR. Read the diff, check for correctness, regressions, missing tests, and edge cases. Summarize your findings.".to_string(),
+                ),
+                worktree: None,
+                done_at: None,
+                session_id: None,
+                linear_id: None,
+                linear_identifier: None,
+                linear_url: None,
+                linear_imported: false,
+                pr_number: Some(pr.number),
+                pr_imported: true,
+                pr_import_source: Some(PrImportSource::ReviewRequested),
             });
         }
 
         let added = new_issues.len();
         self.issues.append(&mut new_issues);
 
-        if added == 0 && removed == 0 {
+        if added == 0 && removed == 0 && completed == 0 {
             return (false, None);
         }
 
@@ -623,6 +707,13 @@ impl Project {
                 "Removed {} stale PR{}",
                 removed,
                 if removed == 1 { "" } else { "s" }
+            ));
+        }
+        if completed > 0 {
+            parts.push(format!(
+                "Completed {} review{}",
+                completed,
+                if completed == 1 { "" } else { "s" }
             ));
         }
         (true, Some(parts.join(", ")))
@@ -709,6 +800,11 @@ impl Project {
             }
         }
         for pr in &live.user_prs {
+            if seen.insert(pr.number) {
+                prs.push(pr);
+            }
+        }
+        for pr in &live.review_requested_prs {
             if seen.insert(pr.number) {
                 prs.push(pr);
             }
@@ -1227,6 +1323,7 @@ fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
     merge_field!(linear_imported);
     merge_field!(pr_number);
     merge_field!(pr_imported);
+    merge_field!(pr_import_source);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1687,6 +1784,7 @@ mod tests {
             linear_imported: false,
             pr_number: None,
             pr_imported: false,
+            pr_import_source: None,
         }
     }
 

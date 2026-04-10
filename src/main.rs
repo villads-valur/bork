@@ -45,6 +45,7 @@ use types::PrStatus;
 struct PrPollResult {
     prs: HashMap<String, PrStatus>,
     user_prs: Vec<PrStatus>,
+    review_requested_prs: Vec<PrStatus>,
     github_user: Option<String>,
 }
 
@@ -179,18 +180,21 @@ fn spawn_pr_poll_worker(
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || loop {
-        // Run the 3 independent gh api calls in parallel
+        // Run the 4 independent gh api calls in parallel
         let result = thread::scope(|s| {
             let prs_handle = s.spawn(|| {
                 let prs = external::github::fetch_prs(&main_worktree);
                 external::github::index_by_branch(prs)
             });
             let user_prs_handle = s.spawn(|| external::github::fetch_user_prs(&main_worktree));
+            let review_handle =
+                s.spawn(|| external::github::fetch_review_requested_prs(&main_worktree));
             let user_handle = s.spawn(|| external::github::fetch_current_user(&main_worktree));
 
             PrPollResult {
                 prs: prs_handle.join().unwrap_or_default(),
                 user_prs: user_prs_handle.join().unwrap_or_default(),
+                review_requested_prs: review_handle.join().unwrap_or_default(),
                 github_user: user_handle.join().ok().flatten(),
             }
         });
@@ -850,6 +854,7 @@ fn run_tui() -> anyhow::Result<()> {
             let live = &mut app.project_mut().live;
             live.pr_statuses = pr_result.prs;
             live.user_prs = pr_result.user_prs;
+            live.review_requested_prs = pr_result.review_requested_prs;
             live.pr_poll_done = true;
             if pr_result.github_user.is_some() {
                 live.github_user = pr_result.github_user;
@@ -860,6 +865,7 @@ fn run_tui() -> anyhow::Result<()> {
                 .live
                 .pr_statuses
                 .values()
+                .chain(p.live.review_requested_prs.iter())
                 .map(|pr| (pr.number, pr.title.clone()))
                 .collect();
             for issue in &mut p.issues {
@@ -985,6 +991,7 @@ fn run_tui() -> anyhow::Result<()> {
                 let live = &mut app.projects[proj_pos].live;
                 live.pr_statuses = pr_result.prs;
                 live.user_prs = pr_result.user_prs;
+                live.review_requested_prs = pr_result.review_requested_prs;
                 live.pr_poll_done = true;
                 if pr_result.github_user.is_some() {
                     live.github_user = pr_result.github_user;

@@ -12,7 +12,7 @@ use crate::external::{github, opencode, tmux, tuicr};
 use crate::global_config::ReloadResult;
 use crate::input::Action;
 use crate::lock;
-use crate::types::{AgentMode, Column, Issue, IssueKind};
+use crate::types::{AgentMode, Column, Issue, IssueKind, PrImportSource};
 
 pub struct ActionChannels<'a> {
     pub action_tx: &'a mpsc::Sender<ActionResult>,
@@ -687,6 +687,7 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
         linear_imported: false,
         pr_number: None,
         pr_imported: false,
+        pr_import_source: None,
     };
 
     apply_linear_fields(&mut issue, &dialog);
@@ -723,10 +724,12 @@ fn apply_pr_fields(issue: &mut Issue, dialog: &crate::app::DialogState) {
     if dialog.github_pr_cleared {
         issue.pr_number = None;
         issue.pr_imported = false;
+        issue.pr_import_source = None;
     } else if let Some(ref pr) = dialog.github_pr {
         issue.pr_number = Some(pr.number);
         // Attached via dialog, not imported — don't sync title
         issue.pr_imported = false;
+        issue.pr_import_source = None;
     }
 }
 
@@ -873,6 +876,7 @@ fn import_linear_issue(app: &mut App, ctx: &ActionContext) {
         linear_imported: true,
         pr_number: None,
         pr_imported: false,
+        pr_import_source: None,
     };
 
     let p = app.find_project_mut(&proj_id).unwrap();
@@ -930,6 +934,7 @@ fn import_github_pr(app: &mut App, ctx: &ActionContext) {
         linear_imported: false,
         pr_number: Some(pr.number),
         pr_imported: true,
+        pr_import_source: Some(PrImportSource::Authored),
     };
 
     let p = app.find_project_mut(&proj_id).unwrap();
@@ -1200,6 +1205,7 @@ mod tests {
             linear_imported: false,
             pr_number: None,
             pr_imported: false,
+            pr_import_source: None,
         }
     }
 
@@ -1345,6 +1351,7 @@ mod tests {
             linear_imported: false,
             pr_number: None,
             pr_imported: false,
+            pr_import_source: None,
         });
 
         let ctx = app.action_context();
@@ -1379,6 +1386,7 @@ mod tests {
             linear_imported: false,
             pr_number: None,
             pr_imported: false,
+            pr_import_source: None,
         });
 
         // Open edit dialog
@@ -1578,6 +1586,7 @@ mod tests {
             linear_imported: false,
             pr_number: None,
             pr_imported: false,
+            pr_import_source: None,
         });
 
         let ctx = app.action_context();
@@ -1622,6 +1631,7 @@ mod tests {
             linear_imported: false,
             pr_number: None,
             pr_imported: false,
+            pr_import_source: None,
         });
 
         let ctx = app.action_context();
@@ -1660,6 +1670,7 @@ mod tests {
             linear_imported: false,
             pr_number: None,
             pr_imported: false,
+            pr_import_source: None,
         });
 
         let ctx = app.action_context();
