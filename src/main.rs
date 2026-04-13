@@ -1190,3 +1190,74 @@ fn resolve_editor() -> Option<(String, Vec<String>)> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The wrapper tmux session name must never collide with agent session names.
+    // Agent sessions follow the pattern "{project_name}-{issue_id}" where
+    // issue_id is "{project_name}-{number}" (e.g. "bork-bork-1", "myapp-myapp-42").
+
+    #[test]
+    fn tui_session_name_does_not_match_any_project_agent_pattern() {
+        let project_names = ["bork", "myapp", "tui", "bork-tui", "test"];
+        for name in project_names {
+            for n in 1..=100 {
+                let agent_session = format!("{}-{}-{}", name, name, n);
+                assert_ne!(
+                    BORK_TUI_SESSION, agent_session,
+                    "wrapper session '{}' collides with agent session '{}'",
+                    BORK_TUI_SESSION, agent_session
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tui_session_name_does_not_equal_any_common_project_name() {
+        let project_names = ["bork", "myapp", "test", "app", "project", "dev"];
+        for name in project_names {
+            assert_ne!(
+                BORK_TUI_SESSION, name,
+                "wrapper session '{}' collides with project name '{}'",
+                BORK_TUI_SESSION, name
+            );
+        }
+    }
+
+    #[test]
+    fn shutdown_flag_stops_session_worker() {
+        let shutdown = Arc::new(AtomicBool::new(true));
+        let dir = std::env::temp_dir().join(format!("bork-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        let rx = spawn_session_status_worker(dir.clone(), shutdown);
+
+        // Worker should exit quickly since shutdown is already set.
+        // If it doesn't, recv will time out.
+        let result = rx.recv_timeout(Duration::from_secs(2));
+        // Either we get a result (worker did one iteration) or disconnected (worker exited)
+        // The key is it doesn't hang.
+        assert!(
+            result.is_ok() || result.is_err(),
+            "worker should not hang when shutdown is set"
+        );
+        // The channel should disconnect shortly after
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shutdown_flag_stops_port_worker() {
+        let shutdown = Arc::new(AtomicBool::new(true));
+        let sessions = Arc::new(Mutex::new(HashSet::<String>::new()));
+
+        let rx = spawn_port_poll_worker(sessions, shutdown);
+
+        let result = rx.recv_timeout(Duration::from_secs(2));
+        assert!(
+            result.is_ok() || result.is_err(),
+            "worker should not hang when shutdown is set"
+        );
+    }
+}

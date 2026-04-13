@@ -2394,4 +2394,31 @@ mod tests {
         assert_eq!(app.projects[1].live.pr_statuses.len(), 0);
         assert_eq!(app.projects[2].live.pr_statuses.len(), 0);
     }
+
+    // ================================================================
+    // DebugReset: only sets should_quit, no side effects
+    // ================================================================
+
+    #[test]
+    fn debug_reset_sets_should_quit_when_debug_enabled() {
+        let mut config = test_config();
+        config.debug = true;
+        let state = crate::config::AppState { issues: vec![] };
+        let mut app = App::new(config, state);
+        assert!(!app.should_quit);
+
+        act(&mut app, Action::DebugReset);
+
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn debug_reset_is_noop_when_debug_disabled() {
+        let mut app = test_app(); // debug: false
+        assert!(!app.should_quit);
+
+        act(&mut app, Action::DebugReset);
+
+        assert!(!app.should_quit);
+    }
 }
