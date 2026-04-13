@@ -11,7 +11,6 @@ use crate::config::{self, AppConfig};
 use crate::external::{github, opencode, tmux, tuicr};
 use crate::global_config::ReloadResult;
 use crate::input::Action;
-use crate::lock;
 use crate::types::{AgentMode, Column, Issue, IssueKind, PrImportSource};
 
 pub struct ActionChannels<'a> {
@@ -458,9 +457,6 @@ fn handle_normal(
             if !app.context_project(ctx).config.debug {
                 return PostAction::None;
             }
-            lock::release_lock(&app.context_project(ctx).config.project_root);
-            let session_name = app.context_project(ctx).config.project_name.clone();
-            let _ = tmux::kill_session(&session_name);
             app.should_quit = true;
             PostAction::None
         }
