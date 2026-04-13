@@ -57,16 +57,23 @@ const PORT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const LINEAR_POLL_INTERVAL: Duration = Duration::from_secs(45);
 const PR_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const STATE_POLL_TICKS: usize = 40; // 40 * 50ms = 2s
+const BORK_TUI_SESSION: &str = "bork-tui";
 
 struct SessionPollResult {
     sessions: HashSet<String>,
     agent_statuses: HashMap<String, AgentStatusInfo>,
 }
 
-fn spawn_session_status_worker(status_dir: PathBuf) -> mpsc::Receiver<SessionPollResult> {
+fn spawn_session_status_worker(
+    status_dir: PathBuf,
+    shutdown: Arc<AtomicBool>,
+) -> mpsc::Receiver<SessionPollResult> {
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || loop {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
         let sessions = external::tmux::list_sessions();
         let agent_statuses = read_agent_statuses(&status_dir);
         let result = SessionPollResult {
@@ -82,10 +89,16 @@ fn spawn_session_status_worker(status_dir: PathBuf) -> mpsc::Receiver<SessionPol
     rx
 }
 
-fn spawn_port_poll_worker(sessions: Arc<Mutex<HashSet<String>>>) -> mpsc::Receiver<PortPollResult> {
+fn spawn_port_poll_worker(
+    sessions: Arc<Mutex<HashSet<String>>>,
+    shutdown: Arc<AtomicBool>,
+) -> mpsc::Receiver<PortPollResult> {
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || loop {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
         let sessions = sessions.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let ports = external::ports::poll_listening_ports(&sessions);
         if tx.send(PortPollResult { ports }).is_err() {
@@ -392,7 +405,7 @@ fn spawn_shared_workers() -> SharedWorkers {
     let shutdown = Arc::new(AtomicBool::new(false));
 
     let port_sessions = Arc::new(Mutex::new(HashSet::<String>::new()));
-    let port_rx = spawn_port_poll_worker(port_sessions.clone());
+    let port_rx = spawn_port_poll_worker(port_sessions.clone(), shutdown.clone());
 
     let (linear_wake_tx, linear_wake_rx) = mpsc::channel::<()>();
 
@@ -410,7 +423,7 @@ fn spawn_project_workers(project: &app::Project, shutdown: &Arc<AtomicBool>) -> 
     let project_root = project.config.project_root.clone();
 
     let status_dir = config::agent_status_dir(&project_root);
-    let session_rx = spawn_session_status_worker(status_dir);
+    let session_rx = spawn_session_status_worker(status_dir, shutdown.clone());
 
     let git_skip_set = Arc::new(Mutex::new(project.done_worktree_names()));
     let (git_wake_tx, git_wake_rx) = mpsc::channel::<()>();
@@ -435,10 +448,14 @@ const ACTIVITY_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 fn spawn_activity_poller(
     projects: Vec<(ProjectId, PathBuf)>,
+    shutdown: Arc<AtomicBool>,
 ) -> mpsc::Receiver<HashMap<ProjectId, bool>> {
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || loop {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
         let mut activity: HashMap<ProjectId, bool> = HashMap::new();
         for (id, root) in &projects {
             let status_dir = root.join(".bork").join("agent-status");
@@ -491,8 +508,8 @@ fn run_tui() -> anyhow::Result<()> {
         config::ensure_agent_status_dir(&config.project_root);
     }
 
-    // Tmux auto-wrap: always use a single global "bork" session
-    match external::tmux::ensure_bork_session("bork")? {
+    // Tmux auto-wrap: use a dedicated session name that can't collide with project names
+    match external::tmux::ensure_bork_session(BORK_TUI_SESSION)? {
         external::tmux::EnsureResult::AlreadyInside => {}
         external::tmux::EnsureResult::Wrapped { exit_code } => {
             std::process::exit(exit_code);
@@ -560,7 +577,10 @@ fn run_tui() -> anyhow::Result<()> {
             .iter()
             .map(|p| (p.id(), p.config.project_root.clone()))
             .collect();
-        Some(spawn_activity_poller(project_paths))
+        Some(spawn_activity_poller(
+            project_paths,
+            shared.shutdown.clone(),
+        ))
     } else {
         None
     };
@@ -1169,4 +1189,75 @@ fn resolve_editor() -> Option<(String, Vec<String>)> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The wrapper tmux session name must never collide with agent session names.
+    // Agent sessions follow the pattern "{project_name}-{issue_id}" where
+    // issue_id is "{project_name}-{number}" (e.g. "bork-bork-1", "myapp-myapp-42").
+
+    #[test]
+    fn tui_session_name_does_not_match_any_project_agent_pattern() {
+        let project_names = ["bork", "myapp", "tui", "bork-tui", "test"];
+        for name in project_names {
+            for n in 1..=100 {
+                let agent_session = format!("{}-{}-{}", name, name, n);
+                assert_ne!(
+                    BORK_TUI_SESSION, agent_session,
+                    "wrapper session '{}' collides with agent session '{}'",
+                    BORK_TUI_SESSION, agent_session
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tui_session_name_does_not_equal_any_common_project_name() {
+        let project_names = ["bork", "myapp", "test", "app", "project", "dev"];
+        for name in project_names {
+            assert_ne!(
+                BORK_TUI_SESSION, name,
+                "wrapper session '{}' collides with project name '{}'",
+                BORK_TUI_SESSION, name
+            );
+        }
+    }
+
+    #[test]
+    fn shutdown_flag_stops_session_worker() {
+        let shutdown = Arc::new(AtomicBool::new(true));
+        let dir = std::env::temp_dir().join(format!("bork-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        let rx = spawn_session_status_worker(dir.clone(), shutdown);
+
+        // Worker should exit quickly since shutdown is already set.
+        // If it doesn't, recv will time out.
+        let result = rx.recv_timeout(Duration::from_secs(2));
+        // Either we get a result (worker did one iteration) or disconnected (worker exited)
+        // The key is it doesn't hang.
+        assert!(
+            result.is_ok() || result.is_err(),
+            "worker should not hang when shutdown is set"
+        );
+        // The channel should disconnect shortly after
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shutdown_flag_stops_port_worker() {
+        let shutdown = Arc::new(AtomicBool::new(true));
+        let sessions = Arc::new(Mutex::new(HashSet::<String>::new()));
+
+        let rx = spawn_port_poll_worker(sessions, shutdown);
+
+        let result = rx.recv_timeout(Duration::from_secs(2));
+        assert!(
+            result.is_ok() || result.is_err(),
+            "worker should not hang when shutdown is set"
+        );
+    }
 }

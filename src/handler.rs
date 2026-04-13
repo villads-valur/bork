@@ -11,7 +11,6 @@ use crate::config::{self, AppConfig};
 use crate::external::{github, opencode, tmux, tuicr};
 use crate::global_config::ReloadResult;
 use crate::input::Action;
-use crate::lock;
 use crate::types::{AgentMode, Column, Issue, IssueKind, PrImportSource};
 
 pub struct ActionChannels<'a> {
@@ -458,9 +457,6 @@ fn handle_normal(
             if !app.context_project(ctx).config.debug {
                 return PostAction::None;
             }
-            lock::release_lock(&app.context_project(ctx).config.project_root);
-            let session_name = app.context_project(ctx).config.project_name.clone();
-            let _ = tmux::kill_session(&session_name);
             app.should_quit = true;
             PostAction::None
         }
@@ -2397,5 +2393,32 @@ mod tests {
         // Beta and gamma should NOT
         assert_eq!(app.projects[1].live.pr_statuses.len(), 0);
         assert_eq!(app.projects[2].live.pr_statuses.len(), 0);
+    }
+
+    // ================================================================
+    // DebugReset: only sets should_quit, no side effects
+    // ================================================================
+
+    #[test]
+    fn debug_reset_sets_should_quit_when_debug_enabled() {
+        let mut config = test_config();
+        config.debug = true;
+        let state = crate::config::AppState { issues: vec![] };
+        let mut app = App::new(config, state);
+        assert!(!app.should_quit);
+
+        act(&mut app, Action::DebugReset);
+
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn debug_reset_is_noop_when_debug_disabled() {
+        let mut app = test_app(); // debug: false
+        assert!(!app.should_quit);
+
+        act(&mut app, Action::DebugReset);
+
+        assert!(!app.should_quit);
     }
 }
