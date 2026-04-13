@@ -1121,36 +1121,34 @@ impl DialogState {
         }
     }
 
-    fn cycle_agent_next(&mut self) {
-        if self.available_agents.is_empty() {
-            return;
-        }
-        let idx = self
-            .available_agents
-            .iter()
-            .position(|kind| *kind == self.agent_kind)
-            .unwrap_or(0);
-        let next = (idx + 1) % self.available_agents.len();
-        self.agent_kind = self.available_agents[next];
+    fn set_agent_at(&mut self, index: usize) {
+        self.agent_kind = self.available_agents[index];
         self.agent_mode = Self::normalize_mode_for_agent(self.agent_mode, self.agent_kind);
     }
 
-    fn cycle_agent_prev(&mut self) {
-        if self.available_agents.is_empty() {
+    fn cycle_agent_next(&mut self) {
+        let len = self.available_agents.len();
+        if len == 0 {
             return;
         }
-        let idx = self
-            .available_agents
+        let idx = self.agent_index();
+        self.set_agent_at((idx + 1) % len);
+    }
+
+    fn cycle_agent_prev(&mut self) {
+        let len = self.available_agents.len();
+        if len == 0 {
+            return;
+        }
+        let idx = self.agent_index();
+        self.set_agent_at(if idx == 0 { len - 1 } else { idx - 1 });
+    }
+
+    fn agent_index(&self) -> usize {
+        self.available_agents
             .iter()
             .position(|kind| *kind == self.agent_kind)
-            .unwrap_or(0);
-        let prev = if idx == 0 {
-            self.available_agents.len() - 1
-        } else {
-            idx - 1
-        };
-        self.agent_kind = self.available_agents[prev];
-        self.agent_mode = Self::normalize_mode_for_agent(self.agent_mode, self.agent_kind);
+            .unwrap_or(0)
     }
 
     pub fn prompt_text(&self) -> String {
@@ -1197,7 +1195,7 @@ impl DialogState {
         linear_available: bool,
         github_available: bool,
     ) -> usize {
-        let mut idx = 1; // after kind
+        let mut idx = 1;
         if kind == IssueKind::Agentic {
             idx += 1;
             if !available_agents.is_empty() {
