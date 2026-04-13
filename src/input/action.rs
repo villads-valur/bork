@@ -14,6 +14,8 @@ pub enum Action {
     KillSession,
     MoveIssueLeft,
     MoveIssueRight,
+    MoveIssueUp,
+    MoveIssueDown,
     MoveToDone,
     MoveToTodo,
     ScrollToTop,

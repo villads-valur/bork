@@ -364,6 +364,30 @@ impl Project {
         self.move_issue_to_column(idx, Column::Todo);
     }
 
+    pub fn move_issue_up(&mut self, query: &str) {
+        self.reorder_issue(query, -1);
+    }
+
+    pub fn move_issue_down(&mut self, query: &str) {
+        self.reorder_issue(query, 1);
+    }
+
+    fn reorder_issue(&mut self, query: &str, direction: isize) {
+        let Some(column) = Column::from_index(self.selected_column) else {
+            return;
+        };
+        let items = self.issues_in_column(column, query);
+        let row = self.selected_row[self.selected_column];
+        let target_row = row.wrapping_add(direction as usize);
+        if target_row >= items.len() {
+            return;
+        }
+        let (a, b) = (items[row].0, items[target_row].0);
+        drop(items);
+        self.issues.swap(a, b);
+        self.selected_row[self.selected_column] = target_row;
+    }
+
     fn move_issue_to_column(&mut self, idx: usize, target: Column) {
         let issue = &mut self.issues[idx];
         if issue.column == target {

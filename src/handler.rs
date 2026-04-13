@@ -139,6 +139,18 @@ fn handle_normal(
             p.mark_dirty();
             PostAction::None
         }
+        Action::MoveIssueUp => {
+            let p = app.context_project_mut(ctx);
+            p.move_issue_up(&q);
+            p.mark_dirty();
+            PostAction::None
+        }
+        Action::MoveIssueDown => {
+            let p = app.context_project_mut(ctx);
+            p.move_issue_down(&q);
+            p.mark_dirty();
+            PostAction::None
+        }
         Action::MoveToDone => {
             let p = app.context_project_mut(ctx);
             p.move_to_done(&q);
