@@ -314,6 +314,12 @@ If the `linear` CLI is not found at startup, all Linear features are silently di
 
 When you have two or more projects registered, bork enables a project sidebar and swimlane view for managing multiple projects from a single TUI instance.
 
+<p align="center">
+  <img src="assets/swimlanes-dark.png" alt="bork swimlane view" width="720">
+  <br>
+  <sub>Three projects stacked as swimlanes — Tab switches focus between boards</sub>
+</p>
+
 ### Getting Started
 
 Projects are registered automatically when you run `bork init`. To add existing projects:
