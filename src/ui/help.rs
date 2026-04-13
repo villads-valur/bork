@@ -22,10 +22,7 @@ const TUICR_SECTION: Section = Section {
 
 const DEBUG_SECTION: Section = Section {
     title: "Debug",
-    bindings: &[
-        ("Ctrl+r", "Reset (kill + clear pid)"),
-        ("Ctrl+e", "Inspect issue JSON"),
-    ],
+    bindings: &[("Ctrl+r", "Quit (debug)"), ("Ctrl+e", "Inspect issue JSON")],
 };
 
 const PROJECTS_SECTION: Section = Section {
