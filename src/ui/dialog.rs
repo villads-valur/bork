@@ -69,6 +69,30 @@ pub fn render_dialog(frame: &mut Frame, app: &App) {
     );
     next_row += 2;
 
+    if dialog.linear_available {
+        let linear_area = Rect::new(inner.x + 1, inner.y + next_row, inner.width - 2, 1);
+        render_linear_field(
+            frame,
+            &dialog.linear_issue,
+            linear_area,
+            dialog.current_field() == DialogField::Linear,
+            label_width,
+        );
+        next_row += 2;
+    }
+
+    if dialog.github_available {
+        let github_area = Rect::new(inner.x + 1, inner.y + next_row, inner.width - 2, 1);
+        render_github_pr_field(
+            frame,
+            &dialog.github_pr,
+            github_area,
+            dialog.current_field() == DialogField::GithubPr,
+            label_width,
+        );
+        next_row += 2;
+    }
+
     if dialog.kind == IssueKind::Agentic {
         if !dialog.available_agents.is_empty() {
             let agent_area = Rect::new(inner.x + 1, inner.y + next_row, inner.width - 2, 1);
@@ -90,30 +114,6 @@ pub fn render_dialog(frame: &mut Frame, app: &App) {
             dialog.agent_kind,
             mode_area,
             dialog.current_field() == DialogField::Mode,
-            label_width,
-        );
-        next_row += 2;
-    }
-
-    if dialog.linear_available {
-        let linear_area = Rect::new(inner.x + 1, inner.y + next_row, inner.width - 2, 1);
-        render_linear_field(
-            frame,
-            &dialog.linear_issue,
-            linear_area,
-            dialog.current_field() == DialogField::Linear,
-            label_width,
-        );
-        next_row += 2;
-    }
-
-    if dialog.github_available {
-        let github_area = Rect::new(inner.x + 1, inner.y + next_row, inner.width - 2, 1);
-        render_github_pr_field(
-            frame,
-            &dialog.github_pr,
-            github_area,
-            dialog.current_field() == DialogField::GithubPr,
             label_width,
         );
         next_row += 2;

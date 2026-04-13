@@ -1168,17 +1168,17 @@ impl DialogState {
 
     fn ordered_fields(&self) -> Vec<DialogField> {
         let mut fields = vec![DialogField::Kind];
-        if self.kind == IssueKind::Agentic {
-            fields.push(DialogField::Agent);
-            if !self.available_agents.is_empty() {
-                fields.push(DialogField::Mode);
-            }
-        }
         if self.linear_available {
             fields.push(DialogField::Linear);
         }
         if self.github_available {
             fields.push(DialogField::GithubPr);
+        }
+        if self.kind == IssueKind::Agentic {
+            fields.push(DialogField::Agent);
+            if !self.available_agents.is_empty() {
+                fields.push(DialogField::Mode);
+            }
         }
         fields.push(DialogField::Title);
         fields.push(DialogField::Prompt);
@@ -1196,17 +1196,17 @@ impl DialogState {
         github_available: bool,
     ) -> usize {
         let mut idx = 1;
-        if kind == IssueKind::Agentic {
-            idx += 1;
-            if !available_agents.is_empty() {
-                idx += 1;
-            }
-        }
         if linear_available {
             idx += 1;
         }
         if github_available {
             idx += 1;
+        }
+        if kind == IssueKind::Agentic {
+            idx += 1;
+            if !available_agents.is_empty() {
+                idx += 1;
+            }
         }
         idx
     }

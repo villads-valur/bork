@@ -214,7 +214,7 @@ These are installed automatically by `bork init`. Use `bork install` / `bork uni
 | `Shift+Enter` | Submit from any field |
 | `Ctrl+e` | Open prompt in `$EDITOR` (on Prompt field) |
 | `Esc` / `Ctrl+c` | Cancel |
-| `Space` / `h` / `l` | Cycle mode (on Mode field); open Linear picker (on Linear field) |
+| `Space` / `h` / `l` | Cycle agent (on Agent field); cycle mode (on Mode field); open Linear picker (on Linear field) |
 
 ### Sidebar Mode
 
@@ -242,6 +242,19 @@ project_name = "myproject"       # Issue ID prefix (e.g. myproject-1, myproject-
 agent_kind = "opencode"          # Default agent: "opencode", "claude", or "codex"
 default_prompt = "Check AGENTS.md for project context and start working on the issue."
 ```
+
+### Agent Picker
+
+The new/edit issue dialog includes an Agent field that lets you pick which coding agent to use per issue. Only agents that are actually installed on your system appear in the picker. When a single agent is installed, the field is hidden.
+
+You can configure available agents and the default globally at `~/.config/bork/agents.toml`:
+
+```toml
+agents = ["opencode", "claude", "codex"]   # Which agents to show (order matters)
+default_agent = "claude"                    # Pre-selected agent for new issues
+```
+
+Both `agents` and `default_agent` are optional. Without this file, bork auto-detects all installed agents via `which`. The per-project `agent_kind` in `.bork/config.toml` still controls the default for that project; the global config only restricts and reorders the available list.
 
 ### State
 
