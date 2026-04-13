@@ -6,7 +6,7 @@ Terminal kanban board for orchestrating OpenCode/Claude coding sessions across g
 
 - **Language**: Rust (no async runtime, pure `std::thread` + `mpsc`)
 - **TUI**: ratatui + crossterm
-- **External tools**: tmux, git, gh, linear (optional), opencode/claude (all via `std::process::Command`)
+- **External tools**: tmux, git, gh, linear (optional), opencode/claude/codex (all via `std::process::Command`)
 
 ### Threading Model
 
@@ -39,6 +39,7 @@ All user-facing actions route through `active_project()` / `active_project_mut()
 src/
 ├── main.rs           # Entry point, CLI (clap), event loop, terminal setup, worker management
 ├── app.rs            # App/Project/LiveState/SidebarState structs, navigation, worktree detection
+├── agent_config.rs   # Agent preferences from ~/.config/bork/agents.toml + PATH detection
 ├── handler.rs        # Action dispatch, state mutations, dialog submit/confirm
 ├── config.rs         # Config/state persistence (atomic writes)
 ├── global_config.rs  # Global project registry (~/.config/bork/projects.json)
@@ -54,11 +55,11 @@ src/
 ├── external/
 │   ├── mod.rs
 │   ├── tmux.rs       # Tmux session management
-│   ├── opencode.rs   # Agent session launcher (opencode + claude)
+│   ├── opencode.rs   # Agent session launcher (opencode/claude/codex)
 │   ├── git.rs        # Git worktree status polling
 │   ├── github.rs     # GitHub PR polling via gh api graphql (per-repo identity cache)
 │   ├── linear.rs     # Linear CLI integration (assigned issues via graphql)
-│   └── hooks.rs      # Agent status hooks (install/uninstall for opencode + claude)
+│   └── hooks.rs      # Agent status hooks (install/uninstall for opencode/claude/codex)
 └── ui/
     ├── mod.rs         # Root render, layout composition, swimlane splitting
     ├── board.rs       # 4-column kanban board with adaptive card sizes
@@ -85,6 +86,7 @@ App
 Project
 ├── issues: Vec<Issue>              # Persistent (saved to state.json)
 ├── config: AppConfig               # From .bork/config.toml
+├── available_agents: Vec<AgentKind> # Resolved at startup from ~/.config/bork/agents.toml + PATH
 ├── selected_column/row             # Board cursor (per-project)
 ├── live: LiveState                 # Ephemeral worker data (sessions, git, PRs, etc.)
 └── state_dirty: bool               # Triggers flush to disk
@@ -112,6 +114,7 @@ State lives in `.bork/` at the container root. Config is detected by walking up 
 ## Global State
 
 - `~/.config/bork/projects.json` — registry of all bork projects (auto-registered, auto-pruned)
+- `~/.config/bork/agents.toml` — optional agent preferences (available agents, default agent)
 - `~/.config/bork/bork.pid` — flock-based single instance lock
 
 ## Build & Run

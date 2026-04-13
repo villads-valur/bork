@@ -11,19 +11,10 @@ pub struct AgentSelection {
     pub default_agent: Option<AgentKind>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct AgentPreferences {
     enabled: Option<Vec<AgentKind>>,
     default_agent: Option<AgentKind>,
-}
-
-impl Default for AgentPreferences {
-    fn default() -> Self {
-        Self {
-            enabled: None,
-            default_agent: None,
-        }
-    }
 }
 
 pub fn agent_config_path() -> PathBuf {
@@ -75,28 +66,19 @@ fn parse_agent_preferences(contents: &str) -> AgentPreferences {
 }
 
 fn parse_agent_value(value: &str) -> Option<AgentKind> {
-    let token = trim_value_token(value);
-    if token.is_empty() {
-        return None;
-    }
-    AgentKind::parse(token)
+    AgentKind::parse(trim_value_token(value))
 }
 
 fn parse_agent_list(value: &str) -> Vec<AgentKind> {
     let trimmed = value.trim();
-    let inner = if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() >= 2 {
-        &trimmed[1..trimmed.len() - 1]
-    } else {
-        trimmed
-    };
+    let inner = trimmed
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(trimmed);
 
     let mut agents = Vec::new();
     for item in inner.split(',') {
-        let token = trim_value_token(item);
-        if token.is_empty() {
-            continue;
-        }
-        let Some(kind) = AgentKind::parse(token) else {
+        let Some(kind) = AgentKind::parse(trim_value_token(item)) else {
             continue;
         };
         if !agents.contains(&kind) {

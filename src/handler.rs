@@ -532,10 +532,6 @@ fn handle_dialog(app: &mut App, action: Action, ctx: &ActionContext) -> PostActi
                 app.open_linear_picker_with_context(LinearPickerContext::Attach, ctx);
                 return PostAction::None;
             }
-            Action::DialogNextField => {
-                submit_dialog(app, ctx);
-                return PostAction::None;
-            }
             Action::DialogBackspace | Action::DialogDelete => {
                 if let Some(dialog) = app.dialog.as_mut() {
                     dialog.linear_issue = None;
@@ -553,10 +549,6 @@ fn handle_dialog(app: &mut App, action: Action, ctx: &ActionContext) -> PostActi
             Action::DialogChar(' ') => {
                 app.picker_tab = ImportSource::GitHub;
                 app.open_import_picker_with_context(LinearPickerContext::Attach, ctx);
-                return PostAction::None;
-            }
-            Action::DialogNextField => {
-                submit_dialog(app, ctx);
                 return PostAction::None;
             }
             Action::DialogBackspace | Action::DialogDelete => {
