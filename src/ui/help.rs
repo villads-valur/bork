@@ -64,6 +64,7 @@ const SECTIONS: &[Section] = &[
         title: "Move Issues",
         bindings: &[
             ("H / L", "Move left / right"),
+            ("K / J", "Move up / down"),
             ("D", "Move to Done"),
             ("T", "Move to To Do"),
         ],
