@@ -8,6 +8,7 @@ mod handler;
 mod init;
 mod input;
 mod lock;
+mod ops;
 mod types;
 mod ui;
 mod worktree;
@@ -36,7 +37,7 @@ use app::{App, InputMode, ProjectId};
 use global_config::ReloadResult;
 use handler::{ActionResult, PostAction};
 use input::map_key_to_action;
-use types::{AgentKind, AgentStatusInfo};
+use types::{AgentKind, AgentMode, AgentStatusInfo, Column, IssueKind};
 
 use external::git::GitPollResult;
 use external::linear::LinearPollResult;
@@ -273,6 +274,18 @@ enum Command {
         #[command(subcommand)]
         command: ProjectCommand,
     },
+
+    /// Manage issues on the board
+    Issue {
+        #[command(subcommand)]
+        command: IssueCommand,
+    },
+
+    /// Manage integrations (Linear, GitHub PRs)
+    Integration {
+        #[command(subcommand)]
+        command: IntegrationCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -291,6 +304,157 @@ enum ProjectCommand {
         /// Path to project container
         path: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum IssueCommand {
+    /// List all issues
+    List {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Filter by column (todo, in-progress, code-review, done)
+        #[arg(long, value_parser = parse_column)]
+        column: Option<Column>,
+    },
+
+    /// Create a new issue
+    Create {
+        /// Issue title
+        title: String,
+
+        /// Column to place in (todo, in-progress, code-review, done)
+        #[arg(long, value_parser = parse_column)]
+        column: Option<Column>,
+
+        /// Agent kind (opencode, claude, codex)
+        #[arg(long, value_parser = parse_agent_kind)]
+        agent: Option<AgentKind>,
+
+        /// Agent mode (plan, build, yolo)
+        #[arg(long, value_parser = parse_agent_mode)]
+        mode: Option<AgentMode>,
+
+        /// Prompt text for the agent
+        #[arg(long)]
+        prompt: Option<String>,
+
+        /// Issue kind (agentic, todo)
+        #[arg(long, value_parser = parse_issue_kind)]
+        kind: Option<IssueKind>,
+    },
+
+    /// Update an existing issue
+    Update {
+        /// Issue ID (e.g. bork-1)
+        id: String,
+
+        /// New title
+        #[arg(long)]
+        title: Option<String>,
+
+        /// Move to column (todo, in-progress, code-review, done)
+        #[arg(long, value_parser = parse_column)]
+        column: Option<Column>,
+
+        /// Change agent kind (opencode, claude, codex)
+        #[arg(long, value_parser = parse_agent_kind)]
+        agent: Option<AgentKind>,
+
+        /// Change agent mode (plan, build, yolo)
+        #[arg(long, value_parser = parse_agent_mode)]
+        mode: Option<AgentMode>,
+
+        /// Update prompt text (empty string clears it)
+        #[arg(long)]
+        prompt: Option<String>,
+    },
+
+    /// Delete an issue
+    Delete {
+        /// Issue ID (e.g. bork-1)
+        id: String,
+    },
+
+    /// Show issue details
+    Show {
+        /// Issue ID (e.g. bork-1)
+        id: String,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Move an issue to a column
+    Move {
+        /// Issue ID (e.g. bork-1)
+        id: String,
+
+        /// Target column (todo, in-progress, code-review, done)
+        #[arg(value_parser = parse_column)]
+        column: Column,
+    },
+}
+
+#[derive(Subcommand)]
+enum IntegrationCommand {
+    /// Link a Linear ticket to an issue
+    AttachLinear {
+        /// Issue ID (e.g. bork-1)
+        issue_id: String,
+
+        /// Linear issue identifier (e.g. VIL-123)
+        linear_identifier: String,
+    },
+
+    /// Link a GitHub PR to an issue
+    AttachPr {
+        /// Issue ID (e.g. bork-1)
+        issue_id: String,
+
+        /// GitHub PR number
+        pr_number: u32,
+    },
+}
+
+fn parse_column(s: &str) -> Result<Column, String> {
+    match s.to_lowercase().as_str() {
+        "todo" | "to-do" | "to_do" => Ok(Column::Todo),
+        "in-progress" | "in_progress" | "inprogress" => Ok(Column::InProgress),
+        "code-review" | "code_review" | "codereview" | "review" => Ok(Column::CodeReview),
+        "done" => Ok(Column::Done),
+        _ => Err(format!(
+            "Unknown column '{}'. Options: todo, in-progress, code-review, done",
+            s
+        )),
+    }
+}
+
+fn parse_agent_kind(s: &str) -> Result<AgentKind, String> {
+    AgentKind::parse(s)
+        .ok_or_else(|| format!("Unknown agent '{}'. Options: opencode, claude, codex", s))
+}
+
+fn parse_agent_mode(s: &str) -> Result<AgentMode, String> {
+    match s.to_lowercase().as_str() {
+        "plan" => Ok(AgentMode::Plan),
+        "build" => Ok(AgentMode::Build),
+        "yolo" => Ok(AgentMode::Yolo),
+        _ => Err(format!("Unknown mode '{}'. Options: plan, build, yolo", s)),
+    }
+}
+
+fn parse_issue_kind(s: &str) -> Result<IssueKind, String> {
+    match s.to_lowercase().as_str() {
+        "agentic" => Ok(IssueKind::Agentic),
+        "todo" | "non-agentic" | "nonagentic" => Ok(IssueKind::NonAgentic),
+        _ => Err(format!(
+            "Unknown issue kind '{}'. Options: agentic, todo",
+            s
+        )),
+    }
 }
 
 #[derive(Clone, ValueEnum)]
@@ -327,6 +491,8 @@ fn main() -> anyhow::Result<()> {
             title,
         }) => worktree::run_worktree(&issue_id, slug.as_deref(), title.as_deref()),
         Some(Command::Project { command }) => run_project_command(command),
+        Some(Command::Issue { command }) => run_issue_command(command),
+        Some(Command::Integration { command }) => run_integration_command(command),
         None => run_tui(),
     }
 }
@@ -377,6 +543,104 @@ fn run_project_command(command: ProjectCommand) -> anyhow::Result<()> {
             } else {
                 println!("No project registered at {}", target.display());
             }
+            Ok(())
+        }
+    }
+}
+
+fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
+    let project_root = config::find_project_root();
+
+    match command {
+        IssueCommand::List { json, column } => {
+            let output = ops::list_issues(&project_root, &ops::ListOptions { column, json })?;
+            println!("{}", output);
+            Ok(())
+        }
+        IssueCommand::Create {
+            title,
+            column,
+            agent,
+            mode,
+            prompt,
+            kind,
+        } => {
+            let issue = ops::create_issue(
+                &project_root,
+                ops::CreateOptions {
+                    title,
+                    column,
+                    agent_kind: agent,
+                    agent_mode: mode,
+                    prompt,
+                    kind,
+                },
+            )?;
+            println!("Created {}: \"{}\"", issue.id, issue.title);
+            Ok(())
+        }
+        IssueCommand::Update {
+            id,
+            title,
+            column,
+            agent,
+            mode,
+            prompt,
+        } => {
+            let issue = ops::update_issue(
+                &project_root,
+                &id,
+                ops::UpdateOptions {
+                    title,
+                    column,
+                    agent_kind: agent,
+                    agent_mode: mode,
+                    prompt,
+                },
+            )?;
+            println!("Updated {}: \"{}\"", issue.id, issue.title);
+            Ok(())
+        }
+        IssueCommand::Delete { id } => {
+            let issue = ops::delete_issue(&project_root, &id)?;
+            println!("Deleted {}: \"{}\"", issue.id, issue.title);
+            Ok(())
+        }
+        IssueCommand::Show { id, json } => {
+            let output = ops::show_issue(&project_root, &id, json)?;
+            println!("{}", output);
+            Ok(())
+        }
+        IssueCommand::Move { id, column } => {
+            let issue = ops::move_issue(&project_root, &id, column)?;
+            println!("Moved {} to {}", issue.id, issue.column);
+            Ok(())
+        }
+    }
+}
+
+fn run_integration_command(command: IntegrationCommand) -> anyhow::Result<()> {
+    let project_root = config::find_project_root();
+
+    match command {
+        IntegrationCommand::AttachLinear {
+            issue_id,
+            linear_identifier,
+        } => {
+            let issue = ops::attach_linear(&project_root, &issue_id, &linear_identifier)?;
+            println!(
+                "Linked {} to Linear {}",
+                issue.id,
+                issue.linear_identifier.as_deref().unwrap_or("?")
+            );
+            Ok(())
+        }
+        IntegrationCommand::AttachPr {
+            issue_id,
+            pr_number,
+        } => {
+            let issue = ops::attach_pr(&project_root, &issue_id, pr_number)?;
+            println!("Linked {} to PR #{}", issue.id, pr_number);
             Ok(())
         }
     }
