@@ -124,6 +124,14 @@ bork --help
 | `bork project list` | List all registered projects |
 | `bork project add [path]` | Register a project (defaults to current directory) |
 | `bork project remove [path]` | Unregister a project |
+| `bork issue list` | List all issues (`--json` for structured output) |
+| `bork issue create <title>` | Create a new issue |
+| `bork issue show <id>` | Show issue details |
+| `bork issue update <id>` | Update issue fields |
+| `bork issue move <id> <column>` | Move an issue to a column |
+| `bork issue delete <id>` | Delete an issue |
+| `bork integration attach-linear <id> <identifier>` | Link a Linear ticket to an issue |
+| `bork integration attach-pr <id> <number>` | Link a GitHub PR to an issue |
 
 ### `bork init`
 
@@ -148,7 +156,9 @@ repo/                        # Container directory
 │   └── agent-status/
 ├── main/                    # Main branch worktree (the cloned repo)
 ├── opencode.jsonc           # OpenCode config
-└── .claude/skills/worktree/ # Worktree skill for Claude Code
+└── .claude/skills/          # Agent skills for Claude Code
+    ├── worktree/            # Worktree management skill
+    └── bork-cli/            # CLI command reference skill
 ```
 
 Agent status hooks are installed automatically and the project is registered in the global project registry (`~/.config/bork/projects.json`). The directory name defaults to the repo name, or you can pass a second argument to override it.
@@ -162,6 +172,31 @@ Bork ships with hooks that report agent status (Idle, Busy, Waiting, Error) back
 - **Codex**: Adds hooks to `~/.codex/hooks.json` and enables `features.codex_hooks = true` in `~/.codex/config.toml`
 
 These are installed automatically by `bork init`. Use `bork install` / `bork uninstall` to manage them manually.
+
+### CLI: Managing Issues
+
+Bork exposes its kanban board through the command line so you (or your AI agents) can create, update, and move issues without opening the TUI. The TUI picks up CLI changes within 2 seconds via its state sync mechanism.
+
+```bash
+bork issue create "Fix auth bug" --agent claude --prompt "Check the login flow"
+bork issue list --column in-progress
+bork issue list --json                    # machine-readable output
+bork issue move bork-3 code-review
+bork issue update bork-3 --title "Fix OAuth flow"
+bork issue show bork-3
+bork issue delete bork-3
+```
+
+**Create options:** `--column` (todo, in-progress, code-review, done), `--agent` (opencode, claude, codex), `--mode` (plan, build, yolo), `--prompt`, `--kind` (agentic, todo).
+
+**Integration commands** link external tickets and PRs to existing issues:
+
+```bash
+bork integration attach-linear bork-3 VIL-123   # link a Linear ticket
+bork integration attach-pr bork-3 42             # link a GitHub PR
+```
+
+All commands must be run from within a bork project directory (any directory containing or nested under `.bork/`). Issue IDs are case-insensitive.
 
 ## Keybindings
 
