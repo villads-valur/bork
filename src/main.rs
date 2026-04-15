@@ -959,10 +959,10 @@ fn run_tui() -> anyhow::Result<()> {
                         .map(|i| (i.id.clone(), i.title.clone()))
                         .collect();
                     for issue in &mut project.issues {
-                        if let Some(ref lid) = issue.linear_id {
-                            if issue.linear_imported {
+                        if issue.is_any_linear_imported() {
+                            if let Some(first_link) = issue.linear_links.first() {
                                 if let Some((_, title)) =
-                                    linear_titles.iter().find(|(id, _)| id == lid)
+                                    linear_titles.iter().find(|(id, _)| id == &first_link.id)
                                 {
                                     issue.title = title.clone();
                                 }

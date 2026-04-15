@@ -226,6 +226,24 @@ impl WorktreeStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LinkedLinear {
+    pub id: String,
+    pub identifier: String,
+    pub url: String,
+    #[serde(default)]
+    pub imported: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LinkedGithubPr {
+    pub number: u32,
+    #[serde(default)]
+    pub imported: bool,
+    #[serde(default)]
+    pub import_source: Option<PrImportSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Issue {
     pub id: String,
     pub title: String,
@@ -241,26 +259,107 @@ pub struct Issue {
     pub done_at: Option<u64>,
     #[serde(default)]
     pub session_id: Option<String>,
+
+    // --- New multi-link fields ---
     #[serde(default)]
+    pub linear_links: Vec<LinkedLinear>,
+    #[serde(default)]
+    pub github_pr_links: Vec<LinkedGithubPr>,
+
+    // --- Legacy singular fields (read-only, for migration from old state.json) ---
+    #[serde(default, skip_serializing)]
     pub linear_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub linear_identifier: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub linear_url: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub linear_imported: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub pr_number: Option<u32>,
-    /// When true, issue was auto-imported from a GitHub PR and title syncs from PR data.
-    #[serde(default, alias = "github_imported")]
+    #[serde(default, skip_serializing, alias = "github_imported")]
     pub pr_imported: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub pr_import_source: Option<PrImportSource>,
 }
 
 impl Issue {
     pub fn session_name(&self, project_name: &str) -> String {
         format!("{}-{}", project_name, self.id.to_lowercase())
+    }
+
+    /// Migrate legacy singular fields into the new Vec fields.
+    /// Called once after deserialization from old state.json format.
+    pub fn migrate_legacy_fields(&mut self) {
+        if self.linear_links.is_empty() {
+            if let (Some(id), Some(identifier), Some(url)) = (
+                self.linear_id.take(),
+                self.linear_identifier.take(),
+                self.linear_url.take(),
+            ) {
+                self.linear_links.push(LinkedLinear {
+                    id,
+                    identifier,
+                    url,
+                    imported: self.linear_imported,
+                });
+            }
+        }
+        self.linear_imported = false;
+
+        if self.github_pr_links.is_empty() {
+            if let Some(number) = self.pr_number.take() {
+                self.github_pr_links.push(LinkedGithubPr {
+                    number,
+                    imported: self.pr_imported,
+                    import_source: self.pr_import_source.take(),
+                });
+            }
+        }
+        self.pr_imported = false;
+    }
+
+    pub fn has_linear(&self) -> bool {
+        !self.linear_links.is_empty()
+    }
+
+    pub fn has_pr(&self) -> bool {
+        !self.github_pr_links.is_empty()
+    }
+
+    pub fn pr_numbers(&self) -> Vec<u32> {
+        self.github_pr_links.iter().map(|l| l.number).collect()
+    }
+
+    pub fn linear_identifiers(&self) -> Vec<&str> {
+        self.linear_links
+            .iter()
+            .map(|l| l.identifier.as_str())
+            .collect()
+    }
+
+    pub fn is_any_linear_imported(&self) -> bool {
+        self.linear_links.iter().any(|l| l.imported)
+    }
+
+    pub fn is_any_pr_imported(&self) -> bool {
+        self.github_pr_links.iter().any(|l| l.imported)
+    }
+
+    pub fn primary_pr_number(&self) -> Option<u32> {
+        self.github_pr_links.first().map(|l| l.number)
+    }
+
+    pub fn primary_pr_import_source(&self) -> Option<PrImportSource> {
+        self.github_pr_links.first().and_then(|l| l.import_source)
+    }
+
+    pub fn has_pr_number(&self, number: u32) -> bool {
+        self.github_pr_links.iter().any(|l| l.number == number)
+    }
+
+    pub fn has_linear_id(&self, id: &str) -> bool {
+        self.linear_links.iter().any(|l| l.id == id)
     }
 }
 
@@ -329,6 +428,8 @@ mod tests {
             worktree: None,
             done_at: None,
             session_id: None,
+            linear_links: Vec::new(),
+            github_pr_links: Vec::new(),
             linear_id: None,
             linear_identifier: None,
             linear_url: None,
@@ -617,5 +718,92 @@ mod tests {
         }"#;
         let issue: Issue = serde_json::from_str(json).unwrap();
         assert!(issue.pr_imported);
+    }
+
+    #[test]
+    fn migrate_legacy_linear_fields() {
+        let json = r#"{
+            "id": "vil-123",
+            "title": "Fix auth",
+            "column": "Todo",
+            "agent_kind": "OpenCode",
+            "agent_mode": "Plan",
+            "prompt": null,
+            "linear_id": "uuid-abc",
+            "linear_identifier": "VIL-123",
+            "linear_url": "https://linear.app/issue/VIL-123",
+            "linear_imported": true
+        }"#;
+        let mut issue: Issue = serde_json::from_str(json).unwrap();
+        issue.migrate_legacy_fields();
+        assert_eq!(issue.linear_links.len(), 1);
+        assert_eq!(issue.linear_links[0].id, "uuid-abc");
+        assert_eq!(issue.linear_links[0].identifier, "VIL-123");
+        assert!(issue.linear_links[0].imported);
+    }
+
+    #[test]
+    fn migrate_legacy_pr_fields() {
+        let json = r#"{
+            "id": "bork-1",
+            "title": "Fix bug",
+            "column": "CodeReview",
+            "agent_kind": "OpenCode",
+            "agent_mode": "Plan",
+            "prompt": null,
+            "pr_number": 42,
+            "pr_imported": true,
+            "pr_import_source": "Authored"
+        }"#;
+        let mut issue: Issue = serde_json::from_str(json).unwrap();
+        issue.migrate_legacy_fields();
+        assert_eq!(issue.github_pr_links.len(), 1);
+        assert_eq!(issue.github_pr_links[0].number, 42);
+        assert!(issue.github_pr_links[0].imported);
+        assert_eq!(
+            issue.github_pr_links[0].import_source,
+            Some(PrImportSource::Authored)
+        );
+    }
+
+    #[test]
+    fn migrate_does_not_overwrite_new_fields() {
+        let json = r#"{
+            "id": "bork-1",
+            "title": "Test",
+            "column": "Todo",
+            "agent_kind": "OpenCode",
+            "agent_mode": "Plan",
+            "prompt": null,
+            "linear_links": [{"id": "uuid-1", "identifier": "VIL-1", "url": "https://a"}],
+            "linear_id": "uuid-2",
+            "linear_identifier": "VIL-2",
+            "linear_url": "https://b"
+        }"#;
+        let mut issue: Issue = serde_json::from_str(json).unwrap();
+        issue.migrate_legacy_fields();
+        assert_eq!(issue.linear_links.len(), 1);
+        assert_eq!(issue.linear_links[0].identifier, "VIL-1");
+    }
+
+    #[test]
+    fn new_format_serializes_without_legacy_fields() {
+        let mut issue = test_issue("bork-1", Column::Todo);
+        issue.linear_links.push(LinkedLinear {
+            id: "uuid".into(),
+            identifier: "VIL-1".into(),
+            url: "https://a".into(),
+            imported: false,
+        });
+        issue.github_pr_links.push(LinkedGithubPr {
+            number: 42,
+            imported: false,
+            import_source: None,
+        });
+        let json = serde_json::to_string(&issue).unwrap();
+        assert!(json.contains("\"linear_links\""));
+        assert!(json.contains("\"github_pr_links\""));
+        assert!(!json.contains("\"linear_id\""));
+        assert!(!json.contains("\"pr_number\""));
     }
 }

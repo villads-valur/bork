@@ -73,7 +73,7 @@ pub fn render_dialog(frame: &mut Frame, app: &App) {
         let linear_area = Rect::new(inner.x + 1, inner.y + next_row, inner.width - 2, 1);
         render_linear_field(
             frame,
-            &dialog.linear_issue,
+            &dialog.linear_issues,
             linear_area,
             dialog.current_field() == DialogField::Linear,
             label_width,
@@ -85,7 +85,7 @@ pub fn render_dialog(frame: &mut Frame, app: &App) {
         let github_area = Rect::new(inner.x + 1, inner.y + next_row, inner.width - 2, 1);
         render_github_pr_field(
             frame,
-            &dialog.github_pr,
+            &dialog.github_prs,
             github_area,
             dialog.current_field() == DialogField::GithubPr,
             label_width,
@@ -461,38 +461,42 @@ fn render_agent_field(
 
 fn render_linear_field(
     frame: &mut Frame,
-    linear_issue: &Option<LinearIssue>,
+    linear_issues: &[LinearIssue],
     area: Rect,
     focused: bool,
     label_width: usize,
 ) {
     let label_style = field_label_style(focused);
+    let accent_style = Style::default()
+        .fg(styles::ACCENT)
+        .add_modifier(Modifier::BOLD);
 
     let mut spans = vec![Span::styled(
         format!("{:<width$}", "Linear:", width = label_width),
         label_style,
     )];
 
-    match linear_issue {
-        Some(li) => {
-            spans.push(Span::styled(
-                &li.identifier,
-                Style::default()
-                    .fg(styles::ACCENT)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            let remaining = (area.width as usize)
-                .saturating_sub(label_width)
-                .saturating_sub(li.identifier.len())
-                .saturating_sub(3);
-            if remaining > 4 {
-                let title_display: String = li.title.chars().take(remaining).collect();
-                spans.push(Span::styled(" \u{2022} ", styles::dim_style()));
-                spans.push(Span::styled(title_display, styles::dim_style()));
+    if linear_issues.is_empty() {
+        spans.push(Span::styled("\u{2014}", styles::dim_style()));
+    } else {
+        let available = (area.width as usize).saturating_sub(label_width);
+        let mut used = 0;
+        for (i, li) in linear_issues.iter().enumerate() {
+            let sep = if i > 0 { ", " } else { "" };
+            let text = format!("{}{}", sep, li.identifier);
+            if used + text.len() > available && i > 0 {
+                let remaining_count = linear_issues.len() - i;
+                spans.push(Span::styled(
+                    format!("+{}", remaining_count),
+                    styles::dim_style(),
+                ));
+                break;
             }
-        }
-        None => {
-            spans.push(Span::styled("\u{2014}", styles::dim_style()));
+            if i > 0 {
+                spans.push(Span::styled(", ", styles::dim_style()));
+            }
+            spans.push(Span::styled(li.identifier.clone(), accent_style));
+            used += text.len();
         }
     }
 
@@ -501,40 +505,42 @@ fn render_linear_field(
 
 fn render_github_pr_field(
     frame: &mut Frame,
-    github_pr: &Option<PrStatus>,
+    github_prs: &[PrStatus],
     area: Rect,
     focused: bool,
     label_width: usize,
 ) {
     let label_style = field_label_style(focused);
+    let accent_style = Style::default()
+        .fg(styles::ACCENT)
+        .add_modifier(Modifier::BOLD);
 
     let mut spans = vec![Span::styled(
         format!("{:<width$}", "GitHub:", width = label_width),
         label_style,
     )];
 
-    match github_pr {
-        Some(pr) => {
-            let number_str = format!("#{}", pr.number);
-            let num_len = number_str.len();
-            spans.push(Span::styled(
-                number_str,
-                Style::default()
-                    .fg(styles::ACCENT)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            let remaining = (area.width as usize)
-                .saturating_sub(label_width)
-                .saturating_sub(num_len)
-                .saturating_sub(3);
-            if remaining > 4 {
-                let title_display: String = pr.title.chars().take(remaining).collect();
-                spans.push(Span::styled(" \u{2022} ", styles::dim_style()));
-                spans.push(Span::styled(title_display, styles::dim_style()));
+    if github_prs.is_empty() {
+        spans.push(Span::styled("\u{2014}", styles::dim_style()));
+    } else {
+        let available = (area.width as usize).saturating_sub(label_width);
+        let mut used = 0;
+        for (i, pr) in github_prs.iter().enumerate() {
+            let sep = if i > 0 { ", " } else { "" };
+            let text = format!("{}#{}", sep, pr.number);
+            if used + text.len() > available && i > 0 {
+                let remaining_count = github_prs.len() - i;
+                spans.push(Span::styled(
+                    format!("+{}", remaining_count),
+                    styles::dim_style(),
+                ));
+                break;
             }
-        }
-        None => {
-            spans.push(Span::styled("\u{2014}", styles::dim_style()));
+            if i > 0 {
+                spans.push(Span::styled(", ", styles::dim_style()));
+            }
+            spans.push(Span::styled(format!("#{}", pr.number), accent_style));
+            used += text.len();
         }
     }
 
