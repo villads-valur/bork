@@ -21,11 +21,6 @@ pub fn render_header(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(styles::TEXT),
         ));
     }
-    title_spans.push(Span::styled(
-        concat!("v", env!("CARGO_PKG_VERSION")),
-        styles::dim_style(),
-    ));
-
     if app.active_project().config.debug {
         title_spans.push(Span::styled(
             " [DEBUG]",
@@ -111,8 +106,9 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             MessageKind::Warning => ratatui::style::Color::Yellow,
             MessageKind::Error => ratatui::style::Color::Red,
         };
-        let line = Line::from(Span::styled(format!(" {msg}"), Style::default().fg(color)));
-        frame.render_widget(Paragraph::new(line), area);
+        let left = Line::from(Span::styled(format!(" {msg}"), Style::default().fg(color)));
+        frame.render_widget(Paragraph::new(left), area);
+        render_update_banner(frame, app, area);
         return;
     }
 
@@ -128,6 +124,7 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(":clear", styles::statusbar_desc_style()),
         ]);
         frame.render_widget(Paragraph::new(line), area);
+        render_update_banner(frame, app, area);
         return;
     }
 
@@ -160,25 +157,57 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         ));
     }
 
+    // Right side: swimlane indicator and/or update banner
+    let mut right_spans: Vec<Span> = Vec::new();
+
     if swimlane_count > 1 {
         let active_name = &app.active_project().config.project_name;
-        let right_text = format!(
-            " {} ({}/{}) ",
-            active_name,
-            app.focused_swimlane + 1,
-            swimlane_count
-        );
+        right_spans.push(Span::styled(
+            format!(
+                "{} ({}/{}) ",
+                active_name,
+                app.focused_swimlane + 1,
+                swimlane_count
+            ),
+            Style::default().fg(styles::ACCENT),
+        ));
+    }
+
+    if app.update_available {
+        if !right_spans.is_empty() {
+            right_spans.push(Span::raw(" "));
+        }
+        right_spans.push(update_span());
+    }
+
+    if !right_spans.is_empty() {
         let left_width: usize = spans.iter().map(|s| s.width()).sum();
-        let gap = (area.width as usize).saturating_sub(left_width + right_text.len());
+        let right_width: usize = right_spans.iter().map(|s| s.width()).sum();
+        let gap = (area.width as usize).saturating_sub(left_width + right_width);
         if gap > 0 {
             spans.push(Span::raw(" ".repeat(gap)));
-            spans.push(Span::styled(
-                right_text,
-                Style::default().fg(styles::ACCENT),
-            ));
+            spans.extend(right_spans);
         }
     }
 
     let line = Line::from(spans);
     frame.render_widget(Paragraph::new(line), area);
+}
+
+fn update_span() -> Span<'static> {
+    Span::styled(
+        "new update available (bork update) ",
+        Style::default()
+            .fg(ratatui::style::Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+fn render_update_banner(frame: &mut Frame, app: &App, area: Rect) {
+    if !app.update_available {
+        return;
+    }
+    let line = Line::from(update_span());
+    let right = Paragraph::new(line).alignment(Alignment::Right);
+    frame.render_widget(right, area);
 }

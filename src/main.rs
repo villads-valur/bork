@@ -10,6 +10,7 @@ mod input;
 mod lock;
 mod types;
 mod ui;
+mod update;
 mod worktree;
 
 use std::collections::{HashMap, HashSet};
@@ -273,6 +274,9 @@ enum Command {
         #[command(subcommand)]
         command: ProjectCommand,
     },
+
+    /// Update bork to the latest version (git pull + cargo build)
+    Update,
 }
 
 #[derive(Subcommand)]
@@ -327,6 +331,7 @@ fn main() -> anyhow::Result<()> {
             title,
         }) => worktree::run_worktree(&issue_id, slug.as_deref(), title.as_deref()),
         Some(Command::Project { command }) => run_project_command(command),
+        Some(Command::Update) => update::run_update(),
         None => run_tui(),
     }
 }
@@ -595,6 +600,11 @@ fn run_tui() -> anyhow::Result<()> {
     thread::spawn(move || {
         let available = external::tuicr::check_available();
         let _ = tuicr_check_tx.send(available);
+    });
+
+    let (update_check_tx, update_check_rx) = mpsc::channel::<bool>();
+    thread::spawn(move || {
+        let _ = update_check_tx.send(update::check_for_update());
     });
 
     let mut pending_popup_session: Option<(String, String)> = None;
@@ -928,6 +938,12 @@ fn run_tui() -> anyhow::Result<()> {
             if let Ok(mut skip) = workers.git_skip_set.lock() {
                 *skip = app.project().done_worktree_names();
             }
+        }
+
+        // --- Update check ---
+        if let Ok(true) = update_check_rx.try_recv() {
+            app.update_available = true;
+            needs_redraw = true;
         }
 
         // --- tuicr: check availability ---

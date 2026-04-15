@@ -1499,6 +1499,7 @@ pub struct App {
     pub picker_tab: ImportSource,
     pub debug_inspector_json: Option<String>,
     pub debug_inspector_scroll: usize,
+    pub update_available: bool,
 }
 
 impl App {
@@ -1525,6 +1526,7 @@ impl App {
             picker_tab: ImportSource::Linear,
             debug_inspector_json: None,
             debug_inspector_scroll: 0,
+            update_available: false,
         }
     }
 
