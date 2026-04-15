@@ -11,7 +11,9 @@ use crate::config::{self, AppConfig};
 use crate::external::{github, opencode, tmux, tuicr};
 use crate::global_config::ReloadResult;
 use crate::input::Action;
-use crate::types::{AgentMode, Column, Issue, IssueKind, PrImportSource};
+use crate::types::{
+    AgentMode, Column, Issue, IssueKind, LinkedGithubPr, LinkedLinear, PrImportSource,
+};
 
 pub struct ActionChannels<'a> {
     pub action_tx: &'a mpsc::Sender<ActionResult>,
@@ -410,15 +412,25 @@ fn handle_normal(
             let Some(issue) = app.context_project(ctx).selected_issue(&q) else {
                 return PostAction::None;
             };
-            let Some(pr) = app.context_project(ctx).pr_for(issue) else {
-                app.set_warning("No PR found for this issue");
-                return PostAction::None;
-            };
-            let pr_number = pr.number;
-            let main_worktree = app.context_project(ctx).config.project_root.join("main");
-            thread::spawn(move || {
-                github::open_pr_in_browser(pr_number, &main_worktree);
-            });
+            if issue.github_pr_links.is_empty() {
+                let Some(pr) = app.context_project(ctx).pr_for(issue) else {
+                    app.set_warning("No PR found for this issue");
+                    return PostAction::None;
+                };
+                let pr_number = pr.number;
+                let main_worktree = app.context_project(ctx).config.project_root.join("main");
+                thread::spawn(move || {
+                    github::open_pr_in_browser(pr_number, &main_worktree);
+                });
+            } else {
+                let pr_numbers: Vec<u32> = issue.pr_numbers();
+                let main_worktree = app.context_project(ctx).config.project_root.join("main");
+                thread::spawn(move || {
+                    for num in &pr_numbers {
+                        github::open_pr_in_browser(*num, &main_worktree);
+                    }
+                });
+            }
             PostAction::None
         }
 
@@ -426,12 +438,15 @@ fn handle_normal(
             let Some(issue) = app.context_project(ctx).selected_issue(&q) else {
                 return PostAction::None;
             };
-            let Some(url) = issue.linear_url.clone() else {
+            if issue.linear_links.is_empty() {
                 app.set_warning("No Linear issue linked");
                 return PostAction::None;
-            };
+            }
+            let urls: Vec<String> = issue.linear_links.iter().map(|l| l.url.clone()).collect();
             thread::spawn(move || {
-                let _ = Command::new("open").arg(&url).output();
+                for url in &urls {
+                    let _ = Command::new("open").arg(url).output();
+                }
             });
             PostAction::None
         }
@@ -546,8 +561,14 @@ fn handle_dialog(app: &mut App, action: Action, ctx: &ActionContext) -> PostActi
             }
             Action::DialogBackspace | Action::DialogDelete => {
                 if let Some(dialog) = app.dialog.as_mut() {
-                    dialog.linear_issue = None;
-                    dialog.linear_detached = true;
+                    if dialog.linear_issues.is_empty() {
+                        dialog.linear_detached = true;
+                    } else {
+                        dialog.linear_issues.pop();
+                        if dialog.linear_issues.is_empty() {
+                            dialog.linear_detached = true;
+                        }
+                    }
                 }
                 return PostAction::None;
             }
@@ -565,8 +586,14 @@ fn handle_dialog(app: &mut App, action: Action, ctx: &ActionContext) -> PostActi
             }
             Action::DialogBackspace | Action::DialogDelete => {
                 if let Some(dialog) = app.dialog.as_mut() {
-                    dialog.github_pr = None;
-                    dialog.github_pr_cleared = true;
+                    if dialog.github_prs.is_empty() {
+                        dialog.github_pr_cleared = true;
+                    } else {
+                        dialog.github_prs.pop();
+                        if dialog.github_prs.is_empty() {
+                            dialog.github_pr_cleared = true;
+                        }
+                    }
                 }
                 return PostAction::None;
             }
@@ -681,6 +708,8 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
         worktree: None,
         done_at: None,
         session_id: None,
+        linear_links: Vec::new(),
+        github_pr_links: Vec::new(),
         linear_id: None,
         linear_identifier: None,
         linear_url: None,
@@ -707,29 +736,34 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
 
 fn apply_linear_fields(issue: &mut Issue, dialog: &crate::app::DialogState) {
     if dialog.linear_detached {
-        issue.linear_id = None;
-        issue.linear_identifier = None;
-        issue.linear_url = None;
-        issue.linear_imported = false;
-    } else if let Some(ref li) = dialog.linear_issue {
-        issue.linear_id = Some(li.id.clone());
-        issue.linear_identifier = Some(li.identifier.clone());
-        issue.linear_url = Some(li.url.clone());
-        // Attached via dialog, not imported — don't sync title
-        issue.linear_imported = false;
+        issue.linear_links.clear();
+    } else if !dialog.linear_issues.is_empty() {
+        issue.linear_links = dialog
+            .linear_issues
+            .iter()
+            .map(|li| LinkedLinear {
+                id: li.id.clone(),
+                identifier: li.identifier.clone(),
+                url: li.url.clone(),
+                imported: false,
+            })
+            .collect();
     }
 }
 
 fn apply_pr_fields(issue: &mut Issue, dialog: &crate::app::DialogState) {
     if dialog.github_pr_cleared {
-        issue.pr_number = None;
-        issue.pr_imported = false;
-        issue.pr_import_source = None;
-    } else if let Some(ref pr) = dialog.github_pr {
-        issue.pr_number = Some(pr.number);
-        // Attached via dialog, not imported — don't sync title
-        issue.pr_imported = false;
-        issue.pr_import_source = None;
+        issue.github_pr_links.clear();
+    } else if !dialog.github_prs.is_empty() {
+        issue.github_pr_links = dialog
+            .github_prs
+            .iter()
+            .map(|pr| LinkedGithubPr {
+                number: pr.number,
+                imported: false,
+                import_source: None,
+            })
+            .collect();
     }
 }
 
@@ -811,7 +845,7 @@ fn handle_linear_picker(
     }
 }
 
-fn attach_linear_to_dialog(app: &mut App, ctx: &ActionContext) {
+fn attach_linear_to_dialog(app: &mut App, _ctx: &ActionContext) {
     let filtered = app.filtered_linear_issues();
     let selected_idx = app.linear_picker.as_ref().map(|p| p.selected).unwrap_or(0);
 
@@ -820,13 +854,17 @@ fn attach_linear_to_dialog(app: &mut App, ctx: &ActionContext) {
         None => return,
     };
 
-    app.linear_picker = None;
-    app.input_mode = InputMode::Dialog;
-    app.linear_picker_context = LinearPickerContext::Import;
-
     if let Some(ref mut dialog) = app.dialog {
-        dialog.linear_issue = Some(linear_issue);
-        dialog.linear_detached = false;
+        if let Some(pos) = dialog
+            .linear_issues
+            .iter()
+            .position(|l| l.id == linear_issue.id)
+        {
+            dialog.linear_issues.remove(pos);
+        } else {
+            dialog.linear_issues.push(linear_issue);
+            dialog.linear_detached = false;
+        }
     }
 }
 
@@ -870,10 +908,17 @@ fn import_linear_issue(app: &mut App, ctx: &ActionContext) {
         worktree: None,
         done_at: None,
         session_id: None,
-        linear_id: Some(linear_issue.id.clone()),
-        linear_identifier: Some(linear_issue.identifier.clone()),
-        linear_url: Some(linear_issue.url.clone()),
-        linear_imported: true,
+        linear_links: vec![LinkedLinear {
+            id: linear_issue.id.clone(),
+            identifier: linear_issue.identifier.clone(),
+            url: linear_issue.url.clone(),
+            imported: true,
+        }],
+        github_pr_links: Vec::new(),
+        linear_id: None,
+        linear_identifier: None,
+        linear_url: None,
+        linear_imported: false,
         pr_number: None,
         pr_imported: false,
         pr_import_source: None,
@@ -908,7 +953,7 @@ fn import_github_pr(app: &mut App, ctx: &ActionContext) {
         .unwrap()
         .issues
         .iter()
-        .any(|i| i.pr_number == Some(pr.number))
+        .any(|i| i.has_pr_number(pr.number))
     {
         app.set_warning(format!("PR #{} is already on the board", pr.number));
         app.close_linear_picker();
@@ -928,13 +973,19 @@ fn import_github_pr(app: &mut App, ctx: &ActionContext) {
         worktree: None,
         done_at: None,
         session_id: None,
+        linear_links: Vec::new(),
+        github_pr_links: vec![LinkedGithubPr {
+            number: pr.number,
+            imported: true,
+            import_source: Some(PrImportSource::Authored),
+        }],
         linear_id: None,
         linear_identifier: None,
         linear_url: None,
         linear_imported: false,
-        pr_number: Some(pr.number),
-        pr_imported: true,
-        pr_import_source: Some(PrImportSource::Authored),
+        pr_number: None,
+        pr_imported: false,
+        pr_import_source: None,
     };
 
     let p = app.find_project_mut(&proj_id).unwrap();
@@ -950,7 +1001,7 @@ fn import_github_pr(app: &mut App, ctx: &ActionContext) {
     app.close_linear_picker();
 }
 
-fn attach_github_to_dialog(app: &mut App, ctx: &ActionContext) {
+fn attach_github_to_dialog(app: &mut App, _ctx: &ActionContext) {
     let filtered = app.filtered_github_prs();
     let selected_idx = app.linear_picker.as_ref().map(|p| p.selected).unwrap_or(0);
 
@@ -959,13 +1010,13 @@ fn attach_github_to_dialog(app: &mut App, ctx: &ActionContext) {
         None => return,
     };
 
-    app.linear_picker = None;
-    app.input_mode = InputMode::Dialog;
-    app.linear_picker_context = LinearPickerContext::Import;
-
     if let Some(ref mut dialog) = app.dialog {
-        dialog.github_pr = Some(pr);
-        dialog.github_pr_cleared = false;
+        if let Some(pos) = dialog.github_prs.iter().position(|p| p.number == pr.number) {
+            dialog.github_prs.remove(pos);
+        } else {
+            dialog.github_prs.push(pr);
+            dialog.github_pr_cleared = false;
+        }
     }
 }
 
@@ -1200,6 +1251,8 @@ mod tests {
             worktree: None,
             done_at: None,
             session_id: None,
+            linear_links: Vec::new(),
+            github_pr_links: Vec::new(),
             linear_id: None,
             linear_identifier: None,
             linear_url: None,
@@ -1347,6 +1400,8 @@ mod tests {
             worktree: None,
             done_at: None,
             session_id: None,
+            linear_links: Vec::new(),
+            github_pr_links: Vec::new(),
             linear_id: None,
             linear_identifier: None,
             linear_url: None,
@@ -1382,6 +1437,8 @@ mod tests {
             worktree: Some("main".to_string()),
             done_at: None,
             session_id: None,
+            linear_links: Vec::new(),
+            github_pr_links: Vec::new(),
             linear_id: None,
             linear_identifier: None,
             linear_url: None,
@@ -1446,14 +1503,9 @@ mod tests {
         assert_eq!(app.project().issues[0].id, "test-1");
         assert_eq!(app.project().issues[0].title, "First issue");
         assert_eq!(app.project().issues[0].column, Column::Todo);
-        assert_eq!(
-            app.project().issues[0].linear_id,
-            Some("uuid-1".to_string())
-        );
-        assert_eq!(
-            app.project().issues[0].linear_identifier,
-            Some("TEST-1".to_string())
-        );
+        assert_eq!(app.project().issues[0].linear_links.len(), 1);
+        assert_eq!(app.project().issues[0].linear_links[0].id, "uuid-1");
+        assert_eq!(app.project().issues[0].linear_links[0].identifier, "TEST-1");
     }
 
     #[test]
@@ -1582,6 +1634,8 @@ mod tests {
             worktree: None,
             done_at: None,
             session_id: None,
+            linear_links: Vec::new(),
+            github_pr_links: Vec::new(),
             linear_id: None,
             linear_identifier: None,
             linear_url: None,
@@ -1627,6 +1681,8 @@ mod tests {
             worktree: None,
             done_at: None,
             session_id: None,
+            linear_links: Vec::new(),
+            github_pr_links: Vec::new(),
             linear_id: None,
             linear_identifier: None,
             linear_url: None,
@@ -1666,6 +1722,8 @@ mod tests {
             worktree: None,
             done_at: None,
             session_id: None,
+            linear_links: Vec::new(),
+            github_pr_links: Vec::new(),
             linear_id: None,
             linear_identifier: None,
             linear_url: None,

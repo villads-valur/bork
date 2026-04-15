@@ -504,6 +504,8 @@ mod tests {
             worktree: None,
             done_at: None,
             session_id: None,
+            linear_links: Vec::new(),
+            github_pr_links: Vec::new(),
             linear_id: None,
             linear_identifier: None,
             linear_url: None,

@@ -8,8 +8,8 @@ use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 use crate::config::{AppConfig, AppState};
 use crate::external::linear::LinearIssue;
 use crate::types::{
-    AgentKind, AgentMode, AgentStatus, AgentStatusInfo, Column, Issue, IssueKind, PrImportSource,
-    PrState, PrStatus, WorktreeStatus,
+    AgentKind, AgentMode, AgentStatus, AgentStatusInfo, Column, Issue, IssueKind, LinkedGithubPr,
+    PrImportSource, PrState, PrStatus, WorktreeStatus,
 };
 use crate::ui::styles;
 
@@ -208,9 +208,9 @@ impl Project {
         issue.title.to_lowercase().contains(query)
             || issue.id.to_lowercase().contains(query)
             || issue
-                .linear_identifier
-                .as_ref()
-                .is_some_and(|li| li.to_lowercase().contains(query))
+                .linear_links
+                .iter()
+                .any(|l| l.identifier.to_lowercase().contains(query))
             || self
                 .branch_for(issue)
                 .is_some_and(|b| b.to_lowercase().contains(query))
@@ -548,12 +548,12 @@ impl Project {
             }
         }
 
-        if let Some(pr_num) = issue.pr_number {
+        for link in &issue.github_pr_links {
             if let Some(pr) = live
                 .user_prs
                 .iter()
                 .chain(live.review_requested_prs.iter())
-                .find(|p| p.number == pr_num)
+                .find(|p| p.number == link.number)
             {
                 return Some(pr.head_branch.as_str());
             }
@@ -569,12 +569,18 @@ impl Project {
                 return Some(pr);
             }
         }
-        let pr_num = issue.pr_number?;
-        live.pr_statuses
-            .values()
-            .chain(live.user_prs.iter())
-            .chain(live.review_requested_prs.iter())
-            .find(|p| p.number == pr_num)
+        for link in &issue.github_pr_links {
+            let found = live
+                .pr_statuses
+                .values()
+                .chain(live.user_prs.iter())
+                .chain(live.review_requested_prs.iter())
+                .find(|p| p.number == link.number);
+            if found.is_some() {
+                return found;
+            }
+        }
+        None
     }
 
     pub fn sync_prs_as_issues(&mut self) -> (bool, Option<String>) {
@@ -596,15 +602,16 @@ impl Project {
         // Review-requested issues are NOT removed, they get moved to Done instead.
         let before = self.issues.len();
         self.issues.retain(|issue| {
-            if !issue.pr_imported {
+            if !issue.is_any_pr_imported() {
                 return true;
             }
-            if issue.pr_import_source == Some(PrImportSource::ReviewRequested) {
+            if issue.primary_pr_import_source() == Some(PrImportSource::ReviewRequested) {
                 return true;
             }
             issue
-                .pr_number
-                .is_some_and(|n| live_authored_numbers.contains(&n))
+                .github_pr_links
+                .iter()
+                .any(|l| live_authored_numbers.contains(&l.number))
         });
         let removed = before - self.issues.len();
 
@@ -612,19 +619,20 @@ impl Project {
         let now = unix_now();
         let mut completed = 0usize;
         for issue in &mut self.issues {
-            if !issue.pr_imported {
+            if !issue.is_any_pr_imported() {
                 continue;
             }
-            if issue.pr_import_source != Some(PrImportSource::ReviewRequested) {
+            if issue.primary_pr_import_source() != Some(PrImportSource::ReviewRequested) {
                 continue;
             }
             if issue.column == Column::Done {
                 continue;
             }
-            let Some(pr_num) = issue.pr_number else {
-                continue;
-            };
-            if !live_review_numbers.contains(&pr_num) {
+            let has_live_review = issue
+                .github_pr_links
+                .iter()
+                .any(|l| live_review_numbers.contains(&l.number));
+            if !has_live_review {
                 issue.column = Column::Done;
                 issue.done_at = Some(now);
                 completed += 1;
@@ -641,7 +649,7 @@ impl Project {
         let claimed_pr_numbers: HashSet<u32> = self
             .issues
             .iter()
-            .filter_map(|issue| issue.pr_number)
+            .flat_map(|issue| issue.pr_numbers())
             .collect();
 
         let issue_ids: Vec<String> = self.issues.iter().map(|i| i.id.to_lowercase()).collect();
@@ -705,13 +713,19 @@ impl Project {
                 worktree: None,
                 done_at: None,
                 session_id: None,
+                linear_links: Vec::new(),
+                github_pr_links: vec![LinkedGithubPr {
+                    number: pr.number,
+                    imported: true,
+                    import_source: Some(PrImportSource::Authored),
+                }],
                 linear_id: None,
                 linear_identifier: None,
                 linear_url: None,
                 linear_imported: false,
-                pr_number: Some(pr.number),
-                pr_imported: true,
-                pr_import_source: Some(PrImportSource::Authored),
+                pr_number: None,
+                pr_imported: false,
+                pr_import_source: None,
             });
         }
 
@@ -741,13 +755,19 @@ impl Project {
                 worktree: None,
                 done_at: None,
                 session_id: None,
+                linear_links: Vec::new(),
+                github_pr_links: vec![LinkedGithubPr {
+                    number: pr.number,
+                    imported: true,
+                    import_source: Some(PrImportSource::ReviewRequested),
+                }],
                 linear_id: None,
                 linear_identifier: None,
                 linear_url: None,
                 linear_imported: false,
-                pr_number: Some(pr.number),
-                pr_imported: true,
-                pr_import_source: Some(PrImportSource::ReviewRequested),
+                pr_number: None,
+                pr_imported: false,
+                pr_import_source: None,
             });
         }
 
@@ -1018,10 +1038,10 @@ pub struct DialogState {
     pub focused_field: usize,
     pub editing_index: Option<usize>,
     pub target_column: Option<Column>,
-    pub linear_issue: Option<LinearIssue>,
+    pub linear_issues: Vec<LinearIssue>,
     pub linear_detached: bool,
     pub linear_available: bool,
-    pub github_pr: Option<PrStatus>,
+    pub github_prs: Vec<PrStatus>,
     pub github_pr_cleared: bool,
     pub github_available: bool,
 }
@@ -1061,10 +1081,10 @@ impl DialogState {
             focused_field: title_idx,
             editing_index: None,
             target_column: None,
-            linear_issue: None,
+            linear_issues: Vec::new(),
             linear_detached: false,
             linear_available,
-            github_pr: None,
+            github_prs: Vec::new(),
             github_pr_cleared: false,
             github_available,
         }
@@ -1080,24 +1100,33 @@ impl DialogState {
         user_prs: &[PrStatus],
     ) -> Self {
         let prompt_text = issue.prompt.as_deref().unwrap_or("");
-        let linear_issue = issue.linear_id.as_ref().map(|lid| LinearIssue {
-            id: lid.clone(),
-            identifier: issue.linear_identifier.clone().unwrap_or_default(),
-            title: issue.title.clone(),
-            url: issue.linear_url.clone().unwrap_or_default(),
-            branch_name: String::new(),
-            priority: 0,
-            state_name: String::new(),
-            team_key: String::new(),
-        });
 
-        let github_pr = issue.pr_number.and_then(|num| {
-            all_prs
-                .values()
-                .chain(user_prs.iter())
-                .find(|pr| pr.number == num)
-                .cloned()
-        });
+        let linear_issues: Vec<LinearIssue> = issue
+            .linear_links
+            .iter()
+            .map(|link| LinearIssue {
+                id: link.id.clone(),
+                identifier: link.identifier.clone(),
+                title: issue.title.clone(),
+                url: link.url.clone(),
+                branch_name: String::new(),
+                priority: 0,
+                state_name: String::new(),
+                team_key: String::new(),
+            })
+            .collect();
+
+        let github_prs: Vec<PrStatus> = issue
+            .github_pr_links
+            .iter()
+            .filter_map(|link| {
+                all_prs
+                    .values()
+                    .chain(user_prs.iter())
+                    .find(|pr| pr.number == link.number)
+                    .cloned()
+            })
+            .collect();
 
         let mut prompt = make_prompt_textarea(prompt_text);
         prompt.move_cursor(CursorMove::Bottom);
@@ -1121,10 +1150,10 @@ impl DialogState {
             focused_field: title_idx,
             editing_index: Some(index),
             target_column: None,
-            linear_issue,
+            linear_issues,
             linear_detached: false,
             linear_available,
-            github_pr,
+            github_prs,
             github_pr_cleared: false,
             github_available,
         }
@@ -1463,13 +1492,8 @@ fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
     merge_field!(worktree);
     merge_field!(done_at);
     merge_field!(session_id);
-    merge_field!(linear_id);
-    merge_field!(linear_identifier);
-    merge_field!(linear_url);
-    merge_field!(linear_imported);
-    merge_field!(pr_number);
-    merge_field!(pr_imported);
-    merge_field!(pr_import_source);
+    merge_field!(linear_links);
+    merge_field!(github_pr_links);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1948,6 +1972,8 @@ mod tests {
             worktree: None,
             done_at: None,
             session_id: None,
+            linear_links: Vec::new(),
+            github_pr_links: Vec::new(),
             linear_id: None,
             linear_identifier: None,
             linear_url: None,
@@ -2508,7 +2534,7 @@ mod tests {
         assert_eq!(app.project().issues.len(), 1);
         assert_eq!(app.project().issues[0].title, "PR #1");
         assert_eq!(app.project().issues[0].column, Column::CodeReview);
-        assert_eq!(app.project().issues[0].pr_number, Some(1));
+        assert!(app.project().issues[0].has_pr_number(1));
     }
 
     #[test]
@@ -2595,7 +2621,11 @@ mod tests {
     #[test]
     fn sync_prs_dedup_by_pr_number() {
         let mut issue = test_issue("bork-1", Column::CodeReview);
-        issue.pr_number = Some(42);
+        issue.github_pr_links.push(crate::types::LinkedGithubPr {
+            number: 42,
+            imported: false,
+            import_source: None,
+        });
         let mut app = test_app(vec![issue]);
         app.project_mut().live.user_prs = vec![test_pr(42, "some/branch")];
         app.project_mut().live.pr_poll_done = true;
@@ -2612,13 +2642,13 @@ mod tests {
 
         assert!(app.project_mut().sync_prs_as_issues().0);
         assert_eq!(app.project().issues.len(), 1);
-        assert_eq!(app.project().issues[0].pr_number, Some(42));
+        assert!(app.project().issues[0].has_pr_number(42));
 
         app.project_mut().issues.clear();
 
         assert!(app.project_mut().sync_prs_as_issues().0);
         assert_eq!(app.project().issues.len(), 1);
-        assert_eq!(app.project().issues[0].pr_number, Some(42));
+        assert!(app.project().issues[0].has_pr_number(42));
     }
 
     #[test]
@@ -3946,7 +3976,12 @@ mod tests {
     #[test]
     fn search_matches_linear_identifier() {
         let mut issue = test_issue_titled("bork-1", "Some feature", Column::Todo);
-        issue.linear_identifier = Some("VIL-123".to_string());
+        issue.linear_links.push(crate::types::LinkedLinear {
+            id: "uuid".into(),
+            identifier: "VIL-123".into(),
+            url: "https://linear.app/issue/VIL-123".into(),
+            imported: false,
+        });
         let app = test_app(vec![issue]);
         let results = app.project().issues_in_column(Column::Todo, "vil-123");
         assert_eq!(results.len(), 1);
@@ -3956,7 +3991,12 @@ mod tests {
     #[test]
     fn search_matches_partial_linear_identifier() {
         let mut issue = test_issue_titled("bork-1", "Some feature", Column::Todo);
-        issue.linear_identifier = Some("VIL-123".to_string());
+        issue.linear_links.push(crate::types::LinkedLinear {
+            id: "uuid".into(),
+            identifier: "VIL-123".into(),
+            url: "https://linear.app/issue/VIL-123".into(),
+            imported: false,
+        });
         let app = test_app(vec![issue]);
         let results = app.project().issues_in_column(Column::Todo, "vil");
         assert_eq!(results.len(), 1);
@@ -3965,7 +4005,12 @@ mod tests {
     #[test]
     fn search_linear_identifier_case_insensitive() {
         let mut issue = test_issue_titled("bork-1", "Some feature", Column::Todo);
-        issue.linear_identifier = Some("VIL-123".to_string());
+        issue.linear_links.push(crate::types::LinkedLinear {
+            id: "uuid".into(),
+            identifier: "VIL-123".into(),
+            url: "https://linear.app/issue/VIL-123".into(),
+            imported: false,
+        });
         let app = test_app(vec![issue]);
         assert_eq!(app.project().issues_in_column(Column::Todo, "VIL").len(), 1);
         assert_eq!(app.project().issues_in_column(Column::Todo, "vil").len(), 1);
@@ -3974,7 +4019,7 @@ mod tests {
     #[test]
     fn search_skips_none_linear_identifier() {
         let issue = test_issue_titled("bork-1", "Some feature", Column::Todo);
-        assert!(issue.linear_identifier.is_none());
+        assert!(issue.linear_links.is_empty());
         let app = test_app(vec![issue]);
         let results = app.project().issues_in_column(Column::Todo, "vil");
         assert_eq!(results.len(), 0);
@@ -4029,7 +4074,11 @@ mod tests {
     fn search_matches_partial_pr_title() {
         let mut issue = test_issue_titled("bork-1", "Some task", Column::InProgress);
         issue.worktree = Some("bork-1-wt".to_string());
-        issue.pr_number = Some(7);
+        issue.github_pr_links.push(crate::types::LinkedGithubPr {
+            number: 7,
+            imported: false,
+            import_source: None,
+        });
         let mut app = test_app(vec![issue]);
         let custom_pr = PrStatus {
             number: 7,
@@ -4059,9 +4108,13 @@ mod tests {
     #[test]
     fn search_matches_across_any_field() {
         let mut issue = test_issue_titled("bork-1", "Add feature", Column::Todo);
-        issue.linear_identifier = Some("VIL-99".to_string());
+        issue.linear_links.push(crate::types::LinkedLinear {
+            id: "uuid".into(),
+            identifier: "VIL-99".into(),
+            url: "https://a".into(),
+            imported: false,
+        });
         let app = test_app(vec![issue]);
-        // "vil" doesn't match title or id, but matches linear_identifier
         let results = app.project().issues_in_column(Column::Todo, "vil");
         assert_eq!(results.len(), 1);
     }
@@ -4069,7 +4122,12 @@ mod tests {
     #[test]
     fn search_no_duplicate_when_multiple_fields_match() {
         let mut issue = test_issue_titled("bork-fix", "Fix something", Column::Todo);
-        issue.linear_identifier = Some("FIX-1".to_string());
+        issue.linear_links.push(crate::types::LinkedLinear {
+            id: "uuid".into(),
+            identifier: "FIX-1".into(),
+            url: "https://a".into(),
+            imported: false,
+        });
         let app = test_app(vec![issue]);
         // "fix" matches both title, id, and linear_identifier
         let results = app.project().issues_in_column(Column::Todo, "fix");
@@ -4376,7 +4434,12 @@ mod tests {
     #[test]
     fn filtered_linear_issues_includes_already_imported() {
         let mut issue = test_issue("test-1", Column::Todo);
-        issue.linear_id = Some("uuid-1".to_string());
+        issue.linear_links.push(crate::types::LinkedLinear {
+            id: "uuid-1".into(),
+            identifier: "TEST-1".into(),
+            url: "https://a".into(),
+            imported: true,
+        });
         let mut app = test_app(vec![issue]);
 
         app.project_mut().live.linear_issues = vec![

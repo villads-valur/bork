@@ -118,7 +118,10 @@ pub fn load_state(project_root: &Path) -> AppState {
     let path = state_path(project_root);
     if path.exists() {
         if let Ok(contents) = fs::read_to_string(&path) {
-            if let Ok(state) = serde_json::from_str(&contents) {
+            if let Ok(mut state) = serde_json::from_str::<AppState>(&contents) {
+                for issue in &mut state.issues {
+                    issue.migrate_legacy_fields();
+                }
                 return state;
             }
         }
