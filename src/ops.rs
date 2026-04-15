@@ -146,6 +146,8 @@ pub fn create_issue(project_root: &Path, opts: CreateOptions) -> anyhow::Result<
             None
         },
         session_id: None,
+        linear_links: Vec::new(),
+        github_pr_links: Vec::new(),
         linear_id: None,
         linear_identifier: None,
         linear_url: None,
@@ -252,11 +254,17 @@ pub fn show_issue(project_root: &Path, issue_id: &str, json: bool) -> anyhow::Re
     if let Some(ref wt) = issue.worktree {
         out.push_str(&format!("Worktree: {}\n", wt));
     }
-    if let Some(ref li) = issue.linear_identifier {
-        out.push_str(&format!("Linear:   {}\n", li));
+    if !issue.linear_links.is_empty() {
+        let ids: Vec<&str> = issue.linear_identifiers();
+        out.push_str(&format!("Linear:   {}\n", ids.join(", ")));
     }
-    if let Some(pr) = issue.pr_number {
-        out.push_str(&format!("PR:       #{}\n", pr));
+    if !issue.github_pr_links.is_empty() {
+        let nums: Vec<String> = issue
+            .pr_numbers()
+            .iter()
+            .map(|n| format!("#{}", n))
+            .collect();
+        out.push_str(&format!("PR:       {}\n", nums.join(", ")));
     }
 
     Ok(out.trim_end().to_string())
@@ -272,9 +280,21 @@ pub fn attach_linear(
     let idx = find_issue_index(&state.issues, issue_id)
         .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", issue_id))?;
 
+    let identifier = linear_identifier.to_uppercase();
     let issue = &mut state.issues[idx];
-    issue.linear_identifier = Some(linear_identifier.to_uppercase());
-    issue.linear_imported = false;
+
+    if !issue
+        .linear_links
+        .iter()
+        .any(|l| l.identifier == identifier)
+    {
+        issue.linear_links.push(crate::types::LinkedLinear {
+            id: String::new(),
+            identifier,
+            url: String::new(),
+            imported: false,
+        });
+    }
 
     let updated = issue.clone();
     config::save_state(&state, project_root)?;
@@ -289,8 +309,14 @@ pub fn attach_pr(project_root: &Path, issue_id: &str, pr_number: u32) -> anyhow:
         .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", issue_id))?;
 
     let issue = &mut state.issues[idx];
-    issue.pr_number = Some(pr_number);
-    issue.pr_imported = false;
+
+    if !issue.has_pr_number(pr_number) {
+        issue.github_pr_links.push(crate::types::LinkedGithubPr {
+            number: pr_number,
+            imported: false,
+            import_source: None,
+        });
+    }
 
     let updated = issue.clone();
     config::save_state(&state, project_root)?;
@@ -695,8 +721,8 @@ mod tests {
         .unwrap();
 
         let updated = attach_linear(root, "test-1", "VIL-456").unwrap();
-        assert_eq!(updated.linear_identifier, Some("VIL-456".to_string()));
-        assert!(!updated.linear_imported);
+        assert_eq!(updated.linear_links.len(), 1);
+        assert_eq!(updated.linear_links[0].identifier, "VIL-456");
     }
 
     #[test]
@@ -718,8 +744,8 @@ mod tests {
         .unwrap();
 
         let updated = attach_pr(root, "test-1", 42).unwrap();
-        assert_eq!(updated.pr_number, Some(42));
-        assert!(!updated.pr_imported);
+        assert_eq!(updated.github_pr_links.len(), 1);
+        assert_eq!(updated.github_pr_links[0].number, 42);
     }
 
     #[test]
@@ -794,6 +820,8 @@ mod tests {
             worktree: None,
             done_at: None,
             session_id: None,
+            linear_links: Vec::new(),
+            github_pr_links: Vec::new(),
             linear_id: None,
             linear_identifier: None,
             linear_url: None,

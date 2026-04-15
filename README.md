@@ -68,7 +68,7 @@ Press `n` to create an issue, `Enter` to launch an agent session. You're up and 
 - **Plan, Build, and Yolo modes** &mdash; Toggle between modes per issue; Claude and Codex support Yolo (skips all permission prompts)
 - **Vim-style navigation** &mdash; h/j/k/l, g/G, and familiar modal keybindings
 - **ANSI 16 colors** &mdash; Adapts to any terminal theme, no hardcoded RGB
-- **Linear integration** &mdash; Import and attach Linear issues, sync state bidirectionally, open in Linear with a keypress
+- **Linear integration** &mdash; Import and attach multiple Linear issues per card, sync state bidirectionally, open in Linear with a keypress
 - **Auto-import PRs** &mdash; Open PRs authored by you are automatically added to the Code Review column
 - **Search and filter** &mdash; Type `/` to fuzzy-filter the board by title or issue ID
 - **Issue kinds** &mdash; Agentic issues launch AI sessions; non-agentic "todo" items skip the agent entirely
@@ -130,8 +130,8 @@ bork --help
 | `bork issue update <id>` | Update issue fields |
 | `bork issue move <id> <column>` | Move an issue to a column |
 | `bork issue delete <id>` | Delete an issue |
-| `bork integration attach-linear <id> <identifier>` | Link a Linear ticket to an issue |
-| `bork integration attach-pr <id> <number>` | Link a GitHub PR to an issue |
+| `bork integration attach-linear <id> <identifier>` | Link a Linear ticket to an issue (can attach multiple) |
+| `bork integration attach-pr <id> <number>` | Link a GitHub PR to an issue (can attach multiple) |
 
 ### `bork init`
 
@@ -189,11 +189,13 @@ bork issue delete bork-3
 
 **Create options:** `--column` (todo, in-progress, code-review, done), `--agent` (opencode, claude, codex), `--mode` (plan, build, yolo), `--prompt`, `--kind` (agentic, todo).
 
-**Integration commands** link external tickets and PRs to existing issues:
+**Integration commands** link external tickets and PRs to existing issues. You can attach multiple Linear issues and/or GitHub PRs to a single bork issue:
 
 ```bash
 bork integration attach-linear bork-3 VIL-123   # link a Linear ticket
+bork integration attach-linear bork-3 VIL-456   # link another Linear ticket to the same issue
 bork integration attach-pr bork-3 42             # link a GitHub PR
+bork integration attach-pr bork-3 43             # link another PR to the same issue
 ```
 
 All commands must be run from within a bork project directory (any directory containing or nested under `.bork/`). Issue IDs are case-insensitive.
@@ -319,11 +321,13 @@ Each issue card shows the current agent status:
 
 Bork polls GitHub for open PRs every 60 seconds using a single GraphQL query via the `gh` CLI. PRs are matched to issues by comparing the PR's head branch name against each issue's worktree branch. Open, non-draft PRs authored by the current GitHub user are also auto-imported as issues in the Code Review column, so you can track CI and review status without manual setup.
 
+You can link multiple GitHub PRs to a single bork issue, either via the TUI dialog (multi-select picker) or the CLI (`bork integration attach-pr`). Cards show all linked PR numbers.
+
 Each card shows PR status when a matching PR is found:
 
 | Element | Meaning |
 |---------|---------|
-| `#42` | PR number |
+| `#42, #43` | PR numbers (multiple when linked) |
 | `✓` (green) | CI checks passing |
 | `✗` (red) | CI checks failing |
 | `◌` (yellow) | CI checks pending |
@@ -339,8 +343,8 @@ The `gh` CLI must be installed and authenticated. If `gh` is not available or th
 When the [Linear CLI](https://linear.app/docs/cli) is installed and authenticated, bork polls your assigned issues every 45 seconds and enables these features:
 
 - **Import issues** &mdash; Press `I` to open a fuzzy-search picker of your assigned Linear issues. Imported issues use the Linear identifier as the bork issue ID (e.g. `BORK-14` becomes `bork-14`).
-- **Attach issues** &mdash; In the issue dialog, the Linear field lets you link a Linear issue to an existing bork issue without overwriting the title.
-- **Open in Linear** &mdash; Press `O` to open the linked Linear issue in your browser.
+- **Attach multiple issues** &mdash; In the issue dialog, the Linear field lets you link one or more Linear issues to a bork issue using a multi-select picker. Enter toggles selection, Backspace removes the last item.
+- **Open in Linear** &mdash; Press `O` to open all linked Linear issues in your browser.
 - **State sync** &mdash; Linear issue state is refreshed on each poll cycle. Imported issues also sync their title from Linear.
 
 If the `linear` CLI is not found at startup, all Linear features are silently disabled.
