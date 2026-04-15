@@ -33,8 +33,8 @@ pub fn render_import_picker(frame: &mut Frame, app: &App) {
     frame.render_widget(Clear, picker_area);
 
     let picker_title = match (app.linear_picker_context, app.picker_tab) {
-        (LinearPickerContext::Attach, ImportSource::GitHub) => " Attach GitHub PR ",
-        (LinearPickerContext::Attach, ImportSource::Linear) => " Attach Linear Issue ",
+        (LinearPickerContext::Attach, ImportSource::GitHub) => " Attach GitHub PRs ",
+        (LinearPickerContext::Attach, ImportSource::Linear) => " Attach Linear Issues ",
         (_, ImportSource::GitHub) => " Import GitHub PR ",
         (_, ImportSource::Linear) => " Import Linear Issue ",
     };
@@ -131,7 +131,7 @@ pub fn render_import_picker(frame: &mut Frame, app: &App) {
     };
 
     let select_hint = if app.linear_picker_context == LinearPickerContext::Attach {
-        ":attach  "
+        ":toggle  "
     } else {
         ":import  "
     };
@@ -204,8 +204,15 @@ fn render_linear_list(
         .project()
         .issues
         .iter()
-        .filter_map(|i| i.linear_id.as_deref())
+        .flat_map(|i| i.linear_links.iter().map(|l| l.id.as_str()))
         .collect();
+
+    let dialog_selected_ids: HashSet<&str> = app
+        .dialog
+        .as_ref()
+        .map(|d| d.linear_issues.iter().map(|l| l.id.as_str()).collect())
+        .unwrap_or_default();
+    let is_attach = app.linear_picker_context == LinearPickerContext::Attach;
 
     let scroll = if visible_count == 0 || picker.selected < visible_count {
         0
@@ -234,6 +241,7 @@ fn render_linear_list(
             let issue = filtered[idx];
             let is_selected = idx == picker.selected;
             let is_imported = imported_ids.contains(issue.id.as_str());
+            let is_dialog_selected = is_attach && dialog_selected_ids.contains(issue.id.as_str());
             let y = list_start_y + i as u16;
             let row_area = Rect::new(inner.x + 1, y, inner.width - 2, 1);
 
@@ -246,7 +254,9 @@ fn render_linear_list(
                 Style::default()
             };
 
-            let priority_str = if is_imported {
+            let priority_str = if is_dialog_selected {
+                "\u{25cf}   "
+            } else if is_imported {
                 "\u{2713}   "
             } else {
                 match issue.priority {
@@ -273,7 +283,7 @@ fn render_linear_list(
                 Style::default().fg(styles::TEXT)
             };
 
-            let priority_style = if is_imported {
+            let priority_style = if is_dialog_selected || is_imported {
                 Style::default().fg(styles::ACCENT)
             } else {
                 Style::default().fg(ratatui::style::Color::Yellow)
@@ -309,8 +319,15 @@ fn render_github_list(
         .project()
         .issues
         .iter()
-        .filter_map(|i| i.pr_number)
+        .flat_map(|i| i.pr_numbers())
         .collect();
+
+    let dialog_selected_prs: HashSet<u32> = app
+        .dialog
+        .as_ref()
+        .map(|d| d.github_prs.iter().map(|p| p.number).collect())
+        .unwrap_or_default();
+    let is_attach = app.linear_picker_context == LinearPickerContext::Attach;
 
     let scroll = if visible_count == 0 || picker.selected < visible_count {
         0
@@ -339,6 +356,7 @@ fn render_github_list(
             let pr = filtered[idx];
             let is_selected = idx == picker.selected;
             let is_imported = imported_pr_numbers.contains(&pr.number);
+            let is_dialog_selected = is_attach && dialog_selected_prs.contains(&pr.number);
             let y = list_start_y + i as u16;
             let row_area = Rect::new(inner.x + 1, y, inner.width - 2, 1);
 
@@ -351,7 +369,9 @@ fn render_github_list(
                 Style::default()
             };
 
-            let status_str = if is_imported {
+            let status_str = if is_dialog_selected {
+                "\u{25cf} "
+            } else if is_imported {
                 "\u{2713} "
             } else if pr.is_draft {
                 "\u{25cb} "
@@ -389,7 +409,7 @@ fn render_github_list(
                 Style::default().fg(styles::TEXT)
             };
 
-            let status_style = if is_imported {
+            let status_style = if is_dialog_selected || is_imported {
                 Style::default().fg(styles::ACCENT)
             } else {
                 Style::default()

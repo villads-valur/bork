@@ -134,3 +134,14 @@ The binary is symlinked to `/opt/homebrew/bin/bork`.
 - Tmux agent sessions named: {project_name}-{issue-id}
 - Wrapper tmux session: always named "bork" (single global session)
 - Opencode launched at project root with --prompt for issue context
+
+## Integration Data Model
+
+Each `Issue` can link to multiple Linear issues and GitHub PRs via Vec fields:
+
+- `linear_links: Vec<LinkedLinear>` — each has `id`, `identifier`, `url`, `imported`
+- `github_pr_links: Vec<LinkedGithubPr>` — each has `number`, `imported`, `import_source`
+
+Legacy singular fields (`linear_id`, `pr_number`, etc.) are kept for deserialization backward compat but marked `#[serde(skip_serializing)]`. Migration happens automatically in `load_state()`.
+
+The dialog picker uses multi-select in Attach mode (Enter toggles, Backspace removes last). Import mode stays single-select (creates a new bork issue per selection).

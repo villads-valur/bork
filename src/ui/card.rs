@@ -69,7 +69,7 @@ fn render_full(
     let title_text = styles::truncate(&ctx.issue.title, max_width);
     let title_line = Line::from(highlight_spans(&title_text, ctx.search_query, title_style));
     let status_line = format_status_line(ctx);
-    let pr_line = format_pr_line(ctx.pr);
+    let pr_line = format_pr_line(ctx.pr, ctx.issue);
     let bottom_line = format_bottom_line(ctx.issue, ctx.branch, ctx.ports, max_width);
 
     let mut lines = vec![title_line];
@@ -99,7 +99,7 @@ fn render_medium(
     let title_text = styles::truncate(&ctx.issue.title, max_width);
     let title_line = Line::from(highlight_spans(&title_text, ctx.search_query, title_style));
     let status_line = format_status_line(ctx);
-    let pr_line = format_pr_compact(ctx.pr);
+    let pr_line = format_pr_compact(ctx.pr, ctx.issue);
 
     let mut lines = vec![title_line, status_line];
     if inner.height > 2 {
@@ -145,7 +145,7 @@ fn format_status_line(ctx: &CardContext) -> Line<'static> {
         ]);
     }
 
-    if ctx.issue.pr_import_source == Some(PrImportSource::ReviewRequested) {
+    if ctx.issue.primary_pr_import_source() == Some(PrImportSource::ReviewRequested) {
         return Line::from(vec![
             Span::raw("  "),
             Span::styled("review", Style::default().fg(Color::Yellow)),
@@ -187,7 +187,7 @@ fn format_bottom_line(
     ports: Option<&Vec<u16>>,
     max_width: usize,
 ) -> Line<'static> {
-    let has_linear = issue.linear_identifier.is_some();
+    let has_linear = issue.has_linear();
     let has_missing_branch = branch.is_none();
     let has_ports = ports.is_some_and(|p| !p.is_empty());
 
@@ -198,10 +198,41 @@ fn format_bottom_line(
     let mut left_spans: Vec<Span<'static>> = vec![Span::raw("  ")];
     let mut left_width: usize = 2;
 
-    if let Some(ref identifier) = issue.linear_identifier {
-        let text = format!("\u{25c8} {}", identifier);
-        left_width += text.len();
-        left_spans.push(Span::styled(text, Style::default().fg(Color::Blue)));
+    if has_linear {
+        let identifiers: Vec<&str> = issue.linear_identifiers();
+        let prefix = "\u{25c8} ";
+        left_spans.push(Span::styled(
+            prefix.to_string(),
+            Style::default().fg(Color::Blue),
+        ));
+        left_width += prefix.len();
+
+        let budget = max_width.saturating_sub(left_width + 6);
+        let mut used = 0;
+        for (i, ident) in identifiers.iter().enumerate() {
+            let sep = if i > 0 { ", " } else { "" };
+            let text = format!("{}{}", sep, ident);
+            if used + text.len() > budget && i > 0 {
+                let remaining = identifiers.len() - i;
+                let overflow = format!("+{}", remaining);
+                left_spans.push(Span::styled(
+                    overflow.clone(),
+                    Style::default().fg(Color::Blue),
+                ));
+                left_width += overflow.len();
+                break;
+            }
+            if i > 0 {
+                left_spans.push(Span::styled(", ", Style::default().fg(Color::Blue)));
+                left_width += 2;
+            }
+            left_spans.push(Span::styled(
+                ident.to_string(),
+                Style::default().fg(Color::Blue),
+            ));
+            left_width += ident.len();
+            used += text.len();
+        }
     }
 
     let mut right_spans: Vec<Span<'static>> = Vec::new();
@@ -271,35 +302,63 @@ fn format_git_status(status: Option<&WorktreeStatus>) -> Vec<Span<'static>> {
     spans
 }
 
-fn format_pr_line(pr: Option<&PrStatus>) -> Line<'static> {
+fn format_pr_line(pr: Option<&PrStatus>, issue: &Issue) -> Line<'static> {
     let Some(pr) = pr else {
+        if issue.github_pr_links.len() > 1 {
+            let mut spans = vec![Span::raw("  ")];
+            for (i, link) in issue.github_pr_links.iter().enumerate() {
+                if i > 0 {
+                    spans.push(Span::styled(", ", styles::dim_style()));
+                }
+                spans.push(Span::styled(
+                    format!("#{}", link.number),
+                    styles::dim_style(),
+                ));
+            }
+            return Line::from(spans);
+        }
+        if let Some(num) = issue.primary_pr_number() {
+            return Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("#{}", num), styles::dim_style()),
+            ]);
+        }
         return Line::from("");
     };
 
     let pr_number = Span::styled(format!("#{}", pr.number), styles::dim_style());
 
+    let extra_pr_spans: Vec<Span<'static>> = issue
+        .github_pr_links
+        .iter()
+        .filter(|l| l.number != pr.number)
+        .flat_map(|l| {
+            vec![
+                Span::styled(", ", styles::dim_style()),
+                Span::styled(format!("#{}", l.number), styles::dim_style()),
+            ]
+        })
+        .collect();
+
     match &pr.state {
         PrState::Merged | PrState::Closed => {
             let (label, color) = styles::pr_state_style(&pr.state);
-            Line::from(vec![
-                Span::raw("  "),
-                pr_number,
-                Span::raw(" "),
-                Span::styled(label, Style::default().fg(color)),
-            ])
+            let mut spans = vec![Span::raw("  "), pr_number];
+            spans.extend(extra_pr_spans);
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(label, Style::default().fg(color)));
+            Line::from(spans)
         }
         PrState::Open => {
             let (checks_sym, checks_color) = styles::checks_icon(pr.checks);
             let (review_sym, review_color) = styles::review_icon(pr.review);
 
-            let mut spans = vec![
-                Span::raw("  "),
-                pr_number,
-                Span::raw(" "),
-                Span::styled(checks_sym, Style::default().fg(checks_color)),
-                Span::raw(" "),
-                Span::styled(review_sym, Style::default().fg(review_color)),
-            ];
+            let mut spans = vec![Span::raw("  "), pr_number];
+            spans.extend(extra_pr_spans);
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(checks_sym, Style::default().fg(checks_color)));
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(review_sym, Style::default().fg(review_color)));
 
             if pr.additions > 0 || pr.deletions > 0 {
                 spans.push(Span::raw(" "));
@@ -324,32 +383,54 @@ fn format_pr_line(pr: Option<&PrStatus>) -> Line<'static> {
     }
 }
 
-fn format_pr_compact(pr: Option<&PrStatus>) -> Line<'static> {
+fn format_pr_compact(pr: Option<&PrStatus>, issue: &Issue) -> Line<'static> {
     let Some(pr) = pr else {
+        if let Some(num) = issue.primary_pr_number() {
+            let mut spans = vec![Span::styled(format!("  #{}", num), styles::dim_style())];
+            for link in issue.github_pr_links.iter().skip(1) {
+                spans.push(Span::styled(
+                    format!(", #{}", link.number),
+                    styles::dim_style(),
+                ));
+            }
+            return Line::from(spans);
+        }
         return Line::from("");
     };
 
     let pr_number = Span::styled(format!("  #{}", pr.number), styles::dim_style());
 
+    let extra_pr_spans: Vec<Span<'static>> = issue
+        .github_pr_links
+        .iter()
+        .filter(|l| l.number != pr.number)
+        .flat_map(|l| {
+            vec![
+                Span::styled(", ", styles::dim_style()),
+                Span::styled(format!("#{}", l.number), styles::dim_style()),
+            ]
+        })
+        .collect();
+
     match &pr.state {
         PrState::Merged | PrState::Closed => {
             let (label, color) = styles::pr_state_style(&pr.state);
-            Line::from(vec![
-                pr_number,
-                Span::raw(" "),
-                Span::styled(label, Style::default().fg(color)),
-            ])
+            let mut spans = vec![pr_number];
+            spans.extend(extra_pr_spans);
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(label, Style::default().fg(color)));
+            Line::from(spans)
         }
         PrState::Open => {
             let (checks_sym, checks_color) = styles::checks_icon(pr.checks);
             let (review_sym, review_color) = styles::review_icon(pr.review);
-            Line::from(vec![
-                pr_number,
-                Span::raw(" "),
-                Span::styled(checks_sym, Style::default().fg(checks_color)),
-                Span::raw(" "),
-                Span::styled(review_sym, Style::default().fg(review_color)),
-            ])
+            let mut spans = vec![pr_number];
+            spans.extend(extra_pr_spans);
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(checks_sym, Style::default().fg(checks_color)));
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(review_sym, Style::default().fg(review_color)));
+            Line::from(spans)
         }
     }
 }

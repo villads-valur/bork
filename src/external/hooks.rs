@@ -126,12 +126,43 @@ const CODEX_HOOKS: &str = r#"{
 }"#;
 
 /// Install bork hooks for OpenCode, Claude Code, and Codex.
+/// Also deploys agent skills if run from within a bork project.
 pub fn install() -> anyhow::Result<()> {
     install_opencode_plugin()?;
     install_claude_hooks()?;
     install_codex_hooks()?;
+    install_skills();
     println!("bork hooks installed successfully");
     Ok(())
+}
+
+fn install_skills() {
+    let project_root = crate::config::find_project_root();
+    if !project_root.join(".bork").is_dir() {
+        return;
+    }
+
+    let skills = [
+        ("worktree", crate::init::WORKTREE_SKILL),
+        ("bork-cli", crate::init::BORK_CLI_SKILL),
+    ];
+
+    for (name, content) in &skills {
+        let skill_dir = project_root.join(format!(".claude/skills/{}", name));
+        let skill_path = skill_dir.join("SKILL.md");
+
+        if skill_path.exists() {
+            if let Ok(existing) = fs::read_to_string(&skill_path) {
+                if existing == *content {
+                    continue;
+                }
+            }
+        }
+
+        if fs::create_dir_all(&skill_dir).is_ok() {
+            let _ = fs::write(&skill_path, content);
+        }
+    }
 }
 
 /// Remove bork hooks from OpenCode, Claude Code, and Codex.

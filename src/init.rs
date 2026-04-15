@@ -6,151 +6,10 @@ use anyhow::{bail, Context};
 
 use crate::types::AgentKind;
 
-const WORKTREE_SKILL: &str = r#"---
-name: worktree
-description: Create git worktrees and register them with bork for issue tracking
----
-
-# Worktree Management
-
-Create and manage git worktrees in a bork project.
-
-## Context
-
-This is a bork project. The directory layout is:
-
-```
-project/                    # container root (this is where you are)
-├── main/                   # main branch worktree (owns .git/)
-├── {issue-id}-{slug}/      # issue worktrees (siblings of main/)
-├── .bork/                  # bork state (do not modify directly)
-├── AGENTS.md               # project instructions
-└── opencode.jsonc           # opencode config
-```
-
-The `main/` directory is a regular git repo. All worktrees are created from it and live as sibling directories inside this container.
-
-## Creating a worktree
-
-**Always use `bork worktree` to create worktrees.** This creates the git worktree AND registers it with bork's state so the TUI can track it.
-
-```bash
-bork worktree {issue-id} {slug}
-```
-
-**Example:**
-```bash
-bork worktree bork-14 add-worktree-support
-```
-
-This creates:
-- Directory: `bork-14-add-worktree-support/` (sibling of `main/`)
-- Branch: `bork-14/add-worktree-support` (branched from current HEAD of main)
-- Updates `.bork/state.json` to link the issue to the worktree
-
-To also create the issue if it doesn't exist:
-```bash
-bork worktree bork-14 add-worktree-support --title "Add worktree support"
-```
-
-## Naming conventions
-
-- **Worktree directory**: `{issue-id}-{slug}` when a slug is provided (e.g. `bork-14-add-worktree-support`), or just `{issue-id}` without a slug
-- **Branch name**: `{issue-id}/{kebab-case-slug}` (e.g. `bork-14/add-worktree-support`)
-- Issue IDs follow the pattern `{project-name}-{number}` (e.g. `bork-1`, `bork-14`)
-
-## Linear issues
-
-When an issue was imported from Linear, the bork issue ID is the Linear identifier in lowercase (e.g. `vil-123` for Linear issue `VIL-123`). The worktree follows the same naming pattern:
-
-```bash
-bork worktree vil-123 fix-auth-flow
-```
-
-This creates:
-- Directory: `vil-123-fix-auth-flow/`
-- Branch: `vil-123/fix-auth-flow`
-
-When Linear is not used, issue IDs are regular bork IDs (e.g. `bork-14`).
-
-## After creating a worktree
-
-1. Create a planning file:
-   ```bash
-   mkdir -p {worktree-dir}/.claude
-   ```
-   Then create `{worktree-dir}/.claude/planning.md` with the task plan.
-
-2. Do all work for the issue inside the worktree directory, not in `main/`.
-
-## Listing worktrees
-
-```bash
-git -C main worktree list
-```
-
-## Removing a worktree
-
-When work is done and merged:
-
-```bash
-git -C main worktree remove ../{worktree-dir}
-```
-
-Or forcefully if there are uncommitted changes:
-
-```bash
-git -C main worktree remove --force ../{worktree-dir}
-```
-
-## Important
-
-- Never commit directly to `main` from a worktree. Always use feature branches.
-- The `main/` worktree should stay on the `main` branch.
-- Multiple worktrees can exist simultaneously for parallel work streams.
-- Each worktree is a full checkout sharing the same git objects (disk efficient).
-"#;
-
-const AGENTS_MD_TEMPLATE: &str = r#"# {project_name}
-
-Managed with bork across git worktrees and tmux.
-
-## Project Layout
-
-```
-{project_name}/                     # Container directory (NOT a git repo)
-├── .bork/                          # Bork state (config.toml, state.json)
-├── AGENTS.md
-├── opencode.jsonc
-├── main/                           # Main branch worktree (git repo)
-│   └── CLAUDE.md                   # Project instructions
-└── {issue-id}-{slug}/              # Issue worktrees
-```
-
-## Worktree Conventions
-
-- Use `bork worktree <issue-id> <slug>` to create worktrees
-- Worktree directory: `{issue-id}-{slug}` (e.g. `{project_name}-1-fix-bug`)
-- Branch: `{issue-id}/{slug}` (e.g. `{project_name}-1/fix-bug`)
-- Issue IDs: `{project_name}-{number}`
-- Linear-imported issue IDs: lowercase Linear identifier (e.g. `abc-123` for `ABC-123`)
-- Tmux sessions: `{project_name}-{issue-id}`
-"#;
-
-const CLAUDE_MD_TEMPLATE: &str = r#"# {project_name}
-
-## Build & Run
-
-```bash
-# TODO: Add build commands
-```
-
-## Testing
-
-```bash
-# TODO: Add test commands
-```
-"#;
+pub const WORKTREE_SKILL: &str = include_str!("../skills/worktree.md");
+pub const BORK_CLI_SKILL: &str = include_str!("../skills/bork-cli.md");
+const AGENTS_MD_TEMPLATE: &str = include_str!("../templates/AGENTS.md");
+const CLAUDE_MD_TEMPLATE: &str = include_str!("../templates/CLAUDE.md");
 
 const OPENCODE_JSONC: &str = r#"{
   "$schema": "https://opencode.ai/config.json"
@@ -299,6 +158,12 @@ pub fn run_init(
     fs::create_dir_all(&skill_dir).context("Failed to create .claude/skills/worktree")?;
     fs::write(skill_dir.join("SKILL.md"), WORKTREE_SKILL)
         .context("Failed to write worktree SKILL.md")?;
+
+    // Scaffold CLI skill for Claude Code
+    let cli_skill_dir = container.join(".claude/skills/bork-cli");
+    fs::create_dir_all(&cli_skill_dir).context("Failed to create .claude/skills/bork-cli")?;
+    fs::write(cli_skill_dir.join("SKILL.md"), BORK_CLI_SKILL)
+        .context("Failed to write bork-cli SKILL.md")?;
 
     // Install agent hooks
     println!("Installing agent hooks...");
