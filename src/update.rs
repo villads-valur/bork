@@ -1,13 +1,49 @@
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context};
+use serde::{Deserialize, Serialize};
+
+use crate::global_config;
+
+const CHECK_INTERVAL_SECS: u64 = 6 * 60 * 60; // 6 hours
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct UpdateCache {
+    last_check: u64,
+    update_available: bool,
+}
+
+fn cache_path() -> PathBuf {
+    global_config::global_config_dir().join("update_check.json")
+}
+
+fn load_cache() -> UpdateCache {
+    let path = cache_path();
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_cache(cache: &UpdateCache) {
+    let path = cache_path();
+    let _ = std::fs::create_dir_all(path.parent().unwrap_or(&path));
+    let _ = std::fs::write(&path, serde_json::to_string(cache).unwrap_or_default());
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
 
 fn resolve_source_repo() -> anyhow::Result<PathBuf> {
     let exe = std::env::current_exe().context("failed to determine executable path")?;
     let resolved = std::fs::canonicalize(&exe).unwrap_or(exe);
 
-    // Walk up from e.g. /path/to/main/target/release/bork to find the directory with Cargo.toml
     let mut dir = resolved.parent();
     while let Some(d) = dir {
         if d.join("Cargo.toml").exists() {
@@ -22,55 +58,50 @@ fn resolve_source_repo() -> anyhow::Result<PathBuf> {
     )
 }
 
-fn parse_version_from_cargo_toml(content: &str) -> Option<String> {
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if !trimmed.starts_with("version") {
-            continue;
-        }
-        let version = trimmed.split('=').nth(1)?.trim().trim_matches('"').trim();
-        if !version.is_empty() {
-            return Some(version.to_string());
-        }
-    }
-    None
-}
+fn query_github_for_update() -> bool {
+    let build_commit = env!("BORK_GIT_COMMIT");
+    let repo = env!("BORK_GITHUB_REPO");
 
-/// Check if a newer version is available on origin/main.
-/// Returns true if behind, false if up to date or on error.
-pub fn check_for_update() -> bool {
-    let Ok(repo) = resolve_source_repo() else {
+    if build_commit.is_empty() || repo.is_empty() {
         return false;
-    };
+    }
 
-    let Ok(fetch) = Command::new("git")
-        .args(["fetch", "origin", "main", "--quiet"])
-        .current_dir(&repo)
-        .stdout(Stdio::null())
+    let Ok(output) = Command::new("gh")
+        .args(["api", &format!("repos/{repo}/commits/main"), "--jq", ".sha"])
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .status()
-    else {
-        return false;
-    };
-
-    if !fetch.success() {
-        return false;
-    }
-
-    let Ok(output) = Command::new("git")
-        .args(["rev-list", "HEAD..origin/main", "--count"])
-        .current_dir(&repo)
         .output()
     else {
         return false;
     };
 
-    let count: u32 = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse()
-        .unwrap_or(0);
+    let latest = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
-    count > 0
+    if latest.is_empty() {
+        return false;
+    }
+
+    latest != build_commit
+}
+
+/// Check if a newer version is available. Uses a cache file so we only
+/// hit the GitHub API once every 6 hours.
+pub fn check_for_update() -> bool {
+    let cache = load_cache();
+    let now = unix_now();
+
+    if now.saturating_sub(cache.last_check) < CHECK_INTERVAL_SECS {
+        return cache.update_available;
+    }
+
+    let available = query_github_for_update();
+
+    save_cache(&UpdateCache {
+        last_check: now,
+        update_available: available,
+    });
+
+    available
 }
 
 pub fn run_update() -> anyhow::Result<()> {
@@ -80,7 +111,6 @@ pub fn run_update() -> anyhow::Result<()> {
     println!("Source: {}", repo.display());
     println!();
 
-    // Fetch
     println!("Fetching latest...");
     let fetch = Command::new("git")
         .args(["fetch", "origin", "main", "--quiet"])
@@ -111,7 +141,6 @@ pub fn run_update() -> anyhow::Result<()> {
     println!("{behind} new commit(s) available. Pulling...");
     println!();
 
-    // Pull
     let pull = Command::new("git")
         .args(["pull", "origin", "main"])
         .current_dir(&repo)
@@ -128,7 +157,6 @@ pub fn run_update() -> anyhow::Result<()> {
     println!("Building...");
     println!();
 
-    // Build
     let build = Command::new("cargo")
         .args(["build", "--release"])
         .current_dir(&repo)
@@ -141,55 +169,11 @@ pub fn run_update() -> anyhow::Result<()> {
         bail!("cargo build failed");
     }
 
-    // Read the new version from Cargo.toml on disk (post-pull)
-    let cargo_path = repo.join("Cargo.toml");
-    let cargo_content =
-        std::fs::read_to_string(&cargo_path).context("failed to read Cargo.toml")?;
-    let new_version = parse_version_from_cargo_toml(&cargo_content).unwrap_or_else(|| "?".into());
+    // Clear the cache so next TUI launch re-checks with the new binary's commit
+    save_cache(&UpdateCache::default());
 
     println!();
-    if new_version == current {
-        println!("Rebuilt v{current} with latest changes.");
-    } else {
-        println!("Updated: v{current} -> v{new_version}");
-    }
+    println!("Updated to latest. Restart bork to use the new version.");
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_version_standard() {
-        let toml = r#"
-[package]
-name = "bork"
-version = "1.2.3"
-edition = "2021"
-"#;
-        assert_eq!(
-            parse_version_from_cargo_toml(toml),
-            Some("1.2.3".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_version_with_spaces() {
-        let toml = r#"version  =  "0.5.0""#;
-        assert_eq!(
-            parse_version_from_cargo_toml(toml),
-            Some("0.5.0".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_version_missing() {
-        let toml = r#"
-[package]
-name = "bork"
-"#;
-        assert_eq!(parse_version_from_cargo_toml(toml), None);
-    }
 }
