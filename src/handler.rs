@@ -364,23 +364,29 @@ fn handle_normal(
                 return PostAction::None;
             };
             let session_name = issue.session_name(&app.context_project(ctx).config.project_name);
-            if !app.context_project(ctx).is_session_alive(&session_name) {
-                app.set_warning("No active session");
-                return PostAction::None;
-            }
+            let session_alive = app.context_project(ctx).is_session_alive(&session_name);
             let pr_mode = action == Action::OpenReviewPR;
             let popup_title = format!("{}: {}", issue.id, issue.title);
             let worktree_path = app.context_project(ctx).config.project_root.join(&wt);
             let tx = ch.action_tx.clone();
             app.busy_count += 1;
-            app.set_message(if pr_mode {
-                "Opening tuicr --pr..."
+            app.set_message(if session_alive {
+                if pr_mode {
+                    "Opening tuicr --pr..."
+                } else {
+                    "Opening tuicr..."
+                }
             } else {
-                "Opening tuicr..."
+                "Starting tuicr session..."
             });
 
             thread::spawn(move || {
-                let result = match tuicr::open_in_session(&session_name, &worktree_path, pr_mode) {
+                let outcome = if session_alive {
+                    tuicr::open_in_session(&session_name, &worktree_path, pr_mode)
+                } else {
+                    tuicr::launch_review_session(&session_name, &worktree_path, pr_mode)
+                };
+                let result = match outcome {
                     Ok(()) => ActionResult {
                         message: "tuicr ready".to_string(),
                         message_kind: MessageKind::Info,
