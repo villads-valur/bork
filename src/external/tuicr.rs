@@ -16,13 +16,25 @@ pub fn check_available() -> bool {
 pub fn open_in_session(session: &str, cwd: &Path, pr_mode: bool) -> Result<(), AppError> {
     tmux::create_window(session, "tuicr", cwd)?;
 
-    let cmd = if pr_mode {
-        "tuicr --pr || tuicr"
-    } else {
-        "tuicr"
-    };
     let target = format!("{session}:tuicr");
-    tmux::send_keys(&target, cmd)?;
+    tmux::send_keys(&target, &tuicr_cmd(pr_mode))?;
 
     Ok(())
+}
+
+/// Create a fresh tmux session whose first window runs tuicr.
+/// Used when there is no agent session for the issue but the user wants to review.
+pub fn launch_review_session(session: &str, cwd: &Path, pr_mode: bool) -> Result<(), AppError> {
+    tmux::create_session(session, cwd)?;
+    tmux::send_keys(session, &tuicr_cmd(pr_mode))?;
+    tmux::create_window(session, "terminal", cwd)?;
+    Ok(())
+}
+
+fn tuicr_cmd(pr_mode: bool) -> String {
+    if pr_mode {
+        "tuicr --pr || tuicr".to_string()
+    } else {
+        "tuicr".to_string()
+    }
 }
