@@ -72,47 +72,47 @@ fn build_agent_cmd(
         shell_escape_single_quotes(status_dir_str),
     );
 
-    let main_worktree = config.project_root.join("main");
-    let pr_url_resolver = |number: u32| github::pr_url(&main_worktree, number);
+    // Builds and shell-escapes the issue prompt. Lazy: only invoked for fresh
+    // sessions, since resume paths skip the prompt entirely.
+    let build_escaped_prompt = || {
+        let default_prompt = config
+            .default_prompt
+            .as_deref()
+            .unwrap_or(config::DEFAULT_PROMPT_FALLBACK);
+        let main_worktree = config.project_root.join("main");
+        let prompt = build_prompt(
+            &issue.id,
+            &issue.title,
+            default_prompt,
+            issue.prompt.as_deref(),
+            &issue.linear_links,
+            &issue.github_pr_links,
+            |number| github::pr_url(&main_worktree, number),
+        );
+        shell_escape_single_quotes(&prompt)
+    };
 
     match issue.agent_kind {
         AgentKind::OpenCode => {
+            // Yolo is Claude-only; treat as Build for OpenCode
+            let mode_flag = match issue.agent_mode {
+                AgentMode::Plan => " --agent plan",
+                AgentMode::Build | AgentMode::Yolo => "",
+            };
             if let Some(ref sid) = issue.session_id {
-                // Resume existing OpenCode session — skip --prompt, history is preserved
+                // Resume existing session — skip --prompt, history is preserved
                 let escaped_sid = shell_escape_single_quotes(sid);
-                // Yolo is Claude-only; treat as Build for OpenCode
-                let mode_flag = match issue.agent_mode {
-                    AgentMode::Plan => " --agent plan",
-                    AgentMode::Build | AgentMode::Yolo => "",
-                };
                 let cmd = format!(
                     "{} && opencode --session '{}'{}",
                     env_prefix, escaped_sid, mode_flag,
                 );
                 (cmd, None)
             } else {
-                let default_prompt = config
-                    .default_prompt
-                    .as_deref()
-                    .unwrap_or(config::DEFAULT_PROMPT_FALLBACK);
-                let prompt = build_prompt(
-                    &issue.id,
-                    &issue.title,
-                    default_prompt,
-                    issue.prompt.as_deref(),
-                    &issue.linear_links,
-                    &issue.github_pr_links,
-                    &pr_url_resolver,
-                );
-                let escaped_prompt = shell_escape_single_quotes(&prompt);
-                // Yolo is Claude-only; treat as Build for OpenCode
-                let mode_flag = match issue.agent_mode {
-                    AgentMode::Plan => " --agent plan",
-                    AgentMode::Build | AgentMode::Yolo => "",
-                };
                 let cmd = format!(
                     "{} && opencode --prompt '{}'{}",
-                    env_prefix, escaped_prompt, mode_flag,
+                    env_prefix,
+                    build_escaped_prompt(),
+                    mode_flag,
                 );
                 (cmd, None)
             }
@@ -127,7 +127,7 @@ fn build_agent_cmd(
             };
 
             if let Some(ref sid) = issue.session_id {
-                // Resume existing Claude session — skip the prompt, history is preserved
+                // Resume existing session — skip the prompt, history is preserved
                 let escaped_sid = shell_escape_single_quotes(sid);
                 let cmd = format!(
                     "{} && claude --name '{}'{} --resume '{}'",
@@ -135,22 +135,8 @@ fn build_agent_cmd(
                 );
                 (cmd, Some(sid.clone()))
             } else {
-                // Fresh Claude session: build prompt and optionally pre-assign a UUID
-                let default_prompt = config
-                    .default_prompt
-                    .as_deref()
-                    .unwrap_or(config::DEFAULT_PROMPT_FALLBACK);
-                let prompt = build_prompt(
-                    &issue.id,
-                    &issue.title,
-                    default_prompt,
-                    issue.prompt.as_deref(),
-                    &issue.linear_links,
-                    &issue.github_pr_links,
-                    &pr_url_resolver,
-                );
-                let escaped_prompt = shell_escape_single_quotes(&prompt);
-
+                // Fresh session: build prompt and optionally pre-assign a UUID
+                let escaped_prompt = build_escaped_prompt();
                 let uuid = generate_uuid().unwrap_or_default();
                 if uuid.is_empty() {
                     let cmd = format!(
@@ -183,21 +169,12 @@ fn build_agent_cmd(
                 );
                 (cmd, Some(sid.clone()))
             } else {
-                let default_prompt = config
-                    .default_prompt
-                    .as_deref()
-                    .unwrap_or(config::DEFAULT_PROMPT_FALLBACK);
-                let prompt = build_prompt(
-                    &issue.id,
-                    &issue.title,
-                    default_prompt,
-                    issue.prompt.as_deref(),
-                    &issue.linear_links,
-                    &issue.github_pr_links,
-                    &pr_url_resolver,
+                let cmd = format!(
+                    "{} && codex{} '{}'",
+                    env_prefix,
+                    mode_flag,
+                    build_escaped_prompt()
                 );
-                let escaped_prompt = shell_escape_single_quotes(&prompt);
-                let cmd = format!("{} && codex{} '{}'", env_prefix, mode_flag, escaped_prompt);
                 (cmd, None)
             }
         }
@@ -403,19 +380,21 @@ fn append_section<T>(
     plural: &str,
     format_entry: impl Fn(&T) -> String,
 ) {
+    use std::fmt::Write;
     match items {
         [] => {}
         [single] => {
-            prompt.push_str(&format!(
+            let _ = write!(
+                prompt,
                 "\n\nThis issue has a {}: {}",
                 singular,
                 format_entry(single)
-            ));
+            );
         }
         many => {
-            prompt.push_str(&format!("\n\nThis issue has {}:", plural));
+            let _ = write!(prompt, "\n\nThis issue has {}:", plural);
             for item in many {
-                prompt.push_str(&format!("\n- {}", format_entry(item)));
+                let _ = write!(prompt, "\n- {}", format_entry(item));
             }
         }
     }
