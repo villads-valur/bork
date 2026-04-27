@@ -344,6 +344,19 @@ pub fn open_pr_in_browser(pr_number: u32, main_worktree: &Path) {
         .output();
 }
 
+/// Build the canonical github.com URL for a PR, given the project's main worktree.
+/// Returns None if we can't determine the repo identity (e.g. no `gh` available, or
+/// the worktree isn't a GitHub remote). Uses the cached repo identity, so this is
+/// effectively free after the first call.
+pub fn pr_url(main_worktree: &Path, pr_number: u32) -> Option<String> {
+    let repo = get_repo_identity(main_worktree)?;
+    Some(format_pr_url(&repo.owner, &repo.name, pr_number))
+}
+
+fn format_pr_url(owner: &str, name: &str, pr_number: u32) -> String {
+    format!("https://github.com/{}/{}/pull/{}", owner, name, pr_number)
+}
+
 pub fn index_by_branch(prs: Vec<PrStatus>) -> HashMap<String, PrStatus> {
     prs.into_iter()
         .map(|pr| (pr.head_branch.clone(), pr))
@@ -671,6 +684,32 @@ mod tests {
     fn test_parse_repo_identity_owner_not_object() {
         let json = r#"{"owner": "octocat", "name": "hello-world"}"#;
         assert!(parse_repo_identity(json).is_none());
+    }
+
+    // --- format_pr_url ---
+
+    #[test]
+    fn test_format_pr_url_basic() {
+        assert_eq!(
+            format_pr_url("octocat", "hello-world", 42),
+            "https://github.com/octocat/hello-world/pull/42"
+        );
+    }
+
+    #[test]
+    fn test_format_pr_url_with_dashes_and_dots() {
+        assert_eq!(
+            format_pr_url("my-org", "some.repo", 1),
+            "https://github.com/my-org/some.repo/pull/1"
+        );
+    }
+
+    #[test]
+    fn test_format_pr_url_large_number() {
+        assert_eq!(
+            format_pr_url("o", "r", 123456),
+            "https://github.com/o/r/pull/123456"
+        );
     }
 
     // --- index_by_branch ---
