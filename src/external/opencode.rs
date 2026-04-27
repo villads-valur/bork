@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::config::{self, AppConfig};
 use crate::error::AppError;
-use crate::external::tmux;
+use crate::external::{github, tmux};
 use crate::types::{AgentKind, AgentMode, Issue, LinkedGithubPr, LinkedLinear};
 
 /// Launch an agent session for an issue.
@@ -72,6 +72,9 @@ fn build_agent_cmd(
         shell_escape_single_quotes(status_dir_str),
     );
 
+    let main_worktree = config.project_root.join("main");
+    let pr_url_resolver = |number: u32| github::pr_url(&main_worktree, number);
+
     match issue.agent_kind {
         AgentKind::OpenCode => {
             if let Some(ref sid) = issue.session_id {
@@ -99,6 +102,7 @@ fn build_agent_cmd(
                     issue.prompt.as_deref(),
                     &issue.linear_links,
                     &issue.github_pr_links,
+                    &pr_url_resolver,
                 );
                 let escaped_prompt = shell_escape_single_quotes(&prompt);
                 // Yolo is Claude-only; treat as Build for OpenCode
@@ -143,6 +147,7 @@ fn build_agent_cmd(
                     issue.prompt.as_deref(),
                     &issue.linear_links,
                     &issue.github_pr_links,
+                    &pr_url_resolver,
                 );
                 let escaped_prompt = shell_escape_single_quotes(&prompt);
 
@@ -189,6 +194,7 @@ fn build_agent_cmd(
                     issue.prompt.as_deref(),
                     &issue.linear_links,
                     &issue.github_pr_links,
+                    &pr_url_resolver,
                 );
                 let escaped_prompt = shell_escape_single_quotes(&prompt);
                 let cmd = format!("{} && codex{} '{}'", env_prefix, mode_flag, escaped_prompt);
@@ -340,6 +346,10 @@ fn parse_newest_session_id(output: &str) -> Option<String> {
 /// Always starts with issue context and the default prompt, then optionally
 /// includes Linear tickets and GitHub PRs linked to the issue, then appends
 /// the user's custom prompt (if any) after a blank line.
+///
+/// `pr_url_resolver` is called once per linked PR to fetch its canonical URL.
+/// If it returns `None` (e.g. `gh` not available, non-GitHub remote), the PR
+/// is rendered as `#{number}` with no URL.
 fn build_prompt(
     id: &str,
     title: &str,
@@ -347,6 +357,7 @@ fn build_prompt(
     user_prompt: Option<&str>,
     linear_links: &[LinkedLinear],
     github_pr_links: &[LinkedGithubPr],
+    pr_url_resolver: impl Fn(u32) -> Option<String>,
 ) -> String {
     let mut prompt = format!("You are working on {}: {}. {}", id, title, default_prompt);
 
@@ -368,7 +379,10 @@ fn build_prompt(
         github_pr_links,
         "GitHub PR",
         "GitHub PRs",
-        |link| format!("#{}", link.number),
+        |link| match pr_url_resolver(link.number) {
+            Some(url) => format!("#{} - {}", link.number, url),
+            None => format!("#{}", link.number),
+        },
     );
 
     if let Some(user_text) = user_prompt {
@@ -433,6 +447,16 @@ mod tests {
             imported: false,
             import_source: None,
         }
+    }
+
+    /// PR URL resolver that always returns None (simulates no `gh` available).
+    fn no_pr_url(_: u32) -> Option<String> {
+        None
+    }
+
+    /// PR URL resolver that always returns a stable test URL.
+    fn test_pr_url(number: u32) -> Option<String> {
+        Some(format!("https://github.com/test/repo/pull/{}", number))
     }
 
     // --- append_section ---
@@ -513,7 +537,15 @@ mod tests {
 
     #[test]
     fn build_prompt_without_user_prompt() {
-        let result = build_prompt("bork-1", "Fix auth", TEST_DEFAULT, None, &[], &[]);
+        let result = build_prompt(
+            "bork-1",
+            "Fix auth",
+            TEST_DEFAULT,
+            None,
+            &[],
+            &[],
+            no_pr_url,
+        );
         assert_eq!(
             result,
             "You are working on bork-1: Fix auth. The source code is in main/."
@@ -529,6 +561,7 @@ mod tests {
             Some("Focus on unit tests"),
             &[],
             &[],
+            no_pr_url,
         );
         assert_eq!(
             result,
@@ -538,7 +571,15 @@ mod tests {
 
     #[test]
     fn build_prompt_with_empty_user_prompt() {
-        let result = build_prompt("bork-3", "Refactor", TEST_DEFAULT, Some(""), &[], &[]);
+        let result = build_prompt(
+            "bork-3",
+            "Refactor",
+            TEST_DEFAULT,
+            Some(""),
+            &[],
+            &[],
+            no_pr_url,
+        );
         assert_eq!(
             result,
             "You are working on bork-3: Refactor. The source code is in main/."
@@ -547,7 +588,15 @@ mod tests {
 
     #[test]
     fn build_prompt_with_whitespace_only_user_prompt() {
-        let result = build_prompt("bork-4", "Cleanup", TEST_DEFAULT, Some("   \n  "), &[], &[]);
+        let result = build_prompt(
+            "bork-4",
+            "Cleanup",
+            TEST_DEFAULT,
+            Some("   \n  "),
+            &[],
+            &[],
+            no_pr_url,
+        );
         assert_eq!(
             result,
             "You are working on bork-4: Cleanup. The source code is in main/."
@@ -563,6 +612,7 @@ mod tests {
             Some("  do the thing  "),
             &[],
             &[],
+            no_pr_url,
         );
         assert!(result.ends_with("\n\ndo the thing"));
     }
@@ -576,6 +626,7 @@ mod tests {
             None,
             &[],
             &[],
+            no_pr_url,
         );
         assert!(result.starts_with("You are working on bork-6: New feature."));
         assert!(result.contains("source code is in main/"));
@@ -591,6 +642,7 @@ mod tests {
             Some("Install deps"),
             &[],
             &[],
+            no_pr_url,
         );
         assert_eq!(
             result,
@@ -601,7 +653,15 @@ mod tests {
     #[test]
     fn build_prompt_with_single_linear_link() {
         let links = [linear("VIL-123", "https://linear.app/team/issue/VIL-123")];
-        let result = build_prompt("vil-123", "Fix auth flow", TEST_DEFAULT, None, &links, &[]);
+        let result = build_prompt(
+            "vil-123",
+            "Fix auth flow",
+            TEST_DEFAULT,
+            None,
+            &links,
+            &[],
+            no_pr_url,
+        );
         assert_eq!(
             result,
             "You are working on vil-123: Fix auth flow. The source code is in main/.\n\nThis issue has a Linear ticket: VIL-123 - https://linear.app/team/issue/VIL-123"
@@ -611,7 +671,15 @@ mod tests {
     #[test]
     fn build_prompt_with_linear_link_missing_url() {
         let links = [linear("VIL-123", "")];
-        let result = build_prompt("bork-1", "Fix bug", TEST_DEFAULT, None, &links, &[]);
+        let result = build_prompt(
+            "bork-1",
+            "Fix bug",
+            TEST_DEFAULT,
+            None,
+            &links,
+            &[],
+            no_pr_url,
+        );
         assert!(result.ends_with("\n\nThis issue has a Linear ticket: VIL-123"));
         assert!(!result.contains("VIL-123 -"));
     }
@@ -622,16 +690,50 @@ mod tests {
             linear("VIL-1", "https://linear.app/team/issue/VIL-1"),
             linear("VIL-2", "https://linear.app/team/issue/VIL-2"),
         ];
-        let result = build_prompt("bork-1", "Refactor", TEST_DEFAULT, None, &links, &[]);
+        let result = build_prompt(
+            "bork-1",
+            "Refactor",
+            TEST_DEFAULT,
+            None,
+            &links,
+            &[],
+            no_pr_url,
+        );
         assert!(result.contains(
             "\n\nThis issue has Linear tickets:\n- VIL-1 - https://linear.app/team/issue/VIL-1\n- VIL-2 - https://linear.app/team/issue/VIL-2"
         ));
     }
 
     #[test]
-    fn build_prompt_with_single_github_pr() {
+    fn build_prompt_with_single_github_pr_and_url() {
         let prs = [pr(42)];
-        let result = build_prompt("bork-1", "Fix bug", TEST_DEFAULT, None, &[], &prs);
+        let result = build_prompt(
+            "bork-1",
+            "Fix bug",
+            TEST_DEFAULT,
+            None,
+            &[],
+            &prs,
+            test_pr_url,
+        );
+        assert_eq!(
+            result,
+            "You are working on bork-1: Fix bug. The source code is in main/.\n\nThis issue has a GitHub PR: #42 - https://github.com/test/repo/pull/42"
+        );
+    }
+
+    #[test]
+    fn build_prompt_with_single_github_pr_without_url() {
+        let prs = [pr(42)];
+        let result = build_prompt(
+            "bork-1",
+            "Fix bug",
+            TEST_DEFAULT,
+            None,
+            &[],
+            &prs,
+            no_pr_url,
+        );
         assert_eq!(
             result,
             "You are working on bork-1: Fix bug. The source code is in main/.\n\nThis issue has a GitHub PR: #42"
@@ -639,20 +741,70 @@ mod tests {
     }
 
     #[test]
-    fn build_prompt_with_multiple_github_prs() {
+    fn build_prompt_with_multiple_github_prs_and_urls() {
         let prs = [pr(1), pr(2), pr(3)];
-        let result = build_prompt("bork-1", "Refactor", TEST_DEFAULT, None, &[], &prs);
+        let result = build_prompt(
+            "bork-1",
+            "Refactor",
+            TEST_DEFAULT,
+            None,
+            &[],
+            &prs,
+            test_pr_url,
+        );
+        assert!(result.contains(
+            "\n\nThis issue has GitHub PRs:\n- #1 - https://github.com/test/repo/pull/1\n- #2 - https://github.com/test/repo/pull/2\n- #3 - https://github.com/test/repo/pull/3"
+        ));
+    }
+
+    #[test]
+    fn build_prompt_with_multiple_github_prs_without_urls() {
+        let prs = [pr(1), pr(2), pr(3)];
+        let result = build_prompt(
+            "bork-1",
+            "Refactor",
+            TEST_DEFAULT,
+            None,
+            &[],
+            &prs,
+            no_pr_url,
+        );
         assert!(result.contains("\n\nThis issue has GitHub PRs:\n- #1\n- #2\n- #3"));
+        assert!(!result.contains("github.com"));
+    }
+
+    #[test]
+    fn build_prompt_pr_url_resolved_per_link() {
+        // Resolver returns Some for #1, None for #2 — exercise both branches in one prompt.
+        let prs = [pr(1), pr(2)];
+        let resolver = |n: u32| {
+            if n == 1 {
+                Some("https://github.com/test/repo/pull/1".to_string())
+            } else {
+                None
+            }
+        };
+        let result = build_prompt("bork-1", "Mixed", TEST_DEFAULT, None, &[], &prs, resolver);
+        assert!(result.contains("- #1 - https://github.com/test/repo/pull/1"));
+        assert!(result.contains("- #2\n") || result.ends_with("- #2"));
     }
 
     #[test]
     fn build_prompt_with_both_linear_and_pr() {
         let links = [linear("VIL-123", "https://linear.app/team/issue/VIL-123")];
         let prs = [pr(7)];
-        let result = build_prompt("vil-123", "Fix auth", TEST_DEFAULT, None, &links, &prs);
+        let result = build_prompt(
+            "vil-123",
+            "Fix auth",
+            TEST_DEFAULT,
+            None,
+            &links,
+            &prs,
+            test_pr_url,
+        );
         assert_eq!(
             result,
-            "You are working on vil-123: Fix auth. The source code is in main/.\n\nThis issue has a Linear ticket: VIL-123 - https://linear.app/team/issue/VIL-123\n\nThis issue has a GitHub PR: #7"
+            "You are working on vil-123: Fix auth. The source code is in main/.\n\nThis issue has a Linear ticket: VIL-123 - https://linear.app/team/issue/VIL-123\n\nThis issue has a GitHub PR: #7 - https://github.com/test/repo/pull/7"
         );
     }
 
@@ -667,18 +819,28 @@ mod tests {
             Some("Focus on OAuth"),
             &links,
             &prs,
+            test_pr_url,
         );
         assert!(result.contains("The source code is in main/."));
         assert!(result.contains(
             "\n\nThis issue has a Linear ticket: VIL-123 - https://linear.app/team/issue/VIL-123"
         ));
-        assert!(result.contains("\n\nThis issue has a GitHub PR: #7"));
+        assert!(result
+            .contains("\n\nThis issue has a GitHub PR: #7 - https://github.com/test/repo/pull/7"));
         assert!(result.ends_with("\n\nFocus on OAuth"));
     }
 
     #[test]
     fn build_prompt_without_links_has_no_integration_lines() {
-        let result = build_prompt("bork-7", "Add feature", TEST_DEFAULT, None, &[], &[]);
+        let result = build_prompt(
+            "bork-7",
+            "Add feature",
+            TEST_DEFAULT,
+            None,
+            &[],
+            &[],
+            no_pr_url,
+        );
         assert!(!result.contains("Linear"));
         assert!(!result.contains("GitHub PR"));
     }
