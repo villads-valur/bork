@@ -145,13 +145,6 @@ fn format_status_line(ctx: &CardContext) -> Line<'static> {
         ]);
     }
 
-    if ctx.issue.primary_pr_import_source() == Some(PrImportSource::ReviewRequested) {
-        return Line::from(vec![
-            Span::raw("  "),
-            Span::styled("review", Style::default().fg(Color::Yellow)),
-        ]);
-    }
-
     let status_color = styles::agent_status_color(&ctx.agent_status);
     let session_indicator = if ctx.session_alive { "▶" } else { " " };
     let session_style = if ctx.session_alive {
@@ -159,6 +152,8 @@ fn format_status_line(ctx: &CardContext) -> Line<'static> {
     } else {
         styles::session_dead_style()
     };
+
+    let is_review = ctx.issue.primary_pr_import_source() == Some(PrImportSource::ReviewRequested);
 
     let status_label = match ctx.activity {
         Some(activity) if !activity.is_empty() => activity.to_string(),
@@ -171,6 +166,11 @@ fn format_status_line(ctx: &CardContext) -> Line<'static> {
         Span::styled(ctx.agent_status.symbol(), Style::default().fg(status_color)),
         Span::styled(format!(" {}", status_label), styles::dim_style()),
     ];
+
+    if is_review {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled("review", Style::default().fg(Color::Yellow)));
+    }
 
     let git_spans = format_git_status(ctx.git_status);
     if !git_spans.is_empty() {
