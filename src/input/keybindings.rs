@@ -38,6 +38,10 @@ fn map_normal_key(key: KeyEvent, swimlane_count: usize) -> Action {
         };
     }
 
+    if key.modifiers.contains(KeyModifiers::SHIFT) && key.code == KeyCode::Enter {
+        return Action::StartSession;
+    }
+
     match key.code {
         KeyCode::Char('q') => Action::Quit,
 
@@ -313,6 +317,11 @@ mod tests {
             map_normal_key(key(KeyCode::Char('x')), 1),
             Action::KillSession
         );
+    }
+
+    #[test]
+    fn normal_start_session_shift_enter() {
+        assert_eq!(map_normal_key(shift_enter(), 1), Action::StartSession);
     }
 
     #[test]

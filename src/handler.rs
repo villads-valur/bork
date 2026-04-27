@@ -40,6 +40,7 @@ pub enum PostAction {
     LaunchAndOpenPopup {
         issue_index: usize,
         popup_title: String,
+        open_popup: bool,
     },
     OpenEditor {
         initial_content: String,
@@ -314,7 +315,9 @@ fn handle_normal(
             PostAction::None
         }
 
-        Action::OpenSession => {
+        Action::OpenSession | Action::StartSession => {
+            let open_popup = action == Action::OpenSession;
+
             let Some(idx) = app.context_project(ctx).selected_issue_index(&q) else {
                 return PostAction::None;
             };
@@ -329,14 +332,22 @@ fn handle_normal(
             let popup_title = format!("{}: {}", issue.id, issue.title);
 
             if app.context_project(ctx).is_session_alive(&session_name) {
-                return PostAction::OpenTmuxPopup {
-                    session_name,
-                    popup_title,
-                };
+                if open_popup {
+                    return PostAction::OpenTmuxPopup {
+                        session_name,
+                        popup_title,
+                    };
+                }
+                app.set_message("Session already running");
+                return PostAction::None;
             }
 
             app.busy_count += 1;
-            app.set_message("Launching session...");
+            app.set_message(if open_popup {
+                "Launching session..."
+            } else {
+                "Starting session..."
+            });
 
             let config = app.context_project(ctx).config.clone();
             let tx = ch.action_tx.clone();
@@ -349,6 +360,7 @@ fn handle_normal(
             PostAction::LaunchAndOpenPopup {
                 issue_index: idx,
                 popup_title,
+                open_popup,
             }
         }
 
@@ -1390,6 +1402,111 @@ mod tests {
 
         handle_action(&mut app, Action::DialogCancel, &ctx, &test_channels());
         assert!(app.dialog.is_none());
+    }
+
+    #[test]
+    fn start_session_on_non_agentic_opens_edit_dialog() {
+        let mut app = test_app();
+        app.project_mut().issues.push(crate::types::Issue {
+            id: "bork-1".to_string(),
+            title: "Manual task".to_string(),
+            kind: crate::types::IssueKind::NonAgentic,
+            column: Column::Todo,
+            agent_kind: crate::types::AgentKind::OpenCode,
+            agent_mode: crate::types::AgentMode::Plan,
+            prompt: Some("scratch".to_string()),
+            worktree: None,
+            done_at: None,
+            session_id: None,
+            linear_links: Vec::new(),
+            github_pr_links: Vec::new(),
+            linear_id: None,
+            linear_identifier: None,
+            linear_url: None,
+            linear_imported: false,
+            pr_number: None,
+            pr_imported: false,
+            pr_import_source: None,
+        });
+
+        let ctx = app.action_context();
+        let post = handle_action(&mut app, Action::StartSession, &ctx, &test_channels());
+
+        assert!(matches!(post, PostAction::None));
+        assert_eq!(app.input_mode, InputMode::Dialog);
+    }
+
+    #[test]
+    fn start_session_on_agentic_returns_launch_without_popup() {
+        let mut app = test_app();
+        app.project_mut().issues.push(crate::types::Issue {
+            id: "bork-1".to_string(),
+            title: "Work".to_string(),
+            kind: crate::types::IssueKind::Agentic,
+            column: Column::Todo,
+            agent_kind: crate::types::AgentKind::OpenCode,
+            agent_mode: crate::types::AgentMode::Plan,
+            prompt: None,
+            worktree: Some("main".to_string()),
+            done_at: None,
+            session_id: None,
+            linear_links: Vec::new(),
+            github_pr_links: Vec::new(),
+            linear_id: None,
+            linear_identifier: None,
+            linear_url: None,
+            linear_imported: false,
+            pr_number: None,
+            pr_imported: false,
+            pr_import_source: None,
+        });
+
+        let ctx = app.action_context();
+        let post = handle_action(&mut app, Action::StartSession, &ctx, &test_channels());
+
+        assert!(matches!(
+            post,
+            PostAction::LaunchAndOpenPopup {
+                open_popup: false,
+                ..
+            }
+        ));
+        assert_eq!(app.busy_count, 1);
+    }
+
+    #[test]
+    fn start_session_on_live_session_is_noop() {
+        let mut app = test_app();
+        app.project_mut().issues.push(crate::types::Issue {
+            id: "bork-1".to_string(),
+            title: "Work".to_string(),
+            kind: crate::types::IssueKind::Agentic,
+            column: Column::InProgress,
+            agent_kind: crate::types::AgentKind::OpenCode,
+            agent_mode: crate::types::AgentMode::Plan,
+            prompt: None,
+            worktree: Some("main".to_string()),
+            done_at: None,
+            session_id: None,
+            linear_links: Vec::new(),
+            github_pr_links: Vec::new(),
+            linear_id: None,
+            linear_identifier: None,
+            linear_url: None,
+            linear_imported: false,
+            pr_number: None,
+            pr_imported: false,
+            pr_import_source: None,
+        });
+
+        let session_name = app.project().issues[0].session_name(&app.project().config.project_name);
+        app.project_mut().live.active_sessions.insert(session_name);
+
+        let ctx = app.action_context();
+        let post = handle_action(&mut app, Action::StartSession, &ctx, &test_channels());
+
+        assert!(matches!(post, PostAction::None));
+        assert_eq!(app.busy_count, 0);
     }
 
     #[test]

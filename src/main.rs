@@ -872,7 +872,7 @@ fn run_tui() -> anyhow::Result<()> {
     });
 
     let mut pending_popup_session: Option<(String, String)> = None;
-    let mut pending_popup_for_launch: Option<(usize, ProjectId, String)> = None; // (issue_index, project_id, popup_title)
+    let mut pending_popup_for_launch: Option<(usize, ProjectId, String, bool)> = None; // (issue_index, project_id, popup_title, open_popup)
     let mut needs_redraw = true;
     let mut state_poll_counter: usize = 0;
 
@@ -941,9 +941,14 @@ fn run_tui() -> anyhow::Result<()> {
                             PostAction::LaunchAndOpenPopup {
                                 issue_index,
                                 popup_title,
+                                open_popup,
                             } => {
-                                pending_popup_for_launch =
-                                    Some((issue_index, app.active_project_id(), popup_title));
+                                pending_popup_for_launch = Some((
+                                    issue_index,
+                                    app.active_project_id(),
+                                    popup_title,
+                                    open_popup,
+                                ));
                             }
                             PostAction::OpenEditor { initial_content } => {
                                 if let Some(edited) = open_external_editor(
@@ -1040,7 +1045,7 @@ fn run_tui() -> anyhow::Result<()> {
             if let Some(session_name) = result.session_to_open {
                 if let Some(popup_title) = result.popup_title {
                     pending_popup_session = Some((session_name, popup_title));
-                } else if let Some((launch_idx, proj_id, popup_title)) =
+                } else if let Some((launch_idx, proj_id, popup_title, open_popup)) =
                     pending_popup_for_launch.take()
                 {
                     if let Some(proj_pos) = app.projects.iter().position(|p| p.id() == proj_id) {
@@ -1054,7 +1059,9 @@ fn run_tui() -> anyhow::Result<()> {
                             }
                         }
                     }
-                    pending_popup_session = Some((session_name, popup_title));
+                    if open_popup {
+                        pending_popup_session = Some((session_name, popup_title));
+                    }
                 }
             }
         }
