@@ -7,6 +7,22 @@ use ratatui::Frame;
 use crate::app::{App, InputMode, MessageKind};
 use crate::ui::styles;
 
+/// Dot-matrix Pillar Sweep spinner. Filled dots use ACCENT, empty dots use DIM.
+fn spinner_spans(app: &App) -> Vec<Span<'static>> {
+    let frame = app.spinner_frame();
+    let filled = Style::default().fg(styles::ACCENT);
+    let empty = Style::default().fg(styles::DIM);
+    let mut spans = Vec::with_capacity(frame.len());
+    for on in frame {
+        if on {
+            spans.push(Span::styled("\u{25cf}", filled));
+        } else {
+            spans.push(Span::styled("\u{25cb}", empty));
+        }
+    }
+    spans
+}
+
 pub fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     let has_swimlanes = app.visible_swimlane_count() > 1;
     let mut title_spans = vec![Span::styled(
@@ -32,15 +48,6 @@ pub fn render_header(frame: &mut Frame, app: &App, area: Rect) {
 
     let title = Line::from(title_spans);
     frame.render_widget(Paragraph::new(title), area);
-
-    if app.busy_count > 0 {
-        let spinner = Line::from(Span::styled(
-            format!("{} ", app.spinner_frame()),
-            Style::default().fg(styles::ACCENT),
-        ));
-        let right = Paragraph::new(spinner).alignment(Alignment::Right);
-        frame.render_widget(right, area);
-    }
 }
 
 pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
@@ -108,7 +115,7 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         };
         let left = Line::from(Span::styled(format!(" {msg}"), Style::default().fg(color)));
         frame.render_widget(Paragraph::new(left), area);
-        render_update_banner(frame, app, area);
+        render_right_indicators(frame, app, area);
         return;
     }
 
@@ -124,7 +131,7 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(":clear", styles::statusbar_desc_style()),
         ]);
         frame.render_widget(Paragraph::new(line), area);
-        render_update_banner(frame, app, area);
+        render_right_indicators(frame, app, area);
         return;
     }
 
@@ -180,6 +187,14 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         right_spans.push(update_span());
     }
 
+    if app.is_busy_visible() {
+        if !right_spans.is_empty() {
+            right_spans.push(Span::raw(" "));
+        }
+        right_spans.extend(spinner_spans(app));
+        right_spans.push(Span::raw(" "));
+    }
+
     if !right_spans.is_empty() {
         let left_width: usize = spans.iter().map(|s| s.width()).sum();
         let right_width: usize = right_spans.iter().map(|s| s.width()).sum();
@@ -203,11 +218,22 @@ fn update_span() -> Span<'static> {
     )
 }
 
-fn render_update_banner(frame: &mut Frame, app: &App, area: Rect) {
-    if !app.update_available {
+fn render_right_indicators(frame: &mut Frame, app: &App, area: Rect) {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if app.update_available {
+        spans.push(update_span());
+    }
+    if app.is_busy_visible() {
+        if !spans.is_empty() {
+            spans.push(Span::raw(" "));
+        }
+        spans.extend(spinner_spans(app));
+        spans.push(Span::raw(" "));
+    }
+    if spans.is_empty() {
         return;
     }
-    let line = Line::from(update_span());
+    let line = Line::from(spans);
     let right = Paragraph::new(line).alignment(Alignment::Right);
     frame.render_widget(right, area);
 }

@@ -287,7 +287,7 @@ fn handle_normal(
                 };
             }
 
-            app.busy_count += 1;
+            app.begin_busy();
             app.set_message("Opening terminal...");
             let tx = ch.action_tx.clone();
             let project_root = app.context_project(ctx).config.project_root.clone();
@@ -342,7 +342,7 @@ fn handle_normal(
                 return PostAction::None;
             }
 
-            app.busy_count += 1;
+            app.begin_busy();
             app.set_message(if open_popup {
                 "Launching session..."
             } else {
@@ -381,7 +381,7 @@ fn handle_normal(
             let popup_title = format!("{}: {}", issue.id, issue.title);
             let worktree_path = app.context_project(ctx).config.project_root.join(&wt);
             let tx = ch.action_tx.clone();
-            app.busy_count += 1;
+            app.begin_busy();
             app.set_message(if session_alive {
                 if pr_mode {
                     "Opening tuicr --pr..."
@@ -1130,7 +1130,7 @@ fn handle_confirm(
                         session_name,
                         project_id,
                     } => {
-                        app.busy_count += 1;
+                        app.begin_busy();
                         let tx = action_tx.clone();
                         let project = app.find_project(&project_id).unwrap();
                         let status_file =
@@ -1184,7 +1184,7 @@ fn handle_confirm(
                                         session_id: None,
                                     });
                                 });
-                                app.busy_count += 1;
+                                app.begin_busy();
                             } else {
                                 let _ = std::fs::remove_file(&status_file);
                                 app.set_message(format!("Deleted {}", id));
