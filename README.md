@@ -132,6 +132,8 @@ bork --help
 | `bork issue delete <id>` | Delete an issue |
 | `bork integration attach-linear <id> <identifier>` | Link a Linear ticket to an issue (can attach multiple) |
 | `bork integration attach-pr <id> <number>` | Link a GitHub PR to an issue (can attach multiple) |
+| `bork update` | Pull latest from `main` and rebuild |
+| `bork update --check` | Check whether a new version is available without pulling |
 
 ### `bork init`
 
@@ -199,6 +201,17 @@ bork integration attach-pr bork-3 43             # link another PR to the same i
 ```
 
 All commands must be run from within a bork project directory (any directory containing or nested under `.bork/`). Issue IDs are case-insensitive.
+
+### Updating bork
+
+Bork checks for new versions in the background every 6 hours and shows a banner in the status bar when an update is available. Because the version check is keyed off the binary's git commit, you don't have to restart bork to keep it accurate.
+
+```bash
+bork update           # pull latest main and rebuild (then restart bork)
+bork update --check   # force a fresh check without pulling
+```
+
+`bork update --check` refreshes the cached result so a running TUI session in another terminal picks up the new banner state within seconds.
 
 ## Keybindings
 
