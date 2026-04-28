@@ -1344,8 +1344,11 @@ fn run_tui() -> anyhow::Result<()> {
             }
         }
 
-        if app.busy_count > 0 {
+        if app.is_busy_visible() {
             app.spinner_tick = app.spinner_tick.wrapping_add(1);
+            needs_redraw = true;
+        }
+        if app.tick_busy_visibility() {
             needs_redraw = true;
         }
 

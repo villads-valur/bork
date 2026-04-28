@@ -1,6 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Minimum on-screen time for the busy spinner. Holds the spinner visible
+/// for this long after the last in-flight action finishes so very fast
+/// actions don't appear as a single-frame flash.
+const BUSY_MIN_VISIBLE: Duration = Duration::from_millis(250);
 
 use ratatui::style::{Modifier, Style};
 use ratatui_textarea::{CursorMove, TextArea, WrapMode};
@@ -1517,6 +1522,10 @@ pub struct App {
     pub message: Option<(String, MessageKind)>,
     pub message_set_at: Option<Instant>,
     pub busy_count: usize,
+    /// When the spinner first became visible. Used to hold it on screen for
+    /// at least `BUSY_MIN_VISIBLE` after `busy_count` drops back to zero so
+    /// quick actions don't blink in and out.
+    pub busy_visible_since: Option<Instant>,
     pub spinner_tick: usize,
     pub linear_picker: Option<LinearPickerState>,
     pub linear_picker_context: LinearPickerContext,
@@ -1544,6 +1553,7 @@ impl App {
             message: None,
             message_set_at: None,
             busy_count: 0,
+            busy_visible_since: None,
             spinner_tick: 0,
             linear_picker: None,
             linear_picker_context: LinearPickerContext::Import,
@@ -1724,12 +1734,63 @@ impl App {
         false
     }
 
-    pub fn spinner_frame(&self) -> &'static str {
-        const FRAMES: &[&str] = &[
-            "\u{28cb}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}",
-            "\u{2827}", "\u{2807}", "\u{280f}",
+    /// Increment the busy counter and start (or extend) the spinner's
+    /// minimum-visible window. Use this instead of mutating `busy_count`
+    /// directly so quick actions still show the spinner long enough to
+    /// register visually.
+    pub fn begin_busy(&mut self) {
+        if self.busy_count == 0 && self.busy_visible_since.is_none() {
+            self.busy_visible_since = Some(Instant::now());
+        }
+        self.busy_count += 1;
+    }
+
+    /// Whether the spinner should currently be drawn. True while any
+    /// background action is in flight, and for at least `BUSY_MIN_VISIBLE`
+    /// after the last one finishes.
+    pub fn is_busy_visible(&self) -> bool {
+        if self.busy_count > 0 {
+            return true;
+        }
+        match self.busy_visible_since {
+            Some(started) => started.elapsed() < BUSY_MIN_VISIBLE,
+            None => false,
+        }
+    }
+
+    /// Clear the busy-visible window if its minimum has elapsed and no
+    /// new work is in flight. Returns `true` if state changed (and the UI
+    /// should redraw to hide the spinner).
+    pub fn tick_busy_visibility(&mut self) -> bool {
+        if self.busy_count == 0 {
+            if let Some(started) = self.busy_visible_since {
+                if started.elapsed() >= BUSY_MIN_VISIBLE {
+                    self.busy_visible_since = None;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Dot-matrix "Pillar Sweep" spinner: a 3-wide block of filled dots
+    /// sweeps left-to-right across 5 cells, then trails off. Each entry
+    /// is `true` for a filled dot, `false` for an empty dot. Renderers
+    /// draw filled and empty dots in different styles for the two-tone
+    /// dot-matrix look.
+    pub fn spinner_frame(&self) -> [bool; 5] {
+        const FRAMES: [[bool; 5]; 8] = [
+            [true, false, false, false, false],
+            [true, true, false, false, false],
+            [true, true, true, false, false],
+            [false, true, true, true, false],
+            [false, false, true, true, true],
+            [false, false, false, true, true],
+            [false, false, false, false, true],
+            [false, false, false, false, false],
         ];
-        FRAMES[self.spinner_tick % FRAMES.len()]
+        // Tick runs at 50ms; advance one frame every 2 ticks (~10 fps).
+        FRAMES[(self.spinner_tick / 2) % FRAMES.len()]
     }
 
     pub fn open_dialog(&mut self, ctx: &ActionContext) {
