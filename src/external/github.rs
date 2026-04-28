@@ -15,6 +15,7 @@ static REPO_CACHE: Mutex<Option<HashMap<PathBuf, RepoIdentity>>> = Mutex::new(No
 
 const PR_FIELDS: &str = r#"
     number url title state isDraft headRefName
+    isCrossRepository
     author { login }
     reviewDecision
     additions deletions
@@ -144,6 +145,17 @@ fn parse_pr_node(node: &serde_json::Value) -> Option<PrStatus> {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let head_branch = node.get("headRefName")?.as_str()?.to_string();
+
+    // Drop PRs from forks: their head branch can collide with upstream branch
+    // names and pollute the by-branch index. The field is optional so we treat
+    // missing as same-repo (e.g. for older fixtures or partial responses).
+    let is_cross_repo = node
+        .get("isCrossRepository")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if is_cross_repo {
+        return None;
+    }
 
     let state = match state_str {
         "OPEN" => PrState::Open,
@@ -358,9 +370,29 @@ fn format_pr_url(owner: &str, name: &str, pr_number: u32) -> String {
 }
 
 pub fn index_by_branch(prs: Vec<PrStatus>) -> HashMap<String, PrStatus> {
-    prs.into_iter()
-        .map(|pr| (pr.head_branch.clone(), pr))
-        .collect()
+    // When multiple PRs share a branch (e.g. an old merged PR plus a current
+    // open one on a reused branch name), prefer the higher-priority state.
+    // Open beats Merged/Closed; within the same priority the first PR wins,
+    // and `fetch_prs` returns PRs ordered by UPDATED_AT DESC, so "first" means
+    // most recent.
+    let mut map: HashMap<String, PrStatus> = HashMap::new();
+    for pr in prs {
+        let new_priority = state_priority(&pr.state);
+        match map.get(&pr.head_branch) {
+            Some(existing) if state_priority(&existing.state) >= new_priority => {}
+            _ => {
+                map.insert(pr.head_branch.clone(), pr);
+            }
+        }
+    }
+    map
+}
+
+fn state_priority(state: &PrState) -> u8 {
+    match state {
+        PrState::Open => 2,
+        PrState::Merged | PrState::Closed => 1,
+    }
 }
 
 #[cfg(test)]
@@ -721,12 +753,16 @@ mod tests {
     }
 
     fn test_pr_status(number: u32, branch: &str) -> PrStatus {
+        test_pr_status_with_state(number, branch, PrState::Open)
+    }
+
+    fn test_pr_status_with_state(number: u32, branch: &str, state: PrState) -> PrStatus {
         PrStatus {
             number,
             title: format!("PR #{}", number),
             url: format!("https://github.com/test/repo/pull/{}", number),
             author: "testuser".into(),
-            state: PrState::Open,
+            state,
             is_draft: false,
             checks: None,
             review: None,
@@ -754,13 +790,76 @@ mod tests {
     }
 
     #[test]
-    fn test_index_duplicate_branch_last_wins() {
+    fn test_index_duplicate_branch_first_open_wins() {
+        // Input is ordered newest-first (UPDATED_AT DESC), so the first PR
+        // in the vec is the most recent. With equal priority, first wins.
         let prs = vec![
             test_pr_status(1, "same-branch"),
             test_pr_status(2, "same-branch"),
         ];
         let map = index_by_branch(prs);
         assert_eq!(map.len(), 1);
-        assert_eq!(map["same-branch"].number, 2);
+        assert_eq!(map["same-branch"].number, 1);
+    }
+
+    #[test]
+    fn test_index_open_pr_beats_older_merged_pr() {
+        // Real-world bug: a current Open PR should not be hidden by a stale
+        // Merged PR on a reused branch name, regardless of input order.
+        let prs = vec![
+            test_pr_status_with_state(99, "reused-branch", PrState::Merged),
+            test_pr_status_with_state(100, "reused-branch", PrState::Open),
+        ];
+        let map = index_by_branch(prs);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["reused-branch"].number, 100);
+        assert_eq!(map["reused-branch"].state, PrState::Open);
+    }
+
+    #[test]
+    fn test_index_open_pr_beats_newer_merged_pr() {
+        // Even when the Merged PR is "newer" in the input order, Open wins.
+        let prs = vec![
+            test_pr_status_with_state(50, "reused-branch", PrState::Open),
+            test_pr_status_with_state(51, "reused-branch", PrState::Merged),
+        ];
+        let map = index_by_branch(prs);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["reused-branch"].number, 50);
+        assert_eq!(map["reused-branch"].state, PrState::Open);
+    }
+
+    #[test]
+    fn test_index_two_merged_prefers_first() {
+        // No Open PR present: keep the most recent (first in vec) closed/merged.
+        let prs = vec![
+            test_pr_status_with_state(7, "abandoned", PrState::Merged),
+            test_pr_status_with_state(6, "abandoned", PrState::Closed),
+        ];
+        let map = index_by_branch(prs);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["abandoned"].number, 7);
+        assert_eq!(map["abandoned"].state, PrState::Merged);
+    }
+
+    #[test]
+    fn test_parse_cross_repository_pr_returns_none() {
+        let node = make_pr_node(r#"{"isCrossRepository": true}"#);
+        assert!(parse_pr_node(&node).is_none());
+    }
+
+    #[test]
+    fn test_parse_same_repository_pr_parses_normally() {
+        let node = make_pr_node(r#"{"isCrossRepository": false}"#);
+        let pr = parse_pr_node(&node).unwrap();
+        assert_eq!(pr.number, 42);
+    }
+
+    #[test]
+    fn test_parse_missing_cross_repository_treated_as_same_repo() {
+        let mut node = make_pr_node("");
+        node.as_object_mut().unwrap().remove("isCrossRepository");
+        let pr = parse_pr_node(&node).unwrap();
+        assert_eq!(pr.number, 42);
     }
 }
