@@ -159,10 +159,7 @@ fn fetch_commits_behind(repo: &str, local_sha: &str) -> Option<u32> {
     if !output.status.success() {
         return None;
     }
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse()
-        .ok()
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
 /// Compare the running binary's commit against `origin/main` on GitHub.
