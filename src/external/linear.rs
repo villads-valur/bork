@@ -10,6 +10,7 @@ pub struct LinearIssue {
     pub identifier: String,
     pub title: String,
     pub url: String,
+    #[allow(dead_code)] // Intended for prefilling worktree branch names on import
     pub branch_name: String,
     pub priority: u8,
     pub state_name: String,

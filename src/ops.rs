@@ -339,6 +339,7 @@ pub fn move_issue(project_root: &Path, issue_id: &str, column: Column) -> anyhow
 }
 
 /// Load state and return a JSON snapshot of all issues (for machine consumption).
+#[allow(dead_code)] // Useful debugging/scripting utility; not yet wired to a CLI subcommand
 pub fn dump_state(project_root: &Path) -> anyhow::Result<String> {
     let state = config::load_state(project_root);
     Ok(serde_json::to_string_pretty(&AppState {

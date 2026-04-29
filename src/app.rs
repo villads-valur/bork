@@ -1611,6 +1611,7 @@ impl App {
         self.projects.iter_mut().find(|p| p.id() == *id)
     }
 
+    #[allow(dead_code)] // Future sidebar/swimlane reordering
     pub(crate) fn project_index(&self, id: &ProjectId) -> Option<usize> {
         self.projects.iter().position(|p| p.id() == *id)
     }
@@ -1645,6 +1646,7 @@ impl App {
         self.find_project(&id).expect("active project not found")
     }
 
+    #[allow(dead_code)] // Core navigation accessor; actions currently go through context_project_mut
     pub fn active_project_mut(&mut self) -> &mut Project {
         let id = self.active_project_id();
         self.find_project_mut(&id)
@@ -1719,6 +1721,7 @@ impl App {
         self.show_message(msg, MessageKind::Warning);
     }
 
+    #[allow(dead_code)] // Convenience wrapper; used in tests and future error handling
     pub fn set_error(&mut self, msg: impl Into<String>) {
         self.show_message(msg, MessageKind::Error);
     }
