@@ -289,7 +289,13 @@ enum Command {
     },
 
     /// Update bork to the latest version (git pull + cargo build)
-    Update,
+    Update {
+        /// Only check whether a new version is available; don't pull or build.
+        /// Refreshes the update cache so a running TUI picks up the result
+        /// within seconds.
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -497,7 +503,13 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Project { command }) => run_project_command(command),
         Some(Command::Issue { command }) => run_issue_command(command),
         Some(Command::Integration { command }) => run_integration_command(command),
-        Some(Command::Update) => update::run_update(),
+        Some(Command::Update { check }) => {
+            if check {
+                update::run_check_command()
+            } else {
+                update::run_update()
+            }
+        }
         None => run_tui(),
     }
 }
@@ -867,9 +879,28 @@ fn run_tui() -> anyhow::Result<()> {
     });
 
     let (update_check_tx, update_check_rx) = mpsc::channel::<bool>();
+    let update_shutdown = shared.shutdown.clone();
     thread::spawn(move || {
-        let _ = update_check_tx.send(update::check_for_update());
+        // Long-lived worker: re-checks every CHECK_INTERVAL_SECS so users who
+        // keep bork open for days still see new-version banners. Sleeps in 1s
+        // slices to stay responsive to shutdown.
+        loop {
+            if update_check_tx.send(update::check_for_update()).is_err() {
+                return;
+            }
+            for _ in 0..update::CHECK_INTERVAL_SECS {
+                if update_shutdown.load(Ordering::Relaxed) {
+                    return;
+                }
+                thread::sleep(Duration::from_secs(1));
+            }
+        }
     });
+
+    // Cheap polling of the update cache file's mtime: when `bork update --check`
+    // runs in a second terminal it rewrites the cache, and we pick up the new
+    // result here within seconds without waiting for the 6h periodic worker.
+    let mut last_update_cache_mtime = update::cache_mtime_secs();
 
     let mut pending_popup_session: Option<(String, String)> = None;
     let mut pending_popup_for_launch: Option<(usize, ProjectId, String, bool)> = None; // (issue_index, project_id, popup_title, open_popup)
@@ -1212,9 +1243,22 @@ fn run_tui() -> anyhow::Result<()> {
         }
 
         // --- Update check ---
-        if let Ok(true) = update_check_rx.try_recv() {
-            app.update_available = true;
-            needs_redraw = true;
+        // Latest result from the periodic worker, or `bork update --check` in
+        // another terminal (detected via cache file mtime).
+        let mut new_update_available: Option<bool> = None;
+        while let Ok(available) = update_check_rx.try_recv() {
+            new_update_available = Some(available);
+        }
+        let mtime = update::cache_mtime_secs();
+        if mtime != last_update_cache_mtime {
+            last_update_cache_mtime = mtime;
+            new_update_available = Some(update::cached_update_available());
+        }
+        if let Some(available) = new_update_available {
+            if app.update_available != available {
+                app.update_available = available;
+                needs_redraw = true;
+            }
         }
 
         // --- tuicr: check availability ---
