@@ -139,20 +139,52 @@ fn fetch_remote_head_sha(repo: &str) -> Option<String> {
     non_empty(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Returns how many commits `main` on GitHub is ahead of `local_sha`.
+/// Returns `None` on any error (gh not available, network issue, sha unknown to GitHub).
+fn fetch_commits_behind(repo: &str, local_sha: &str) -> Option<u32> {
+    let output = Command::new("gh")
+        .args([
+            "api",
+            &format!("repos/{repo}/compare/{local_sha}...main"),
+            "--jq",
+            ".ahead_by",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// Compare the running binary's commit against `origin/main` on GitHub.
-/// Returns the verdict plus both shas (for display); `Failed` on any error so
-/// callers can preserve the previous cache.
+/// Returns the verdict plus the local sha and (for display) the remote sha.
+/// `Failed` on any error so callers can preserve the previous cache.
+///
+/// Uses a directional compare (`compare/{local}...main`) instead of simple SHA
+/// equality so that dev builds that are ahead of or diverged from main do not
+/// produce false-positive `UpdateAvailable` results.
 pub fn run_check() -> (CheckResult, Option<String>, Option<String>) {
     let local = current_commit();
-    let remote = github_repo().and_then(fetch_remote_head_sha);
 
-    let result = match (&local, &remote) {
-        (Some(l), Some(r)) if l == r => CheckResult::UpToDate,
-        (Some(_), Some(_)) => CheckResult::UpdateAvailable,
-        _ => CheckResult::Failed,
+    let result = match &local {
+        None => CheckResult::Failed,
+        Some(sha) => match github_repo().and_then(|repo| fetch_commits_behind(repo, sha)) {
+            Some(0) => CheckResult::UpToDate,
+            Some(_) => CheckResult::UpdateAvailable,
+            None => CheckResult::Failed,
+        },
     };
 
-    (result, local, remote)
+    // Remote SHA is not needed for the check itself; run_check_command fetches
+    // it separately for display purposes.
+    (result, local, None)
 }
 
 /// Periodic check used by the background worker. Honours the cache TTL and
@@ -188,7 +220,7 @@ fn short_sha(sha: &str) -> &str {
 /// and writes the result back so a running TUI picks it up via the cache mtime
 /// poller.
 pub fn run_check_command() -> anyhow::Result<()> {
-    let (result, local, remote) = run_check();
+    let (result, local, _) = run_check();
 
     if matches!(result, CheckResult::UpToDate | CheckResult::UpdateAvailable) {
         save_cache(&UpdateCache {
@@ -196,6 +228,10 @@ pub fn run_check_command() -> anyhow::Result<()> {
             update_available: matches!(result, CheckResult::UpdateAvailable),
         });
     }
+
+    // Fetch the remote SHA separately for display (run_check uses the compare
+    // API which doesn't return the remote sha directly).
+    let remote = github_repo().and_then(fetch_remote_head_sha);
 
     let local_str = local.as_deref().map(short_sha).unwrap_or("unknown");
     let remote_str = remote.as_deref().map(short_sha).unwrap_or("unknown");
@@ -287,7 +323,15 @@ pub fn run_update() -> anyhow::Result<()> {
         bail!("cargo build failed");
     }
 
-    save_cache(&UpdateCache::default());
+    // Mark the cache as checked now with no update pending. Using unix_now()
+    // as last_check prevents the background worker in a running TUI session
+    // from immediately re-checking (and re-showing the banner) just because
+    // last_check was reset to 0. The worker will re-check after CHECK_INTERVAL_SECS,
+    // by which point the user should have restarted bork with the new binary.
+    save_cache(&UpdateCache {
+        last_check: unix_now(),
+        update_available: false,
+    });
 
     println!();
     println!("Updated to latest. Restart bork to use the new version.");
