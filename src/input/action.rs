@@ -5,7 +5,9 @@ pub enum Action {
     Quit,
     MoveUp,
     MoveDown,
+    #[allow(dead_code)] // Fine-grained row+column navigation; handler logic ready, keybinding not yet assigned
     FocusLeft,
+    #[allow(dead_code)] // Fine-grained row+column navigation; handler logic ready, keybinding not yet assigned
     FocusRight,
     JumpColumnLeft,
     JumpColumnRight,

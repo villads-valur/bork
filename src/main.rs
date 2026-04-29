@@ -678,7 +678,6 @@ struct ProjectWorkers {
     git_skip_set: Arc<Mutex<HashSet<String>>>,
     pr_rx: mpsc::Receiver<PrPollResult>,
     pr_wake_tx: mpsc::Sender<()>,
-    shutdown: Arc<AtomicBool>,
 }
 
 fn spawn_shared_workers() -> SharedWorkers {
@@ -720,7 +719,6 @@ fn spawn_project_workers(project: &app::Project, shutdown: &Arc<AtomicBool>) -> 
         git_skip_set,
         pr_rx,
         pr_wake_tx,
-        shutdown: shutdown.clone(),
     }
 }
 
@@ -825,6 +823,10 @@ fn run_tui() -> anyhow::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(config, state);
+
+    // Resolve available agents from ~/.config/bork/agents.toml + PATH detection
+    let agent_selection = agent_config::resolve_agent_selection();
+    app.set_available_agents(agent_selection.available, agent_selection.default_agent);
 
     // --- Register current project and load others for multi-project sidebar ---
     let current_root = app.project().config.project_root.clone();

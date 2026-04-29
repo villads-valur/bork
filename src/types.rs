@@ -323,6 +323,7 @@ impl Issue {
         !self.linear_links.is_empty()
     }
 
+    #[allow(dead_code)] // Symmetric with has_linear(); natural API for issue state checks
     pub fn has_pr(&self) -> bool {
         !self.github_pr_links.is_empty()
     }
@@ -358,6 +359,7 @@ impl Issue {
         self.github_pr_links.iter().any(|l| l.number == number)
     }
 
+    #[allow(dead_code)] // Used for deduplication when importing Linear issues
     pub fn has_linear_id(&self, id: &str) -> bool {
         self.linear_links.iter().any(|l| l.id == id)
     }
@@ -401,6 +403,7 @@ pub enum ReviewDecision {
 pub struct PrStatus {
     pub number: u32,
     pub title: String,
+    #[allow(dead_code)] // Fetched from GitHub; natural to display/open in a future PR detail view
     pub url: String,
     pub author: String,
     pub state: PrState,
