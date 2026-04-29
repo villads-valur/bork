@@ -1,11 +1,13 @@
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
 
+use crate::external::tmux::BORK_TUI_SESSION;
 use crate::global_config;
 
 pub const CHECK_INTERVAL_SECS: u64 = 6 * 60 * 60; // 6 hours
@@ -222,12 +224,98 @@ pub fn run_check_command() -> anyhow::Result<()> {
     }
 }
 
+/// Path to the single-instance PID file written by `lock::acquire_lock`.
+fn pid_file_path() -> PathBuf {
+    global_config::global_config_dir().join("bork.pid")
+}
+
+/// Returns true if a process with this PID currently exists.
+fn process_alive(pid: i32) -> bool {
+    // kill(pid, 0) is the standard way to check existence without sending a signal.
+    // Returns 0 on success (process exists, we can signal it), -1 with errno=ESRCH
+    // when the process is gone.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Kill the bork TUI process recorded in `~/.config/bork/bork.pid` (if any) and
+/// tear down the `bork-tui` tmux wrapper session, so the next `bork` launch
+/// starts fresh on the rebuilt binary.
+///
+/// Best-effort: any failure here is logged but doesn't abort the update.
+fn stop_running_instance() {
+    let pid_path = pid_file_path();
+    let Ok(contents) = std::fs::read_to_string(&pid_path) else {
+        return;
+    };
+    let Ok(pid) = contents.trim().parse::<i32>() else {
+        // Corrupt PID file - remove it so the next launch isn't blocked.
+        let _ = std::fs::remove_file(&pid_path);
+        return;
+    };
+
+    // Don't shoot ourselves in the foot.
+    if pid as u32 == std::process::id() {
+        return;
+    }
+
+    if !process_alive(pid) {
+        // Stale PID file (process crashed without releasing the lock).
+        let _ = std::fs::remove_file(&pid_path);
+        let _ = kill_tui_tmux_session();
+        return;
+    }
+
+    println!("Stopping running bork (PID {pid})...");
+
+    // SIGTERM triggers the handler in lock.rs which sets SIGNAL_RECEIVED; the
+    // main loop polls that flag and exits cleanly, dropping the flock and
+    // removing the PID file.
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+
+    // Wait up to 2s for the process to exit (40 * 50ms).
+    for _ in 0..40 {
+        if !process_alive(pid) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    if process_alive(pid) {
+        // Stuck. Escalate to SIGKILL.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        for _ in 0..20 {
+            if !process_alive(pid) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    // Either path may have left the PID file behind (release_lock didn't run
+    // on SIGKILL, or the file was recreated). Make sure it's gone.
+    let _ = std::fs::remove_file(&pid_path);
+    let _ = kill_tui_tmux_session();
+}
+
+/// Tear down the tmux wrapper session that hosts the bork TUI. Errors are
+/// ignored - if the session is already gone, that's the desired state.
+fn kill_tui_tmux_session() -> std::io::Result<()> {
+    Command::new("tmux")
+        .args(["kill-session", "-t", BORK_TUI_SESSION])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|_| ())
+}
+
 pub fn run_update() -> anyhow::Result<()> {
     let repo = resolve_source_repo()?;
     let current = env!("CARGO_PKG_VERSION");
     println!("Current version: v{current}");
     println!("Source: {}", repo.display());
     println!();
+
+    stop_running_instance();
 
     println!("Fetching latest...");
     let fetch = Command::new("git")

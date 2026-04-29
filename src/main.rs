@@ -59,7 +59,6 @@ const PORT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const LINEAR_POLL_INTERVAL: Duration = Duration::from_secs(45);
 const PR_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const STATE_POLL_TICKS: usize = 40; // 40 * 50ms = 2s
-const BORK_TUI_SESSION: &str = "bork-tui";
 
 struct SessionPollResult {
     sessions: HashSet<String>,
@@ -790,7 +789,7 @@ fn run_tui() -> anyhow::Result<()> {
     }
 
     // Tmux auto-wrap: use a dedicated session name that can't collide with project names
-    match external::tmux::ensure_bork_session(BORK_TUI_SESSION)? {
+    match external::tmux::ensure_bork_session(external::tmux::BORK_TUI_SESSION)? {
         external::tmux::EnsureResult::AlreadyInside => {}
         external::tmux::EnsureResult::Wrapped { exit_code } => {
             std::process::exit(exit_code);
@@ -1540,9 +1539,11 @@ mod tests {
             for n in 1..=100 {
                 let agent_session = format!("{}-{}-{}", name, name, n);
                 assert_ne!(
-                    BORK_TUI_SESSION, agent_session,
+                    external::tmux::BORK_TUI_SESSION,
+                    agent_session,
                     "wrapper session '{}' collides with agent session '{}'",
-                    BORK_TUI_SESSION, agent_session
+                    external::tmux::BORK_TUI_SESSION,
+                    agent_session
                 );
             }
         }
@@ -1553,9 +1554,11 @@ mod tests {
         let project_names = ["bork", "myapp", "test", "app", "project", "dev"];
         for name in project_names {
             assert_ne!(
-                BORK_TUI_SESSION, name,
+                external::tmux::BORK_TUI_SESSION,
+                name,
                 "wrapper session '{}' collides with project name '{}'",
-                BORK_TUI_SESSION, name
+                external::tmux::BORK_TUI_SESSION,
+                name
             );
         }
     }
