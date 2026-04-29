@@ -4,6 +4,10 @@ use std::process::{Command, Stdio};
 
 use crate::error::AppError;
 
+/// Name of the tmux session that wraps the bork TUI. Dedicated so it can't
+/// collide with project names.
+pub const BORK_TUI_SESSION: &str = "bork-tui";
+
 pub fn is_inside_tmux() -> bool {
     std::env::var("TMUX").is_ok()
 }
