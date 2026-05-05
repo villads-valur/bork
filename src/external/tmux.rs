@@ -86,6 +86,15 @@ pub fn ensure_bork_session(project_name: &str) -> Result<EnsureResult, AppError>
             .stderr(Stdio::null())
             .status();
 
+        // Forward modifier-bearing keys (Shift+Enter, Ctrl+Enter, etc.) through to bork.
+        // Without this, tmux collapses Shift+Enter into plain Enter and our keybinding
+        // mapping never sees the modifier. `always` is stricter than `on` and is supported
+        // on tmux >= 3.2; older versions silently ignore the option.
+        let _ = Command::new("tmux")
+            .args(["set-option", "-t", session_name, "extended-keys", "always"])
+            .stderr(Stdio::null())
+            .status();
+
         // Bind Ctrl+q to detach (scoped to this tmux server, not the user's outer tmux)
         let _ = Command::new("tmux")
             .args(["bind-key", "-n", "C-q", "detach-client"])

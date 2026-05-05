@@ -26,7 +26,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use crossterm::{
-    event::{self, Event, KeyEventKind},
+    event::{
+        self, Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
+    },
     execute,
     terminal::{
         disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
@@ -51,6 +54,12 @@ struct PrPollResult {
     review_requested_prs: Vec<PrStatus>,
     github_user: Option<String>,
 }
+
+/// Kitty keyboard protocol flags we negotiate so Ghostty/kitty/foot/WezTerm/recent
+/// Alacritty report Shift+Enter (and other modified keys) as distinct events instead
+/// of collapsing them to plain Enter. Terminals without support silently ignore them.
+const KITTY_KEYBOARD_FLAGS: KeyboardEnhancementFlags =
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES;
 
 const TICK_RATE: Duration = Duration::from_millis(50);
 const TMUX_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -803,6 +812,7 @@ fn run_tui() -> anyhow::Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
         lock::release_lock(&panic_lock_root);
+        pop_kitty_flags(&mut io::stdout());
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen, SetTitle(""));
         original_hook(panic_info);
@@ -819,6 +829,7 @@ fn run_tui() -> anyhow::Result<()> {
         EnterAlternateScreen,
         SetTitle(format!("bork: {}", config.project_name))
     )?;
+    push_kitty_flags(&mut stdout);
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -1435,10 +1446,20 @@ fn run_tui() -> anyhow::Result<()> {
     }
     lock::release_lock(&lock_root);
 
+    pop_kitty_flags(terminal.backend_mut());
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, SetTitle(""))?;
 
     Ok(())
+}
+
+/// Best-effort: ignored by terminals that don't support the kitty keyboard protocol.
+fn push_kitty_flags<W: io::Write>(out: &mut W) {
+    let _ = execute!(out, PushKeyboardEnhancementFlags(KITTY_KEYBOARD_FLAGS));
+}
+
+fn pop_kitty_flags<W: io::Write>(out: &mut W) {
+    let _ = execute!(out, PopKeyboardEnhancementFlags);
 }
 
 fn open_tmux_popup(
@@ -1447,6 +1468,7 @@ fn open_tmux_popup(
     title: &str,
     project_name: &str,
 ) -> anyhow::Result<()> {
+    pop_kitty_flags(terminal.backend_mut());
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
@@ -1458,6 +1480,7 @@ fn open_tmux_popup(
         EnterAlternateScreen,
         SetTitle(format!("bork: {}", project_name))
     )?;
+    push_kitty_flags(terminal.backend_mut());
     terminal.clear()?;
 
     Ok(())
@@ -1475,6 +1498,7 @@ fn open_external_editor(
     let temp_path = std::env::temp_dir().join(format!(".bork-edit-{}.md", std::process::id()));
     fs::write(&temp_path, initial_content)?;
 
+    pop_kitty_flags(terminal.backend_mut());
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
@@ -1489,6 +1513,7 @@ fn open_external_editor(
         EnterAlternateScreen,
         SetTitle(format!("bork: {}", project_name))
     )?;
+    push_kitty_flags(terminal.backend_mut());
     terminal.clear()?;
 
     let result = match status {
