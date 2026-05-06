@@ -856,6 +856,7 @@ mod tests {
             default_prompt: Some("The source code is in main/.".to_string()),
             done_session_ttl: 300,
             debug: false,
+            agents_allowlist: None,
         }
     }
 

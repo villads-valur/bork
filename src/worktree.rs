@@ -179,6 +179,7 @@ mod tests {
             default_prompt: None,
             done_session_ttl: 300,
             debug: false,
+            agents_allowlist: None,
         };
 
         (tmp, project, cfg)
