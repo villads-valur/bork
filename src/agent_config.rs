@@ -1,8 +1,7 @@
-use std::fs;
-use std::path::PathBuf;
+use std::path::Path;
 use std::process::{Command, Stdio};
 
-use crate::global_config::global_config_dir;
+use crate::config;
 use crate::types::AgentKind;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11,18 +10,13 @@ pub struct AgentSelection {
     pub default_agent: Option<AgentKind>,
 }
 
-#[derive(Debug, Clone, Default)]
-struct AgentPreferences {
-    enabled: Option<Vec<AgentKind>>,
-    default_agent: Option<AgentKind>,
-}
-
-pub fn agent_config_path() -> PathBuf {
-    global_config_dir().join("agents.toml")
-}
-
-pub fn resolve_agent_selection() -> AgentSelection {
-    let prefs = load_agent_preferences();
+/// Resolve the available agent set + default from the layered config.
+///
+/// `project_root` is optional so this can run before a project has been
+/// chosen (e.g. cold startup with no `.bork/`). When provided, the project's
+/// allowlist and default override the global one.
+pub fn resolve_agent_selection(project_root: Option<&Path>) -> AgentSelection {
+    let prefs = load_layered_prefs(project_root);
     let installed: Vec<AgentKind> = AgentKind::ALL
         .into_iter()
         .filter(|kind| command_exists(kind.command()))
@@ -30,66 +24,29 @@ pub fn resolve_agent_selection() -> AgentSelection {
     resolve_with_installed(prefs, &installed)
 }
 
-fn load_agent_preferences() -> AgentPreferences {
-    let path = agent_config_path();
-    let Ok(contents) = fs::read_to_string(path) else {
-        return AgentPreferences::default();
-    };
-    parse_agent_preferences(&contents)
+#[derive(Debug, Clone, Default)]
+struct AgentPreferences {
+    enabled: Option<Vec<AgentKind>>,
+    default_agent: Option<AgentKind>,
 }
 
-fn parse_agent_preferences(contents: &str) -> AgentPreferences {
-    let mut enabled = None;
-    let mut default_agent = None;
-
-    for raw in contents.lines() {
-        let line = raw.split('#').next().unwrap_or("").trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
+/// Read the layered config and project the agent-relevant fields out of it.
+/// `load_config_from` already handles the global + project merge, so we just
+/// pick what we need; for the no-project case we read the global layer alone.
+fn load_layered_prefs(project_root: Option<&Path>) -> AgentPreferences {
+    if let Some(root) = project_root {
+        let merged = config::load_config_from(root);
+        return AgentPreferences {
+            enabled: merged.agents_allowlist,
+            default_agent: Some(merged.agent_kind),
         };
-        let key = key.trim();
-        let value = value.trim();
-        match key {
-            "agents" => enabled = Some(parse_agent_list(value)),
-            "default_agent" | "default" => default_agent = parse_agent_value(value),
-            _ => {}
-        }
     }
 
+    let global = config::load_global_partial();
     AgentPreferences {
-        enabled,
-        default_agent,
+        enabled: global.agents_allowlist,
+        default_agent: global.agent_kind,
     }
-}
-
-fn parse_agent_value(value: &str) -> Option<AgentKind> {
-    AgentKind::parse(trim_value_token(value))
-}
-
-fn parse_agent_list(value: &str) -> Vec<AgentKind> {
-    let trimmed = value.trim();
-    let inner = trimmed
-        .strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-        .unwrap_or(trimmed);
-
-    let mut agents = Vec::new();
-    for item in inner.split(',') {
-        let Some(kind) = AgentKind::parse(trim_value_token(item)) else {
-            continue;
-        };
-        if !agents.contains(&kind) {
-            agents.push(kind);
-        }
-    }
-    agents
-}
-
-fn trim_value_token(value: &str) -> &str {
-    value.trim().trim_matches('"').trim_matches('\'')
 }
 
 fn command_exists(command: &str) -> bool {
@@ -120,64 +77,23 @@ fn resolve_with_installed(prefs: AgentPreferences, installed: &[AgentKind]) -> A
     }
 }
 
+/// Print a one-line warning to stderr if the user still has a legacy
+/// `~/.config/bork/agents.toml`. The file is no longer read; bork-119 was a
+/// hard cutover.
+pub fn warn_if_legacy_agents_file() {
+    let path = config::legacy_agents_config_path();
+    if path.exists() {
+        eprintln!(
+            "warning: {} is no longer read. Move its contents to {} (keys: agents, default_agent).",
+            path.display(),
+            config::global_config_path().display()
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_agent_preferences_defaults_when_empty() {
-        let prefs = parse_agent_preferences("");
-        assert_eq!(prefs.enabled, None);
-        assert_eq!(prefs.default_agent, None);
-    }
-
-    #[test]
-    fn parse_agent_preferences_with_csv_agents_and_default() {
-        let prefs = parse_agent_preferences(
-            r#"
-agents = "claude, opencode"
-default_agent = "claude"
-"#,
-        );
-
-        assert_eq!(
-            prefs.enabled,
-            Some(vec![AgentKind::Claude, AgentKind::OpenCode])
-        );
-        assert_eq!(prefs.default_agent, Some(AgentKind::Claude));
-    }
-
-    #[test]
-    fn parse_agent_preferences_with_array_syntax() {
-        let prefs = parse_agent_preferences(
-            r#"
-agents = ["opencode", "claude"]
-default = "opencode"
-"#,
-        );
-
-        assert_eq!(
-            prefs.enabled,
-            Some(vec![AgentKind::OpenCode, AgentKind::Claude])
-        );
-        assert_eq!(prefs.default_agent, Some(AgentKind::OpenCode));
-    }
-
-    #[test]
-    fn parse_agent_preferences_supports_codex() {
-        let prefs = parse_agent_preferences(
-            r#"
-agents = ["codex", "claude"]
-default_agent = "codex"
-"#,
-        );
-
-        assert_eq!(
-            prefs.enabled,
-            Some(vec![AgentKind::Codex, AgentKind::Claude])
-        );
-        assert_eq!(prefs.default_agent, Some(AgentKind::Codex));
-    }
 
     #[test]
     fn resolve_with_installed_filters_unavailable_agents() {
@@ -197,5 +113,25 @@ default_agent = "codex"
         let selection = resolve_with_installed(prefs, &[AgentKind::Claude]);
         assert_eq!(selection.available, vec![AgentKind::Claude]);
         assert_eq!(selection.default_agent, Some(AgentKind::Claude));
+    }
+
+    #[test]
+    fn resolve_with_installed_honors_explicit_default() {
+        let prefs = AgentPreferences {
+            enabled: Some(vec![AgentKind::OpenCode, AgentKind::Claude]),
+            default_agent: Some(AgentKind::Claude),
+        };
+        let selection = resolve_with_installed(prefs, &[AgentKind::OpenCode, AgentKind::Claude]);
+        assert_eq!(selection.default_agent, Some(AgentKind::Claude));
+    }
+
+    #[test]
+    fn resolve_with_installed_falls_back_when_default_uninstalled() {
+        let prefs = AgentPreferences {
+            enabled: Some(vec![AgentKind::OpenCode, AgentKind::Claude]),
+            default_agent: Some(AgentKind::Claude),
+        };
+        let selection = resolve_with_installed(prefs, &[AgentKind::OpenCode]);
+        assert_eq!(selection.default_agent, Some(AgentKind::OpenCode));
     }
 }

@@ -285,26 +285,31 @@ bork update --check   # force a fresh check without pulling
 
 ## Configuration
 
-Bork looks for a `.bork/` directory by walking up from the current working directory. Configuration lives at `.bork/config.toml`:
+Bork uses a single config schema in two layered locations. Project values override global values; both fall back to built-in defaults.
+
+- Global: `~/.config/bork/config.toml` — defaults that apply to every project.
+- Project: `<project>/.bork/config.toml` — per-project overrides.
 
 ```toml
-project_name = "myproject"       # Issue ID prefix (e.g. myproject-1, myproject-2)
-agent_kind = "opencode"          # Default agent: "opencode", "claude", or "codex"
-default_prompt = "Check AGENTS.md for project context and start working on the issue."
+# All keys are optional. The same flat schema is accepted in both files.
+project_name     = "myproject"                       # project file only
+agent_kind       = "opencode"                        # default agent for this project
+default_agent    = "claude"                          # alias for agent_kind, more natural in the global file
+agents           = ["opencode", "claude", "codex"]   # allowed agent picker entries (order matters)
+default_prompt   = "Check AGENTS.md for project context and start working on the issue."
+done_session_ttl = 300                               # seconds a Done tmux session lingers
+debug            = false                             # enable debug-only keybindings
 ```
+
+Resolution order (highest wins): built-in defaults → `~/.config/bork/config.toml` → `<project>/.bork/config.toml` → CLI flags.
 
 ### Agent Picker
 
 The new/edit issue dialog includes an Agent field that lets you pick which coding agent to use per issue. Only agents that are actually installed on your system appear in the picker. When a single agent is installed, the field is hidden.
 
-You can configure available agents and the default globally at `~/.config/bork/agents.toml`:
+`agents` and `default_agent` (or `agent_kind`) are both optional. Without them, bork auto-detects every installed agent via `which`. A project-level `agents = [...]` overrides the global allowlist for that project, useful for locking a team to a specific agent.
 
-```toml
-agents = ["opencode", "claude", "codex"]   # Which agents to show (order matters)
-default_agent = "claude"                    # Pre-selected agent for new issues
-```
-
-Both `agents` and `default_agent` are optional. Without this file, bork auto-detects all installed agents via `which`. The per-project `agent_kind` in `.bork/config.toml` still controls the default for that project; the global config only restricts and reorders the available list.
+> Note: `~/.config/bork/agents.toml` from earlier versions is no longer read. Move its keys into `~/.config/bork/config.toml`.
 
 ### State
 

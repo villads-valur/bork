@@ -1249,6 +1249,7 @@ mod tests {
             default_prompt: Some("Check AGENTS.md for context.".to_string()),
             done_session_ttl: DEFAULT_DONE_SESSION_TTL,
             debug: false,
+            agents_allowlist: None,
         }
     }
 
@@ -2243,6 +2244,7 @@ mod tests {
             default_prompt: None,
             done_session_ttl: DEFAULT_DONE_SESSION_TTL,
             debug: false,
+            agents_allowlist: None,
         }
     }
 
