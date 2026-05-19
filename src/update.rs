@@ -341,11 +341,44 @@ fn kill_tui_tmux_session() -> std::io::Result<()> {
         .map(|_| ())
 }
 
+/// Count commits on `origin/main` not reachable from `from`. Returns `None` if
+/// the rev-list call fails (e.g. unknown SHA), so callers can fall back.
+fn count_commits_behind_origin(repo: &PathBuf, from: &str) -> Option<u32> {
+    let output = Command::new("git")
+        .args(["rev-list", &format!("{from}..origin/main"), "--count"])
+        .current_dir(repo)
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
+/// Read `origin/main`'s SHA via local git. `None` if the ref isn't resolvable.
+fn local_origin_main_sha(repo: &PathBuf) -> Option<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "origin/main"])
+        .current_dir(repo)
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    non_empty(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 pub fn run_update() -> anyhow::Result<()> {
     let repo = resolve_source_repo()?;
     let current = env!("CARGO_PKG_VERSION");
+    let build_sha = current_commit();
     println!("Current version: v{current}");
     println!("Source: {}", repo.display());
+    if let Some(sha) = &build_sha {
+        println!("Build commit:    {}", short_sha(sha));
+    }
     println!();
 
     stop_running_instance();
@@ -361,18 +394,20 @@ pub fn run_update() -> anyhow::Result<()> {
         bail!("git fetch failed");
     }
 
-    let output = Command::new("git")
-        .args(["rev-list", "HEAD..origin/main", "--count"])
-        .current_dir(&repo)
-        .output()
+    // Compare the *installed binary's* build commit against origin/main, not
+    // the source worktree's HEAD. HEAD can equal or run ahead of origin/main
+    // (squash-merged PRs, local commits, feature-branch worktrees) while the
+    // actually-running binary is still stale. Falls back to HEAD if the build
+    // SHA isn't available in the local source repo.
+    let compare_from = build_sha.as_deref().unwrap_or("HEAD");
+    let behind = count_commits_behind_origin(&repo, compare_from)
+        .or_else(|| count_commits_behind_origin(&repo, "HEAD"))
         .context("failed to check for updates")?;
 
-    let behind: u32 = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse()
-        .unwrap_or(0);
-
     if behind == 0 {
+        if let Some(sha) = local_origin_main_sha(&repo) {
+            println!("origin/main:     {}", short_sha(&sha));
+        }
         println!("Already up to date (v{current}).");
         return Ok(());
     }
