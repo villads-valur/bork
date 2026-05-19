@@ -9,7 +9,7 @@ const CLAUDE_HOOKS: &str = r#"{
       "hooks": [
         {
           "type": "command",
-          "command": "cat > /dev/null; [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"Busy\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\""
+          "command": "cat > /dev/null; { [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"Busy\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\"; } || true"
         }
       ]
     }
@@ -20,7 +20,7 @@ const CLAUDE_HOOKS: &str = r#"{
       "hooks": [
         {
           "type": "command",
-          "command": "TOOL=$(cat | grep -o '\"tool_name\":\"[^\"]*\"' | head -1 | cut -d'\"' -f4); [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"Busy\",\"activity\":\"%s\",\"updated_at\":%s}' \"$TOOL\" \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\""
+          "command": "TOOL=$(cat | grep -o '\"tool_name\":\"[^\"]*\"' | head -1 | cut -d'\"' -f4); { [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"Busy\",\"activity\":\"%s\",\"updated_at\":%s}' \"$TOOL\" \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\"; } || true"
         }
       ]
     }
@@ -31,7 +31,7 @@ const CLAUDE_HOOKS: &str = r#"{
       "hooks": [
         {
           "type": "command",
-          "command": "cat > /dev/null; [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"WaitingInput\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\""
+          "command": "cat > /dev/null; { [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"WaitingInput\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\"; } || true"
         }
       ]
     },
@@ -40,7 +40,7 @@ const CLAUDE_HOOKS: &str = r#"{
       "hooks": [
         {
           "type": "command",
-          "command": "cat > /dev/null; [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"WaitingApproval\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\""
+          "command": "cat > /dev/null; { [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"WaitingApproval\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\"; } || true"
         }
       ]
     }
@@ -50,7 +50,7 @@ const CLAUDE_HOOKS: &str = r#"{
       "hooks": [
         {
           "type": "command",
-          "command": "cat > /dev/null; [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"Idle\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\""
+          "command": "cat > /dev/null; { [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"Idle\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\"; } || true"
         }
       ]
     }
@@ -60,7 +60,7 @@ const CLAUDE_HOOKS: &str = r#"{
       "hooks": [
         {
           "type": "command",
-          "command": "cat > /dev/null; [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"WaitingInput\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\""
+          "command": "cat > /dev/null; { [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"WaitingInput\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\"; } || true"
         }
       ]
     }
@@ -70,7 +70,7 @@ const CLAUDE_HOOKS: &str = r#"{
       "hooks": [
         {
           "type": "command",
-          "command": "cat > /dev/null; [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"WaitingPermission\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\""
+          "command": "cat > /dev/null; { [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"WaitingPermission\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\"; } || true"
         }
       ]
     }
@@ -86,7 +86,7 @@ const CODEX_HOOKS: &str = r#"{
         "hooks": [
           {
             "type": "command",
-            "command": "cat > /dev/null; [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"Idle\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\""
+            "command": "cat > /dev/null; { [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"Idle\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\"; } || true"
           }
         ]
       }
@@ -96,7 +96,7 @@ const CODEX_HOOKS: &str = r#"{
         "hooks": [
           {
             "type": "command",
-            "command": "cat > /dev/null; [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"Busy\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\""
+            "command": "cat > /dev/null; { [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"Busy\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\"; } || true"
           }
         ]
       }
@@ -107,7 +107,7 @@ const CODEX_HOOKS: &str = r#"{
         "hooks": [
           {
             "type": "command",
-            "command": "cat > /dev/null; [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"Busy\",\"activity\":\"Bash\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\""
+            "command": "cat > /dev/null; { [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"Busy\",\"activity\":\"Bash\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\"; } || true"
           }
         ]
       }
@@ -117,7 +117,7 @@ const CODEX_HOOKS: &str = r#"{
         "hooks": [
           {
             "type": "command",
-            "command": "cat > /dev/null; [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"Idle\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\""
+            "command": "cat > /dev/null; { [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"Idle\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\"; } || true"
           }
         ]
       }
@@ -586,6 +586,60 @@ mod tests {
         std::fs::write(&tmp, "not json").unwrap();
         assert!(!json_hooks_already_installed(&tmp, &claude_hook_entries()));
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    // --- regression: hook commands must exit 0 when BORK env vars are unset ---
+
+    fn assert_all_hooks_exit_zero_without_env(events: &serde_json::Map<String, serde_json::Value>) {
+        let mut count = 0;
+        for (event_name, entries) in events {
+            for entry in entries.as_array().expect("event entries are array") {
+                let matcher = entry
+                    .get("matcher")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<none>");
+                let hooks = entry
+                    .get("hooks")
+                    .and_then(|v| v.as_array())
+                    .expect("entry has hooks array");
+                for hook in hooks {
+                    let cmd = hook
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .expect("hook has command string");
+                    let status = std::process::Command::new("sh")
+                        .arg("-c")
+                        .arg(cmd)
+                        .env_remove("BORK_STATUS_DIR")
+                        .env_remove("BORK_SESSION")
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .expect("sh -c runs");
+                    assert!(
+                        status.success(),
+                        "{}[{}] exited {:?} with BORK env unset\n  cmd: {}",
+                        event_name,
+                        matcher,
+                        status.code(),
+                        cmd
+                    );
+                    count += 1;
+                }
+            }
+        }
+        assert!(count > 0, "expected at least one hook command");
+    }
+
+    #[test]
+    fn claude_hooks_exit_zero_when_bork_env_unset() {
+        assert_all_hooks_exit_zero_without_env(&parse_hook_entries(CLAUDE_HOOKS, None));
+    }
+
+    #[test]
+    fn codex_hooks_exit_zero_when_bork_env_unset() {
+        assert_all_hooks_exit_zero_without_env(&parse_hook_entries(CODEX_HOOKS, Some("hooks")));
     }
 }
 
