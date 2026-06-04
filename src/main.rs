@@ -25,7 +25,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use crossterm::{
     event::{
         self, Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
@@ -232,6 +232,50 @@ fn spawn_pr_poll_worker(
     });
 
     rx
+}
+
+/// Quickstart block shown before Options on the top-level `bork --help`.
+/// Aimed at AI agents driving bork from the CLI: where to start, plus the
+/// --agent / --mode knobs. Kept accurate against external/opencode.rs and
+/// config.rs.
+const AGENTS_START_HERE: &str = "\
+Start here (for AI agents):
+  bork issue list                List the kanban board (use --json to parse)
+  bork issue create \"<title>\"    Add an issue (its agent runs in a worktree)
+  bork worktree <id> <slug>      Create the git worktree for an issue
+
+  Each issue runs one coding agent. Pick which and how with:
+    --agent   opencode (default), claude, codex     # must be on your PATH
+    --mode    plan (read-only), build, yolo          # yolo: claude/codex only
+
+  Defaults + allowlist live in ~/.config/bork/config.toml
+  (default_agent, agents = [...]); per-project override in .bork/config.toml.";
+
+/// One-line pointer shown before Options on every subcommand `--help`, so the
+/// quickstart is discoverable at any level without repeating the full block.
+const AGENTS_POINTER: &str =
+    "Agents: run 'bork --help' for the AI-agent quickstart (--agent / --mode).";
+
+/// Build a help template that injects `agents_block` between the usage line and
+/// the auto-generated argument/command listing. clap only substitutes its own
+/// tags (`{all-args}`, `{usage}`, ...), so the agents text is interpolated here
+/// rather than left as a placeholder. Mirrors Harbor's "Start here" layout:
+/// the block sits up top, before Commands and Options.
+fn help_template_with_agents(agents_block: &str) -> String {
+    format!(
+        "{{about-with-newline}}\n\
+         {{usage-heading}} {{usage}}\n\n\
+         {agents_block}\n\n\
+         {{all-args}}{{after-help}}"
+    )
+}
+
+/// Apply the agents help template to a command and, recursively, to all of its
+/// subcommands. The root gets the full quickstart; every nested command gets
+/// the one-line pointer.
+fn apply_agents_help(cmd: clap::Command, agents_block: &str) -> clap::Command {
+    cmd.help_template(help_template_with_agents(agents_block))
+        .mut_subcommands(|sub| apply_agents_help(sub, AGENTS_POINTER))
 }
 
 #[derive(Parser)]
@@ -494,7 +538,9 @@ impl From<AgentKindArg> for AgentKind {
 }
 
 fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let command = apply_agents_help(Cli::command(), AGENTS_START_HERE);
+    let matches = command.get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
     match cli.command {
         Some(Command::Init {
