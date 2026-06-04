@@ -8,15 +8,55 @@ use crate::types::{AgentMode, Column, Issue, IssueKind};
 /// Create a git worktree and register it with bork's state.json.
 pub fn run_worktree(issue_id: &str, slug: Option<&str>, title: Option<&str>) -> anyhow::Result<()> {
     let config = config::load_config();
-    run_worktree_in(&config, issue_id, slug, title)
+    let result = create_worktree_in(&config, issue_id, slug, title)?;
+
+    println!(
+        "Created worktree: {}/ on branch {}",
+        result.worktree_dir, result.branch_name
+    );
+
+    Ok(())
 }
 
-fn run_worktree_in(
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeResult {
+    pub worktree_dir: String,
+    pub branch_name: String,
+}
+
+const SLUG_MAX_LEN: usize = 48;
+
+pub fn slugify_title(title: &str) -> String {
+    let mut slug = String::new();
+
+    for ch in title.chars().flat_map(char::to_lowercase) {
+        if slug.len() >= SLUG_MAX_LEN {
+            break;
+        }
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+        } else if !slug.ends_with('-') && !slug.is_empty() {
+            slug.push('-');
+        }
+    }
+
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+
+    if slug.is_empty() {
+        "issue".to_string()
+    } else {
+        slug
+    }
+}
+
+pub fn create_worktree_in(
     config: &config::AppConfig,
     issue_id: &str,
     slug: Option<&str>,
     title: Option<&str>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<WorktreeResult> {
     let mut state = config::load_state(&config.project_root);
 
     let main_dir = config.project_root.join("main");
@@ -95,12 +135,10 @@ fn run_worktree_in(
 
     config::save_state(&state, &config.project_root)?;
 
-    println!(
-        "Created worktree: {}/ on branch {}",
-        worktree_dir, branch_name
-    );
-
-    Ok(())
+    Ok(WorktreeResult {
+        worktree_dir,
+        branch_name,
+    })
 }
 
 #[cfg(test)]
@@ -190,7 +228,7 @@ mod tests {
     fn test_worktree_creates_dir_and_updates_state() {
         let (tmp, project, cfg) = setup_test_project();
 
-        let result = run_worktree_in(&cfg, "bork-1", Some("fix-bug"), None);
+        let result = create_worktree_in(&cfg, "bork-1", Some("fix-bug"), None);
         assert!(result.is_ok(), "run_worktree failed: {:?}", result.err());
 
         assert!(project.join("bork-1-fix-bug").exists());
@@ -207,7 +245,7 @@ mod tests {
     fn test_worktree_creates_issue_with_title() {
         let (tmp, _project, cfg) = setup_test_project();
 
-        let result = run_worktree_in(&cfg, "bork-2", Some("new-feature"), Some("New feature"));
+        let result = create_worktree_in(&cfg, "bork-2", Some("new-feature"), Some("New feature"));
         assert!(result.is_ok(), "run_worktree failed: {:?}", result.err());
 
         let state = config::load_state(&cfg.project_root);
@@ -225,7 +263,7 @@ mod tests {
 
         fs::create_dir_all(project.join("bork-1-fix-bug")).unwrap();
 
-        let result = run_worktree_in(&cfg, "bork-1", Some("fix-bug"), None);
+        let result = create_worktree_in(&cfg, "bork-1", Some("fix-bug"), None);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("already exists"));
@@ -237,7 +275,7 @@ mod tests {
     fn test_worktree_without_slug_uses_id_as_branch() {
         let (tmp, project, cfg) = setup_test_project();
 
-        let result = run_worktree_in(&cfg, "bork-1", None, None);
+        let result = create_worktree_in(&cfg, "bork-1", None, None);
         assert!(result.is_ok(), "run_worktree failed: {:?}", result.err());
 
         let output = Command::new("git")
@@ -253,5 +291,20 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn slugify_title_uses_kebab_case() {
+        assert_eq!(slugify_title("Add agent spawning!"), "add-agent-spawning");
+    }
+
+    #[test]
+    fn slugify_title_collapses_separators() {
+        assert_eq!(slugify_title("Fix: auth/API bug"), "fix-auth-api-bug");
+    }
+
+    #[test]
+    fn slugify_title_falls_back_for_empty_slug() {
+        assert_eq!(slugify_title("!!!"), "issue");
     }
 }

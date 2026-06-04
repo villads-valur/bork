@@ -408,6 +408,36 @@ enum IssueCommand {
         kind: Option<IssueKind>,
     },
 
+    /// Create an issue, create a worktree, and start its agent session
+    Start {
+        /// Issue title
+        title: String,
+
+        /// Prompt text for the agent
+        #[arg(long)]
+        prompt: Option<String>,
+
+        /// Agent kind (opencode, claude, codex)
+        #[arg(long, value_parser = parse_agent_kind)]
+        agent: Option<AgentKind>,
+
+        /// Agent mode (plan, build, yolo). Defaults to build.
+        #[arg(long, value_parser = parse_agent_mode)]
+        mode: Option<AgentMode>,
+
+        /// Branch/worktree slug. Defaults to a slug generated from the title.
+        #[arg(long)]
+        slug: Option<String>,
+
+        /// Skip creating a git worktree before launching the agent
+        #[arg(long)]
+        no_worktree: bool,
+
+        /// Project name or path to start the issue in. Defaults to current project.
+        #[arg(long)]
+        project: Option<String>,
+    },
+
     /// Update an existing issue
     Update {
         /// Issue ID (e.g. bork-1)
@@ -651,6 +681,35 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
             println!("Created {}: \"{}\"", issue.id, issue.title);
             Ok(())
         }
+        IssueCommand::Start {
+            title,
+            prompt,
+            agent,
+            mode,
+            slug,
+            no_worktree,
+            project,
+        } => {
+            let project_root = resolve_start_project_root(project.as_deref())?;
+            let report = start_issue(
+                &project_root,
+                StartIssueOptions {
+                    title,
+                    prompt,
+                    agent_kind: agent,
+                    agent_mode: mode,
+                    slug,
+                    no_worktree,
+                },
+            )?;
+            println!("Started {}: \"{}\"", report.issue_id, report.title);
+            if let Some(worktree_dir) = report.worktree_dir {
+                println!("Worktree: {}/", worktree_dir);
+            }
+            println!("Session:  {}", report.session_name);
+            println!("Attach:   tmux attach -t {}", report.session_name);
+            Ok(())
+        }
         IssueCommand::Update {
             id,
             title,
@@ -689,6 +748,101 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+struct StartIssueOptions {
+    title: String,
+    prompt: Option<String>,
+    agent_kind: Option<AgentKind>,
+    agent_mode: Option<AgentMode>,
+    slug: Option<String>,
+    no_worktree: bool,
+}
+
+struct StartIssueReport {
+    issue_id: String,
+    title: String,
+    worktree_dir: Option<String>,
+    session_name: String,
+}
+
+fn resolve_start_project_root(project: Option<&str>) -> anyhow::Result<PathBuf> {
+    let Some(project) = project else {
+        return Ok(config::find_project_root());
+    };
+
+    let project_path = Path::new(project);
+    if project_path.exists() {
+        if let Some(root) = find_project_root_from(project_path) {
+            return Ok(root);
+        }
+    }
+
+    global_config::prune_stale_projects();
+    global_config::list_projects()
+        .into_iter()
+        .find(|entry| entry.name == project)
+        .map(|entry| entry.path)
+        .ok_or_else(|| anyhow::anyhow!("Project '{}' not found", project))
+}
+
+fn find_project_root_from(path: &Path) -> Option<PathBuf> {
+    let mut dir = if path.is_file() { path.parent()? } else { path };
+
+    loop {
+        if dir.join(".bork").is_dir() {
+            return Some(dir.to_path_buf());
+        }
+        dir = dir.parent()?;
+    }
+}
+
+fn start_issue(project_root: &Path, opts: StartIssueOptions) -> anyhow::Result<StartIssueReport> {
+    let config = config::load_config_from(project_root);
+    let mut issue = ops::create_issue(
+        project_root,
+        ops::CreateOptions {
+            title: opts.title.clone(),
+            column: None,
+            agent_kind: opts.agent_kind,
+            agent_mode: Some(opts.agent_mode.unwrap_or(AgentMode::Build)),
+            prompt: opts.prompt,
+            kind: Some(IssueKind::Agentic),
+        },
+    )?;
+
+    let worktree_dir = if opts.no_worktree {
+        None
+    } else {
+        let slug = opts
+            .slug
+            .unwrap_or_else(|| worktree::slugify_title(&opts.title));
+        let result = worktree::create_worktree_in(&config, &issue.id, Some(&slug), None)?;
+        issue.worktree = Some(result.worktree_dir.clone());
+        Some(result.worktree_dir)
+    };
+
+    let (session_name, agent_session_id) = external::opencode::launch_session(&issue, &config)
+        .map_err(|e| anyhow::anyhow!("Failed to launch agent: {e}"))?;
+
+    // Reload state so we don't clobber concurrent updates that happened during launch
+    let mut state = config::load_state(project_root);
+    if let Some(saved) = state.issues.iter_mut().find(|i| i.id == issue.id) {
+        if saved.column == Column::Todo {
+            saved.column = Column::InProgress;
+        }
+        if let Some(sid) = agent_session_id {
+            saved.session_id = Some(sid);
+        }
+    }
+    config::save_state(&state, project_root)?;
+
+    Ok(StartIssueReport {
+        issue_id: issue.id,
+        title: issue.title,
+        worktree_dir,
+        session_name,
+    })
 }
 
 fn run_integration_command(command: IntegrationCommand) -> anyhow::Result<()> {
@@ -1639,6 +1793,30 @@ mod tests {
                 name
             );
         }
+    }
+
+    #[test]
+    fn find_project_root_from_container_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".bork")).unwrap();
+
+        assert_eq!(
+            find_project_root_from(dir.path()),
+            Some(dir.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn find_project_root_from_nested_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let nested = dir.path().join("main").join("src");
+        std::fs::create_dir_all(dir.path().join(".bork")).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(
+            find_project_root_from(&nested),
+            Some(dir.path().to_path_buf())
+        );
     }
 
     #[test]

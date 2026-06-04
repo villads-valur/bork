@@ -126,6 +126,7 @@ bork --help
 | `bork project remove [path]` | Unregister a project |
 | `bork issue list` | List all issues (`--json` for structured output) |
 | `bork issue create <title>` | Create a new issue |
+| `bork issue start <title>` | Create an issue, create a worktree, and start its agent |
 | `bork issue show <id>` | Show issue details |
 | `bork issue update <id>` | Update issue fields |
 | `bork issue move <id> <column>` | Move an issue to a column |
@@ -181,6 +182,8 @@ Bork exposes its kanban board through the command line so you (or your AI agents
 
 ```bash
 bork issue create "Fix auth bug" --agent claude --prompt "Check the login flow"
+bork issue start "Add search" --prompt "Implement search in a separate worktree"
+bork issue start "Add API route" --project my-api --prompt "Implement this in my-api"
 bork issue list --column in-progress
 bork issue list --json                    # machine-readable output
 bork issue move bork-3 code-review
@@ -190,6 +193,8 @@ bork issue delete bork-3
 ```
 
 **Create options:** `--column` (todo, in-progress, code-review, done), `--agent` (opencode, claude, codex), `--mode` (plan, build, yolo), `--prompt`, `--kind` (agentic, todo).
+
+**Start options:** `--prompt`, `--agent` (opencode, claude, codex), `--mode` (plan, build, yolo), `--slug`, `--no-worktree`, `--project` (registered project name or path). `bork issue start` defaults to build mode and creates a worktree with a slug generated from the title.
 
 **Integration commands** link external tickets and PRs to existing issues. You can attach multiple Linear issues and/or GitHub PRs to a single bork issue:
 

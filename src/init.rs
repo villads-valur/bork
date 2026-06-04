@@ -420,8 +420,8 @@ mod tests {
             "AGENTS.md should contain project name"
         );
         assert!(
-            agents.contains("bork worktree"),
-            "AGENTS.md should mention bork worktree"
+            agents.contains("bork issue start"),
+            "AGENTS.md should mention bork issue start"
         );
 
         // Verify CLAUDE.md inside git repo

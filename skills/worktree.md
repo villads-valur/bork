@@ -24,7 +24,13 @@ The `main/` directory is a regular git repo. All worktrees are created from it a
 
 ## Creating a worktree
 
-**Always use `bork worktree` to create worktrees.** This creates the git worktree AND registers it with bork's state so the TUI can track it.
+Use `bork issue start` when you want to create a new issue, create a worktree, and start another agent immediately:
+
+```bash
+bork issue start "Add search" --prompt "Implement search in a separate worktree"
+```
+
+Use `bork worktree` when an issue already exists and you only need to create/register its worktree. This creates the git worktree AND registers it with bork's state so the TUI can track it.
 
 ```bash
 bork worktree {issue-id} {slug}
@@ -100,6 +106,7 @@ git -C main worktree remove --force ../{worktree-dir}
 Use `bork issue` commands to manage issues without the TUI:
 
 ```bash
+bork issue start "Spin off work" --prompt "Details..."
 bork issue create "Fix the bug" --prompt "Details..."
 bork issue list
 bork issue move bork-1 in-progress

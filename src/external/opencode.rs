@@ -80,7 +80,7 @@ fn build_agent_cmd(
             .as_deref()
             .unwrap_or(config::DEFAULT_PROMPT_FALLBACK);
         let main_worktree = config.project_root.join("main");
-        let prompt = build_prompt(
+        let mut prompt = build_prompt(
             &issue.id,
             &issue.title,
             default_prompt,
@@ -89,6 +89,13 @@ fn build_agent_cmd(
             &issue.github_pr_links,
             |number| github::pr_url(&main_worktree, number),
         );
+        prompt.push_str("\n\nBork project: ");
+        prompt.push_str(&config.project_name);
+        if let Some(worktree) = issue.worktree.as_deref() {
+            prompt.push_str("\n\nAssigned worktree: ");
+            prompt.push_str(worktree);
+            prompt.push_str(". Do all work for this issue inside that directory.");
+        }
         shell_escape_single_quotes(&prompt)
     };
 
@@ -666,7 +673,7 @@ mod tests {
         );
         assert!(result.starts_with("You are working on bork-6: New feature."));
         assert!(result.contains("source code is in main/"));
-        assert!(result.contains("bork worktree"));
+        assert!(result.contains("bork issue start"));
     }
 
     #[test]
@@ -939,6 +946,24 @@ mod tests {
         let (cmd, _) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         assert!(cmd.contains("opencode --prompt"));
         assert!(!cmd.contains("--agent plan"));
+    }
+
+    #[test]
+    fn fresh_prompt_includes_project_name() {
+        let issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        let config = test_config();
+        let (cmd, _) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(cmd.contains("Bork project: bork"));
+    }
+
+    #[test]
+    fn fresh_prompt_includes_assigned_worktree() {
+        let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        issue.worktree = Some("bork-1-fix-bug".to_string());
+        let config = test_config();
+        let (cmd, _) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(cmd.contains("Assigned worktree: bork-1-fix-bug"));
+        assert!(cmd.contains("inside that directory"));
     }
 
     #[test]
