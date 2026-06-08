@@ -36,8 +36,23 @@ pub fn launch_session(
     let status_dir = config::agent_status_dir(&config.project_root);
     let status_dir_str = status_dir.to_str().unwrap_or("");
 
-    let (agent_cmd, pre_assigned_session_id) =
-        build_agent_cmd(issue, config, &session_name, status_dir_str);
+    let prompt_path = prompt_file_path(&status_dir, &session_name);
+    let prompt_path_str = prompt_path.to_str().unwrap_or("");
+
+    let (agent_cmd, pre_assigned_session_id, prompt_contents) = build_agent_cmd(
+        issue,
+        config,
+        &session_name,
+        status_dir_str,
+        prompt_path_str,
+    );
+
+    // Multiline prompts can't be typed directly: tmux send-keys collapses
+    // embedded newlines. Instead we write the prompt to a file and the launch
+    // command reads it back via `"$(cat ...)"`, which preserves it verbatim.
+    if let Some(contents) = &prompt_contents {
+        write_prompt_file(&prompt_path, contents)?;
+    }
 
     tmux::send_keys(&session_name, &agent_cmd)?;
 
@@ -57,24 +72,43 @@ pub fn launch_session(
     Ok((session_name, agent_session_id))
 }
 
-/// Build the agent launch command and return (command, pre_assigned_session_id).
+/// Path for an issue's staged prompt file, scoped to its session name so
+/// concurrent launches don't collide.
+fn prompt_file_path(status_dir: &Path, session_name: &str) -> PathBuf {
+    status_dir.join(format!("prompt-{session_name}.txt"))
+}
+
+/// Write the prompt to disk (creating the parent dir if needed) so the launch
+/// command can read it back verbatim.
+fn write_prompt_file(path: &Path, contents: &str) -> Result<(), AppError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(AppError::Io)?;
+    }
+    fs::write(path, contents).map_err(AppError::Io)
+}
+
+/// Build the agent launch command and return
+/// (command, pre_assigned_session_id, prompt_contents).
 /// For Claude, pre-assigns a UUID and returns it. For OpenCode, returns None (ID detected post-launch).
-/// If the issue already has a session_id, builds a resume command instead.
+/// `prompt_contents` is `Some` for fresh sessions (staged to a file by the
+/// caller) and `None` for resume sessions, which carry no prompt.
 fn build_agent_cmd(
     issue: &Issue,
     config: &AppConfig,
     session_name: &str,
     status_dir_str: &str,
-) -> (String, Option<String>) {
+    prompt_path_str: &str,
+) -> (String, Option<String>, Option<String>) {
     let env_prefix = format!(
         "export BORK_SESSION='{}' BORK_STATUS_DIR='{}'",
         shell_escape_single_quotes(session_name),
         shell_escape_single_quotes(status_dir_str),
     );
 
-    // Builds and shell-escapes the issue prompt. Lazy: only invoked for fresh
-    // sessions, since resume paths skip the prompt entirely.
-    let build_escaped_prompt = || {
+    // Builds the full issue prompt text. Lazy: only invoked for fresh sessions,
+    // since resume paths skip the prompt entirely. Returned verbatim (no shell
+    // escaping) because it's staged to a file and read back via `"$(cat ...)"`.
+    let build_prompt_contents = || {
         let default_prompt = config
             .default_prompt
             .as_deref()
@@ -96,8 +130,15 @@ fn build_agent_cmd(
             prompt.push_str(worktree);
             prompt.push_str(". Do all work for this issue inside that directory.");
         }
-        shell_escape_single_quotes(&prompt)
+        prompt
     };
+
+    // Shell snippet that expands to the prompt at runtime by reading the staged
+    // file, plus a cleanup suffix that removes the file afterwards. Using a file
+    // sidesteps tmux send-keys mangling newlines in the typed command line.
+    let escaped_prompt_path = shell_escape_single_quotes(prompt_path_str);
+    let prompt_subst = format!("\"$(cat '{}')\"", escaped_prompt_path);
+    let prompt_cleanup = format!("; rm -f '{}'", escaped_prompt_path);
 
     // Built-in mode flags. These are replaced when the user configured
     // per-mode args under `[agent.<name>.mode.<mode>]`.
@@ -136,15 +177,13 @@ fn build_agent_cmd(
                     "{} && opencode --session '{}'{}",
                     env_prefix, escaped_sid, trailing,
                 );
-                (cmd, None)
+                (cmd, None, None)
             } else {
                 let cmd = format!(
-                    "{} && opencode --prompt '{}'{}",
-                    env_prefix,
-                    build_escaped_prompt(),
-                    trailing,
+                    "{} && opencode --prompt {}{}{}",
+                    env_prefix, prompt_subst, trailing, prompt_cleanup,
                 );
-                (cmd, None)
+                (cmd, None, Some(build_prompt_contents()))
             }
         }
         AgentKind::Claude => {
@@ -158,24 +197,29 @@ fn build_agent_cmd(
                     "{} && claude --name '{}'{} --resume '{}'",
                     env_prefix, escaped_name, trailing, escaped_sid,
                 );
-                (cmd, Some(sid.clone()))
+                (cmd, Some(sid.clone()), None)
             } else {
-                // Fresh session: build prompt and optionally pre-assign a UUID
-                let escaped_prompt = build_escaped_prompt();
+                // Fresh session: stage prompt and optionally pre-assign a UUID
+                let prompt = build_prompt_contents();
                 let uuid = generate_uuid().unwrap_or_default();
                 if uuid.is_empty() {
                     let cmd = format!(
-                        "{} && claude --name '{}'{} '{}'",
-                        env_prefix, escaped_name, trailing, escaped_prompt,
+                        "{} && claude --name '{}'{} {}{}",
+                        env_prefix, escaped_name, trailing, prompt_subst, prompt_cleanup,
                     );
-                    (cmd, None)
+                    (cmd, None, Some(prompt))
                 } else {
                     let escaped_uuid = shell_escape_single_quotes(&uuid);
                     let cmd = format!(
-                        "{} && claude --name '{}'{} --session-id '{}' '{}'",
-                        env_prefix, escaped_name, trailing, escaped_uuid, escaped_prompt,
+                        "{} && claude --name '{}'{} --session-id '{}' {}{}",
+                        env_prefix,
+                        escaped_name,
+                        trailing,
+                        escaped_uuid,
+                        prompt_subst,
+                        prompt_cleanup,
                     );
-                    (cmd, Some(uuid))
+                    (cmd, Some(uuid), Some(prompt))
                 }
             }
         }
@@ -186,15 +230,13 @@ fn build_agent_cmd(
                     "{} && codex resume '{}'{}",
                     env_prefix, escaped_sid, trailing
                 );
-                (cmd, Some(sid.clone()))
+                (cmd, Some(sid.clone()), None)
             } else {
                 let cmd = format!(
-                    "{} && codex{} '{}'",
-                    env_prefix,
-                    trailing,
-                    build_escaped_prompt()
+                    "{} && codex{} {}{}",
+                    env_prefix, trailing, prompt_subst, prompt_cleanup,
                 );
-                (cmd, None)
+                (cmd, None, Some(build_prompt_contents()))
             }
         }
     }
@@ -925,14 +967,29 @@ mod tests {
         }
     }
 
+    /// Test wrapper: invoke build_agent_cmd with a fixed prompt-file path and
+    /// return (cmd, pre_assigned_sid, prompt_contents). The prompt-file path is
+    /// fixed so tests can also assert on the `"$(cat ...)"` substitution.
+    const TEST_PROMPT_PATH: &str = "/tmp/status/prompt-bork-bork-1.txt";
+
+    fn agent_cmd(
+        issue: &Issue,
+        config: &AppConfig,
+        session: &str,
+        status_dir: &str,
+    ) -> (String, Option<String>, Option<String>) {
+        build_agent_cmd(issue, config, session, status_dir, TEST_PROMPT_PATH)
+    }
+
     // --- build_agent_cmd ---
 
     #[test]
     fn opencode_fresh_plan() {
         let issue = test_issue(AgentKind::OpenCode, AgentMode::Plan);
         let config = test_config();
-        let (cmd, sid) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
-        assert!(cmd.contains("opencode --prompt"));
+        let (cmd, sid, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(cmd.contains("opencode --prompt \"$(cat '/tmp/status/prompt-bork-bork-1.txt')\""));
+        assert!(cmd.contains("rm -f '/tmp/status/prompt-bork-bork-1.txt'"));
         assert!(cmd.contains("--agent plan"));
         assert!(cmd.contains("BORK_SESSION='bork-bork-1'"));
         assert!(cmd.contains("BORK_STATUS_DIR='/tmp/status'"));
@@ -943,7 +1000,7 @@ mod tests {
     fn opencode_fresh_build() {
         let issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
         let config = test_config();
-        let (cmd, _) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         assert!(cmd.contains("opencode --prompt"));
         assert!(!cmd.contains("--agent plan"));
     }
@@ -952,8 +1009,8 @@ mod tests {
     fn fresh_prompt_includes_project_name() {
         let issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
         let config = test_config();
-        let (cmd, _) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
-        assert!(cmd.contains("Bork project: bork"));
+        let (_, _, prompt) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(prompt.unwrap().contains("Bork project: bork"));
     }
 
     #[test]
@@ -961,16 +1018,17 @@ mod tests {
         let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
         issue.worktree = Some("bork-1-fix-bug".to_string());
         let config = test_config();
-        let (cmd, _) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
-        assert!(cmd.contains("Assigned worktree: bork-1-fix-bug"));
-        assert!(cmd.contains("inside that directory"));
+        let (_, _, prompt) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let prompt = prompt.unwrap();
+        assert!(prompt.contains("Assigned worktree: bork-1-fix-bug"));
+        assert!(prompt.contains("inside that directory"));
     }
 
     #[test]
     fn opencode_fresh_yolo_treated_as_build() {
         let issue = test_issue(AgentKind::OpenCode, AgentMode::Yolo);
         let config = test_config();
-        let (cmd, _) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         assert!(cmd.contains("opencode --prompt"));
         assert!(!cmd.contains("--agent plan"));
         assert!(!cmd.contains("yolo"));
@@ -981,7 +1039,7 @@ mod tests {
         let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Plan);
         issue.session_id = Some("ses_abc123".to_string());
         let config = test_config();
-        let (cmd, sid) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let (cmd, sid, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         assert!(cmd.contains("opencode --session 'ses_abc123'"));
         assert!(cmd.contains("--agent plan"));
         assert!(!cmd.contains("--prompt"));
@@ -993,7 +1051,7 @@ mod tests {
         let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
         issue.session_id = Some("ses_abc123".to_string());
         let config = test_config();
-        let (cmd, _) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         assert!(cmd.contains("opencode --session 'ses_abc123'"));
         assert!(!cmd.contains("--agent plan"));
     }
@@ -1002,7 +1060,7 @@ mod tests {
     fn claude_fresh_plan() {
         let issue = test_issue(AgentKind::Claude, AgentMode::Plan);
         let config = test_config();
-        let (cmd, sid) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let (cmd, sid, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         assert!(cmd.contains("claude --name"));
         assert!(cmd.contains("--permission-mode plan"));
         assert!(!cmd.contains("--resume"));
@@ -1018,7 +1076,7 @@ mod tests {
     fn claude_fresh_build() {
         let issue = test_issue(AgentKind::Claude, AgentMode::Build);
         let config = test_config();
-        let (cmd, _) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         assert!(cmd.contains("claude --name"));
         assert!(!cmd.contains("--permission-mode plan"));
         assert!(!cmd.contains("--dangerously-skip-permissions"));
@@ -1028,7 +1086,7 @@ mod tests {
     fn claude_fresh_yolo() {
         let issue = test_issue(AgentKind::Claude, AgentMode::Yolo);
         let config = test_config();
-        let (cmd, _) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         assert!(cmd.contains("--dangerously-skip-permissions"));
         assert!(!cmd.contains("--permission-mode plan"));
     }
@@ -1038,7 +1096,7 @@ mod tests {
         let mut issue = test_issue(AgentKind::Claude, AgentMode::Plan);
         issue.session_id = Some("uuid-123-456".to_string());
         let config = test_config();
-        let (cmd, sid) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let (cmd, sid, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         assert!(cmd.contains("claude --name"));
         assert!(cmd.contains("--resume 'uuid-123-456'"));
         assert!(cmd.contains("--permission-mode plan"));
@@ -1051,7 +1109,7 @@ mod tests {
         let mut issue = test_issue(AgentKind::Claude, AgentMode::Yolo);
         issue.session_id = Some("uuid-789".to_string());
         let config = test_config();
-        let (cmd, _) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         assert!(cmd.contains("--resume 'uuid-789'"));
         assert!(cmd.contains("--dangerously-skip-permissions"));
     }
@@ -1060,9 +1118,11 @@ mod tests {
     fn codex_fresh_plan() {
         let issue = test_issue(AgentKind::Codex, AgentMode::Plan);
         let config = test_config();
-        let (cmd, sid) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let (cmd, sid, prompt) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         assert!(cmd.contains("codex --sandbox workspace-write --ask-for-approval on-request"));
-        assert!(cmd.contains("You are working on bork-1: Fix bug"));
+        assert!(prompt
+            .unwrap()
+            .contains("You are working on bork-1: Fix bug"));
         assert!(sid.is_none());
     }
 
@@ -1070,7 +1130,7 @@ mod tests {
     fn codex_fresh_build_uses_workspace_write_never() {
         let issue = test_issue(AgentKind::Codex, AgentMode::Build);
         let config = test_config();
-        let (cmd, _) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         assert!(cmd.contains("codex --sandbox workspace-write --ask-for-approval never"));
         assert!(!cmd.contains("--full-auto"));
         assert!(!cmd.contains("--dangerously-bypass-approvals-and-sandbox"));
@@ -1080,7 +1140,7 @@ mod tests {
     fn codex_fresh_yolo() {
         let issue = test_issue(AgentKind::Codex, AgentMode::Yolo);
         let config = test_config();
-        let (cmd, _) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         assert!(cmd.contains("codex --dangerously-bypass-approvals-and-sandbox"));
         assert!(!cmd.contains("--full-auto"));
         assert!(!cmd.contains("workspace-write"));
@@ -1091,7 +1151,7 @@ mod tests {
         let mut issue = test_issue(AgentKind::Codex, AgentMode::Build);
         issue.session_id = Some("019d76ad-9734-77c0-8169-a727a5524013".to_string());
         let config = test_config();
-        let (cmd, sid) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let (cmd, sid, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         assert!(cmd.contains(
             "codex resume '019d76ad-9734-77c0-8169-a727a5524013' --sandbox workspace-write --ask-for-approval never"
         ));
@@ -1103,10 +1163,36 @@ mod tests {
     }
 
     #[test]
+    fn fresh_prompt_staged_to_file_not_inlined() {
+        // A multiline prompt with characters that break naive shell quoting must
+        // be staged verbatim to the file, while the command references it via
+        // `"$(cat ...)"` and never inlines the prompt text.
+        let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        issue.prompt = Some("line one\nline `two`\n$VAR and \"quotes\"".to_string());
+        let config = test_config();
+        let (cmd, _, prompt) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+
+        let prompt = prompt.expect("fresh session should stage a prompt file");
+        assert!(prompt.contains("line one\nline `two`\n$VAR and \"quotes\""));
+
+        // Command must read the file, not embed the multiline text.
+        assert!(cmd.contains("\"$(cat '/tmp/status/prompt-bork-bork-1.txt')\""));
+        assert!(!cmd.contains("line `two`"));
+        // No literal newlines in the typed command line (send-keys would mangle them).
+        assert!(!cmd.contains('\n'));
+    }
+
+    #[test]
+    fn prompt_file_path_is_scoped_to_session() {
+        let path = prompt_file_path(Path::new("/tmp/status"), "bork-bork-7");
+        assert_eq!(path, PathBuf::from("/tmp/status/prompt-bork-bork-7.txt"));
+    }
+
+    #[test]
     fn cmd_env_prefix() {
         let issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
         let config = test_config();
-        let (cmd, _) = build_agent_cmd(&issue, &config, "my-session", "/path/to/status");
+        let (cmd, _, _) = agent_cmd(&issue, &config, "my-session", "/path/to/status");
         assert!(
             cmd.starts_with("export BORK_SESSION='my-session' BORK_STATUS_DIR='/path/to/status'")
         );
@@ -1133,7 +1219,7 @@ mod tests {
     fn cmd_escapes_single_quotes_in_session_name() {
         let issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
         let config = test_config();
-        let (cmd, _) = build_agent_cmd(&issue, &config, "it's-a-test", "/tmp/status");
+        let (cmd, _, _) = agent_cmd(&issue, &config, "it's-a-test", "/tmp/status");
         assert!(cmd.contains("BORK_SESSION='it'\\''s-a-test'"));
     }
 
@@ -1143,7 +1229,7 @@ mod tests {
     fn claude_base_args_are_appended() {
         let issue = test_issue(AgentKind::Claude, AgentMode::Build);
         let config = config_with_launch(AgentKind::Claude, &["--verbose"], &[]);
-        let (cmd, _) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         assert!(cmd.contains(" '--verbose' "));
     }
 
@@ -1155,7 +1241,7 @@ mod tests {
             &[],
             &[(AgentMode::Plan, &["--dangerously-skip-permissions"])],
         );
-        let (cmd, _) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         assert!(cmd.contains("'--dangerously-skip-permissions'"));
         assert!(!cmd.contains("--permission-mode plan"));
     }
@@ -1164,7 +1250,7 @@ mod tests {
     fn claude_empty_mode_override_clears_builtin_flag() {
         let issue = test_issue(AgentKind::Claude, AgentMode::Plan);
         let config = config_with_launch(AgentKind::Claude, &[], &[(AgentMode::Plan, &[])]);
-        let (cmd, _) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         assert!(!cmd.contains("--permission-mode plan"));
     }
 
@@ -1173,7 +1259,7 @@ mod tests {
         let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
         issue.session_id = Some("ses_abc123".to_string());
         let config = config_with_launch(AgentKind::OpenCode, &["--quiet"], &[]);
-        let (cmd, _) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         assert!(cmd.contains("opencode --session 'ses_abc123' '--quiet'"));
     }
 
@@ -1185,7 +1271,7 @@ mod tests {
             &[],
             &[(AgentMode::Build, &["--sandbox", "read-only"])],
         );
-        let (cmd, _) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         assert!(cmd.contains("'--sandbox' 'read-only'"));
         assert!(!cmd.contains("workspace-write"));
         assert!(!cmd.contains("--ask-for-approval never"));
@@ -1195,7 +1281,7 @@ mod tests {
     fn launcher_does_not_affect_other_agents() {
         let issue = test_issue(AgentKind::Claude, AgentMode::Build);
         let config = config_with_launch(AgentKind::OpenCode, &["--quiet"], &[]);
-        let (cmd, _) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         assert!(!cmd.contains("--quiet"));
     }
 
@@ -1203,7 +1289,7 @@ mod tests {
     fn configured_args_are_individually_shell_escaped() {
         let issue = test_issue(AgentKind::Claude, AgentMode::Build);
         let config = config_with_launch(AgentKind::Claude, &["it's a flag"], &[]);
-        let (cmd, _) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         assert!(cmd.contains("'it'\\''s a flag'"));
     }
 
