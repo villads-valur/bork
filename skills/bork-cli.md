@@ -31,7 +31,7 @@ bork issue create "Add search" --prompt "Implement full-text search using the ex
 
 Options:
 - `--column`: todo (default), in-progress, code-review, done
-- `--agent`: opencode (default from project config), claude, codex
+- `--agent`: opencode (default from project config), claude, codex, pi
 - `--mode`: plan (default), build, yolo
 - `--kind`: agentic (default), todo (non-agentic)
 - `--prompt`: agent prompt text

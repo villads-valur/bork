@@ -67,17 +67,30 @@ pub enum AgentKind {
     OpenCode,
     Claude,
     Codex,
+    Pi,
 }
 
 impl AgentKind {
-    pub const ALL: [AgentKind; 3] = [AgentKind::OpenCode, AgentKind::Claude, AgentKind::Codex];
+    pub const ALL: [AgentKind; 4] = [
+        AgentKind::OpenCode,
+        AgentKind::Claude,
+        AgentKind::Codex,
+        AgentKind::Pi,
+    ];
 
     pub fn command(self) -> &'static str {
         match self {
             AgentKind::OpenCode => "opencode",
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
+            AgentKind::Pi => "pi",
         }
+    }
+
+    /// Whether this agent has bork-managed plan/build/yolo modes. Pi has a
+    /// single mode, so the dialog hides the mode picker for it.
+    pub fn has_modes(self) -> bool {
+        !matches!(self, AgentKind::Pi)
     }
 
     pub fn parse(value: &str) -> Option<Self> {
@@ -85,6 +98,7 @@ impl AgentKind {
             "opencode" | "open_code" | "open-code" => Some(AgentKind::OpenCode),
             "claude" => Some(AgentKind::Claude),
             "codex" => Some(AgentKind::Codex),
+            "pi" => Some(AgentKind::Pi),
             _ => None,
         }
     }
@@ -96,6 +110,7 @@ impl fmt::Display for AgentKind {
             AgentKind::OpenCode => write!(f, "opencode"),
             AgentKind::Claude => write!(f, "claude"),
             AgentKind::Codex => write!(f, "codex"),
+            AgentKind::Pi => write!(f, "pi"),
         }
     }
 }
@@ -672,6 +687,30 @@ mod tests {
         assert_eq!(AgentMode::Plan.to_string(), "plan");
         assert_eq!(AgentMode::Build.to_string(), "build");
         assert_eq!(AgentMode::Yolo.to_string(), "yolo");
+    }
+
+    // --- AgentKind ---
+
+    #[test]
+    fn agent_kind_parse_and_display_pi() {
+        assert_eq!(AgentKind::parse("pi"), Some(AgentKind::Pi));
+        assert_eq!(AgentKind::parse("PI"), Some(AgentKind::Pi));
+        assert_eq!(AgentKind::Pi.to_string(), "pi");
+        assert_eq!(AgentKind::Pi.command(), "pi");
+    }
+
+    #[test]
+    fn agent_kind_pi_has_no_modes() {
+        assert!(!AgentKind::Pi.has_modes());
+        assert!(AgentKind::OpenCode.has_modes());
+        assert!(AgentKind::Claude.has_modes());
+        assert!(AgentKind::Codex.has_modes());
+    }
+
+    #[test]
+    fn agent_kind_all_includes_pi() {
+        assert!(AgentKind::ALL.contains(&AgentKind::Pi));
+        assert_eq!(AgentKind::ALL.len(), 4);
     }
 
     // --- Issue session_id ---

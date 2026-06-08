@@ -20,11 +20,11 @@
 
 ## Overview
 
-Bork is a terminal UI for managing multiple AI coding sessions. It gives you a 4-column kanban board where each issue maps to a git worktree and a tmux session running [OpenCode](https://opencode.ai), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), or [Codex](https://developers.openai.com/codex). Switch between sessions with a keypress, see agent status at a glance, and keep your work organized. Register multiple projects and view them side-by-side in stacked swimlanes.
+Bork is a terminal UI for managing multiple AI coding sessions. It gives you a 4-column kanban board where each issue maps to a git worktree and a tmux session running [OpenCode](https://opencode.ai), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://developers.openai.com/codex), or [Pi](https://pi.dev). Switch between sessions with a keypress, see agent status at a glance, and keep your work organized. Register multiple projects and view them side-by-side in stacked swimlanes.
 
 ## Quickstart
 
-You need [tmux](https://github.com/tmux/tmux), [git](https://git-scm.com/), a [Rust toolchain](https://rustup.rs/), and at least one AI coding agent ([OpenCode](https://opencode.ai), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), or [Codex](https://developers.openai.com/codex)).
+You need [tmux](https://github.com/tmux/tmux), [git](https://git-scm.com/), a [Rust toolchain](https://rustup.rs/), and at least one AI coding agent ([OpenCode](https://opencode.ai), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://developers.openai.com/codex), or [Pi](https://pi.dev)).
 
 **1. Install bork**
 
@@ -58,7 +58,7 @@ Press `n` to create an issue, `Enter` to launch an agent session. You're up and 
 ## Features
 
 - **4-column kanban board** &mdash; To Do, In Progress, Code Review, Done
-- **AI agent sessions** &mdash; Launch OpenCode, Claude Code, or Codex per issue in tmux popups
+- **AI agent sessions** &mdash; Launch OpenCode, Claude Code, Codex, or Pi per issue in tmux popups
 - **Session resumption** &mdash; Closing a tmux popup and reopening it continues the same conversation, not a fresh one
 - **Real-time status monitoring** &mdash; See agent state on each card (Idle, Busy, Waiting, Error)
 - **GitHub PR status** &mdash; Background polling shows checks, review status, and diff stats on cards
@@ -83,7 +83,7 @@ Press `n` to create an issue, `Enter` to launch an agent session. You're up and 
 | [git](https://git-scm.com/) | Worktree status and branch detection |
 | [gh](https://cli.github.com/) | GitHub PR status polling (optional) |
 | [linear](https://linear.app/docs/cli) | Linear issue import and sync (optional) |
-| [OpenCode](https://opencode.ai), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), or [Codex](https://developers.openai.com/codex) | AI coding agent (at least one) |
+| [OpenCode](https://opencode.ai), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://developers.openai.com/codex), or [Pi](https://pi.dev) | AI coding agent (at least one) |
 | [Rust toolchain](https://rustup.rs/) | Building from source |
 
 ## Installation
@@ -147,6 +147,7 @@ bork init https://github.com/owner/repo   # HTTPS URL
 bork init owner/repo myproject            # Custom directory name
 bork init owner/repo --agent claude       # Use Claude Code instead of OpenCode
 bork init owner/repo --agent codex        # Use Codex instead of OpenCode
+bork init owner/repo --agent pi           # Use Pi instead of OpenCode
 ```
 
 This creates:
@@ -173,6 +174,9 @@ Bork ships with hooks that report agent status (Idle, Busy, Waiting, Error) back
 - **OpenCode**: Installs as a plugin
 - **Claude Code**: Adds hooks to `settings.json`
 - **Codex**: Adds hooks to `~/.codex/hooks.json` and enables `features.codex_hooks = true` in `~/.codex/config.toml`
+- **Pi**: Installs a status extension to `~/.pi/agent/extensions/bork-status.ts`
+
+`bork install` also deploys the `worktree` and `bork-cli` skills into the project at `.claude/skills/` (Claude Code) and `.agents/skills/` (the cross-agent standard read by Pi and others).
 
 These are installed automatically by `bork init`. Use `bork install` / `bork uninstall` to manage them manually.
 
@@ -192,7 +196,7 @@ bork issue show bork-3
 bork issue delete bork-3
 ```
 
-**Create options:** `--column` (todo, in-progress, code-review, done), `--agent` (opencode, claude, codex), `--mode` (plan, build, yolo), `--prompt`, `--kind` (agentic, todo).
+**Create options:** `--column` (todo, in-progress, code-review, done), `--agent` (opencode, claude, codex, pi), `--mode` (plan, build, yolo), `--prompt`, `--kind` (agentic, todo).
 
 **Start options:** `--prompt`, `--agent` (opencode, claude, codex), `--mode` (plan, build, yolo), `--slug`, `--no-worktree`, `--project` (registered project name or path). `bork issue start` defaults to build mode and creates a worktree with a slug generated from the title.
 
@@ -300,7 +304,7 @@ Bork uses a single config schema in two layered locations. Project values overri
 project_name     = "myproject"                       # project file only
 agent_kind       = "opencode"                        # default agent for this project
 default_agent    = "claude"                          # alias for agent_kind, more natural in the global file
-agents           = ["opencode", "claude", "codex"]   # allowed agent picker entries (order matters)
+agents           = ["opencode", "claude", "codex", "pi"]   # allowed agent picker entries (order matters)
 default_prompt   = "Check AGENTS.md for project context and start working on the issue."
 done_session_ttl = 300                               # seconds a Done tmux session lingers
 debug            = false                             # enable debug-only keybindings
@@ -337,6 +341,7 @@ agent.codex.mode.yolo.args = ["--dangerously-bypass-approvals-and-sandbox"]
 Semantics:
 - `[agent.<name>].args` are always appended after bork's own flags.
 - `[agent.<name>.mode.<mode>].args` *replace* bork's built-in flags for that agent/mode. Omit the key to keep the defaults; set to `[]` to launch with no mode flags.
+- Pi has a single mode and no built-in mode flags, so `[agent.pi]` args always apply; `[agent.pi.mode.<mode>]` keys are effectively a way to inject extra flags (e.g. a plan-mode extension via `--extension`).
 - Project config overrides global config per key.
 - Each configured arg is shell-escaped individually, so values containing spaces or quotes are passed through safely.
 

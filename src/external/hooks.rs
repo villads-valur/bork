@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 
 const OPENCODE_PLUGIN: &str = include_str!("../../plugins/bork-status.ts");
 
+const PI_EXTENSION: &str = include_str!("../../plugins/bork-status-pi.ts");
+
 const CLAUDE_HOOKS: &str = r#"{
   "UserPromptSubmit": [
     {
@@ -131,9 +133,15 @@ pub fn install() -> anyhow::Result<()> {
     install_opencode_plugin()?;
     install_claude_hooks()?;
     install_codex_hooks()?;
+    install_pi_extension()?;
     install_skills();
     println!("bork hooks installed successfully");
     Ok(())
+}
+
+/// Whether `path` already exists and holds exactly `content`.
+fn file_has_content(path: &Path, content: &str) -> bool {
+    fs::read_to_string(path).is_ok_and(|existing| existing == content)
 }
 
 fn install_skills() {
@@ -147,20 +155,23 @@ fn install_skills() {
         ("bork-cli", crate::init::BORK_CLI_SKILL),
     ];
 
-    for (name, content) in &skills {
-        let skill_dir = project_root.join(format!(".claude/skills/{}", name));
-        let skill_path = skill_dir.join("SKILL.md");
+    // `.claude/skills/` is read by Claude Code; `.agents/skills/` is the
+    // cross-agent standard that Pi (and other harnesses) discover. Deploy to
+    // both so every supported agent picks up bork's skills.
+    let skill_roots = [".claude/skills", ".agents/skills"];
 
-        if skill_path.exists() {
-            if let Ok(existing) = fs::read_to_string(&skill_path) {
-                if existing == *content {
-                    continue;
-                }
+    for root in &skill_roots {
+        for (name, content) in &skills {
+            let skill_dir = project_root.join(format!("{}/{}", root, name));
+            let skill_path = skill_dir.join("SKILL.md");
+
+            if file_has_content(&skill_path, content) {
+                continue;
             }
-        }
 
-        if fs::create_dir_all(&skill_dir).is_ok() {
-            let _ = fs::write(&skill_path, content);
+            if fs::create_dir_all(&skill_dir).is_ok() {
+                let _ = fs::write(&skill_path, content);
+            }
         }
     }
 }
@@ -170,6 +181,7 @@ pub fn uninstall() -> anyhow::Result<()> {
     uninstall_opencode_plugin()?;
     uninstall_claude_hooks()?;
     uninstall_codex_hooks()?;
+    uninstall_pi_extension()?;
     println!("bork hooks uninstalled successfully");
     Ok(())
 }
@@ -206,6 +218,46 @@ fn uninstall_opencode_plugin() -> anyhow::Result<()> {
         println!("  OpenCode plugin removed from {}", path.display());
     } else {
         println!("  OpenCode plugin not found (already removed)");
+    }
+    Ok(())
+}
+
+// --- Pi extension ---
+
+/// Pi loads extensions from `<PI_CODING_AGENT_DIR or ~/.pi/agent>/extensions/`.
+fn pi_extension_path() -> PathBuf {
+    let root = if let Ok(dir) = std::env::var("PI_CODING_AGENT_DIR") {
+        PathBuf::from(dir)
+    } else {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        PathBuf::from(home).join(".pi").join("agent")
+    };
+    root.join("extensions").join("bork-status.ts")
+}
+
+fn install_pi_extension() -> anyhow::Result<()> {
+    let path = pi_extension_path();
+
+    if file_has_content(&path, PI_EXTENSION) {
+        println!("  Pi extension already installed (skipped)");
+        return Ok(());
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, PI_EXTENSION)?;
+    println!("  Pi extension installed at {}", path.display());
+    Ok(())
+}
+
+fn uninstall_pi_extension() -> anyhow::Result<()> {
+    let path = pi_extension_path();
+    if path.exists() {
+        fs::remove_file(&path)?;
+        println!("  Pi extension removed from {}", path.display());
+    } else {
+        println!("  Pi extension not found (already removed)");
     }
     Ok(())
 }

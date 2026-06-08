@@ -1073,15 +1073,20 @@ impl DialogState {
     ) -> Self {
         let kind = IssueKind::Agentic;
         let resolved_agent = Self::resolve_agent_kind(agent_kind, &available_agents);
-        let title_idx =
-            Self::compute_title_index(kind, &available_agents, linear_available, github_available);
+        let title_idx = Self::compute_title_index(
+            kind,
+            resolved_agent,
+            &available_agents,
+            linear_available,
+            github_available,
+        );
         DialogState {
             kind,
             title: String::new(),
             title_cursor: 0,
             prompt: make_prompt_textarea(""),
             available_agents,
-            agent_mode: AgentMode::Plan,
+            agent_mode: Self::normalize_mode_for_agent(AgentMode::Plan, resolved_agent),
             agent_kind: resolved_agent,
             focused_field: title_idx,
             editing_index: None,
@@ -1140,6 +1145,7 @@ impl DialogState {
         let resolved_agent = Self::resolve_agent_kind(issue.agent_kind, &available_agents);
         let title_idx = Self::compute_title_index(
             issue.kind,
+            resolved_agent,
             &available_agents,
             linear_available,
             github_available,
@@ -1172,6 +1178,11 @@ impl DialogState {
     }
 
     fn normalize_mode_for_agent(mode: AgentMode, agent_kind: AgentKind) -> AgentMode {
+        // Pi has a single mode; pin it to Build so a stale Plan/Yolo from
+        // another agent never carries over (and no mode picker is shown).
+        if !agent_kind.has_modes() {
+            return AgentMode::Build;
+        }
         if agent_kind == AgentKind::OpenCode && mode == AgentMode::Yolo {
             AgentMode::Build
         } else {
@@ -1234,7 +1245,7 @@ impl DialogState {
         }
         if self.kind == IssueKind::Agentic {
             fields.push(DialogField::Agent);
-            if !self.available_agents.is_empty() {
+            if !self.available_agents.is_empty() && self.agent_kind.has_modes() {
                 fields.push(DialogField::Mode);
             }
         }
@@ -1249,6 +1260,7 @@ impl DialogState {
 
     fn compute_title_index(
         kind: IssueKind,
+        agent_kind: AgentKind,
         available_agents: &[AgentKind],
         linear_available: bool,
         github_available: bool,
@@ -1262,7 +1274,9 @@ impl DialogState {
         }
         if kind == IssueKind::Agentic {
             idx += 1;
-            if !available_agents.is_empty() {
+            // Mirror `ordered_fields`: the Mode field only exists for agents
+            // with modes (Pi is single-mode and hides it).
+            if !available_agents.is_empty() && agent_kind.has_modes() {
                 idx += 1;
             }
         }
@@ -1332,7 +1346,9 @@ impl DialogState {
                         AgentKind::Claude | AgentKind::Codex => {
                             self.agent_mode.next_for_yolo_agents()
                         }
-                        AgentKind::OpenCode => self.agent_mode.toggle(),
+                        // Pi has a single mode and no Mode field, so this arm
+                        // is unreachable in practice; toggle is a safe no-op.
+                        AgentKind::OpenCode | AgentKind::Pi => self.agent_mode.toggle(),
                     };
                 }
             }
@@ -2862,6 +2878,36 @@ mod tests {
         assert_eq!(d.agent_mode, crate::types::AgentMode::Build);
         d.push_char('h');
         assert_eq!(d.agent_mode, crate::types::AgentMode::Yolo);
+    }
+
+    #[test]
+    fn dialog_pi_hides_mode_field() {
+        let d = DialogState::new(
+            crate::types::AgentKind::Pi,
+            crate::types::AgentKind::ALL.to_vec(),
+            false,
+            false,
+        );
+        assert!(!d.ordered_fields().contains(&DialogField::Mode));
+        // Pi pins its single mode to Build.
+        assert_eq!(d.agent_mode, crate::types::AgentMode::Build);
+    }
+
+    #[test]
+    fn dialog_cycling_to_pi_resets_mode_to_build() {
+        // Start on Claude in Yolo, then cycle agents until we land on Pi.
+        let mut d = claude_dialog();
+        d.agent_mode = crate::types::AgentMode::Yolo;
+        d.focused_field = 1; // Agent field
+
+        for _ in 0..crate::types::AgentKind::ALL.len() {
+            if d.agent_kind == crate::types::AgentKind::Pi {
+                break;
+            }
+            d.push_char('l');
+        }
+        assert_eq!(d.agent_kind, crate::types::AgentKind::Pi);
+        assert_eq!(d.agent_mode, crate::types::AgentMode::Build);
     }
 
     #[test]

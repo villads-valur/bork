@@ -42,4 +42,4 @@ bork integration attach-linear {project_name}-1 VIL-123   # Link Linear ticket
 bork integration attach-pr {project_name}-1 42             # Link GitHub PR
 ```
 
-Create flags: `--column` (todo, in-progress, code-review, done), `--agent` (opencode, claude, codex), `--mode` (plan, build, yolo), `--prompt`, `--kind` (agentic, todo).
+Create flags: `--column` (todo, in-progress, code-review, done), `--agent` (opencode, claude, codex, pi), `--mode` (plan, build, yolo), `--prompt`, `--kind` (agentic, todo).

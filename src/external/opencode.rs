@@ -11,7 +11,7 @@ use crate::types::{AgentKind, AgentMode, Issue, LinkedGithubPr, LinkedLinear};
 
 /// Launch an agent session for an issue.
 /// Creates a tmux session with two windows:
-///   1. The agent (opencode/claude/codex) launched at the project root with issue context
+///   1. The agent (opencode/claude/codex/pi) launched at the project root with issue context
 ///   2. A bare terminal
 ///
 /// Exports BORK_SESSION and BORK_STATUS_DIR so hooks/plugins can write status files.
@@ -66,6 +66,7 @@ pub fn launch_session(
             AgentKind::OpenCode => detect_opencode_session_id(),
             AgentKind::Claude => None,
             AgentKind::Codex => detect_codex_session_id(),
+            AgentKind::Pi => detect_pi_session_id(&config.project_root),
         },
     };
 
@@ -159,6 +160,9 @@ fn build_agent_cmd(
             AgentMode::Build => "--sandbox workspace-write --ask-for-approval never",
             AgentMode::Yolo => "--dangerously-bypass-approvals-and-sandbox",
         },
+        // Pi has a single mode and no built-in plan/yolo flags. Users can still
+        // add per-mode args via `[agent.pi.mode.<mode>]` if desired.
+        AgentKind::Pi => "",
     };
 
     let trailing = trailing_args(
@@ -235,6 +239,26 @@ fn build_agent_cmd(
                 let cmd = format!(
                     "{} && codex{} {}{}",
                     env_prefix, trailing, prompt_subst, prompt_cleanup,
+                );
+                (cmd, None, Some(build_prompt_contents()))
+            }
+        }
+        AgentKind::Pi => {
+            let session_display_name = format!("{}: {}", issue.id, issue.title);
+            let escaped_name = shell_escape_single_quotes(&session_display_name);
+
+            if let Some(ref sid) = issue.session_id {
+                // Resume existing session — skip the prompt, history is preserved.
+                let escaped_sid = shell_escape_single_quotes(sid);
+                let cmd = format!(
+                    "{} && pi --session '{}'{}",
+                    env_prefix, escaped_sid, trailing,
+                );
+                (cmd, Some(sid.clone()), None)
+            } else {
+                let cmd = format!(
+                    "{} && pi --name '{}'{} {}{}",
+                    env_prefix, escaped_name, trailing, prompt_subst, prompt_cleanup,
                 );
                 (cmd, None, Some(build_prompt_contents()))
             }
@@ -398,6 +422,92 @@ fn is_uuid_like(value: &str) -> bool {
             ch.is_ascii_hexdigit()
         }
     })
+}
+
+/// Detect a newly created Pi session UUID by scanning Pi's per-cwd session
+/// directory. Snapshots existing sessions before waiting, then polls for a new
+/// one. Pi stores sessions under `<sessions_root>/--<cwd>--/` as
+/// `<timestamp>_<uuid>.jsonl`, where `<cwd>` has `/` replaced by `-`.
+fn detect_pi_session_id(project_root: &Path) -> Option<String> {
+    let sessions_dir = pi_sessions_dir(project_root)?;
+
+    let before = collect_pi_session_ids(&sessions_dir);
+
+    std::thread::sleep(Duration::from_millis(800));
+
+    for _ in 0..9 {
+        let after = collect_pi_session_ids(&sessions_dir);
+        for (id, _) in &after {
+            if !before.contains_key(id) {
+                return Some(id.clone());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    // Fallback: return the newest session if no new one appeared.
+    collect_pi_session_ids(&sessions_dir)
+        .into_iter()
+        .max_by_key(|(_, modified)| *modified)
+        .map(|(id, _)| id)
+}
+
+/// Resolve Pi's session directory for a given working directory.
+/// Honors `PI_CODING_AGENT_SESSION_DIR` (flat dir) and `PI_CODING_AGENT_DIR`
+/// overrides, falling back to `~/.pi/agent/sessions/--<cwd>--/`.
+fn pi_sessions_dir(project_root: &Path) -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("PI_CODING_AGENT_SESSION_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+
+    let root = if let Ok(dir) = std::env::var("PI_CODING_AGENT_DIR") {
+        PathBuf::from(dir)
+    } else {
+        let home = std::env::var("HOME").ok()?;
+        PathBuf::from(home).join(".pi").join("agent")
+    };
+
+    let cwd = project_root.to_str()?;
+    Some(
+        root.join("sessions")
+            .join(format!("--{}--", cwd.replace('/', "-"))),
+    )
+}
+
+/// Collect Pi session UUIDs and their modification times from a session dir.
+fn collect_pi_session_ids(sessions_dir: &Path) -> HashMap<String, SystemTime> {
+    let mut sessions = HashMap::new();
+    let Ok(entries) = fs::read_dir(sessions_dir) else {
+        return sessions;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(session_id) = parse_pi_session_id_from_filename(file_name) else {
+            continue;
+        };
+        let modified = fs::metadata(&path)
+            .and_then(|meta| meta.modified())
+            .unwrap_or(UNIX_EPOCH);
+        sessions.insert(session_id, modified);
+    }
+    sessions
+}
+
+/// Extract the session UUID from a Pi session filename (`<timestamp>_<uuid>.jsonl`).
+fn parse_pi_session_id_from_filename(file_name: &str) -> Option<String> {
+    let stem = file_name.strip_suffix(".jsonl")?;
+    let candidate = stem.rsplit('_').next()?;
+    if is_uuid_like(candidate) {
+        Some(candidate.to_string())
+    } else {
+        None
+    }
 }
 
 /// Run `opencode session list` and return the first (newest) session ID found.
@@ -1186,6 +1296,70 @@ mod tests {
     fn prompt_file_path_is_scoped_to_session() {
         let path = prompt_file_path(Path::new("/tmp/status"), "bork-bork-7");
         assert_eq!(path, PathBuf::from("/tmp/status/prompt-bork-bork-7.txt"));
+    }
+
+    #[test]
+    fn pi_fresh_uses_name_and_prompt() {
+        let issue = test_issue(AgentKind::Pi, AgentMode::Build);
+        let config = test_config();
+        let (cmd, sid, prompt) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(cmd.contains("pi --name 'bork-1: Fix bug'"));
+        assert!(prompt
+            .unwrap()
+            .contains("You are working on bork-1: Fix bug"));
+        // Pi has no built-in mode flags.
+        assert!(!cmd.contains("--agent plan"));
+        assert!(!cmd.contains("--permission-mode"));
+        assert!(!cmd.contains("--sandbox"));
+        assert!(sid.is_none());
+    }
+
+    #[test]
+    fn pi_single_mode_ignores_agent_mode() {
+        // Pi behaves identically regardless of the stored agent_mode.
+        let config = test_config();
+        let plan = agent_cmd(
+            &test_issue(AgentKind::Pi, AgentMode::Plan),
+            &config,
+            "bork-bork-1",
+            "/tmp/status",
+        )
+        .0;
+        let build = agent_cmd(
+            &test_issue(AgentKind::Pi, AgentMode::Build),
+            &config,
+            "bork-bork-1",
+            "/tmp/status",
+        )
+        .0;
+        assert_eq!(plan, build);
+    }
+
+    #[test]
+    fn pi_resume_uses_session_id() {
+        let mut issue = test_issue(AgentKind::Pi, AgentMode::Build);
+        issue.session_id = Some("019d76ad-9734-77c0-8169-a727a5524013".to_string());
+        let config = test_config();
+        let (cmd, sid, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(cmd.contains("pi --session '019d76ad-9734-77c0-8169-a727a5524013'"));
+        assert!(!cmd.contains("--prompt"));
+        assert!(!cmd.contains("--name"));
+        assert_eq!(
+            sid,
+            Some("019d76ad-9734-77c0-8169-a727a5524013".to_string())
+        );
+    }
+
+    #[test]
+    fn pi_session_id_parsed_from_filename() {
+        assert_eq!(
+            parse_pi_session_id_from_filename(
+                "2024-12-03T14-00-00_019d76ad-9734-77c0-8169-a727a5524013.jsonl"
+            ),
+            Some("019d76ad-9734-77c0-8169-a727a5524013".to_string())
+        );
+        assert_eq!(parse_pi_session_id_from_filename("not-a-session.txt"), None);
+        assert_eq!(parse_pi_session_id_from_filename("123_short.jsonl"), None);
     }
 
     #[test]

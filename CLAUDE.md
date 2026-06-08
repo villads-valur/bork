@@ -6,7 +6,7 @@ Terminal kanban board for orchestrating OpenCode/Claude coding sessions across g
 
 - **Language**: Rust (no async runtime, pure `std::thread` + `mpsc`)
 - **TUI**: ratatui + crossterm
-- **External tools**: tmux, git, gh, linear (optional), opencode/claude/codex (all via `std::process::Command`)
+- **External tools**: tmux, git, gh, linear (optional), opencode/claude/codex/pi (all via `std::process::Command`)
 
 ### Threading Model
 
@@ -56,11 +56,11 @@ src/
 ├── external/
 │   ├── mod.rs
 │   ├── tmux.rs       # Tmux session management
-│   ├── opencode.rs   # Agent session launcher (opencode/claude/codex)
+│   ├── opencode.rs   # Agent session launcher (opencode/claude/codex/pi)
 │   ├── git.rs        # Git worktree status polling
 │   ├── github.rs     # GitHub PR polling via gh api graphql (per-repo identity cache)
 │   ├── linear.rs     # Linear CLI integration (assigned issues via graphql)
-│   └── hooks.rs      # Agent status hooks (install/uninstall for opencode/claude/codex)
+│   └── hooks.rs      # Agent status hooks (install/uninstall for opencode/claude/codex/pi)
 └── ui/
     ├── mod.rs         # Root render, layout composition, swimlane splitting
     ├── board.rs       # 4-column kanban board with adaptive card sizes
