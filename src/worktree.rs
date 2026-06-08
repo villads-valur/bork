@@ -6,9 +6,14 @@ use crate::config;
 use crate::types::{AgentMode, Column, Issue, IssueKind};
 
 /// Create a git worktree and register it with bork's state.json.
-pub fn run_worktree(issue_id: &str, slug: Option<&str>, title: Option<&str>) -> anyhow::Result<()> {
+pub fn run_worktree(
+    issue_id: &str,
+    slug: Option<&str>,
+    title: Option<&str>,
+    base_branch: Option<&str>,
+) -> anyhow::Result<()> {
     let config = config::load_config();
-    let result = create_worktree_in(&config, issue_id, slug, title)?;
+    let result = create_worktree_in(&config, issue_id, slug, title, base_branch)?;
 
     println!(
         "Created worktree: {}/ on branch {}",
@@ -56,6 +61,7 @@ pub fn create_worktree_in(
     issue_id: &str,
     slug: Option<&str>,
     title: Option<&str>,
+    base_branch: Option<&str>,
 ) -> anyhow::Result<WorktreeResult> {
     let mut state = config::load_state(&config.project_root);
 
@@ -83,14 +89,17 @@ pub fn create_worktree_in(
         None => issue_id.to_string(),
     };
 
+    let worktree_path = format!("../{}", worktree_dir);
+    let mut args = vec!["worktree", "add", &worktree_path, "-b", &branch_name];
+    // When a base branch is given, pass it as the start-point so the new branch
+    // is created from it. Without one, git branches off main/'s current HEAD
+    // (the main/master branch by bork convention).
+    if let Some(base) = base_branch {
+        args.push(base);
+    }
+
     let status = Command::new("git")
-        .args([
-            "worktree",
-            "add",
-            &format!("../{}", worktree_dir),
-            "-b",
-            &branch_name,
-        ])
+        .args(&args)
         .current_dir(&main_dir)
         .status()
         .context("Failed to run git worktree add")?;
@@ -228,7 +237,7 @@ mod tests {
     fn test_worktree_creates_dir_and_updates_state() {
         let (tmp, project, cfg) = setup_test_project();
 
-        let result = create_worktree_in(&cfg, "bork-1", Some("fix-bug"), None);
+        let result = create_worktree_in(&cfg, "bork-1", Some("fix-bug"), None, None);
         assert!(result.is_ok(), "run_worktree failed: {:?}", result.err());
 
         assert!(project.join("bork-1-fix-bug").exists());
@@ -245,7 +254,13 @@ mod tests {
     fn test_worktree_creates_issue_with_title() {
         let (tmp, _project, cfg) = setup_test_project();
 
-        let result = create_worktree_in(&cfg, "bork-2", Some("new-feature"), Some("New feature"));
+        let result = create_worktree_in(
+            &cfg,
+            "bork-2",
+            Some("new-feature"),
+            Some("New feature"),
+            None,
+        );
         assert!(result.is_ok(), "run_worktree failed: {:?}", result.err());
 
         let state = config::load_state(&cfg.project_root);
@@ -263,7 +278,7 @@ mod tests {
 
         fs::create_dir_all(project.join("bork-1-fix-bug")).unwrap();
 
-        let result = create_worktree_in(&cfg, "bork-1", Some("fix-bug"), None);
+        let result = create_worktree_in(&cfg, "bork-1", Some("fix-bug"), None, None);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("already exists"));
@@ -275,7 +290,7 @@ mod tests {
     fn test_worktree_without_slug_uses_id_as_branch() {
         let (tmp, project, cfg) = setup_test_project();
 
-        let result = create_worktree_in(&cfg, "bork-1", None, None);
+        let result = create_worktree_in(&cfg, "bork-1", None, None, None);
         assert!(result.is_ok(), "run_worktree failed: {:?}", result.err());
 
         let output = Command::new("git")
@@ -289,6 +304,45 @@ mod tests {
             "Branch 'bork-1' should exist, got: {}",
             branches
         );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_worktree_bases_new_branch_on_given_branch() {
+        let (tmp, project, cfg) = setup_test_project();
+        let main_dir = project.join("main");
+
+        // Create a base branch with a distinct commit that doesn't exist on the
+        // default branch, so we can prove the new worktree was based on it.
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(&main_dir)
+                .output()
+                .unwrap()
+        };
+        git(&["checkout", "-b", "feature-base"]);
+        fs::write(main_dir.join("BASE_MARKER.md"), "marker").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.email=test@test.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-m",
+            "base marker",
+        ]);
+        // Switch main back off the base branch so HEAD differs from it.
+        git(&["checkout", "-"]);
+
+        let result =
+            create_worktree_in(&cfg, "bork-1", Some("fix-bug"), None, Some("feature-base"));
+        assert!(result.is_ok(), "create failed: {:?}", result.err());
+
+        // The new worktree should contain the marker file only present on the base.
+        assert!(project.join("bork-1-fix-bug/BASE_MARKER.md").exists());
 
         let _ = fs::remove_dir_all(&tmp);
     }

@@ -242,7 +242,11 @@ const AGENTS_START_HERE: &str = "\
 Start here (for AI agents):
   bork issue list                List the kanban board (use --json to parse)
   bork issue create \"<title>\"    Add an issue (its agent runs in a worktree)
+  bork issue start \"<title>\"     Create issue + worktree + agent in one step
+                                 (--no-worktree to skip it, --base <branch> to
+                                  pick the worktree's base; defaults to main)
   bork worktree <id> <slug>      Create the git worktree for an issue
+                                 (--base <branch> to pick its base branch)
 
   Each issue runs one coding agent. Pick which and how with:
     --agent   opencode (default), claude, codex     # must be on your PATH
@@ -321,6 +325,10 @@ enum Command {
         /// Create the issue if it doesn't exist (with this title)
         #[arg(long)]
         title: Option<String>,
+
+        /// Branch to base the new worktree on (defaults to main/master)
+        #[arg(long)]
+        base: Option<String>,
     },
 
     /// Manage registered bork projects
@@ -432,6 +440,10 @@ enum IssueCommand {
         /// Skip creating a git worktree before launching the agent
         #[arg(long)]
         no_worktree: bool,
+
+        /// Branch to base the new worktree on (defaults to main/master)
+        #[arg(long)]
+        base: Option<String>,
 
         /// Project name or path to start the issue in. Defaults to current project.
         #[arg(long)]
@@ -584,7 +596,13 @@ fn main() -> anyhow::Result<()> {
             issue_id,
             slug,
             title,
-        }) => worktree::run_worktree(&issue_id, slug.as_deref(), title.as_deref()),
+            base,
+        }) => worktree::run_worktree(
+            &issue_id,
+            slug.as_deref(),
+            title.as_deref(),
+            base.as_deref(),
+        ),
         Some(Command::Project { command }) => run_project_command(command),
         Some(Command::Issue { command }) => run_issue_command(command),
         Some(Command::Integration { command }) => run_integration_command(command),
@@ -688,6 +706,7 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
             mode,
             slug,
             no_worktree,
+            base,
             project,
         } => {
             let project_root = resolve_start_project_root(project.as_deref())?;
@@ -700,6 +719,7 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
                     agent_mode: mode,
                     slug,
                     no_worktree,
+                    base_branch: base,
                 },
             )?;
             println!("Started {}: \"{}\"", report.issue_id, report.title);
@@ -757,6 +777,7 @@ struct StartIssueOptions {
     agent_mode: Option<AgentMode>,
     slug: Option<String>,
     no_worktree: bool,
+    base_branch: Option<String>,
 }
 
 struct StartIssueReport {
@@ -817,7 +838,13 @@ fn start_issue(project_root: &Path, opts: StartIssueOptions) -> anyhow::Result<S
         let slug = opts
             .slug
             .unwrap_or_else(|| worktree::slugify_title(&opts.title));
-        let result = worktree::create_worktree_in(&config, &issue.id, Some(&slug), None)?;
+        let result = worktree::create_worktree_in(
+            &config,
+            &issue.id,
+            Some(&slug),
+            None,
+            opts.base_branch.as_deref(),
+        )?;
         issue.worktree = Some(result.worktree_dir.clone());
         Some(result.worktree_dir)
     };
