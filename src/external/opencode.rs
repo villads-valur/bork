@@ -1073,6 +1073,8 @@ mod tests {
             review_prompt: None,
             done_session_ttl: 300,
             debug: false,
+            auto_import_reviews: true,
+            auto_import_authored_prs: true,
             agents_allowlist: None,
             agent_launch: std::collections::HashMap::new(),
         }
