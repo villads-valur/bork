@@ -70,7 +70,23 @@ pub type Table = HashMap<String, Value>;
 
 /// Parse a TOML-lite document. Unknown shapes are silently skipped so partial
 /// configs do not fail; callers decide which keys they care about.
+#[cfg_attr(not(test), allow(dead_code))] // Production callers use parse_with_warnings
 pub fn parse(contents: &str) -> Table {
+    parse_with_warnings(contents).0
+}
+
+/// Like [`parse`], but also reports constructs we know users will reach for
+/// that this reader deliberately does not support (currently: `"""` multiline
+/// strings). Callers can surface these so a prompt doesn't silently mis-parse.
+pub fn parse_with_warnings(contents: &str) -> (Table, Vec<String>) {
+    let mut warnings = Vec::new();
+    if contents.contains("\"\"\"") {
+        warnings.push(
+            "multiline strings (\"\"\") are not supported; use a single-line value with \\n escapes"
+                .to_string(),
+        );
+    }
+
     let mut table = Table::new();
     let mut section: Vec<String> = Vec::new();
 
@@ -101,7 +117,7 @@ pub fn parse(contents: &str) -> Table {
         table.insert(full_key, value);
     }
 
-    table
+    (table, warnings)
 }
 
 /// Parse a `[a.b.c]` header. Returns the dotted segments, or `None` if the

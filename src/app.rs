@@ -7,16 +7,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// actions don't appear as a single-frame flash.
 const BUSY_MIN_VISIBLE: Duration = Duration::from_millis(250);
 
-use ratatui::style::{Modifier, Style};
-use ratatui_textarea::{CursorMove, TextArea, WrapMode};
-
 use crate::config::{AppConfig, AppState, DEFAULT_REVIEW_PROMPT};
 use crate::external::linear::LinearIssue;
 use crate::types::{
-    AgentKind, AgentMode, AgentStatus, AgentStatusInfo, Column, Issue, IssueKind, LinkedGithubPr,
-    PrImportSource, PrState, PrStatus, WorktreeStatus,
+    AgentKind, AgentStatus, AgentStatusInfo, Column, Issue, LinkedGithubPr, PrImportSource,
+    PrState, PrStatus, WorktreeStatus,
 };
-use crate::ui::styles;
 
 pub type ProjectId = PathBuf;
 
@@ -66,6 +62,9 @@ impl LiveState {
 }
 
 pub struct Project {
+    /// Canonicalized project root, computed once at construction. `id()` is
+    /// called in per-frame render paths, so it must not hit the filesystem.
+    id: ProjectId,
     pub issues: Vec<Issue>,
     pub config: AppConfig,
     pub available_agents: Vec<AgentKind>,
@@ -90,7 +89,10 @@ impl Project {
         }
         let base_issues = issues.clone();
         let last_state_mtime = crate::config::state_mtime(&config.project_root);
+        let id = std::fs::canonicalize(&config.project_root)
+            .unwrap_or_else(|_| config.project_root.clone());
         Project {
+            id,
             issues,
             config,
             available_agents: AgentKind::ALL.to_vec(),
@@ -106,8 +108,7 @@ impl Project {
     }
 
     pub fn id(&self) -> ProjectId {
-        std::fs::canonicalize(&self.config.project_root)
-            .unwrap_or_else(|_| self.config.project_root.clone())
+        self.id.clone()
     }
 
     pub fn set_available_agents(
@@ -182,12 +183,20 @@ impl Project {
             }
         }
 
-        // Field-level merge for issues present in both memory and file
+        // Field-level merge for issues present in both memory and file.
+        // Indexed by ID to avoid an O(issues^2) scan per merge.
+        let file_by_id: HashMap<&str, &Issue> =
+            file_issues.iter().map(|i| (i.id.as_str(), i)).collect();
+        let base_by_id: HashMap<&str, &Issue> = self
+            .base_issues
+            .iter()
+            .map(|i| (i.id.as_str(), i))
+            .collect();
         for issue in &mut self.issues {
-            let Some(file_issue) = file_issues.iter().find(|f| f.id == issue.id) else {
+            let Some(file_issue) = file_by_id.get(issue.id.as_str()).copied() else {
                 continue;
             };
-            let Some(base_issue) = self.base_issues.iter().find(|b| b.id == issue.id) else {
+            let Some(base_issue) = base_by_id.get(issue.id.as_str()).copied() else {
                 // No base means this issue was added after last snapshot; keep memory version
                 continue;
             };
@@ -246,9 +255,8 @@ impl Project {
     }
 
     pub fn move_selection_down(&mut self, query: &str) {
-        let column = match Column::from_index(self.selected_column) {
-            Some(c) => c,
-            None => return,
+        let Some(column) = Column::from_index(self.selected_column) else {
+            return;
         };
         let count = self.issues_in_column(column, query).len();
         let row = &mut self.selected_row[self.selected_column];
@@ -290,9 +298,8 @@ impl Project {
     }
 
     pub fn focus_right(&mut self, query: &str) {
-        let column = match Column::from_index(self.selected_column) {
-            Some(c) => c,
-            None => return,
+        let Some(column) = Column::from_index(self.selected_column) else {
+            return;
         };
         let count = self.issues_in_column(column, query).len();
         let row = self.selected_row[self.selected_column];
@@ -325,9 +332,8 @@ impl Project {
     }
 
     pub fn scroll_to_bottom(&mut self, query: &str) {
-        let column = match Column::from_index(self.selected_column) {
-            Some(c) => c,
-            None => return,
+        let Some(column) = Column::from_index(self.selected_column) else {
+            return;
         };
         let count = self.issues_in_column(column, query).len();
         if count > 0 {
@@ -383,12 +389,16 @@ impl Project {
         };
         let items = self.issues_in_column(column, query);
         let row = self.selected_row[self.selected_column];
-        let target_row = row.wrapping_add(direction as usize);
+        if row >= items.len() {
+            return;
+        }
+        let Some(target_row) = row.checked_add_signed(direction) else {
+            return;
+        };
         if target_row >= items.len() {
             return;
         }
         let (a, b) = (items[row].0, items[target_row].0);
-        drop(items);
         self.issues.swap(a, b);
         self.selected_row[self.selected_column] = target_row;
     }
@@ -474,7 +484,7 @@ impl Project {
             let before_ok = pos == 0 || dir_lower.as_bytes()[pos - 1] == b'-';
             let end = pos + issue_id_lower.len();
             let after_ok = end == dir_lower.len() || dir_lower.as_bytes()[end] == b'-';
-            if before_ok && after_ok && (best.is_none() || dir_name.len() < best.unwrap().len()) {
+            if before_ok && after_ok && best.is_none_or(|b| dir_name.len() < b.len()) {
                 best = Some(dir_name.as_str());
             }
         }
@@ -707,31 +717,7 @@ impl Project {
             }
             new_pr_numbers.insert(pr.number);
             let id = self.next_issue_id_after(new_issues.len() as u32);
-            new_issues.push(Issue {
-                id,
-                title: pr.title.clone(),
-                kind: IssueKind::Agentic,
-                column: Column::CodeReview,
-                agent_kind: self.config.agent_kind,
-                agent_mode: AgentMode::Plan,
-                prompt: None,
-                worktree: None,
-                done_at: None,
-                session_id: None,
-                linear_links: Vec::new(),
-                github_pr_links: vec![LinkedGithubPr {
-                    number: pr.number,
-                    imported: true,
-                    import_source: Some(PrImportSource::Authored),
-                }],
-                linear_id: None,
-                linear_identifier: None,
-                linear_url: None,
-                linear_imported: false,
-                pr_number: None,
-                pr_imported: false,
-                pr_import_source: None,
-            });
+            new_issues.push(self.imported_pr_issue(id, pr, PrImportSource::Authored));
         }
 
         // Import review-requested PRs
@@ -747,38 +733,7 @@ impl Project {
             }
             new_pr_numbers.insert(pr.number);
             let id = self.next_issue_id_after(new_issues.len() as u32);
-            new_issues.push(Issue {
-                id,
-                title: pr.title.clone(),
-                kind: IssueKind::Agentic,
-                column: Column::CodeReview,
-                agent_kind: self.config.agent_kind,
-                agent_mode: AgentMode::Plan,
-                prompt: Some({
-                    let body = self
-                        .config
-                        .review_prompt
-                        .as_deref()
-                        .unwrap_or(DEFAULT_REVIEW_PROMPT);
-                    format!("Review this PR: #{} ({}). {}", pr.number, pr.url, body)
-                }),
-                worktree: None,
-                done_at: None,
-                session_id: None,
-                linear_links: Vec::new(),
-                github_pr_links: vec![LinkedGithubPr {
-                    number: pr.number,
-                    imported: true,
-                    import_source: Some(PrImportSource::ReviewRequested),
-                }],
-                linear_id: None,
-                linear_identifier: None,
-                linear_url: None,
-                linear_imported: false,
-                pr_number: None,
-                pr_imported: false,
-                pr_import_source: None,
-            });
+            new_issues.push(self.imported_pr_issue(id, pr, PrImportSource::ReviewRequested));
         }
 
         let added = new_issues.len();
@@ -813,6 +768,39 @@ impl Project {
         (true, Some(parts.join(", ")))
     }
 
+    /// Issue skeleton for a PR auto-imported into Code Review. Review-requested
+    /// PRs get a review prompt; authored PRs get none.
+    fn imported_pr_issue(&self, id: String, pr: &PrStatus, source: PrImportSource) -> Issue {
+        let prompt = match source {
+            PrImportSource::Authored => None,
+            PrImportSource::ReviewRequested => {
+                let body = self
+                    .config
+                    .review_prompt
+                    .as_deref()
+                    .unwrap_or(DEFAULT_REVIEW_PROMPT);
+                Some(format!(
+                    "Review this PR: #{} ({}). {}",
+                    pr.number, pr.url, body
+                ))
+            }
+        };
+        Issue {
+            prompt,
+            github_pr_links: vec![LinkedGithubPr {
+                number: pr.number,
+                imported: true,
+                import_source: Some(source),
+            }],
+            ..Issue::new(
+                id,
+                pr.title.clone(),
+                Column::CodeReview,
+                self.config.agent_kind,
+            )
+        }
+    }
+
     pub fn done_worktree_names(&self) -> HashSet<String> {
         self.issues
             .iter()
@@ -822,10 +810,10 @@ impl Project {
     }
 
     pub fn freeze_worktree_status(&mut self, worktree: &str) {
-        if let Some(status) = self.live.worktree_statuses.get(worktree) {
+        if let Some(status) = self.live.worktree_statuses.get(worktree).copied() {
             self.live
                 .frozen_worktree_statuses
-                .insert(worktree.to_string(), status.clone());
+                .insert(worktree.to_string(), status);
         }
         if let Some(branch) = self.live.worktree_branches.get(worktree).cloned() {
             self.live
@@ -925,20 +913,7 @@ impl Project {
     }
 
     fn next_issue_id_after(&self, offset: u32) -> String {
-        let prefix = &self.config.project_name;
-        let max_num = self
-            .issues
-            .iter()
-            .filter_map(|issue| {
-                issue
-                    .id
-                    .strip_prefix(&format!("{}-", prefix))
-                    .and_then(|s| s.parse::<u32>().ok())
-            })
-            .max()
-            .unwrap_or(0);
-
-        format!("{}-{}", prefix, max_num + 1 + offset)
+        crate::ops::next_issue_id_after(&self.issues, &self.config.project_name, offset)
     }
 
     pub fn clamp_all_rows(&mut self, query: &str) {
@@ -953,9 +928,8 @@ impl Project {
     }
 
     fn clamp_row(&mut self, query: &str) {
-        let column = match Column::from_index(self.selected_column) {
-            Some(c) => c,
-            None => return,
+        let Some(column) = Column::from_index(self.selected_column) else {
+            return;
         };
         let count = self.issues_in_column(column, query).len();
         let row = &mut self.selected_row[self.selected_column];
@@ -1009,7 +983,9 @@ pub enum ConfirmAction {
         project_id: ProjectId,
     },
     DeleteIssue {
-        issue_index: usize,
+        /// Stored by ID, not index: background workers can reorder/remove
+        /// issues while the confirm prompt is open.
+        issue_id: String,
         project_id: ProjectId,
     },
 }
@@ -1026,478 +1002,7 @@ pub enum ImportSource {
     GitHub,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DialogField {
-    Kind,
-    Agent,
-    Mode,
-    Linear,
-    GithubPr,
-    Title,
-    Prompt,
-}
-
-pub struct DialogState {
-    pub kind: IssueKind,
-    pub title: String,
-    pub title_cursor: usize,
-    pub prompt: TextArea<'static>,
-    pub available_agents: Vec<AgentKind>,
-    pub agent_mode: AgentMode,
-    pub agent_kind: AgentKind,
-    pub focused_field: usize,
-    pub editing_index: Option<usize>,
-    pub target_column: Option<Column>,
-    pub linear_issues: Vec<LinearIssue>,
-    pub linear_detached: bool,
-    pub linear_available: bool,
-    pub github_prs: Vec<PrStatus>,
-    pub github_pr_cleared: bool,
-    pub github_available: bool,
-}
-
-fn make_prompt_textarea(text: &str) -> TextArea<'static> {
-    let mut ta = TextArea::from(text.lines());
-    ta.set_cursor_line_style(Style::default());
-    ta.set_cursor_style(
-        Style::default()
-            .fg(styles::ACCENT)
-            .add_modifier(Modifier::REVERSED),
-    );
-    ta.set_block(ratatui::widgets::Block::default());
-    ta.set_wrap_mode(WrapMode::Word);
-    ta
-}
-
-impl DialogState {
-    pub fn new(
-        agent_kind: AgentKind,
-        available_agents: Vec<AgentKind>,
-        linear_available: bool,
-        github_available: bool,
-    ) -> Self {
-        let kind = IssueKind::Agentic;
-        let resolved_agent = Self::resolve_agent_kind(agent_kind, &available_agents);
-        let title_idx = Self::compute_title_index(
-            kind,
-            resolved_agent,
-            &available_agents,
-            linear_available,
-            github_available,
-        );
-        DialogState {
-            kind,
-            title: String::new(),
-            title_cursor: 0,
-            prompt: make_prompt_textarea(""),
-            available_agents,
-            agent_mode: Self::normalize_mode_for_agent(AgentMode::Plan, resolved_agent),
-            agent_kind: resolved_agent,
-            focused_field: title_idx,
-            editing_index: None,
-            target_column: None,
-            linear_issues: Vec::new(),
-            linear_detached: false,
-            linear_available,
-            github_prs: Vec::new(),
-            github_pr_cleared: false,
-            github_available,
-        }
-    }
-
-    pub fn from_issue(
-        issue: &Issue,
-        index: usize,
-        available_agents: Vec<AgentKind>,
-        linear_available: bool,
-        github_available: bool,
-        all_prs: &HashMap<String, PrStatus>,
-        user_prs: &[PrStatus],
-    ) -> Self {
-        let prompt_text = issue.prompt.as_deref().unwrap_or("");
-
-        let linear_issues: Vec<LinearIssue> = issue
-            .linear_links
-            .iter()
-            .map(|link| LinearIssue {
-                id: link.id.clone(),
-                identifier: link.identifier.clone(),
-                title: issue.title.clone(),
-                url: link.url.clone(),
-                branch_name: String::new(),
-                priority: 0,
-                state_name: String::new(),
-                team_key: String::new(),
-            })
-            .collect();
-
-        let github_prs: Vec<PrStatus> = issue
-            .github_pr_links
-            .iter()
-            .filter_map(|link| {
-                all_prs
-                    .values()
-                    .chain(user_prs.iter())
-                    .find(|pr| pr.number == link.number)
-                    .cloned()
-            })
-            .collect();
-
-        let mut prompt = make_prompt_textarea(prompt_text);
-        prompt.move_cursor(CursorMove::Bottom);
-        prompt.move_cursor(CursorMove::End);
-
-        let resolved_agent = Self::resolve_agent_kind(issue.agent_kind, &available_agents);
-        let title_idx = Self::compute_title_index(
-            issue.kind,
-            resolved_agent,
-            &available_agents,
-            linear_available,
-            github_available,
-        );
-        DialogState {
-            kind: issue.kind,
-            title: issue.title.clone(),
-            title_cursor: issue.title.chars().count(),
-            prompt,
-            available_agents,
-            agent_mode: Self::normalize_mode_for_agent(issue.agent_mode, resolved_agent),
-            agent_kind: resolved_agent,
-            focused_field: title_idx,
-            editing_index: Some(index),
-            target_column: None,
-            linear_issues,
-            linear_detached: false,
-            linear_available,
-            github_prs,
-            github_pr_cleared: false,
-            github_available,
-        }
-    }
-
-    fn resolve_agent_kind(preferred: AgentKind, available_agents: &[AgentKind]) -> AgentKind {
-        if available_agents.contains(&preferred) {
-            return preferred;
-        }
-        available_agents.first().copied().unwrap_or(preferred)
-    }
-
-    fn normalize_mode_for_agent(mode: AgentMode, agent_kind: AgentKind) -> AgentMode {
-        // Pi has a single mode; pin it to Build so a stale Plan/Yolo from
-        // another agent never carries over (and no mode picker is shown).
-        if !agent_kind.has_modes() {
-            return AgentMode::Build;
-        }
-        if agent_kind == AgentKind::OpenCode && mode == AgentMode::Yolo {
-            AgentMode::Build
-        } else {
-            mode
-        }
-    }
-
-    fn set_agent_at(&mut self, index: usize) {
-        self.agent_kind = self.available_agents[index];
-        self.agent_mode = Self::normalize_mode_for_agent(self.agent_mode, self.agent_kind);
-    }
-
-    fn cycle_agent_next(&mut self) {
-        let len = self.available_agents.len();
-        if len == 0 {
-            return;
-        }
-        let idx = self.agent_index();
-        self.set_agent_at((idx + 1) % len);
-    }
-
-    fn cycle_agent_prev(&mut self) {
-        let len = self.available_agents.len();
-        if len == 0 {
-            return;
-        }
-        let idx = self.agent_index();
-        self.set_agent_at(if idx == 0 { len - 1 } else { idx - 1 });
-    }
-
-    fn agent_index(&self) -> usize {
-        self.available_agents
-            .iter()
-            .position(|kind| *kind == self.agent_kind)
-            .unwrap_or(0)
-    }
-
-    pub fn prompt_text(&self) -> String {
-        self.prompt.lines().join("\n")
-    }
-
-    pub fn set_prompt_text(&mut self, text: &str) {
-        self.prompt = make_prompt_textarea(text);
-        self.prompt.move_cursor(CursorMove::Bottom);
-        self.prompt.move_cursor(CursorMove::End);
-    }
-
-    pub fn current_field(&self) -> DialogField {
-        let fields = self.ordered_fields();
-        fields[self.focused_field.min(fields.len() - 1)]
-    }
-
-    fn ordered_fields(&self) -> Vec<DialogField> {
-        let mut fields = vec![DialogField::Kind];
-        if self.linear_available {
-            fields.push(DialogField::Linear);
-        }
-        if self.github_available {
-            fields.push(DialogField::GithubPr);
-        }
-        if self.kind == IssueKind::Agentic {
-            fields.push(DialogField::Agent);
-            if !self.available_agents.is_empty() && self.agent_kind.has_modes() {
-                fields.push(DialogField::Mode);
-            }
-        }
-        fields.push(DialogField::Title);
-        fields.push(DialogField::Prompt);
-        fields
-    }
-
-    pub fn active_field_count(&self) -> usize {
-        self.ordered_fields().len()
-    }
-
-    fn compute_title_index(
-        kind: IssueKind,
-        agent_kind: AgentKind,
-        available_agents: &[AgentKind],
-        linear_available: bool,
-        github_available: bool,
-    ) -> usize {
-        let mut idx = 1;
-        if linear_available {
-            idx += 1;
-        }
-        if github_available {
-            idx += 1;
-        }
-        if kind == IssueKind::Agentic {
-            idx += 1;
-            // Mirror `ordered_fields`: the Mode field only exists for agents
-            // with modes (Pi is single-mode and hides it).
-            if !available_agents.is_empty() && agent_kind.has_modes() {
-                idx += 1;
-            }
-        }
-        idx
-    }
-
-    pub fn is_on_linear_field(&self) -> bool {
-        self.current_field() == DialogField::Linear
-    }
-
-    pub fn is_on_github_field(&self) -> bool {
-        self.current_field() == DialogField::GithubPr
-    }
-
-    pub fn next_field(&mut self) {
-        self.focused_field = (self.focused_field + 1) % self.active_field_count();
-    }
-
-    pub fn prev_field(&mut self) {
-        if self.focused_field > 0 {
-            self.focused_field -= 1;
-        } else {
-            self.focused_field = self.active_field_count() - 1;
-        }
-    }
-
-    fn clamp_focused_field(&mut self) {
-        let max = self.active_field_count() - 1;
-        if self.focused_field > max {
-            self.focused_field = max;
-        }
-    }
-
-    pub fn push_char(&mut self, c: char) {
-        match self.current_field() {
-            DialogField::Kind => {
-                match c {
-                    ' ' => {
-                        self.kind = match self.kind {
-                            IssueKind::Agentic => IssueKind::NonAgentic,
-                            IssueKind::NonAgentic => IssueKind::Agentic,
-                        };
-                    }
-                    'h' => self.kind = IssueKind::Agentic,
-                    'l' => self.kind = IssueKind::NonAgentic,
-                    _ => {}
-                }
-                if self.kind == IssueKind::Agentic {
-                    self.agent_kind =
-                        Self::resolve_agent_kind(self.agent_kind, &self.available_agents);
-                    self.agent_mode =
-                        Self::normalize_mode_for_agent(self.agent_mode, self.agent_kind);
-                }
-                self.clamp_focused_field();
-            }
-            DialogField::Agent => match c {
-                ' ' | 'l' => self.cycle_agent_next(),
-                'h' => self.cycle_agent_prev(),
-                _ => {}
-            },
-            DialogField::Mode => {
-                if self.available_agents.is_empty() {
-                    return;
-                }
-                if c == ' ' || c == 'h' || c == 'l' {
-                    self.agent_mode = match self.agent_kind {
-                        AgentKind::Claude | AgentKind::Codex => {
-                            self.agent_mode.next_for_yolo_agents()
-                        }
-                        // Pi has a single mode and no Mode field, so this arm
-                        // is unreachable in practice; toggle is a safe no-op.
-                        AgentKind::OpenCode | AgentKind::Pi => self.agent_mode.toggle(),
-                    };
-                }
-            }
-            DialogField::Linear | DialogField::GithubPr => {}
-            DialogField::Title => insert_char(&mut self.title, &mut self.title_cursor, c),
-            DialogField::Prompt => self.prompt.insert_char(c),
-        }
-    }
-
-    pub fn delete_char(&mut self) {
-        match self.current_field() {
-            DialogField::Title => {
-                delete_char_before_cursor(&mut self.title, &mut self.title_cursor)
-            }
-            DialogField::Prompt => {
-                self.prompt.delete_char();
-            }
-            _ => {}
-        }
-    }
-
-    pub fn delete_char_forward(&mut self) {
-        match self.current_field() {
-            DialogField::Title => delete_char_at_cursor(&mut self.title, self.title_cursor),
-            DialogField::Prompt => {
-                self.prompt.delete_next_char();
-            }
-            _ => {}
-        }
-    }
-
-    pub fn move_cursor_left(&mut self) {
-        match self.current_field() {
-            DialogField::Title => self.title_cursor = self.title_cursor.saturating_sub(1),
-            DialogField::Prompt => self.prompt.move_cursor(CursorMove::Back),
-            _ => {}
-        }
-    }
-
-    pub fn move_cursor_right(&mut self) {
-        match self.current_field() {
-            DialogField::Title => {
-                self.title_cursor = (self.title_cursor + 1).min(self.title.chars().count())
-            }
-            DialogField::Prompt => self.prompt.move_cursor(CursorMove::Forward),
-            _ => {}
-        }
-    }
-
-    pub fn move_cursor_start(&mut self) {
-        match self.current_field() {
-            DialogField::Title => self.title_cursor = 0,
-            DialogField::Prompt => self.prompt.move_cursor(CursorMove::Head),
-            _ => {}
-        }
-    }
-
-    pub fn move_cursor_end(&mut self) {
-        match self.current_field() {
-            DialogField::Title => self.title_cursor = self.title.chars().count(),
-            DialogField::Prompt => self.prompt.move_cursor(CursorMove::End),
-            _ => {}
-        }
-    }
-
-    pub fn delete_word_backward(&mut self) {
-        match self.current_field() {
-            DialogField::Title => delete_word_backward(&mut self.title, &mut self.title_cursor),
-            DialogField::Prompt => {
-                self.prompt.delete_word();
-            }
-            _ => {}
-        }
-    }
-
-    pub fn clear_to_start(&mut self) {
-        match self.current_field() {
-            DialogField::Title => clear_to_start(&mut self.title, &mut self.title_cursor),
-            DialogField::Prompt => {
-                self.prompt.delete_line_by_head();
-            }
-            _ => {}
-        }
-    }
-}
-
-fn char_to_byte_index(s: &str, char_index: usize) -> usize {
-    s.char_indices()
-        .nth(char_index)
-        .map(|(idx, _)| idx)
-        .unwrap_or_else(|| s.len())
-}
-
-fn insert_char(text: &mut String, cursor: &mut usize, c: char) {
-    let byte_index = char_to_byte_index(text, *cursor);
-    text.insert(byte_index, c);
-    *cursor += 1;
-}
-
-fn delete_char_before_cursor(text: &mut String, cursor: &mut usize) {
-    if *cursor == 0 {
-        return;
-    }
-    let end = char_to_byte_index(text, *cursor);
-    let start = char_to_byte_index(text, *cursor - 1);
-    text.drain(start..end);
-    *cursor -= 1;
-}
-
-fn delete_char_at_cursor(text: &mut String, cursor: usize) {
-    if cursor >= text.chars().count() {
-        return;
-    }
-    let start = char_to_byte_index(text, cursor);
-    let end = char_to_byte_index(text, cursor + 1);
-    text.drain(start..end);
-}
-
-fn delete_word_backward(text: &mut String, cursor: &mut usize) {
-    if *cursor == 0 {
-        return;
-    }
-    let chars: Vec<char> = text.chars().collect();
-    let mut start = *cursor;
-    while start > 0 && chars[start - 1].is_whitespace() {
-        start -= 1;
-    }
-    while start > 0 && !chars[start - 1].is_whitespace() {
-        start -= 1;
-    }
-    let start_byte = char_to_byte_index(text, start);
-    let end_byte = char_to_byte_index(text, *cursor);
-    text.drain(start_byte..end_byte);
-    *cursor = start;
-}
-
-fn clear_to_start(text: &mut String, cursor: &mut usize) {
-    if *cursor == 0 {
-        return;
-    }
-    let end_byte = char_to_byte_index(text, *cursor);
-    text.drain(0..end_byte);
-    *cursor = 0;
-}
+pub use crate::dialog_state::{DialogField, DialogState};
 
 /// 3-way field merge: for each field, if file diverged from base but memory didn't,
 /// take the file value. If both diverged, memory wins.
@@ -1548,6 +1053,9 @@ pub struct App {
     /// quick actions don't blink in and out.
     pub busy_visible_since: Option<Instant>,
     pub spinner_tick: usize,
+    /// Issue IDs with a session launch currently in flight. Guards against
+    /// double-launch races from repeated keypresses.
+    pub launches_in_flight: HashSet<String>,
     pub linear_picker: Option<LinearPickerState>,
     pub linear_picker_context: LinearPickerContext,
     pub picker_tab: ImportSource,
@@ -1576,6 +1084,7 @@ impl App {
             busy_count: 0,
             busy_visible_since: None,
             spinner_tick: 0,
+            launches_in_flight: HashSet::new(),
             linear_picker: None,
             linear_picker_context: LinearPickerContext::Import,
             picker_tab: ImportSource::Linear,
@@ -1916,17 +1425,15 @@ impl App {
     }
 
     pub fn filtered_linear_issues(&self) -> Vec<&LinearIssue> {
-        let picker = match &self.linear_picker {
-            Some(p) => p,
-            None => return Vec::new(),
+        let Some(picker) = &self.linear_picker else {
+            return Vec::new();
         };
         self.active_project().filtered_linear_issues(picker)
     }
 
     pub fn filtered_github_prs(&self) -> Vec<&PrStatus> {
-        let picker = match &self.linear_picker {
-            Some(p) => p,
-            None => return Vec::new(),
+        let Some(picker) = &self.linear_picker else {
+            return Vec::new();
         };
         self.active_project().filtered_github_prs(picker)
     }
@@ -2032,7 +1539,7 @@ mod tests {
 
     use super::*;
     use crate::config::DEFAULT_DONE_SESSION_TTL;
-    use crate::types::{AgentKind, AgentMode, IssueKind, PrState, PrStatus};
+    use crate::types::{AgentKind, IssueKind, PrState, PrStatus};
 
     fn test_config() -> AppConfig {
         AppConfig {
@@ -2049,38 +1556,17 @@ mod tests {
     }
 
     fn test_issue(id: &str, column: Column) -> Issue {
-        Issue {
-            id: id.to_string(),
-            title: format!("Test issue {}", id),
-            kind: IssueKind::Agentic,
+        Issue::new(
+            id,
+            format!("Test issue {}", id),
             column,
-            agent_kind: AgentKind::OpenCode,
-            agent_mode: AgentMode::Plan,
-            prompt: None,
-            worktree: None,
-            done_at: None,
-            session_id: None,
-            linear_links: Vec::new(),
-            github_pr_links: Vec::new(),
-            linear_id: None,
-            linear_identifier: None,
-            linear_url: None,
-            linear_imported: false,
-            pr_number: None,
-            pr_imported: false,
-            pr_import_source: None,
-        }
+            AgentKind::OpenCode,
+        )
     }
 
     fn test_issue_titled(id: &str, title: &str, column: Column) -> Issue {
         let mut issue = test_issue(id, column);
         issue.title = title.to_string();
-        issue
-    }
-
-    fn test_issue_with_worktree(id: &str, column: Column, worktree: &str) -> Issue {
-        let mut issue = test_issue(id, column);
-        issue.worktree = Some(worktree.to_string());
         issue
     }
 
@@ -2509,7 +1995,7 @@ mod tests {
     fn test_clear_stale_does_not_touch_none() {
         let app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
         // worktree is already None, should not count as changed
-        assert!(!app.project().issues[0].worktree.is_some());
+        assert!(app.project().issues[0].worktree.is_none());
     }
 
     #[test]
@@ -4312,7 +3798,7 @@ mod tests {
 
         // test_multi_app creates issues with titles like "Test issue alpha-1"
         // so "test" should match them
-        assert!(alpha_results.len() > 0 || beta_results.len() > 0);
+        assert!(!alpha_results.is_empty() || !beta_results.is_empty());
     }
 
     #[test]

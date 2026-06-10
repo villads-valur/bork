@@ -11,9 +11,7 @@ use crate::config::{self, AppConfig};
 use crate::external::{github, opencode, tmux, tuicr};
 use crate::global_config::ReloadResult;
 use crate::input::Action;
-use crate::types::{
-    AgentMode, Column, Issue, IssueKind, LinkedGithubPr, LinkedLinear, PrImportSource,
-};
+use crate::types::{Column, Issue, IssueKind, LinkedGithubPr, LinkedLinear, PrImportSource};
 
 pub struct ActionChannels<'a> {
     pub action_tx: &'a mpsc::Sender<ActionResult>,
@@ -29,6 +27,9 @@ pub struct ActionResult {
     pub session_to_open: Option<String>,
     pub popup_title: Option<String>,
     pub session_id: Option<(String, String)>,
+    /// Set (on success *and* failure) when this result completes a session
+    /// launch, so the main loop can clear the in-flight guard for the issue.
+    pub launched_issue_id: Option<String>,
 }
 
 pub enum PostAction {
@@ -38,7 +39,7 @@ pub enum PostAction {
         popup_title: String,
     },
     LaunchAndOpenPopup {
-        issue_index: usize,
+        issue_id: String,
         popup_title: String,
         open_popup: bool,
     },
@@ -213,14 +214,11 @@ fn handle_normal(
             let Some(issue) = app.context_project(ctx).selected_issue(&q) else {
                 return PostAction::None;
             };
-            let Some(idx) = app.context_project(ctx).selected_issue_index(&q) else {
-                return PostAction::None;
-            };
 
             app.start_confirm(
                 format!("Delete {}: {}? (y/n)", issue.id, issue.title),
                 ConfirmAction::DeleteIssue {
-                    issue_index: idx,
+                    issue_id: issue.id.clone(),
                     project_id: ctx.project_id.clone(),
                 },
             );
@@ -300,6 +298,7 @@ fn handle_normal(
                         session_to_open: Some(session_name),
                         popup_title: Some(popup_title),
                         session_id: None,
+                        launched_issue_id: None,
                     },
                     Err(e) => ActionResult {
                         message: format!("Failed to open terminal: {e}"),
@@ -307,6 +306,7 @@ fn handle_normal(
                         session_to_open: None,
                         popup_title: None,
                         session_id: None,
+                        launched_issue_id: None,
                     },
                 };
                 let _ = tx.send(result);
@@ -342,6 +342,14 @@ fn handle_normal(
                 return PostAction::None;
             }
 
+            // Guard against double-launch: tmux::session_exists inside the
+            // launch thread is check-then-act, so a second keypress before
+            // the first launch completes would race it.
+            if !app.launches_in_flight.insert(issue.id.clone()) {
+                app.set_message("Session launch already in progress");
+                return PostAction::None;
+            }
+
             app.begin_busy();
             app.set_message(if open_popup {
                 "Launching session..."
@@ -351,14 +359,29 @@ fn handle_normal(
 
             let config = app.context_project(ctx).config.clone();
             let tx = ch.action_tx.clone();
+            let issue_id = issue.id.clone();
+            let panic_issue_id = issue.id.clone();
 
             thread::spawn(move || {
-                let result = launch_and_report(issue, config);
+                // A panic in the launch path must still deliver a result,
+                // otherwise the in-flight guard for this issue leaks and
+                // blocks every future launch attempt until restart.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    launch_and_report(issue, config)
+                }))
+                .unwrap_or_else(|_| ActionResult {
+                    message: "Launch failed unexpectedly (internal panic)".to_string(),
+                    message_kind: MessageKind::Error,
+                    session_to_open: None,
+                    popup_title: None,
+                    session_id: None,
+                    launched_issue_id: Some(panic_issue_id),
+                });
                 let _ = tx.send(result);
             });
 
             PostAction::LaunchAndOpenPopup {
-                issue_index: idx,
+                issue_id,
                 popup_title,
                 open_popup,
             }
@@ -405,6 +428,7 @@ fn handle_normal(
                         session_to_open: Some(session_name),
                         popup_title: Some(popup_title),
                         session_id: None,
+                        launched_issue_id: None,
                     },
                     Err(e) => ActionResult {
                         message: format!("Failed to open tuicr: {e}"),
@@ -412,6 +436,7 @@ fn handle_normal(
                         session_to_open: None,
                         popup_title: None,
                         session_id: None,
+                        launched_issue_id: None,
                     },
                 };
                 let _ = tx.send(result);
@@ -694,7 +719,10 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
     let proj_id = ctx.project_id.clone();
 
     if let Some(idx) = dialog.editing_index {
-        let p = app.find_project_mut(&proj_id).unwrap();
+        let Some(p) = app.find_project_mut(&proj_id) else {
+            app.set_warning("Project no longer available");
+            return;
+        };
         if idx < p.issues.len() {
             p.issues[idx].title = title;
             p.issues[idx].prompt = prompt;
@@ -712,35 +740,27 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
         return;
     }
 
-    let id = app.find_project(&proj_id).unwrap().next_issue_id();
+    let Some(p) = app.find_project(&proj_id) else {
+        app.set_warning("Project no longer available");
+        return;
+    };
+    let id = p.next_issue_id();
     let column = dialog.target_column.unwrap_or(Column::Todo);
     let column_index = column.index();
     let mut issue = Issue {
-        id: id.clone(),
-        title,
         kind: dialog.kind,
-        column,
-        agent_kind: dialog.agent_kind,
         agent_mode: dialog.agent_mode,
         prompt,
-        worktree: None,
-        done_at: None,
-        session_id: None,
-        linear_links: Vec::new(),
-        github_pr_links: Vec::new(),
-        linear_id: None,
-        linear_identifier: None,
-        linear_url: None,
-        linear_imported: false,
-        pr_number: None,
-        pr_imported: false,
-        pr_import_source: None,
+        ..Issue::new(id.clone(), title, column, dialog.agent_kind)
     };
 
     apply_linear_fields(&mut issue, &dialog);
     apply_pr_fields(&mut issue, &dialog);
 
-    let p = app.find_project_mut(&proj_id).unwrap();
+    let Some(p) = app.find_project_mut(&proj_id) else {
+        app.set_warning("Project no longer available");
+        return;
+    };
     p.issues.push(issue);
     p.selected_column = column_index;
     let count = p.issues_in_column(column, "").len();
@@ -898,14 +918,13 @@ fn import_linear_issue(app: &mut App, ctx: &ActionContext) {
     let id = linear_issue.identifier.to_lowercase();
 
     let proj_id = ctx.project_id.clone();
+    let Some(project) = app.find_project(&proj_id) else {
+        app.set_warning("Project no longer available");
+        app.close_linear_picker();
+        return;
+    };
 
-    if app
-        .find_project(&proj_id)
-        .unwrap()
-        .issues
-        .iter()
-        .any(|i| i.id == id)
-    {
+    if project.issues.iter().any(|i| i.id == id) {
         app.set_message(format!(
             "{} is already on the board",
             linear_issue.identifier
@@ -914,35 +933,24 @@ fn import_linear_issue(app: &mut App, ctx: &ActionContext) {
         return;
     }
 
-    let agent_kind = app.find_project(&proj_id).unwrap().config.agent_kind;
     let issue = Issue {
-        id,
-        title: linear_issue.title.clone(),
-        kind: IssueKind::Agentic,
-        column: Column::Todo,
-        agent_kind,
-        agent_mode: crate::types::AgentMode::Plan,
-        prompt: None,
-        worktree: None,
-        done_at: None,
-        session_id: None,
         linear_links: vec![LinkedLinear {
             id: linear_issue.id.clone(),
             identifier: linear_issue.identifier.clone(),
             url: linear_issue.url.clone(),
             imported: true,
         }],
-        github_pr_links: Vec::new(),
-        linear_id: None,
-        linear_identifier: None,
-        linear_url: None,
-        linear_imported: false,
-        pr_number: None,
-        pr_imported: false,
-        pr_import_source: None,
+        ..Issue::new(
+            id,
+            linear_issue.title.clone(),
+            Column::Todo,
+            project.config.agent_kind,
+        )
     };
 
-    let p = app.find_project_mut(&proj_id).unwrap();
+    let Some(p) = app.find_project_mut(&proj_id) else {
+        return;
+    };
     p.issues.push(issue);
     let count = p.issues_in_column(Column::Todo, "").len();
     if count > 0 {
@@ -965,48 +973,35 @@ fn import_github_pr(app: &mut App, ctx: &ActionContext) {
     };
 
     let proj_id = ctx.project_id.clone();
+    let Some(project) = app.find_project(&proj_id) else {
+        app.set_warning("Project no longer available");
+        app.close_linear_picker();
+        return;
+    };
 
-    if app
-        .find_project(&proj_id)
-        .unwrap()
-        .issues
-        .iter()
-        .any(|i| i.has_pr_number(pr.number))
-    {
+    if project.issues.iter().any(|i| i.has_pr_number(pr.number)) {
         app.set_warning(format!("PR #{} is already on the board", pr.number));
         app.close_linear_picker();
         return;
     }
 
-    let id = app.find_project(&proj_id).unwrap().next_issue_id();
-    let agent_kind = app.find_project(&proj_id).unwrap().config.agent_kind;
     let issue = Issue {
-        id,
-        title: pr.title.clone(),
-        kind: IssueKind::Agentic,
-        column: Column::CodeReview,
-        agent_kind,
-        agent_mode: AgentMode::Plan,
-        prompt: None,
-        worktree: None,
-        done_at: None,
-        session_id: None,
-        linear_links: Vec::new(),
         github_pr_links: vec![LinkedGithubPr {
             number: pr.number,
             imported: true,
             import_source: Some(PrImportSource::Authored),
         }],
-        linear_id: None,
-        linear_identifier: None,
-        linear_url: None,
-        linear_imported: false,
-        pr_number: None,
-        pr_imported: false,
-        pr_import_source: None,
+        ..Issue::new(
+            project.next_issue_id(),
+            pr.title.clone(),
+            Column::CodeReview,
+            project.config.agent_kind,
+        )
     };
 
-    let p = app.find_project_mut(&proj_id).unwrap();
+    let Some(p) = app.find_project_mut(&proj_id) else {
+        return;
+    };
     p.issues.push(issue);
     let count = p.issues_in_column(Column::CodeReview, "").len();
     if count > 0 {
@@ -1130,11 +1125,14 @@ fn handle_confirm(
                         session_name,
                         project_id,
                     } => {
-                        app.begin_busy();
-                        let tx = action_tx.clone();
-                        let project = app.find_project(&project_id).unwrap();
+                        let Some(project) = app.find_project(&project_id) else {
+                            app.set_warning("Project no longer available");
+                            return;
+                        };
                         let status_file =
                             agent_status_file(&project.config.project_root, &session_name);
+                        app.begin_busy();
+                        let tx = action_tx.clone();
 
                         thread::spawn(move || {
                             let (message, message_kind) = match tmux::kill_session(&session_name) {
@@ -1155,43 +1153,53 @@ fn handle_confirm(
                                 session_to_open: None,
                                 popup_title: None,
                                 session_id: None,
+                                launched_issue_id: None,
                             });
                         });
                     }
                     ConfirmAction::DeleteIssue {
-                        issue_index,
+                        issue_id,
                         project_id,
                     } => {
-                        let p = app.find_project(&project_id).unwrap();
-                        if issue_index < p.issues.len() {
-                            let issue = &p.issues[issue_index];
-                            let session_name = issue.session_name(&p.config.project_name);
-                            let id = issue.id.clone();
-                            let status_file =
-                                agent_status_file(&p.config.project_root, &session_name);
+                        let Some(p) = app.find_project(&project_id) else {
+                            app.set_warning("Project no longer available");
+                            return;
+                        };
+                        // Resolve by ID at confirm time: indices can shift while
+                        // the prompt is open (PR sync, external state merges).
+                        let Some(issue_index) = p.issues.iter().position(|i| i.id == issue_id)
+                        else {
+                            app.set_warning(format!("{} is no longer on the board", issue_id));
+                            return;
+                        };
+                        let issue = &p.issues[issue_index];
+                        let session_name = issue.session_name(&p.config.project_name);
+                        let id = issue.id.clone();
+                        let status_file = agent_status_file(&p.config.project_root, &session_name);
 
-                            if p.is_session_alive(&session_name) {
-                                let tx = action_tx.clone();
-                                let sn = session_name.clone();
-                                thread::spawn(move || {
-                                    let _ = tmux::kill_session(&sn);
-                                    let _ = std::fs::remove_file(&status_file);
-                                    let _ = tx.send(ActionResult {
-                                        message: format!("Deleted {} and killed session", id),
-                                        message_kind: MessageKind::Info,
-                                        session_to_open: None,
-                                        popup_title: None,
-                                        session_id: None,
-                                    });
-                                });
-                                app.begin_busy();
-                            } else {
+                        if p.is_session_alive(&session_name) {
+                            let tx = action_tx.clone();
+                            let sn = session_name.clone();
+                            thread::spawn(move || {
+                                let _ = tmux::kill_session(&sn);
                                 let _ = std::fs::remove_file(&status_file);
-                                app.set_message(format!("Deleted {}", id));
-                            }
+                                let _ = tx.send(ActionResult {
+                                    message: format!("Deleted {} and killed session", id),
+                                    message_kind: MessageKind::Info,
+                                    session_to_open: None,
+                                    popup_title: None,
+                                    session_id: None,
+                                    launched_issue_id: None,
+                                });
+                            });
+                            app.begin_busy();
+                        } else {
+                            let _ = std::fs::remove_file(&status_file);
+                            app.set_message(format!("Deleted {}", id));
+                        }
 
-                            let q = app.search_query.clone();
-                            let p = app.find_project_mut(&project_id).unwrap();
+                        let q = app.search_query.clone();
+                        if let Some(p) = app.find_project_mut(&project_id) {
                             p.issues.remove(issue_index);
                             p.clamp_all_rows(&q);
                             p.mark_dirty();
@@ -1215,6 +1223,7 @@ fn launch_and_report(issue: Issue, config: AppConfig) -> ActionResult {
             session_to_open: Some(session_name),
             popup_title: None,
             session_id: agent_sid.map(|sid| (issue.id.clone(), sid)),
+            launched_issue_id: Some(issue.id.clone()),
         },
         Err(e) => ActionResult {
             message: format!("Failed to launch: {e}"),
@@ -1222,6 +1231,7 @@ fn launch_and_report(issue: Issue, config: AppConfig) -> ActionResult {
             session_to_open: None,
             popup_title: None,
             session_id: None,
+            launched_issue_id: Some(issue.id),
         },
     }
 }
@@ -1261,27 +1271,16 @@ mod tests {
     }
 
     fn test_issue(id: &str, column: Column) -> crate::types::Issue {
-        crate::types::Issue {
-            id: id.to_string(),
-            title: format!("Test issue {}", id),
-            kind: crate::types::IssueKind::Agentic,
+        crate::types::Issue::new(
+            id,
+            format!("Test issue {}", id),
             column,
-            agent_kind: crate::types::AgentKind::OpenCode,
-            agent_mode: crate::types::AgentMode::Plan,
-            prompt: None,
-            worktree: None,
-            done_at: None,
-            session_id: None,
-            linear_links: Vec::new(),
-            github_pr_links: Vec::new(),
-            linear_id: None,
-            linear_identifier: None,
-            linear_url: None,
-            linear_imported: false,
-            pr_number: None,
-            pr_imported: false,
-            pr_import_source: None,
-        }
+            crate::types::AgentKind::OpenCode,
+        )
+    }
+
+    fn test_issue_titled(id: &str, title: &str, column: Column) -> crate::types::Issue {
+        crate::types::Issue::new(id, title, column, crate::types::AgentKind::OpenCode)
     }
 
     // ================================================================
@@ -1411,25 +1410,9 @@ mod tests {
     fn start_session_on_non_agentic_opens_edit_dialog() {
         let mut app = test_app();
         app.project_mut().issues.push(crate::types::Issue {
-            id: "bork-1".to_string(),
-            title: "Manual task".to_string(),
             kind: crate::types::IssueKind::NonAgentic,
-            column: Column::Todo,
-            agent_kind: crate::types::AgentKind::OpenCode,
-            agent_mode: crate::types::AgentMode::Plan,
             prompt: Some("scratch".to_string()),
-            worktree: None,
-            done_at: None,
-            session_id: None,
-            linear_links: Vec::new(),
-            github_pr_links: Vec::new(),
-            linear_id: None,
-            linear_identifier: None,
-            linear_url: None,
-            linear_imported: false,
-            pr_number: None,
-            pr_imported: false,
-            pr_import_source: None,
+            ..test_issue_titled("bork-1", "Manual task", Column::Todo)
         });
 
         let ctx = app.action_context();
@@ -1443,25 +1426,8 @@ mod tests {
     fn start_session_on_agentic_returns_launch_without_popup() {
         let mut app = test_app();
         app.project_mut().issues.push(crate::types::Issue {
-            id: "bork-1".to_string(),
-            title: "Work".to_string(),
-            kind: crate::types::IssueKind::Agentic,
-            column: Column::Todo,
-            agent_kind: crate::types::AgentKind::OpenCode,
-            agent_mode: crate::types::AgentMode::Plan,
-            prompt: None,
             worktree: Some("main".to_string()),
-            done_at: None,
-            session_id: None,
-            linear_links: Vec::new(),
-            github_pr_links: Vec::new(),
-            linear_id: None,
-            linear_identifier: None,
-            linear_url: None,
-            linear_imported: false,
-            pr_number: None,
-            pr_imported: false,
-            pr_import_source: None,
+            ..test_issue_titled("bork-1", "Work", Column::Todo)
         });
 
         let ctx = app.action_context();
@@ -1481,25 +1447,8 @@ mod tests {
     fn start_session_on_live_session_is_noop() {
         let mut app = test_app();
         app.project_mut().issues.push(crate::types::Issue {
-            id: "bork-1".to_string(),
-            title: "Work".to_string(),
-            kind: crate::types::IssueKind::Agentic,
-            column: Column::InProgress,
-            agent_kind: crate::types::AgentKind::OpenCode,
-            agent_mode: crate::types::AgentMode::Plan,
-            prompt: None,
             worktree: Some("main".to_string()),
-            done_at: None,
-            session_id: None,
-            linear_links: Vec::new(),
-            github_pr_links: Vec::new(),
-            linear_id: None,
-            linear_identifier: None,
-            linear_url: None,
-            linear_imported: false,
-            pr_number: None,
-            pr_imported: false,
-            pr_import_source: None,
+            ..test_issue_titled("bork-1", "Work", Column::InProgress)
         });
 
         let session_name = app.project().issues[0].session_name(&app.project().config.project_name);
@@ -1516,25 +1465,9 @@ mod tests {
     fn open_session_on_non_agentic_opens_edit_dialog() {
         let mut app = test_app();
         app.project_mut().issues.push(crate::types::Issue {
-            id: "bork-1".to_string(),
-            title: "Manual task".to_string(),
             kind: crate::types::IssueKind::NonAgentic,
-            column: Column::Todo,
-            agent_kind: crate::types::AgentKind::OpenCode,
-            agent_mode: crate::types::AgentMode::Plan,
             prompt: Some("scratch".to_string()),
-            worktree: None,
-            done_at: None,
-            session_id: None,
-            linear_links: Vec::new(),
-            github_pr_links: Vec::new(),
-            linear_id: None,
-            linear_identifier: None,
-            linear_url: None,
-            linear_imported: false,
-            pr_number: None,
-            pr_imported: false,
-            pr_import_source: None,
+            ..test_issue_titled("bork-1", "Manual task", Column::Todo)
         });
 
         let ctx = app.action_context();
@@ -1553,25 +1486,8 @@ mod tests {
 
         // Create an issue first
         app.project_mut().issues.push(crate::types::Issue {
-            id: "bork-1".to_string(),
-            title: "Test".to_string(),
-            kind: crate::types::IssueKind::Agentic,
-            column: Column::Todo,
-            agent_kind: crate::types::AgentKind::OpenCode,
-            agent_mode: crate::types::AgentMode::Plan,
-            prompt: None,
             worktree: Some("main".to_string()),
-            done_at: None,
-            session_id: None,
-            linear_links: Vec::new(),
-            github_pr_links: Vec::new(),
-            linear_id: None,
-            linear_identifier: None,
-            linear_url: None,
-            linear_imported: false,
-            pr_number: None,
-            pr_imported: false,
-            pr_import_source: None,
+            ..test_issue_titled("bork-1", "Test", Column::Todo)
         });
 
         // Open edit dialog
@@ -1749,27 +1665,9 @@ mod tests {
         let mut app = test_app();
         app.project_mut().linear_available = true;
 
-        app.project_mut().issues.push(crate::types::Issue {
-            id: "bork-1".to_string(),
-            title: "Test issue".to_string(),
-            kind: crate::types::IssueKind::Agentic,
-            column: Column::Todo,
-            agent_kind: crate::types::AgentKind::OpenCode,
-            agent_mode: crate::types::AgentMode::Plan,
-            prompt: None,
-            worktree: None,
-            done_at: None,
-            session_id: None,
-            linear_links: Vec::new(),
-            github_pr_links: Vec::new(),
-            linear_id: None,
-            linear_identifier: None,
-            linear_url: None,
-            linear_imported: false,
-            pr_number: None,
-            pr_imported: false,
-            pr_import_source: None,
-        });
+        app.project_mut()
+            .issues
+            .push(test_issue_titled("bork-1", "Test issue", Column::Todo));
 
         let ctx = app.action_context();
         let issue = app.project().issues[0].clone();
@@ -1796,27 +1694,9 @@ mod tests {
         // No linear issues loaded
         app.project_mut().live.linear_issues = vec![];
 
-        app.project_mut().issues.push(crate::types::Issue {
-            id: "bork-1".to_string(),
-            title: "Test issue".to_string(),
-            kind: crate::types::IssueKind::Agentic,
-            column: Column::Todo,
-            agent_kind: crate::types::AgentKind::OpenCode,
-            agent_mode: crate::types::AgentMode::Plan,
-            prompt: None,
-            worktree: None,
-            done_at: None,
-            session_id: None,
-            linear_links: Vec::new(),
-            github_pr_links: Vec::new(),
-            linear_id: None,
-            linear_identifier: None,
-            linear_url: None,
-            linear_imported: false,
-            pr_number: None,
-            pr_imported: false,
-            pr_import_source: None,
-        });
+        app.project_mut()
+            .issues
+            .push(test_issue_titled("bork-1", "Test issue", Column::Todo));
 
         let ctx = app.action_context();
         let issue = app.project().issues[0].clone();
@@ -1837,27 +1717,9 @@ mod tests {
         let mut app = test_app();
         app.project_mut().linear_available = true;
 
-        app.project_mut().issues.push(crate::types::Issue {
-            id: "bork-1".to_string(),
-            title: "Test issue".to_string(),
-            kind: crate::types::IssueKind::Agentic,
-            column: Column::Todo,
-            agent_kind: crate::types::AgentKind::OpenCode,
-            agent_mode: crate::types::AgentMode::Plan,
-            prompt: None,
-            worktree: None,
-            done_at: None,
-            session_id: None,
-            linear_links: Vec::new(),
-            github_pr_links: Vec::new(),
-            linear_id: None,
-            linear_identifier: None,
-            linear_url: None,
-            linear_imported: false,
-            pr_number: None,
-            pr_imported: false,
-            pr_import_source: None,
-        });
+        app.project_mut()
+            .issues
+            .push(test_issue_titled("bork-1", "Test issue", Column::Todo));
 
         let ctx = app.action_context();
         let issue = app.project().issues[0].clone();

@@ -1,6 +1,7 @@
 mod agent_config;
 mod app;
 mod config;
+mod dialog_state;
 mod error;
 mod external;
 mod global_config;
@@ -19,11 +20,11 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command as StdCommand, Stdio};
+use std::process::Command as StdCommand;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use crossterm::{
@@ -65,36 +66,60 @@ const KITTY_KEYBOARD_FLAGS: KeyboardEnhancementFlags =
 const TICK_RATE: Duration = Duration::from_millis(50);
 const TMUX_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const GIT_POLL_INTERVAL: Duration = Duration::from_secs(5);
-const PORT_POLL_INTERVAL: Duration = Duration::from_secs(5);
+// `lsof -iTCP` scans every process and routinely takes 100ms+ on macOS, so the
+// port poll runs at a slower cadence than the other pollers.
+const PORT_POLL_INTERVAL: Duration = Duration::from_secs(10);
 const LINEAR_POLL_INTERVAL: Duration = Duration::from_secs(45);
 const PR_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const STATE_POLL_TICKS: usize = 40; // 40 * 50ms = 2s
 
-struct SessionPollResult {
-    sessions: HashSet<String>,
-    agent_statuses: HashMap<String, AgentStatusInfo>,
+/// Sleep while polling is suspended (e.g. a tmux popup owns the terminal).
+/// Keeps workers from spawning subprocesses nobody will consume.
+fn wait_while_suspended(suspended: &AtomicBool) {
+    while suspended.load(Ordering::Relaxed) {
+        thread::sleep(Duration::from_millis(200));
+    }
 }
 
-fn spawn_session_status_worker(
-    status_dir: PathBuf,
-    shutdown: Arc<AtomicBool>,
-) -> mpsc::Receiver<SessionPollResult> {
+/// Single shared `tmux list-sessions` poller. Tmux sessions are server-global,
+/// so one worker serves every project/swimlane instead of N identical polls.
+fn spawn_tmux_session_worker(
+    suspended: Arc<AtomicBool>,
+    wake_rx: mpsc::Receiver<()>,
+) -> mpsc::Receiver<HashSet<String>> {
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || loop {
-        if shutdown.load(Ordering::Relaxed) {
-            break;
-        }
+        wait_while_suspended(&suspended);
         let sessions = external::tmux::list_sessions();
-        let agent_statuses = read_agent_statuses(&status_dir);
-        let result = SessionPollResult {
-            sessions,
-            agent_statuses,
-        };
-        if tx.send(result).is_err() {
+        if tx.send(sessions).is_err() {
             break;
         }
-        thread::sleep(TMUX_POLL_INTERVAL);
+        if !sleep_with_wake(&wake_rx, TMUX_POLL_INTERVAL) {
+            break;
+        }
+    });
+
+    rx
+}
+
+/// Per-project poller for the agent status files in `.bork/agent-status/`.
+fn spawn_agent_status_worker(
+    status_dir: PathBuf,
+    suspended: Arc<AtomicBool>,
+    wake_rx: mpsc::Receiver<()>,
+) -> mpsc::Receiver<HashMap<String, AgentStatusInfo>> {
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || loop {
+        wait_while_suspended(&suspended);
+        let agent_statuses = read_agent_statuses(&status_dir);
+        if tx.send(agent_statuses).is_err() {
+            break;
+        }
+        if !sleep_with_wake(&wake_rx, TMUX_POLL_INTERVAL) {
+            break;
+        }
     });
 
     rx
@@ -102,6 +127,7 @@ fn spawn_session_status_worker(
 
 fn spawn_port_poll_worker(
     sessions: Arc<Mutex<HashSet<String>>>,
+    suspended: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
 ) -> mpsc::Receiver<PortPollResult> {
     let (tx, rx) = mpsc::channel();
@@ -110,6 +136,7 @@ fn spawn_port_poll_worker(
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
+        wait_while_suspended(&suspended);
         let sessions = sessions.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let ports = external::ports::poll_listening_ports(&sessions);
         if tx.send(PortPollResult { ports }).is_err() {
@@ -148,11 +175,13 @@ fn read_agent_statuses(status_dir: &Path) -> HashMap<String, AgentStatusInfo> {
 fn spawn_git_status_worker(
     project_root: PathBuf,
     skip: Arc<Mutex<HashSet<String>>>,
+    suspended: Arc<AtomicBool>,
     wake_rx: mpsc::Receiver<()>,
 ) -> mpsc::Receiver<GitPollResult> {
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || loop {
+        wait_while_suspended(&suspended);
         let skip_set = skip.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let result = external::git::poll_all_worktrees(&project_root, &skip_set);
         if tx.send(result).is_err() {
@@ -169,23 +198,26 @@ fn spawn_git_status_worker(
 /// Sleep until `interval` elapses or `wake_rx` signals.
 /// Returns `false` if the wake channel disconnected (caller should exit).
 fn sleep_with_wake(wake_rx: &mpsc::Receiver<()>, interval: Duration) -> bool {
-    let deadline = Instant::now() + interval;
-    loop {
-        if Instant::now() >= deadline {
-            return true;
+    match wake_rx.recv_timeout(interval) {
+        Ok(()) => {
+            // Drain queued wakes so mashing a refresh key triggers one
+            // poll round, not N back-to-back rounds.
+            while wake_rx.try_recv().is_ok() {}
+            true
         }
-        match wake_rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(()) => return true,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => return false,
-        }
+        Err(mpsc::RecvTimeoutError::Timeout) => true,
+        Err(mpsc::RecvTimeoutError::Disconnected) => false,
     }
 }
 
-fn spawn_linear_worker(wake_rx: mpsc::Receiver<()>) -> mpsc::Receiver<LinearPollResult> {
+fn spawn_linear_worker(
+    suspended: Arc<AtomicBool>,
+    wake_rx: mpsc::Receiver<()>,
+) -> mpsc::Receiver<LinearPollResult> {
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || loop {
+        wait_while_suspended(&suspended);
         let issues = external::linear::fetch_assigned_issues().unwrap_or_default();
         if tx.send(LinearPollResult { issues }).is_err() {
             break;
@@ -200,11 +232,13 @@ fn spawn_linear_worker(wake_rx: mpsc::Receiver<()>) -> mpsc::Receiver<LinearPoll
 
 fn spawn_pr_poll_worker(
     main_worktree: PathBuf,
+    suspended: Arc<AtomicBool>,
     wake_rx: mpsc::Receiver<()>,
 ) -> mpsc::Receiver<PrPollResult> {
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || loop {
+        wait_while_suspended(&suspended);
         // Run the 4 independent gh api calls in parallel
         let result = thread::scope(|s| {
             let prs_handle = s.spawn(|| {
@@ -906,16 +940,22 @@ fn run_integration_command(command: IntegrationCommand) -> anyhow::Result<()> {
 }
 
 struct SharedWorkers {
+    tmux_rx: mpsc::Receiver<HashSet<String>>,
+    tmux_wake_tx: mpsc::Sender<()>,
     port_rx: mpsc::Receiver<PortPollResult>,
     port_sessions: Arc<Mutex<HashSet<String>>>,
     linear_rx: Option<mpsc::Receiver<LinearPollResult>>,
     linear_wake_tx: mpsc::Sender<()>,
     linear_wake_rx: Option<mpsc::Receiver<()>>,
     shutdown: Arc<AtomicBool>,
+    /// While set, all pollers idle instead of spawning subprocesses. Used when
+    /// the terminal is handed over to a tmux popup or external editor.
+    poll_suspended: Arc<AtomicBool>,
 }
 
 struct ProjectWorkers {
-    session_rx: mpsc::Receiver<SessionPollResult>,
+    session_rx: mpsc::Receiver<HashMap<String, AgentStatusInfo>>,
+    session_wake_tx: mpsc::Sender<()>,
     git_rx: mpsc::Receiver<GitPollResult>,
     git_wake_tx: mpsc::Sender<()>,
     git_skip_set: Arc<Mutex<HashSet<String>>>,
@@ -925,38 +965,56 @@ struct ProjectWorkers {
 
 fn spawn_shared_workers() -> SharedWorkers {
     let shutdown = Arc::new(AtomicBool::new(false));
+    let poll_suspended = Arc::new(AtomicBool::new(false));
+
+    let (tmux_wake_tx, tmux_wake_rx) = mpsc::channel::<()>();
+    let tmux_rx = spawn_tmux_session_worker(poll_suspended.clone(), tmux_wake_rx);
 
     let port_sessions = Arc::new(Mutex::new(HashSet::<String>::new()));
-    let port_rx = spawn_port_poll_worker(port_sessions.clone(), shutdown.clone());
+    let port_rx = spawn_port_poll_worker(
+        port_sessions.clone(),
+        poll_suspended.clone(),
+        shutdown.clone(),
+    );
 
     let (linear_wake_tx, linear_wake_rx) = mpsc::channel::<()>();
 
     SharedWorkers {
+        tmux_rx,
+        tmux_wake_tx,
         port_rx,
         port_sessions,
         linear_rx: None,
         linear_wake_tx,
         linear_wake_rx: Some(linear_wake_rx),
         shutdown,
+        poll_suspended,
     }
 }
 
-fn spawn_project_workers(project: &app::Project, shutdown: &Arc<AtomicBool>) -> ProjectWorkers {
+fn spawn_project_workers(project: &app::Project, suspended: &Arc<AtomicBool>) -> ProjectWorkers {
     let project_root = project.config.project_root.clone();
 
     let status_dir = config::agent_status_dir(&project_root);
-    let session_rx = spawn_session_status_worker(status_dir, shutdown.clone());
+    let (session_wake_tx, session_wake_rx) = mpsc::channel::<()>();
+    let session_rx = spawn_agent_status_worker(status_dir, suspended.clone(), session_wake_rx);
 
     let git_skip_set = Arc::new(Mutex::new(project.done_worktree_names()));
     let (git_wake_tx, git_wake_rx) = mpsc::channel::<()>();
-    let git_rx = spawn_git_status_worker(project_root.clone(), git_skip_set.clone(), git_wake_rx);
+    let git_rx = spawn_git_status_worker(
+        project_root.clone(),
+        git_skip_set.clone(),
+        suspended.clone(),
+        git_wake_rx,
+    );
 
     let (pr_wake_tx, pr_wake_rx) = mpsc::channel::<()>();
     let main_worktree = project_root.join("main");
-    let pr_rx = spawn_pr_poll_worker(main_worktree, pr_wake_rx);
+    let pr_rx = spawn_pr_poll_worker(main_worktree, suspended.clone(), pr_wake_rx);
 
     ProjectWorkers {
         session_rx,
+        session_wake_tx,
         git_rx,
         git_wake_tx,
         git_skip_set,
@@ -969,6 +1027,7 @@ const ACTIVITY_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 fn spawn_activity_poller(
     projects: Vec<(ProjectId, PathBuf)>,
+    suspended: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
 ) -> mpsc::Receiver<HashMap<ProjectId, bool>> {
     let (tx, rx) = mpsc::channel();
@@ -977,6 +1036,7 @@ fn spawn_activity_poller(
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
+        wait_while_suspended(&suspended);
         let mut activity: HashMap<ProjectId, bool> = HashMap::new();
         for (id, root) in &projects {
             let status_dir = root.join(".bork").join("agent-status");
@@ -1094,11 +1154,16 @@ fn run_tui() -> anyhow::Result<()> {
     }
     app.enable_sidebar();
 
+    // Clean up tmp files left behind by writers that crashed mid-save.
+    for project in &app.projects {
+        config::sweep_stale_tmp_files(&project.config.project_root);
+    }
+
     // --- Workers ---
     let (action_tx, action_rx) = mpsc::channel::<ActionResult>();
     let (reload_tx, reload_rx) = mpsc::channel::<ReloadResult>();
     let mut shared = spawn_shared_workers();
-    let mut workers = spawn_project_workers(app.project(), &shared.shutdown);
+    let mut workers = spawn_project_workers(app.project(), &shared.poll_suspended);
     let mut swimlane_workers: HashMap<ProjectId, ProjectWorkers> = HashMap::new();
 
     // --- Activity poller for sidebar markers ---
@@ -1110,6 +1175,7 @@ fn run_tui() -> anyhow::Result<()> {
             .collect();
         Some(spawn_activity_poller(
             project_paths,
+            shared.poll_suspended.clone(),
             shared.shutdown.clone(),
         ))
     } else {
@@ -1153,7 +1219,9 @@ fn run_tui() -> anyhow::Result<()> {
     let mut last_update_cache_mtime = update::cache_mtime_secs();
 
     let mut pending_popup_session: Option<(String, String)> = None;
-    let mut pending_popup_for_launch: Option<(usize, ProjectId, String, bool)> = None; // (issue_index, project_id, popup_title, open_popup)
+    // Launches in flight, keyed by issue ID so concurrent launches can't get
+    // their results crossed: (project_id, popup_title, open_popup).
+    let mut pending_popup_for_launch: HashMap<String, (ProjectId, String, bool)> = HashMap::new();
     let mut needs_redraw = true;
     let mut state_poll_counter: usize = 0;
 
@@ -1177,6 +1245,9 @@ fn run_tui() -> anyhow::Result<()> {
                         break;
                     }
                 };
+                if let Event::Resize(..) = event {
+                    needs_redraw = true;
+                }
                 if let Event::Key(key) = event {
                     if key.kind == KeyEventKind::Press {
                         needs_redraw = true;
@@ -1188,11 +1259,16 @@ fn run_tui() -> anyhow::Result<()> {
                             app.visible_swimlane_count(),
                         );
                         let ctx = app.action_context();
+                        // Route wakes to the active swimlane's workers, not the
+                        // focused project's: refresh actions in a swimlane must
+                        // wake that lane's pollers.
+                        let active_workers =
+                            swimlane_workers.get(&ctx.project_id).unwrap_or(&workers);
                         let ch = handler::ActionChannels {
                             action_tx: &action_tx,
-                            pr_wake_tx: &workers.pr_wake_tx,
+                            pr_wake_tx: &active_workers.pr_wake_tx,
                             linear_wake_tx: &shared.linear_wake_tx,
-                            git_wake_tx: &workers.git_wake_tx,
+                            git_wake_tx: &active_workers.git_wake_tx,
                             reload_tx: &reload_tx,
                         };
                         let post_action = handler::handle_action(&mut app, action, &ctx, &ch);
@@ -1216,26 +1292,26 @@ fn run_tui() -> anyhow::Result<()> {
                                     &session_name,
                                     &popup_title,
                                     &app.project().config.project_name,
+                                    &shared.poll_suspended,
                                 )?;
                                 app.message = None;
                             }
                             PostAction::LaunchAndOpenPopup {
-                                issue_index,
+                                issue_id,
                                 popup_title,
                                 open_popup,
                             } => {
-                                pending_popup_for_launch = Some((
-                                    issue_index,
-                                    app.active_project_id(),
-                                    popup_title,
-                                    open_popup,
-                                ));
+                                pending_popup_for_launch.insert(
+                                    issue_id,
+                                    (app.active_project_id(), popup_title, open_popup),
+                                );
                             }
                             PostAction::OpenEditor { initial_content } => {
                                 if let Some(edited) = open_external_editor(
                                     &mut terminal,
                                     &initial_content,
                                     &app.project().config.project_name,
+                                    &shared.poll_suspended,
                                 )? {
                                     if let Some(dialog) = app.dialog.as_mut() {
                                         dialog.set_prompt_text(&edited);
@@ -1263,16 +1339,18 @@ fn run_tui() -> anyhow::Result<()> {
                                     app.focused_project = id.clone();
                                     app.focused_swimlane = 0;
 
-                                    let old_workers = if let Some(existing) =
-                                        swimlane_workers.remove(&id)
-                                    {
-                                        std::mem::replace(&mut workers, existing)
-                                    } else {
-                                        std::mem::replace(
-                                            &mut workers,
-                                            spawn_project_workers(app.project(), &shared.shutdown),
-                                        )
-                                    };
+                                    let old_workers =
+                                        if let Some(existing) = swimlane_workers.remove(&id) {
+                                            std::mem::replace(&mut workers, existing)
+                                        } else {
+                                            std::mem::replace(
+                                                &mut workers,
+                                                spawn_project_workers(
+                                                    app.project(),
+                                                    &shared.poll_suspended,
+                                                ),
+                                            )
+                                        };
 
                                     let still_swimlane = app
                                         .sidebar
@@ -1308,8 +1386,10 @@ fn run_tui() -> anyhow::Result<()> {
             break;
         }
 
+        let mut action_results_arrived = false;
         while let Ok(result) = action_rx.try_recv() {
             needs_redraw = true;
+            action_results_arrived = true;
             app.busy_count = app.busy_count.saturating_sub(1);
             app.show_message(result.message, result.message_kind);
 
@@ -1323,27 +1403,43 @@ fn run_tui() -> anyhow::Result<()> {
                 }
             }
 
-            if let Some(session_name) = result.session_to_open {
-                if let Some(popup_title) = result.popup_title {
-                    pending_popup_session = Some((session_name, popup_title));
-                } else if let Some((launch_idx, proj_id, popup_title, open_popup)) =
-                    pending_popup_for_launch.take()
-                {
-                    if let Some(proj_pos) = app.projects.iter().position(|p| p.id() == proj_id) {
-                        if launch_idx < app.projects[proj_pos].issues.len() {
-                            if app.projects[proj_pos].issues[launch_idx].column
-                                == types::Column::Todo
+            if let Some(launch_id) = result.launched_issue_id {
+                app.launches_in_flight.remove(&launch_id);
+                let pending = pending_popup_for_launch.remove(&launch_id);
+                // Only act on a successful launch; failures already surfaced
+                // their error message above.
+                if let Some(session_name) = result.session_to_open {
+                    if let Some((proj_id, popup_title, open_popup)) = pending {
+                        if let Some(project) = app.find_project_mut(&proj_id) {
+                            if let Some(issue) =
+                                project.issues.iter_mut().find(|i| i.id == launch_id)
                             {
-                                app.projects[proj_pos].issues[launch_idx].column =
-                                    types::Column::InProgress;
-                                app.projects[proj_pos].mark_dirty();
+                                if issue.column == types::Column::Todo {
+                                    issue.column = types::Column::InProgress;
+                                    project.mark_dirty();
+                                }
                             }
                         }
-                    }
-                    if open_popup {
-                        pending_popup_session = Some((session_name, popup_title));
+                        if open_popup {
+                            pending_popup_session = Some((session_name, popup_title));
+                        }
                     }
                 }
+            } else if let Some(session_name) = result.session_to_open {
+                if let Some(popup_title) = result.popup_title {
+                    pending_popup_session = Some((session_name, popup_title));
+                }
+            }
+        }
+
+        // Completed actions usually changed tmux session state (launch, kill,
+        // terminal). Wake the session pollers so cards update within ms, not
+        // a full 2s poll interval.
+        if action_results_arrived {
+            let _ = shared.tmux_wake_tx.send(());
+            let _ = workers.session_wake_tx.send(());
+            for sw in swimlane_workers.values() {
+                let _ = sw.session_wake_tx.send(());
             }
         }
 
@@ -1360,6 +1456,7 @@ fn run_tui() -> anyhow::Result<()> {
                 &session_name,
                 &popup_title,
                 &app.project().config.project_name,
+                &shared.poll_suspended,
             )?;
             app.message = None;
             needs_redraw = true;
@@ -1376,8 +1473,10 @@ fn run_tui() -> anyhow::Result<()> {
             for id in &active_swimlanes {
                 if !swimlane_workers.contains_key(id) {
                     if let Some(project) = app.find_project(id) {
-                        swimlane_workers
-                            .insert(id.clone(), spawn_project_workers(project, &shared.shutdown));
+                        swimlane_workers.insert(
+                            id.clone(),
+                            spawn_project_workers(project, &shared.poll_suspended),
+                        );
                     }
                 }
             }
@@ -1386,19 +1485,38 @@ fn run_tui() -> anyhow::Result<()> {
             swimlane_workers.clear();
         }
 
-        while let Ok(poll) = workers.session_rx.try_recv() {
-            needs_redraw = true;
+        // Drain all queued poll results but only redraw when data changed:
+        // workers send every interval regardless, and undiffed assignment
+        // would rebuild the whole widget tree every 2s while idle.
+        let mut sessions_changed = false;
+
+        // Shared: tmux sessions are server-global, distribute to all projects.
+        while let Ok(sessions) = shared.tmux_rx.try_recv() {
+            for project in &mut app.projects {
+                if project.live.active_sessions != sessions {
+                    project.live.active_sessions = sessions.clone();
+                    sessions_changed = true;
+                    needs_redraw = true;
+                }
+            }
+        }
+
+        while let Ok(statuses) = workers.session_rx.try_recv() {
             let live = &mut app.project_mut().live;
-            live.active_sessions = poll.sessions;
-            live.agent_statuses = poll.agent_statuses;
+            if live.agent_statuses != statuses {
+                live.agent_statuses = statuses;
+                needs_redraw = true;
+            }
         }
 
         // --- Shared: port data (distributed to all projects) ---
         while let Ok(port_result) = shared.port_rx.try_recv() {
             for project in &mut app.projects {
-                project.live.listening_ports = port_result.ports.clone();
+                if project.live.listening_ports != port_result.ports {
+                    project.live.listening_ports = port_result.ports.clone();
+                    needs_redraw = true;
+                }
             }
-            needs_redraw = true;
         }
 
         // --- Auto-kill Done sessions past TTL ---
@@ -1424,26 +1542,41 @@ fn run_tui() -> anyhow::Result<()> {
 
         let mut git_data_changed = false;
         while let Ok(git_result) = workers.git_rx.try_recv() {
-            needs_redraw = true;
-            git_data_changed = true;
             let live = &mut app.project_mut().live;
-            live.worktree_statuses = git_result.statuses;
-            live.worktree_branches = git_result.branches;
-            live.git_poll_done = true;
+            // The first poll must always register (sets git_poll_done) even
+            // when the data matches the empty default.
+            if !live.git_poll_done
+                || live.worktree_statuses != git_result.statuses
+                || live.worktree_branches != git_result.branches
+            {
+                live.worktree_statuses = git_result.statuses;
+                live.worktree_branches = git_result.branches;
+                live.git_poll_done = true;
+                git_data_changed = true;
+                needs_redraw = true;
+            }
         }
 
         let mut pr_data_changed = false;
         while let Ok(pr_result) = workers.pr_rx.try_recv() {
+            let live = &mut app.project_mut().live;
+            let changed = !live.pr_poll_done
+                || live.pr_statuses != pr_result.prs
+                || live.user_prs != pr_result.user_prs
+                || live.review_requested_prs != pr_result.review_requested_prs;
+            if pr_result.github_user.is_some() && live.github_user != pr_result.github_user {
+                live.github_user = pr_result.github_user;
+                needs_redraw = true;
+            }
+            if !changed {
+                continue;
+            }
             needs_redraw = true;
             pr_data_changed = true;
-            let live = &mut app.project_mut().live;
             live.pr_statuses = pr_result.prs;
             live.user_prs = pr_result.user_prs;
             live.review_requested_prs = pr_result.review_requested_prs;
             live.pr_poll_done = true;
-            if pr_result.github_user.is_some() {
-                live.github_user = pr_result.github_user;
-            }
 
             let p = app.project_mut();
             let pr_titles: Vec<(u32, String)> = p
@@ -1475,8 +1608,12 @@ fn run_tui() -> anyhow::Result<()> {
             }
         }
 
-        // --- Auto-assign worktrees (only when git data changed) ---
-        if git_data_changed {
+        // --- Auto-assign worktrees ---
+        // Runs when git data changed OR when issues changed (state_dirty):
+        // a freshly created issue whose worktree already exists must be
+        // assigned even if the git poll data is identical. Gated on
+        // git_poll_done so an empty pre-poll branch map can't wipe worktrees.
+        if git_data_changed || (app.project().state_dirty && app.project().live.git_poll_done) {
             let mut worktree_changed = app.project_mut().auto_assign_worktrees();
             worktree_changed = app.project_mut().clear_stale_worktrees() || worktree_changed;
             if worktree_changed {
@@ -1487,22 +1624,19 @@ fn run_tui() -> anyhow::Result<()> {
 
         // --- Update git skip set when issues changed columns or git data arrived ---
         if git_data_changed || app.project().state_dirty {
-            if let Ok(mut skip) = workers.git_skip_set.lock() {
-                *skip = app.project().done_worktree_names();
-            }
+            let mut skip = workers
+                .git_skip_set
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *skip = app.project().done_worktree_names();
         }
 
-        // --- Update check ---
-        // Latest result from the periodic worker, or `bork update --check` in
-        // another terminal (detected via cache file mtime).
+        // --- Update check (periodic worker results) ---
+        // The `bork update --check` cache-mtime poll lives in the 2s state
+        // poll block below; no need to stat the file every 50ms tick.
         let mut new_update_available: Option<bool> = None;
         while let Ok(available) = update_check_rx.try_recv() {
             new_update_available = Some(available);
-        }
-        let mtime = update::cache_mtime_secs();
-        if mtime != last_update_cache_mtime {
-            last_update_cache_mtime = mtime;
-            new_update_available = Some(update::cached_update_available());
         }
         if let Some(available) = new_update_available {
             if app.update_available != available {
@@ -1525,7 +1659,8 @@ fn run_tui() -> anyhow::Result<()> {
                 p.linear_available = true;
             }
             if let Some(wake_rx) = shared.linear_wake_rx.take() {
-                shared.linear_rx = Some(spawn_linear_worker(wake_rx));
+                shared.linear_rx =
+                    Some(spawn_linear_worker(shared.poll_suspended.clone(), wake_rx));
             }
         }
         if let Some(ref rx) = shared.linear_rx {
@@ -1563,42 +1698,56 @@ fn run_tui() -> anyhow::Result<()> {
             let Some(proj_pos) = app.projects.iter().position(|p| p.id() == *proj_id) else {
                 continue;
             };
-            while let Ok(poll) = sw.session_rx.try_recv() {
-                needs_redraw = true;
+            while let Ok(statuses) = sw.session_rx.try_recv() {
                 let live = &mut app.projects[proj_pos].live;
-                live.active_sessions = poll.sessions;
-                live.agent_statuses = poll.agent_statuses;
+                if live.agent_statuses != statuses {
+                    live.agent_statuses = statuses;
+                    needs_redraw = true;
+                }
             }
             let mut sw_git_changed = false;
             while let Ok(git_result) = sw.git_rx.try_recv() {
-                needs_redraw = true;
-                sw_git_changed = true;
                 let live = &mut app.projects[proj_pos].live;
-                live.worktree_statuses = git_result.statuses;
-                live.worktree_branches = git_result.branches;
-                live.git_poll_done = true;
+                if !live.git_poll_done
+                    || live.worktree_statuses != git_result.statuses
+                    || live.worktree_branches != git_result.branches
+                {
+                    live.worktree_statuses = git_result.statuses;
+                    live.worktree_branches = git_result.branches;
+                    live.git_poll_done = true;
+                    sw_git_changed = true;
+                    needs_redraw = true;
+                }
             }
-            if sw_git_changed {
+            let sw_state_dirty =
+                app.projects[proj_pos].state_dirty && app.projects[proj_pos].live.git_poll_done;
+            if sw_git_changed || sw_state_dirty {
                 let changed = app.projects[proj_pos].auto_assign_worktrees();
                 let stale = app.projects[proj_pos].clear_stale_worktrees();
                 if changed || stale {
                     app.projects[proj_pos].mark_dirty();
                 }
-                if let Ok(mut skip) = sw.git_skip_set.lock() {
-                    *skip = app.projects[proj_pos].done_worktree_names();
-                }
+                let mut skip = sw.git_skip_set.lock().unwrap_or_else(|e| e.into_inner());
+                *skip = app.projects[proj_pos].done_worktree_names();
             }
             let mut sw_pr_changed = false;
             while let Ok(pr_result) = sw.pr_rx.try_recv() {
-                needs_redraw = true;
-                sw_pr_changed = true;
                 let live = &mut app.projects[proj_pos].live;
-                live.pr_statuses = pr_result.prs;
-                live.user_prs = pr_result.user_prs;
-                live.review_requested_prs = pr_result.review_requested_prs;
-                live.pr_poll_done = true;
-                if pr_result.github_user.is_some() {
+                if pr_result.github_user.is_some() && live.github_user != pr_result.github_user {
                     live.github_user = pr_result.github_user;
+                    needs_redraw = true;
+                }
+                if !live.pr_poll_done
+                    || live.pr_statuses != pr_result.prs
+                    || live.user_prs != pr_result.user_prs
+                    || live.review_requested_prs != pr_result.review_requested_prs
+                {
+                    live.pr_statuses = pr_result.prs;
+                    live.user_prs = pr_result.user_prs;
+                    live.review_requested_prs = pr_result.review_requested_prs;
+                    live.pr_poll_done = true;
+                    sw_pr_changed = true;
+                    needs_redraw = true;
                 }
             }
             if sw_pr_changed {
@@ -1612,8 +1761,13 @@ fn run_tui() -> anyhow::Result<()> {
             }
         }
 
-        // Rebuild shared port sessions from all projects' active sessions
-        if let Ok(mut port_sess) = shared.port_sessions.lock() {
+        // Rebuild shared port sessions, but only when session data actually
+        // changed; no need to take the lock 20x/sec against the port worker.
+        if sessions_changed {
+            let mut port_sess = shared
+                .port_sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             port_sess.clear();
             for project in &app.projects {
                 port_sess.extend(project.live.active_sessions.iter().cloned());
@@ -1640,7 +1794,11 @@ fn run_tui() -> anyhow::Result<()> {
 
         if app.is_busy_visible() {
             app.spinner_tick = app.spinner_tick.wrapping_add(1);
-            needs_redraw = true;
+            // The spinner advances one frame every 2 ticks; redraw only when
+            // the visible frame actually changes.
+            if app.spinner_tick.is_multiple_of(2) {
+                needs_redraw = true;
+            }
         }
         if app.tick_busy_visibility() {
             needs_redraw = true;
@@ -1650,11 +1808,35 @@ fn run_tui() -> anyhow::Result<()> {
         state_poll_counter += 1;
         if state_poll_counter >= STATE_POLL_TICKS {
             state_poll_counter = 0;
+
+            // Pick up `bork update --check` runs from other terminals.
+            let mtime = update::cache_mtime_secs();
+            if mtime != last_update_cache_mtime {
+                last_update_cache_mtime = mtime;
+                let available = update::cached_update_available();
+                if app.update_available != available {
+                    app.update_available = available;
+                    needs_redraw = true;
+                }
+            }
+
             for project in &mut app.projects {
                 let current_mtime = config::state_mtime(&project.config.project_root);
                 if current_mtime != project.last_state_mtime {
-                    let new_state = config::load_state(&project.config.project_root);
-                    project.merge_external_state(new_state);
+                    // Skip the merge when the file is unreadable/corrupt:
+                    // merging a defaulted empty state would wipe the board.
+                    if let Some(new_state) = config::try_load_state(&project.config.project_root) {
+                        project.merge_external_state(new_state);
+                        // Issues created externally (e.g. `bork issue create`)
+                        // may already have a matching worktree on disk.
+                        if project.live.git_poll_done {
+                            let changed = project.auto_assign_worktrees();
+                            let stale = project.clear_stale_worktrees();
+                            if changed || stale {
+                                project.mark_dirty();
+                            }
+                        }
+                    }
                     project.last_state_mtime = current_mtime;
                     needs_redraw = true;
                 }
@@ -1700,12 +1882,32 @@ fn pop_kitty_flags<W: io::Write>(out: &mut W) {
     let _ = execute!(out, PopKeyboardEnhancementFlags);
 }
 
+/// RAII guard that pauses worker polling for its lifetime. Used while the
+/// terminal is handed over to a tmux popup or external editor, so workers
+/// don't keep spawning subprocesses and queueing results nobody consumes.
+struct SuspendGuard<'a>(&'a AtomicBool);
+
+impl<'a> SuspendGuard<'a> {
+    fn new(flag: &'a AtomicBool) -> Self {
+        flag.store(true, Ordering::Relaxed);
+        SuspendGuard(flag)
+    }
+}
+
+impl Drop for SuspendGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
 fn open_tmux_popup(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     session_name: &str,
     title: &str,
     project_name: &str,
+    suspended: &AtomicBool,
 ) -> anyhow::Result<()> {
+    let _guard = SuspendGuard::new(suspended);
     pop_kitty_flags(terminal.backend_mut());
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -1728,7 +1930,9 @@ fn open_external_editor(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     initial_content: &str,
     project_name: &str,
+    suspended: &AtomicBool,
 ) -> anyhow::Result<Option<String>> {
+    let _guard = SuspendGuard::new(suspended);
     let Some((editor_cmd, editor_args)) = resolve_editor() else {
         return Err(anyhow::anyhow!("No editor found. Set $EDITOR or $VISUAL."));
     };
@@ -1776,13 +1980,7 @@ fn resolve_editor() -> Option<(String, Vec<String>)> {
         }
     }
     for name in ["vim", "nvim", "vi", "nano"] {
-        if StdCommand::new("which")
-            .arg(name)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
-        {
+        if agent_config::command_exists(name) {
             return Some((name.to_string(), vec![]));
         }
     }
@@ -1853,37 +2051,69 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_flag_stops_session_worker() {
-        let shutdown = Arc::new(AtomicBool::new(true));
+    fn agent_status_worker_exits_when_wake_channel_disconnects() {
         let dir = std::env::temp_dir().join(format!("bork-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
 
-        let rx = spawn_session_status_worker(dir.clone(), shutdown);
+        let (wake_tx, wake_rx) = mpsc::channel::<()>();
+        let suspended = Arc::new(AtomicBool::new(false));
+        let rx = spawn_agent_status_worker(dir.clone(), suspended, wake_rx);
 
-        // Worker should exit quickly since shutdown is already set.
-        // If it doesn't, recv will time out.
-        let result = rx.recv_timeout(Duration::from_secs(2));
-        // Either we get a result (worker did one iteration) or disconnected (worker exited)
-        // The key is it doesn't hang.
+        // First result arrives from the initial poll.
         assert!(
-            result.is_ok() || result.is_err(),
-            "worker should not hang when shutdown is set"
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "worker should deliver an initial poll result"
         );
-        // The channel should disconnect shortly after
+
+        // Dropping the wake sender disconnects the channel; the worker must
+        // notice during its sleep and exit, closing the result channel.
+        drop(wake_tx);
+        assert!(
+            matches!(
+                rx.recv_timeout(Duration::from_secs(5)),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            ),
+            "worker should exit once the wake channel disconnects"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn shutdown_flag_stops_port_worker() {
         let shutdown = Arc::new(AtomicBool::new(true));
+        let suspended = Arc::new(AtomicBool::new(false));
         let sessions = Arc::new(Mutex::new(HashSet::<String>::new()));
 
-        let rx = spawn_port_poll_worker(sessions, shutdown);
+        let rx = spawn_port_poll_worker(sessions, suspended, shutdown);
 
-        let result = rx.recv_timeout(Duration::from_secs(2));
+        // Shutdown is pre-set, so the worker must exit before polling and
+        // disconnect the channel instead of delivering a result.
         assert!(
-            result.is_ok() || result.is_err(),
-            "worker should not hang when shutdown is set"
+            matches!(
+                rx.recv_timeout(Duration::from_secs(5)),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            ),
+            "worker should exit without polling when shutdown is set"
         );
+    }
+
+    #[test]
+    fn sleep_with_wake_drains_queued_wakes() {
+        let (wake_tx, wake_rx) = mpsc::channel::<()>();
+        // Queue several wakes (user mashing a refresh key).
+        for _ in 0..5 {
+            wake_tx.send(()).unwrap();
+        }
+        assert!(sleep_with_wake(&wake_rx, Duration::from_secs(5)));
+        // All queued wakes were consumed by the single wake-up.
+        assert!(wake_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn sleep_with_wake_returns_false_on_disconnect() {
+        let (wake_tx, wake_rx) = mpsc::channel::<()>();
+        drop(wake_tx);
+        assert!(!sleep_with_wake(&wake_rx, Duration::from_secs(5)));
     }
 }

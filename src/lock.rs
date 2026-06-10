@@ -54,11 +54,7 @@ pub fn acquire_lock(project_root: &Path) -> anyhow::Result<()> {
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
             let existing_pid = read_pid_from_file(&mut file).unwrap_or(0);
-            anyhow::bail!(
-                "Another bork instance is already running (PID {existing_pid}). \
-                 If this is stale, remove {}",
-                path.display()
-            );
+            anyhow::bail!("Another bork instance is already running (PID {existing_pid}).");
         }
         return Err(err.into());
     }
@@ -78,14 +74,15 @@ pub fn acquire_lock(project_root: &Path) -> anyhow::Result<()> {
 }
 
 /// Release the lock by dropping the held file descriptor.
-pub fn release_lock(project_root: &Path) {
+///
+/// The PID file is intentionally left in place: unlinking it would race with
+/// another instance that already opened and flocked the same inode, allowing
+/// a third instance to create a fresh file and lock it concurrently. The
+/// flock release alone is sufficient.
+pub fn release_lock(_project_root: &Path) {
     if let Ok(mut guard) = LOCK_FILE.lock() {
-        if guard.is_some() {
-            // Drop the File, which closes the fd and releases the flock.
-            *guard = None;
-            // Remove the PID file for tidiness (not required for correctness).
-            let _ = fs::remove_file(lock_path(project_root));
-        }
+        // Drop the File, which closes the fd and releases the flock.
+        *guard = None;
     }
 }
 

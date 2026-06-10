@@ -1,23 +1,31 @@
+use std::fmt::Write as _;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{self, AppState};
 use crate::types::{AgentKind, AgentMode, Column, Issue, IssueKind};
+use crate::ui::styles::truncate;
 
 pub fn next_issue_id(issues: &[Issue], project_name: &str) -> String {
-    let prefix = project_name;
+    next_issue_id_after(issues, project_name, 0)
+}
+
+/// Next free `{project}-{n}` ID, skipping `offset` extra slots. The offset
+/// supports batch-creating issues before any of them is pushed to the list.
+pub fn next_issue_id_after(issues: &[Issue], project_name: &str, offset: u32) -> String {
+    let prefix = format!("{}-", project_name);
     let max_num = issues
         .iter()
         .filter_map(|issue| {
             issue
                 .id
-                .strip_prefix(&format!("{}-", prefix))
+                .strip_prefix(&prefix)
                 .and_then(|s| s.parse::<u32>().ok())
         })
         .max()
         .unwrap_or(0);
 
-    format!("{}-{}", prefix, max_num + 1)
+    format!("{}{}", prefix, max_num + 1 + offset)
 }
 
 fn find_issue_index(issues: &[Issue], id: &str) -> Option<usize> {
@@ -87,7 +95,7 @@ fn format_issue_table(issues: &[&Issue], _project_name: &str) -> anyhow::Result<
         if i > 0 {
             out.push_str("  ");
         }
-        out.push_str(&format!("{:<width$}", header, width = widths[i]));
+        let _ = write!(out, "{:<width$}", header, width = widths[i]);
     }
     out.push('\n');
 
@@ -96,20 +104,12 @@ fn format_issue_table(issues: &[&Issue], _project_name: &str) -> anyhow::Result<
             if i > 0 {
                 out.push_str("  ");
             }
-            out.push_str(&format!("{:<width$}", cell, width = widths[i]));
+            let _ = write!(out, "{:<width$}", cell, width = widths[i]);
         }
         out.push('\n');
     }
 
     Ok(out.trim_end().to_string())
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max - 3])
-    }
 }
 
 pub struct CreateOptions {
@@ -132,29 +132,15 @@ pub fn create_issue(project_root: &Path, opts: CreateOptions) -> anyhow::Result<
     let agent_mode = opts.agent_mode.unwrap_or(AgentMode::Plan);
 
     let issue = Issue {
-        id,
-        title: opts.title,
         kind,
-        column,
-        agent_kind,
         agent_mode,
         prompt: opts.prompt,
-        worktree: None,
         done_at: if column == Column::Done {
             Some(now_epoch())
         } else {
             None
         },
-        session_id: None,
-        linear_links: Vec::new(),
-        github_pr_links: Vec::new(),
-        linear_id: None,
-        linear_identifier: None,
-        linear_url: None,
-        linear_imported: false,
-        pr_number: None,
-        pr_imported: false,
-        pr_import_source: None,
+        ..Issue::new(id, opts.title, column, agent_kind)
     };
 
     state.issues.push(issue.clone());
@@ -242,21 +228,21 @@ pub fn show_issue(project_root: &Path, issue_id: &str, json: bool) -> anyhow::Re
     }
 
     let mut out = String::new();
-    out.push_str(&format!("ID:       {}\n", issue.id));
-    out.push_str(&format!("Title:    {}\n", issue.title));
-    out.push_str(&format!("Kind:     {}\n", issue.kind));
-    out.push_str(&format!("Column:   {}\n", issue.column));
-    out.push_str(&format!("Agent:    {}\n", issue.agent_kind));
-    out.push_str(&format!("Mode:     {}\n", issue.agent_mode));
+    let _ = writeln!(out, "ID:       {}", issue.id);
+    let _ = writeln!(out, "Title:    {}", issue.title);
+    let _ = writeln!(out, "Kind:     {}", issue.kind);
+    let _ = writeln!(out, "Column:   {}", issue.column);
+    let _ = writeln!(out, "Agent:    {}", issue.agent_kind);
+    let _ = writeln!(out, "Mode:     {}", issue.agent_mode);
     if let Some(ref prompt) = issue.prompt {
-        out.push_str(&format!("Prompt:   {}\n", prompt));
+        let _ = writeln!(out, "Prompt:   {}", prompt);
     }
     if let Some(ref wt) = issue.worktree {
-        out.push_str(&format!("Worktree: {}\n", wt));
+        let _ = writeln!(out, "Worktree: {}", wt);
     }
     if !issue.linear_links.is_empty() {
         let ids: Vec<&str> = issue.linear_identifiers();
-        out.push_str(&format!("Linear:   {}\n", ids.join(", ")));
+        let _ = writeln!(out, "Linear:   {}", ids.join(", "));
     }
     if !issue.github_pr_links.is_empty() {
         let nums: Vec<String> = issue
@@ -264,7 +250,7 @@ pub fn show_issue(project_root: &Path, issue_id: &str, json: bool) -> anyhow::Re
             .iter()
             .map(|n| format!("#{}", n))
             .collect();
-        out.push_str(&format!("PR:       {}\n", nums.join(", ")));
+        let _ = writeln!(out, "PR:       {}", nums.join(", "));
     }
 
     Ok(out.trim_end().to_string())
@@ -384,6 +370,43 @@ mod tests {
     fn next_id_ignores_non_matching_prefix() {
         let issues = vec![test_issue("vil-123", Column::Todo)];
         assert_eq!(next_issue_id(&issues, "bork"), "bork-1");
+    }
+
+    #[test]
+    fn next_id_after_skips_offset_slots() {
+        let issues = vec![test_issue("bork-2", Column::Todo)];
+        assert_eq!(next_issue_id_after(&issues, "bork", 0), "bork-3");
+        assert_eq!(next_issue_id_after(&issues, "bork", 2), "bork-5");
+    }
+
+    #[test]
+    fn list_table_handles_non_ascii_titles() {
+        // Regression: byte-slice truncation panicked on multi-byte UTF-8.
+        let dir = setup_project();
+        let root = dir.path();
+
+        create_issue(
+            root,
+            CreateOptions {
+                title: "Fix résumé parsing — naïve solution breaks on émojis 🎉🎉🎉🎉🎉🎉🎉".into(),
+                column: None,
+                agent_kind: None,
+                agent_mode: None,
+                prompt: None,
+                kind: None,
+            },
+        )
+        .unwrap();
+
+        let output = list_issues(
+            root,
+            &ListOptions {
+                column: None,
+                json: false,
+            },
+        )
+        .unwrap();
+        assert!(output.contains("test-1"));
     }
 
     #[test]
@@ -810,26 +833,6 @@ mod tests {
     }
 
     fn test_issue(id: &str, column: Column) -> Issue {
-        Issue {
-            id: id.to_string(),
-            title: format!("Test {}", id),
-            kind: IssueKind::Agentic,
-            column,
-            agent_kind: AgentKind::OpenCode,
-            agent_mode: AgentMode::Plan,
-            prompt: None,
-            worktree: None,
-            done_at: None,
-            session_id: None,
-            linear_links: Vec::new(),
-            github_pr_links: Vec::new(),
-            linear_id: None,
-            linear_identifier: None,
-            linear_url: None,
-            linear_imported: false,
-            pr_number: None,
-            pr_imported: false,
-            pr_import_source: None,
-        }
+        Issue::new(id, format!("Test {}", id), column, AgentKind::OpenCode)
     }
 }

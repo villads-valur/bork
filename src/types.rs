@@ -106,12 +106,7 @@ impl AgentKind {
 
 impl fmt::Display for AgentKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            AgentKind::OpenCode => write!(f, "opencode"),
-            AgentKind::Claude => write!(f, "claude"),
-            AgentKind::Codex => write!(f, "codex"),
-            AgentKind::Pi => write!(f, "pi"),
-        }
+        write!(f, "{}", self.command())
     }
 }
 
@@ -230,7 +225,7 @@ impl fmt::Display for AgentStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentStatusInfo {
     pub status: AgentStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -238,7 +233,7 @@ pub struct AgentStatusInfo {
     pub updated_at: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WorktreeStatus {
     pub staged: usize,
     pub unstaged: usize,
@@ -309,6 +304,38 @@ pub struct Issue {
 }
 
 impl Issue {
+    /// Baseline issue with all optional/legacy fields empty. Combine with
+    /// struct update syntax for variations:
+    /// `Issue { prompt: Some(p), ..Issue::new(id, title, column, agent) }`.
+    pub fn new(
+        id: impl Into<String>,
+        title: impl Into<String>,
+        column: Column,
+        agent_kind: AgentKind,
+    ) -> Self {
+        Issue {
+            id: id.into(),
+            title: title.into(),
+            kind: IssueKind::Agentic,
+            column,
+            agent_kind,
+            agent_mode: AgentMode::Plan,
+            prompt: None,
+            worktree: None,
+            done_at: None,
+            session_id: None,
+            linear_links: Vec::new(),
+            github_pr_links: Vec::new(),
+            linear_id: None,
+            linear_identifier: None,
+            linear_url: None,
+            linear_imported: false,
+            pr_number: None,
+            pr_imported: false,
+            pr_import_source: None,
+        }
+    }
+
     pub fn session_name(&self, project_name: &str) -> String {
         format!("{}-{}", project_name, self.id.to_lowercase())
     }
@@ -424,7 +451,7 @@ pub enum ReviewDecision {
     ReviewRequired,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrStatus {
     pub number: u32,
     pub title: String,
@@ -444,27 +471,12 @@ mod tests {
     use super::*;
 
     fn test_issue(id: &str, column: Column) -> Issue {
-        Issue {
-            id: id.to_string(),
-            title: format!("Test issue {}", id),
-            kind: IssueKind::Agentic,
+        Issue::new(
+            id,
+            format!("Test issue {}", id),
             column,
-            agent_kind: AgentKind::OpenCode,
-            agent_mode: AgentMode::Plan,
-            prompt: None,
-            worktree: None,
-            done_at: None,
-            session_id: None,
-            linear_links: Vec::new(),
-            github_pr_links: Vec::new(),
-            linear_id: None,
-            linear_identifier: None,
-            linear_url: None,
-            linear_imported: false,
-            pr_number: None,
-            pr_imported: false,
-            pr_import_source: None,
-        }
+            AgentKind::OpenCode,
+        )
     }
 
     // --- PR types ---

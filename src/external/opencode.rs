@@ -348,7 +348,7 @@ fn detect_codex_session_id() -> Option<String> {
 
     for _ in 0..9 {
         let after = collect_codex_session_ids(&sessions_root);
-        for (id, _) in &after {
+        for id in after.keys() {
             if !before.contains_key(id) {
                 return Some(id.clone());
             }
@@ -437,7 +437,7 @@ fn detect_pi_session_id(project_root: &Path) -> Option<String> {
 
     for _ in 0..9 {
         let after = collect_pi_session_ids(&sessions_dir);
-        for (id, _) in &after {
+        for id in after.keys() {
             if !before.contains_key(id) {
                 return Some(id.clone());
             }
@@ -1042,25 +1042,13 @@ mod tests {
 
     fn test_issue(agent_kind: AgentKind, agent_mode: AgentMode) -> Issue {
         Issue {
-            id: "bork-1".to_string(),
-            title: "Fix bug".to_string(),
-            kind: crate::types::IssueKind::Agentic,
-            column: crate::types::Column::InProgress,
-            agent_kind,
             agent_mode,
-            prompt: None,
-            worktree: None,
-            done_at: None,
-            session_id: None,
-            linear_links: Vec::new(),
-            github_pr_links: Vec::new(),
-            linear_id: None,
-            linear_identifier: None,
-            linear_url: None,
-            linear_imported: false,
-            pr_number: None,
-            pr_imported: false,
-            pr_import_source: None,
+            ..Issue::new(
+                "bork-1",
+                "Fix bug",
+                crate::types::Column::InProgress,
+                agent_kind,
+            )
         }
     }
 

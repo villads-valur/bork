@@ -3,7 +3,7 @@ use std::process::Command;
 use anyhow::{bail, Context};
 
 use crate::config;
-use crate::types::{AgentMode, Column, Issue, IssueKind};
+use crate::types::{Column, Issue};
 
 /// Create a git worktree and register it with bork's state.json.
 pub fn run_worktree(
@@ -108,29 +108,18 @@ pub fn create_worktree_in(
         bail!("git worktree add failed");
     }
 
-    if let Some(issue) = state.issues.iter_mut().find(|i| i.id == issue_id) {
+    // Match case-insensitively: stored ids are lowercase but users may type
+    // e.g. `bork worktree BORK-1` or a Linear identifier like `VIL-123`.
+    if let Some(issue) = state
+        .issues
+        .iter_mut()
+        .find(|i| i.id.eq_ignore_ascii_case(issue_id))
+    {
         issue.worktree = Some(worktree_dir.to_string());
     } else if let Some(title) = title {
         let issue = Issue {
-            id: issue_id.to_string(),
-            title: title.to_string(),
-            kind: IssueKind::Agentic,
-            column: Column::Todo,
-            agent_kind: config.agent_kind,
-            agent_mode: AgentMode::Plan,
-            prompt: None,
             worktree: Some(worktree_dir.to_string()),
-            done_at: None,
-            session_id: None,
-            linear_links: Vec::new(),
-            github_pr_links: Vec::new(),
-            linear_id: None,
-            linear_identifier: None,
-            linear_url: None,
-            linear_imported: false,
-            pr_number: None,
-            pr_imported: false,
-            pr_import_source: None,
+            ..Issue::new(issue_id, title, Column::Todo, config.agent_kind)
         };
         state.issues.push(issue);
     } else {

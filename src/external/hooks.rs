@@ -538,6 +538,14 @@ fn is_bork_hook(entry: &serde_json::Value) -> bool {
         })
 }
 
+fn dirs_global_config() -> PathBuf {
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        return PathBuf::from(xdg);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".config")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -693,12 +701,4 @@ mod tests {
     fn codex_hooks_exit_zero_when_bork_env_unset() {
         assert_all_hooks_exit_zero_without_env(&parse_hook_entries(CODEX_HOOKS, Some("hooks")));
     }
-}
-
-fn dirs_global_config() -> PathBuf {
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        return PathBuf::from(xdg);
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".config")
 }

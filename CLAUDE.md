@@ -12,16 +12,26 @@ Terminal kanban board for orchestrating OpenCode/Claude coding sessions across g
 
 ```
 Main Thread (50ms tick event loop)
+├── Shared workers (one each, app-wide)
+│   ├── Tmux Session Worker (polls every 2s - one global `tmux list-sessions`)
+│   ├── Port Poll Worker (polls every 10s - listening TCP ports via lsof/ps)
+│   ├── Linear Worker (polls every 45s - assigned Linear issues, conditional on `linear` CLI)
+│   ├── Activity Poller (polls every 5s - agent status dirs for all registered projects)
+│   └── Update Check Worker (every 6h - new-version banner, plus cache mtime poll every 2s)
 ├── Primary ProjectWorkers (for focused project)
-│   ├── Session Status Worker (polls every 2s - tmux sessions + agent status files)
-│   ├── Port Poll Worker (polls every 5s - listening TCP ports)
-│   ├── Git Status Worker (polls every 3s - worktree changes + branches)
-│   ├── PR Status Worker (polls every 60s - GitHub PRs via gh api graphql)
-│   └── Linear Worker (polls every 45s - assigned Linear issues, conditional on `linear` CLI)
+│   ├── Agent Status Worker (polls every 2s - agent status files)
+│   ├── Git Status Worker (polls every 5s - per-worktree `git status` + one batched
+│   │                       `git worktree list --porcelain` for branches)
+│   └── PR Status Worker (polls every 60s - GitHub PRs via gh api graphql)
 ├── Swimlane Workers (one ProjectWorkers set per visible swimlane, excluding focused)
-├── Activity Poller (polls every 5s - agent status dirs for all registered projects)
 └── Action Threads (fire-and-forget per user action)
 ```
+
+Workers send results over per-worker `mpsc` channels drained on the main loop tick.
+Results are diffed against the previous data before triggering a redraw. Wake
+channels (`sleep_with_wake`) let user actions trigger an immediate poll; queued
+wakes are coalesced. While a tmux popup or external editor owns the terminal,
+all pollers idle via a shared `poll_suspended` flag.
 
 ### Data Flow
 

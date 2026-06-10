@@ -124,7 +124,9 @@ pub fn agent_status_dir(project_root: &Path) -> PathBuf {
 
 pub fn ensure_agent_status_dir(project_root: &Path) {
     let dir = agent_status_dir(project_root);
-    let _ = fs::create_dir_all(&dir);
+    if let Err(err) = fs::create_dir_all(&dir) {
+        eprintln!("bork: warning: could not create {}: {err}", dir.display());
+    }
 }
 
 fn state_path(project_root: &Path) -> PathBuf {
@@ -271,14 +273,25 @@ fn read_partial(path: &Path) -> PartialConfig {
     if !path.exists() {
         return PartialConfig::default();
     }
-    let Ok(contents) = fs::read_to_string(path) else {
-        return PartialConfig::default();
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) => {
+            // An unreadable config silently becoming "no config" would make
+            // the user's settings vanish with no explanation.
+            eprintln!("bork: warning: could not read {}: {err}", path.display());
+            return PartialConfig::default();
+        }
     };
-    parse_partial(&contents)
+    let (table, warnings) = toml_lite::parse_with_warnings(&contents);
+    for warning in warnings {
+        eprintln!("bork: warning: {}: {warning}", path.display());
+    }
+    partial_from_table(&table)
 }
 
+#[cfg(test)]
 pub(crate) fn parse_partial(contents: &str) -> PartialConfig {
-    let table = toml_lite::parse(contents);
+    let (table, _) = toml_lite::parse_with_warnings(contents);
     partial_from_table(&table)
 }
 
@@ -367,17 +380,37 @@ fn collect_agent_launch(table: &Table) -> HashMap<AgentKind, PartialAgentLaunch>
 }
 
 pub fn load_state(project_root: &Path) -> AppState {
+    try_load_state(project_root).unwrap_or_default()
+}
+
+/// Load state, distinguishing "no file yet" (`Some(default)`) from "file
+/// exists but is unreadable or corrupt" (`None`). Callers that merge external
+/// changes must skip the merge on `None`, otherwise a transient parse failure
+/// would wipe the in-memory board. Reads never modify the file; corrupt
+/// content is preserved by [`save_state`] right before it would be clobbered.
+pub fn try_load_state(project_root: &Path) -> Option<AppState> {
     let path = state_path(project_root);
-    let Ok(contents) = fs::read_to_string(&path) else {
-        return AppState::default();
+    if !path.exists() {
+        return Some(AppState::default());
+    }
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(err) => {
+            eprintln!("bork: warning: could not read {}: {err}", path.display());
+            return None;
+        }
     };
-    let Ok(mut state) = serde_json::from_str::<AppState>(&contents) else {
-        return AppState::default();
+    let mut state = match serde_json::from_str::<AppState>(&contents) {
+        Ok(state) => state,
+        Err(err) => {
+            eprintln!("bork: warning: {} is corrupt: {err}", path.display());
+            return None;
+        }
     };
     for issue in &mut state.issues {
         issue.migrate_legacy_fields();
     }
-    state
+    Some(state)
 }
 
 pub fn state_mtime(project_root: &Path) -> Option<SystemTime> {
@@ -391,11 +424,62 @@ pub fn save_state(state: &AppState, project_root: &Path) -> anyhow::Result<()> {
     let path = state_path(project_root);
     let json = serde_json::to_string_pretty(state)?;
 
-    let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
-    fs::write(&tmp_path, &json)?;
-    fs::rename(&tmp_path, &path)?;
+    // If the existing file is unparseable, this rename is the moment its
+    // content would be lost forever. Preserve a copy for recovery first.
+    if let Ok(existing) = fs::read_to_string(&path) {
+        if serde_json::from_str::<AppState>(&existing).is_err() {
+            let backup = path.with_extension("json.corrupt");
+            let _ = fs::copy(&path, &backup);
+            eprintln!(
+                "bork: warning: overwriting corrupt {}; original preserved at {}",
+                path.display(),
+                backup.display()
+            );
+        }
+    }
 
-    Ok(())
+    // Write + fsync the tmp file before the atomic rename so a crash or power
+    // loss can't leave a truncated state.json behind the journaled rename.
+    let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
+    let result = (|| -> anyhow::Result<()> {
+        let mut file = fs::File::create(&tmp_path)?;
+        std::io::Write::write_all(&mut file, json.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&tmp_path, &path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    result
+}
+
+/// Remove leftover `state.tmp.*` files from writers that crashed before the
+/// atomic rename. Called once per project at TUI startup.
+pub fn sweep_stale_tmp_files(project_root: &Path) {
+    let dir = config_dir(project_root);
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("state.tmp.") {
+            continue;
+        }
+        // Leave fresh tmp files alone: another process may be mid-write.
+        let is_stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|mtime| SystemTime::now().duration_since(mtime).ok())
+            .is_some_and(|age| age.as_secs() > 60);
+        if is_stale {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -738,5 +822,90 @@ args = ["--dangerously-skip-permissions"]
         let (base, mode_args) = cfg.launch_args_for(AgentKind::Claude, AgentMode::Plan);
         assert!(base.is_empty());
         assert!(mode_args.is_none());
+    }
+
+    // --- state persistence ---
+
+    fn temp_project() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join(".bork")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn load_state_missing_file_returns_default() {
+        let dir = temp_project();
+        let state = load_state(dir.path());
+        assert!(state.issues.is_empty());
+    }
+
+    #[test]
+    fn save_then_load_state_roundtrips() {
+        let dir = temp_project();
+        let state = AppState {
+            issues: vec![crate::types::Issue::new(
+                "bork-1",
+                "Test",
+                crate::types::Column::Todo,
+                AgentKind::OpenCode,
+            )],
+        };
+        save_state(&state, dir.path()).unwrap();
+        let loaded = load_state(dir.path());
+        assert_eq!(loaded.issues.len(), 1);
+        assert_eq!(loaded.issues[0].id, "bork-1");
+    }
+
+    #[test]
+    fn try_load_state_returns_none_for_corrupt_file_without_touching_it() {
+        let dir = temp_project();
+        let path = dir.path().join(".bork").join("state.json");
+        fs::write(&path, "{ this is not json").unwrap();
+
+        // Reads never modify the file (read-only CLI commands and version
+        // mismatches must not move a live state.json aside).
+        assert!(try_load_state(dir.path()).is_none());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{ this is not json");
+
+        // load_state degrades to an empty board.
+        assert!(load_state(dir.path()).issues.is_empty());
+    }
+
+    #[test]
+    fn save_state_backs_up_corrupt_file_before_overwriting() {
+        let dir = temp_project();
+        let path = dir.path().join(".bork").join("state.json");
+        fs::write(&path, "{ this is not json").unwrap();
+
+        save_state(&AppState::default(), dir.path()).unwrap();
+
+        // New state written, original corrupt content preserved for recovery.
+        assert!(load_state(dir.path()).issues.is_empty());
+        let backup = path.with_extension("json.corrupt");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "{ this is not json");
+    }
+
+    #[test]
+    fn sweep_removes_only_stale_tmp_files() {
+        let dir = temp_project();
+        let bork = dir.path().join(".bork");
+        let stale = bork.join("state.tmp.12345");
+        let fresh = bork.join("state.tmp.67890");
+        let unrelated = bork.join("state.json");
+        fs::write(&stale, "old").unwrap();
+        fs::write(&fresh, "new").unwrap();
+        fs::write(&unrelated, "{}").unwrap();
+
+        // Backdate the stale file beyond the 60s threshold.
+        let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        let file = fs::File::options().write(true).open(&stale).unwrap();
+        file.set_modified(old_time).unwrap();
+        drop(file);
+
+        sweep_stale_tmp_files(dir.path());
+
+        assert!(!stale.exists(), "stale tmp file should be removed");
+        assert!(fresh.exists(), "fresh tmp file must be left alone");
+        assert!(unrelated.exists());
     }
 }
