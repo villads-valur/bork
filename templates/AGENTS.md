@@ -37,6 +37,7 @@ bork issue start "Subtask" --project {project_name} --prompt "Implement this in 
 bork issue show {project_name}-1              # Show details
 bork issue update {project_name}-1 --title "New title" --column code-review
 bork issue move {project_name}-1 done         # Move to column
+bork issue archive {project_name}-1           # Kill session + teardown + remove worktree + Done
 bork issue delete {project_name}-1            # Delete
 bork integration attach-linear {project_name}-1 VIL-123   # Link Linear ticket
 bork integration attach-pr {project_name}-1 42             # Link GitHub PR

@@ -247,6 +247,8 @@ Start here (for AI agents):
                                   pick the worktree's base; defaults to main)
   bork worktree <id> <slug>      Create the git worktree for an issue
                                  (--base <branch> to pick its base branch)
+  bork issue archive <id>        Kill session + teardown + remove worktree
+                                 (--force to discard uncommitted changes)
 
   Each issue runs one coding agent. Pick which and how with:
     --agent   opencode (default), claude, codex     # must be on your PATH
@@ -474,6 +476,16 @@ enum IssueCommand {
         /// Update prompt text (empty string clears it)
         #[arg(long)]
         prompt: Option<String>,
+    },
+
+    /// Archive an issue: kill its session, run teardown, remove its worktree
+    Archive {
+        /// Issue ID (e.g. bork-1)
+        id: String,
+
+        /// Proceed past a failing teardown script and discard uncommitted changes
+        #[arg(long)]
+        force: bool,
     },
 
     /// Delete an issue
@@ -756,6 +768,17 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
                 },
             )?;
             println!("Updated {}: \"{}\"", issue.id, issue.title);
+            Ok(())
+        }
+        IssueCommand::Archive { id, force } => {
+            let report = ops::archive_issue(&project_root, &id, force)?;
+            println!("Archived {}: \"{}\"", report.issue_id, report.title);
+            if let Some(worktree_dir) = report.worktree_removed {
+                println!("Removed worktree: {}/", worktree_dir);
+            }
+            if report.session_killed {
+                println!("Killed session: {}", report.session_name);
+            }
             Ok(())
         }
         IssueCommand::Delete { id } => {

@@ -130,6 +130,7 @@ bork --help
 | `bork issue show <id>` | Show issue details |
 | `bork issue update <id>` | Update issue fields |
 | `bork issue move <id> <column>` | Move an issue to a column |
+| `bork issue archive <id>` | Kill session, run teardown, remove worktree, move to Done |
 | `bork issue delete <id>` | Delete an issue |
 | `bork integration attach-linear <id> <identifier>` | Link a Linear ticket to an issue (can attach multiple) |
 | `bork integration attach-pr <id> <number>` | Link a GitHub PR to an issue (can attach multiple) |
@@ -193,12 +194,15 @@ bork issue list --json                    # machine-readable output
 bork issue move bork-3 code-review
 bork issue update bork-3 --title "Fix OAuth flow"
 bork issue show bork-3
+bork issue archive bork-3                 # cleanup when work is merged
 bork issue delete bork-3
 ```
 
 **Create options:** `--column` (todo, in-progress, code-review, done), `--agent` (opencode, claude, codex, pi), `--mode` (plan, build, yolo), `--prompt`, `--kind` (agentic, todo).
 
-**Start options:** `--prompt`, `--agent` (opencode, claude, codex), `--mode` (plan, build, yolo), `--slug`, `--no-worktree`, `--project` (registered project name or path). `bork issue start` defaults to build mode and creates a worktree with a slug generated from the title.
+**Start options:** `--prompt`, `--agent` (opencode, claude, codex), `--mode` (plan, build, yolo), `--slug`, `--no-worktree`, `--project` (registered project name or path). `bork issue start` defaults to build mode and creates a worktree with a slug generated from the title. If a `setup_script` is configured, it runs inside the worktree before the agent starts.
+
+**Archive options:** `bork issue archive <id> [--force]` kills the issue's tmux session, runs the configured `teardown_script` inside the worktree, removes the worktree, and moves the issue to Done. `--force` proceeds past a failing teardown and discards uncommitted changes.
 
 **Integration commands** link external tickets and PRs to existing issues. You can attach multiple Linear issues and/or GitHub PRs to a single bork issue:
 
@@ -307,11 +311,26 @@ default_agent    = "claude"                          # alias for agent_kind, mor
 agents           = ["opencode", "claude", "codex", "pi"]   # allowed agent picker entries (order matters)
 default_prompt   = "Check AGENTS.md for project context and start working on the issue."
 review_prompt    = "Read the diff and summarize findings."  # body for auto-imported review-requested PRs (bork prepends the PR number + link)
+setup_script     = "npm install"                     # run inside a fresh worktree before its agent starts
+teardown_script  = "docker compose down"             # run inside a worktree before `bork issue archive` removes it
 done_session_ttl = 300                               # seconds a Done tmux session lingers
 debug            = false                             # enable debug-only keybindings
 ```
 
 Resolution order (highest wins): built-in defaults → `~/.config/bork/config.toml` → `<project>/.bork/config.toml` → CLI flags.
+
+### Worktree Setup & Teardown Scripts
+
+Fresh git worktrees are bare checkouts: no installed dependencies, no untracked config like `.env`. `setup_script` fixes that. When an agent session is launched for an issue with a worktree, the script runs inside that worktree first, chained with `&&` so the agent only starts if setup succeeds. Output is visible in the agent's tmux window. Resumed sessions skip it.
+
+`teardown_script` is the mirror hook: `bork issue archive <id>` runs it inside the worktree before removal, for cleanup that `git worktree remove` can't do (stopping services, dropping per-worktree databases). A failing teardown aborts the archive unless `--force` is passed.
+
+```toml
+setup_script    = "npm install && cp ../main/.env .env"
+teardown_script = "docker compose down"
+```
+
+Both keys accept a single shell command line and can live in either config layer. Scripts should be idempotent — setup may run again if a session is recreated for an existing worktree.
 
 ### Agent Picker
 

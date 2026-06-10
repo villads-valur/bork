@@ -150,6 +150,70 @@ pub fn create_worktree_in(
     })
 }
 
+/// Remove an issue worktree: run the configured teardown script inside it,
+/// then `git worktree remove` it from main/.
+///
+/// Teardown failure aborts the removal unless `force` is set. `force` is also
+/// passed through to git, so worktrees with uncommitted changes are removed.
+/// A missing worktree directory is not an error; stale git metadata is pruned.
+pub fn remove_worktree_in(
+    config: &config::AppConfig,
+    worktree_dir: &str,
+    force: bool,
+) -> anyhow::Result<()> {
+    let main_dir = config.project_root.join("main");
+    if !main_dir.join(".git").exists() {
+        bail!(
+            "No git repo found at {}/main. Are you in a bork project?",
+            config.project_root.display()
+        );
+    }
+
+    let worktree_path = config.project_root.join(worktree_dir);
+    if !worktree_path.exists() {
+        // Directory already gone; clean up any stale worktree metadata.
+        let _ = Command::new("git")
+            .args(["worktree", "prune"])
+            .current_dir(&main_dir)
+            .status();
+        return Ok(());
+    }
+
+    if let Some(script) = config.teardown_script.as_deref() {
+        let status = Command::new("sh")
+            .args(["-c", script])
+            .current_dir(&worktree_path)
+            .status()
+            .context("Failed to run teardown_script")?;
+        if !status.success() && !force {
+            bail!(
+                "teardown_script failed (exit {}). Fix it or re-run with --force to remove anyway.",
+                status.code().unwrap_or(-1)
+            );
+        }
+    }
+
+    let worktree_arg = format!("../{}", worktree_dir);
+    let mut args = vec!["worktree", "remove", worktree_arg.as_str()];
+    if force {
+        args.push("--force");
+    }
+
+    let status = Command::new("git")
+        .args(&args)
+        .current_dir(&main_dir)
+        .status()
+        .context("Failed to run git worktree remove")?;
+
+    if !status.success() {
+        bail!(
+            "git worktree remove failed. The worktree may have uncommitted changes; re-run with --force to discard them."
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -225,6 +289,8 @@ mod tests {
             agent_kind: crate::types::AgentKind::OpenCode,
             default_prompt: None,
             review_prompt: None,
+            setup_script: None,
+            teardown_script: None,
             done_session_ttl: 300,
             debug: false,
             agents_allowlist: None,
@@ -344,6 +410,130 @@ mod tests {
 
         // The new worktree should contain the marker file only present on the base.
         assert!(project.join("bork-1-fix-bug/BASE_MARKER.md").exists());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_remove_worktree_removes_dir() {
+        let (tmp, project, cfg) = setup_test_project();
+
+        create_worktree_in(&cfg, "bork-1", Some("fix-bug"), None, None).unwrap();
+        assert!(project.join("bork-1-fix-bug").exists());
+
+        let result = remove_worktree_in(&cfg, "bork-1-fix-bug", false);
+        assert!(result.is_ok(), "remove failed: {:?}", result.err());
+        assert!(!project.join("bork-1-fix-bug").exists());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_remove_worktree_runs_teardown_script() {
+        let (tmp, project, mut cfg) = setup_test_project();
+        let marker = tmp.join("teardown-ran");
+        cfg.teardown_script = Some(format!("touch '{}'", marker.display()));
+
+        create_worktree_in(&cfg, "bork-1", Some("fix-bug"), None, None).unwrap();
+        remove_worktree_in(&cfg, "bork-1-fix-bug", false).unwrap();
+
+        assert!(marker.exists(), "teardown_script should have run");
+        assert!(!project.join("bork-1-fix-bug").exists());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_remove_worktree_teardown_failure_aborts() {
+        let (tmp, project, mut cfg) = setup_test_project();
+        cfg.teardown_script = Some("exit 1".to_string());
+
+        create_worktree_in(&cfg, "bork-1", Some("fix-bug"), None, None).unwrap();
+
+        let result = remove_worktree_in(&cfg, "bork-1-fix-bug", false);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("teardown_script"));
+        assert!(
+            project.join("bork-1-fix-bug").exists(),
+            "worktree should survive a failed teardown"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_remove_worktree_teardown_failure_force_removes() {
+        let (tmp, project, mut cfg) = setup_test_project();
+        cfg.teardown_script = Some("exit 1".to_string());
+
+        create_worktree_in(&cfg, "bork-1", Some("fix-bug"), None, None).unwrap();
+
+        let result = remove_worktree_in(&cfg, "bork-1-fix-bug", true);
+        assert!(result.is_ok(), "force remove failed: {:?}", result.err());
+        assert!(!project.join("bork-1-fix-bug").exists());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_remove_worktree_dirty_requires_force() {
+        let (tmp, project, cfg) = setup_test_project();
+
+        create_worktree_in(&cfg, "bork-1", Some("fix-bug"), None, None).unwrap();
+        fs::write(project.join("bork-1-fix-bug/dirty.txt"), "uncommitted").unwrap();
+
+        let without_force = remove_worktree_in(&cfg, "bork-1-fix-bug", false);
+        assert!(without_force.is_err());
+        assert!(project.join("bork-1-fix-bug").exists());
+
+        let with_force = remove_worktree_in(&cfg, "bork-1-fix-bug", true);
+        assert!(with_force.is_ok(), "force failed: {:?}", with_force.err());
+        assert!(!project.join("bork-1-fix-bug").exists());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_archive_issue_end_to_end() {
+        let (tmp, project, cfg) = setup_test_project();
+        let marker = tmp.join("teardown-ran");
+
+        // archive_issue loads config from disk. Use a unique project name so
+        // the derived tmux session name can never collide with (and kill) a
+        // real running session.
+        fs::write(
+            project.join(".bork/config.toml"),
+            format!(
+                "project_name = \"bork-wt-test-{}\"\nagent_kind = \"opencode\"\nteardown_script = \"touch '{}'\"\n",
+                std::process::id(),
+                marker.display()
+            ),
+        )
+        .unwrap();
+
+        create_worktree_in(&cfg, "bork-1", Some("fix-bug"), None, None).unwrap();
+        assert!(project.join("bork-1-fix-bug").exists());
+
+        let report = crate::ops::archive_issue(&project, "bork-1", false).unwrap();
+        assert_eq!(report.issue_id, "bork-1");
+        assert_eq!(report.worktree_removed.as_deref(), Some("bork-1-fix-bug"));
+        assert!(!project.join("bork-1-fix-bug").exists());
+        assert!(marker.exists(), "teardown_script should have run");
+
+        let state = config::load_state(&project);
+        let issue = state.issues.iter().find(|i| i.id == "bork-1").unwrap();
+        assert_eq!(issue.column, crate::types::Column::Done);
+        assert!(issue.worktree.is_none());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_remove_worktree_missing_dir_is_ok() {
+        let (tmp, _project, cfg) = setup_test_project();
+
+        let result = remove_worktree_in(&cfg, "bork-9-never-existed", false);
+        assert!(result.is_ok());
 
         let _ = fs::remove_dir_all(&tmp);
     }
