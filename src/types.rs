@@ -360,20 +360,25 @@ impl Issue {
     /// would skip the new kind's prompt); becoming an orchestrator also drops
     /// the worktree and PR links since orchestrators run at the project root
     /// and have no PR of their own.
-    pub fn set_kind(&mut self, kind: IssueKind) {
+    ///
+    /// Returns `true` when the orchestrator boundary was crossed. Callers
+    /// should then kill any live tmux session, since re-attaching it would
+    /// silently resume the old agent with the previous kind's prompt.
+    pub fn set_kind(&mut self, kind: IssueKind) -> bool {
         let previous = self.kind;
         self.kind = kind;
         if kind == previous {
-            return;
+            return false;
         }
         if kind != IssueKind::Orchestrator && previous != IssueKind::Orchestrator {
-            return;
+            return false;
         }
         self.session_id = None;
         if kind == IssueKind::Orchestrator {
             self.worktree = None;
             self.github_pr_links.clear();
         }
+        true
     }
 
     pub fn has_linear(&self) -> bool {
@@ -662,7 +667,7 @@ mod tests {
     #[test]
     fn set_kind_to_orchestrator_clears_worktree_session_and_prs() {
         let mut issue = issue_with_session_state(IssueKind::Agentic);
-        issue.set_kind(IssueKind::Orchestrator);
+        assert!(issue.set_kind(IssueKind::Orchestrator));
         assert_eq!(issue.kind, IssueKind::Orchestrator);
         assert!(issue.worktree.is_none());
         assert!(issue.session_id.is_none());
@@ -672,7 +677,7 @@ mod tests {
     #[test]
     fn set_kind_from_orchestrator_clears_session_only() {
         let mut issue = issue_with_session_state(IssueKind::Orchestrator);
-        issue.set_kind(IssueKind::Agentic);
+        assert!(issue.set_kind(IssueKind::Agentic));
         assert!(issue.session_id.is_none());
         assert_eq!(issue.worktree, Some("bork-1-fix-bug".into()));
         assert_eq!(issue.github_pr_links.len(), 1);
@@ -681,7 +686,7 @@ mod tests {
     #[test]
     fn set_kind_between_agentic_and_todo_keeps_state() {
         let mut issue = issue_with_session_state(IssueKind::Agentic);
-        issue.set_kind(IssueKind::NonAgentic);
+        assert!(!issue.set_kind(IssueKind::NonAgentic));
         assert_eq!(issue.worktree, Some("bork-1-fix-bug".into()));
         assert_eq!(issue.session_id, Some("ses_abc".into()));
         assert_eq!(issue.github_pr_links.len(), 1);
@@ -690,7 +695,7 @@ mod tests {
     #[test]
     fn set_kind_same_kind_is_noop() {
         let mut issue = issue_with_session_state(IssueKind::Orchestrator);
-        issue.set_kind(IssueKind::Orchestrator);
+        assert!(!issue.set_kind(IssueKind::Orchestrator));
         assert_eq!(issue.worktree, Some("bork-1-fix-bug".into()));
         assert_eq!(issue.session_id, Some("ses_abc".into()));
     }

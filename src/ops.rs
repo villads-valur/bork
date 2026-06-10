@@ -214,7 +214,12 @@ pub fn update_issue(
         }
     }
     if let Some(kind) = opts.kind {
-        issue.set_kind(kind);
+        if issue.set_kind(kind) {
+            // Kill any live session so it isn't re-attached with the old
+            // kind's prompt and cwd. Best effort; the session may not exist.
+            let config = config::load_config_from(project_root);
+            let _ = tmux::kill_session(&issue.session_name(&config.project_name));
+        }
     }
 
     let updated = issue.clone();
@@ -970,6 +975,33 @@ mod tests {
         assert_eq!(issue.column, Column::Done);
         assert!(issue.done_at.is_some());
         assert!(issue.worktree.is_none());
+    }
+
+    #[test]
+    fn archive_orchestrator_issue_moves_to_done() {
+        let dir = setup_project();
+        let root = dir.path();
+
+        create_issue(
+            root,
+            CreateOptions {
+                title: "Coordinate".into(),
+                column: Some(Column::InProgress),
+                agent_kind: None,
+                agent_mode: None,
+                prompt: None,
+                kind: Some(IssueKind::Orchestrator),
+            },
+        )
+        .unwrap();
+
+        let report = archive_issue(root, "test-1", false).unwrap();
+        assert!(report.worktree_removed.is_none());
+
+        let state = config::load_state(root);
+        let issue = state.issues.iter().find(|i| i.id == "test-1").unwrap();
+        assert_eq!(issue.column, Column::Done);
+        assert_eq!(issue.kind, IssueKind::Orchestrator);
     }
 
     #[test]

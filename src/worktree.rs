@@ -106,6 +106,17 @@ pub fn create_worktree_in(
 ) -> anyhow::Result<WorktreeResult> {
     let mut state = config::load_state(&config.project_root);
 
+    if state
+        .issues
+        .iter()
+        .any(|i| i.id == issue_id && i.kind == IssueKind::Orchestrator)
+    {
+        bail!(
+            "'{}' is an orchestrator issue; orchestrators run at the project root and have no worktree",
+            issue_id
+        );
+    }
+
     let main_dir = config.project_root.join("main");
     if !main_dir.join(".git").exists() {
         bail!(
@@ -420,6 +431,23 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("already exists"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_worktree_rejects_orchestrator_issue() {
+        let (tmp, project, cfg) = setup_test_project();
+
+        let mut state = config::load_state(&project);
+        state.issues[0].kind = crate::types::IssueKind::Orchestrator;
+        config::save_state(&state, &project).unwrap();
+
+        let result = create_worktree_in(&cfg, "bork-1", Some("fix-bug"), None, None);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("orchestrator"), "unexpected error: {}", err);
+        assert!(!project.join("bork-1-fix-bug").exists());
 
         let _ = fs::remove_dir_all(&tmp);
     }

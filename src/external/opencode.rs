@@ -1477,6 +1477,21 @@ mod tests {
     }
 
     #[test]
+    fn setup_prefix_skipped_for_orchestrator() {
+        // Orchestrators never have a worktree (set_kind clears it,
+        // auto_assign and `bork worktree` skip them), so setup_script
+        // must not run for their launches.
+        let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        issue.kind = crate::types::IssueKind::Orchestrator;
+        issue.worktree = None;
+        let mut config = test_config();
+        config.setup_script = Some("npm install".to_string());
+        assert_eq!(setup_prefix(&issue, &config), None);
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(!cmd.contains("npm install"));
+    }
+
+    #[test]
     fn setup_prefix_skipped_without_config() {
         let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
         issue.worktree = Some("bork-1-fix-bug".to_string());

@@ -775,7 +775,15 @@ fn toml_literal_for(kind: ConfigKeyKind, value: &str) -> anyhow::Result<String> 
             None => anyhow::bail!("unknown agent '{}'", value),
         },
         ConfigKeyKind::Str => {
-            let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+            // toml_lite is line-based: raw newlines inside a quoted string
+            // corrupt the value on read-back, so escape control chars too
+            // (the reader understands \n, \r, and \t).
+            let escaped = value
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+                .replace('\t', "\\t");
             Ok(format!("\"{}\"", escaped))
         }
     }
@@ -1972,6 +1980,32 @@ fn resolve_editor() -> Option<(String, Vec<String>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn toml_literal_escapes_control_chars_for_roundtrip() {
+        let literal =
+            toml_literal_for(ConfigKeyKind::Str, "line one\nline two\twith \"quotes\"").unwrap();
+        assert_eq!(literal, r#""line one\nline two\twith \"quotes\"""#);
+
+        // The escaped literal must survive a toml_lite read-back.
+        let table = toml_lite::parse(&format!("orchestrator_prompt = {}", literal));
+        assert_eq!(
+            table.get("orchestrator_prompt").and_then(|v| v.as_str()),
+            Some("line one\nline two\twith \"quotes\"")
+        );
+    }
+
+    #[test]
+    fn parse_issue_kind_accepts_orchestrator_aliases() {
+        assert_eq!(
+            parse_issue_kind("orchestrator"),
+            Ok(IssueKind::Orchestrator)
+        );
+        assert_eq!(parse_issue_kind("orch"), Ok(IssueKind::Orchestrator));
+        assert_eq!(parse_issue_kind("planner"), Ok(IssueKind::Orchestrator));
+        assert_eq!(parse_issue_kind("todo"), Ok(IssueKind::NonAgentic));
+        assert!(parse_issue_kind("bogus").is_err());
+    }
 
     // The wrapper tmux session name must never collide with agent session names.
     // Agent sessions follow the pattern "{project_name}-{issue_id}" where

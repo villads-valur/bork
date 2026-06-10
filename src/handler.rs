@@ -696,18 +696,35 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
     if let Some(idx) = dialog.editing_index {
         let p = app.find_project_mut(&proj_id).unwrap();
         if idx < p.issues.len() {
+            let session_name = p.issues[idx].session_name(&p.config.project_name);
+            let detached_worktree = p.issues[idx].worktree.clone();
+
             p.issues[idx].title = title;
             p.issues[idx].prompt = prompt;
             p.issues[idx].agent_kind = dialog.agent_kind;
             p.issues[idx].agent_mode = dialog.agent_mode;
-            p.issues[idx].set_kind(dialog.kind);
+            let crossed_orchestrator_boundary = p.issues[idx].set_kind(dialog.kind);
 
             apply_linear_fields(&mut p.issues[idx], &dialog);
             apply_pr_fields(&mut p.issues[idx], &dialog);
 
             let updated_id = p.issues[idx].id.clone();
             p.mark_dirty();
-            app.set_message(format!("Updated {}", updated_id));
+
+            if crossed_orchestrator_boundary {
+                // A live session would otherwise be re-attached with the old
+                // kind's prompt and cwd.
+                let _ = tmux::kill_session(&session_name);
+                match detached_worktree.filter(|_| dialog.kind == IssueKind::Orchestrator) {
+                    Some(wt) => app.set_message(format!(
+                        "Updated {} (session reset; worktree {} detached, remove it manually)",
+                        updated_id, wt
+                    )),
+                    None => app.set_message(format!("Updated {} (session reset)", updated_id)),
+                }
+            } else {
+                app.set_message(format!("Updated {}", updated_id));
+            }
         }
         return;
     }
