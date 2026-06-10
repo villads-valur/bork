@@ -182,6 +182,16 @@ pub enum IssueKind {
     #[default]
     Agentic,
     NonAgentic,
+    /// Coordinates work across multiple bork issues: maintains a plan file,
+    /// spawns issues via `bork issue start`, and monitors their agents.
+    Orchestrator,
+}
+
+impl IssueKind {
+    /// Whether this kind launches an agent session.
+    pub fn is_agentic(self) -> bool {
+        matches!(self, Self::Agentic | Self::Orchestrator)
+    }
 }
 
 impl fmt::Display for IssueKind {
@@ -189,6 +199,7 @@ impl fmt::Display for IssueKind {
         match self {
             Self::Agentic => write!(f, "Agentic"),
             Self::NonAgentic => write!(f, "Todo"),
+            Self::Orchestrator => write!(f, "Orchestrator"),
         }
     }
 }
@@ -342,6 +353,27 @@ impl Issue {
             }
         }
         self.pr_imported = false;
+    }
+
+    /// Change the issue kind, clearing state the new kind invalidates.
+    /// Crossing the orchestrator boundary drops the agent session (resuming it
+    /// would skip the new kind's prompt); becoming an orchestrator also drops
+    /// the worktree and PR links since orchestrators run at the project root
+    /// and have no PR of their own.
+    pub fn set_kind(&mut self, kind: IssueKind) {
+        let previous = self.kind;
+        self.kind = kind;
+        if kind == previous {
+            return;
+        }
+        if kind != IssueKind::Orchestrator && previous != IssueKind::Orchestrator {
+            return;
+        }
+        self.session_id = None;
+        if kind == IssueKind::Orchestrator {
+            self.worktree = None;
+            self.github_pr_links.clear();
+        }
     }
 
     pub fn has_linear(&self) -> bool {
@@ -573,6 +605,94 @@ mod tests {
     fn column_from_index_out_of_range() {
         assert_eq!(Column::from_index(4), None);
         assert_eq!(Column::from_index(99), None);
+    }
+
+    // --- IssueKind ---
+
+    #[test]
+    fn issue_kind_is_agentic() {
+        assert!(IssueKind::Agentic.is_agentic());
+        assert!(IssueKind::Orchestrator.is_agentic());
+        assert!(!IssueKind::NonAgentic.is_agentic());
+    }
+
+    #[test]
+    fn issue_kind_display() {
+        assert_eq!(IssueKind::Agentic.to_string(), "Agentic");
+        assert_eq!(IssueKind::NonAgentic.to_string(), "Todo");
+        assert_eq!(IssueKind::Orchestrator.to_string(), "Orchestrator");
+    }
+
+    #[test]
+    fn issue_kind_orchestrator_serde_roundtrip() {
+        let mut issue = test_issue("bork-1", Column::Todo);
+        issue.kind = IssueKind::Orchestrator;
+        let json = serde_json::to_string(&issue).unwrap();
+        let back: Issue = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.kind, IssueKind::Orchestrator);
+    }
+
+    #[test]
+    fn issue_without_kind_defaults_to_agentic() {
+        let json = r#"{
+            "id": "bork-1",
+            "title": "Test",
+            "column": "Todo",
+            "agent_kind": "OpenCode",
+            "agent_mode": "Plan",
+            "prompt": null
+        }"#;
+        let issue: Issue = serde_json::from_str(json).unwrap();
+        assert_eq!(issue.kind, IssueKind::Agentic);
+    }
+
+    fn issue_with_session_state(kind: IssueKind) -> Issue {
+        let mut issue = test_issue("bork-1", Column::InProgress);
+        issue.kind = kind;
+        issue.worktree = Some("bork-1-fix-bug".into());
+        issue.session_id = Some("ses_abc".into());
+        issue.github_pr_links.push(LinkedGithubPr {
+            number: 42,
+            imported: false,
+            import_source: None,
+        });
+        issue
+    }
+
+    #[test]
+    fn set_kind_to_orchestrator_clears_worktree_session_and_prs() {
+        let mut issue = issue_with_session_state(IssueKind::Agentic);
+        issue.set_kind(IssueKind::Orchestrator);
+        assert_eq!(issue.kind, IssueKind::Orchestrator);
+        assert!(issue.worktree.is_none());
+        assert!(issue.session_id.is_none());
+        assert!(issue.github_pr_links.is_empty());
+    }
+
+    #[test]
+    fn set_kind_from_orchestrator_clears_session_only() {
+        let mut issue = issue_with_session_state(IssueKind::Orchestrator);
+        issue.set_kind(IssueKind::Agentic);
+        assert!(issue.session_id.is_none());
+        assert_eq!(issue.worktree, Some("bork-1-fix-bug".into()));
+        assert_eq!(issue.github_pr_links.len(), 1);
+    }
+
+    #[test]
+    fn set_kind_between_agentic_and_todo_keeps_state() {
+        let mut issue = issue_with_session_state(IssueKind::Agentic);
+        issue.set_kind(IssueKind::NonAgentic);
+        assert_eq!(issue.worktree, Some("bork-1-fix-bug".into()));
+        assert_eq!(issue.session_id, Some("ses_abc".into()));
+        assert_eq!(issue.github_pr_links.len(), 1);
+    }
+
+    #[test]
+    fn set_kind_same_kind_is_noop() {
+        let mut issue = issue_with_session_state(IssueKind::Orchestrator);
+        issue.set_kind(IssueKind::Orchestrator);
+        assert_eq!(issue.worktree, Some("bork-1-fix-bug".into()));
+        assert_eq!(issue.session_id, Some("ses_abc".into()));
     }
 
     // --- Issue session_name ---

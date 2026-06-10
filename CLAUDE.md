@@ -114,7 +114,7 @@ State lives in `.bork/` at the container root. Config is detected by walking up 
 
 ## Global State
 
-- `~/.config/bork/config.toml` — global config layer (agents allowlist, default_agent, default_prompt, review_prompt, etc.). Same flat schema as `<project>/.bork/config.toml`; project values override global.
+- `~/.config/bork/config.toml` — global config layer (agents allowlist, default_agent, default_prompt, review_prompt, orchestrator_prompt, etc.). Same flat schema as `<project>/.bork/config.toml`; project values override global.
 - `~/.config/bork/projects.json` — registry of all bork projects (auto-registered, auto-pruned, managed artifact)
 - `~/.config/bork/bork.pid` — flock-based single instance lock
 
@@ -137,6 +137,12 @@ The binary is symlinked to `/opt/homebrew/bin/bork`.
 - Tmux agent sessions named: {project_name}-{issue-id}
 - Wrapper tmux session: always named "bork" (single global session)
 - Opencode launched at project root with --prompt for issue context
+
+## Issue Kinds
+
+- `Agentic` (default) — launches a coding agent in a tmux session, usually in its own worktree
+- `NonAgentic` ("Todo") — plain checklist card, never launches an agent; Enter opens the edit dialog
+- `Orchestrator` — launches a coordinating agent at the project root with no worktree and no GitHub PR field. Its prompt comes from `orchestrator_prompt` (project overrides global, falls back to `DEFAULT_ORCHESTRATOR_PROMPT` in config.rs) instead of `default_prompt`, and bork appends the planning file path `plans/{issue-id}/planning.md`. The agent breaks the goal into issues, spawns them via `bork issue start`, and monitors/nudges their agents via `bork issue list --json` and tmux. Cards render with a magenta border and an `◆ orch` badge. `IssueKind::is_agentic()` is true for both `Agentic` and `Orchestrator`. Kind changes go through `Issue::set_kind()`, which clears the session ID when crossing the orchestrator boundary and additionally drops the worktree and PR links when becoming an orchestrator (`bork integration attach-pr` also rejects orchestrators).
 
 ## Integration Data Model
 

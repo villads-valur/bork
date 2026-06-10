@@ -323,7 +323,7 @@ fn handle_normal(
             };
             let issue = app.context_project(ctx).issues[idx].clone();
 
-            if issue.kind == IssueKind::NonAgentic {
+            if !issue.kind.is_agentic() {
                 app.open_edit_dialog(&issue, idx, ctx);
                 return PostAction::None;
             }
@@ -700,7 +700,7 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
             p.issues[idx].prompt = prompt;
             p.issues[idx].agent_kind = dialog.agent_kind;
             p.issues[idx].agent_mode = dialog.agent_mode;
-            p.issues[idx].kind = dialog.kind;
+            p.issues[idx].set_kind(dialog.kind);
 
             apply_linear_fields(&mut p.issues[idx], &dialog);
             apply_pr_fields(&mut p.issues[idx], &dialog);
@@ -770,7 +770,8 @@ fn apply_linear_fields(issue: &mut Issue, dialog: &crate::app::DialogState) {
 }
 
 fn apply_pr_fields(issue: &mut Issue, dialog: &crate::app::DialogState) {
-    if dialog.github_pr_cleared {
+    // Orchestrators have no PR field; drop any links left from a kind change.
+    if dialog.kind == IssueKind::Orchestrator || dialog.github_pr_cleared {
         issue.github_pr_links.clear();
     } else if !dialog.github_prs.is_empty() {
         issue.github_pr_links = dialog
@@ -1248,6 +1249,7 @@ mod tests {
             agent_kind: crate::types::AgentKind::OpenCode,
             default_prompt: Some("Check AGENTS.md for context.".to_string()),
             review_prompt: None,
+            orchestrator_prompt: None,
             done_session_ttl: DEFAULT_DONE_SESSION_TTL,
             debug: false,
             agents_allowlist: None,
@@ -2245,6 +2247,7 @@ mod tests {
             agent_kind: crate::types::AgentKind::OpenCode,
             default_prompt: None,
             review_prompt: None,
+            orchestrator_prompt: None,
             done_session_ttl: DEFAULT_DONE_SESSION_TTL,
             debug: false,
             agents_allowlist: None,

@@ -71,7 +71,7 @@ Press `n` to create an issue, `Enter` to launch an agent session. You're up and 
 - **Linear integration** &mdash; Import and attach multiple Linear issues per card, sync state bidirectionally, open in Linear with a keypress
 - **Auto-import PRs** &mdash; Open PRs authored by you are automatically added to the Code Review column
 - **Search and filter** &mdash; Type `/` to fuzzy-filter the board by title or issue ID
-- **Issue kinds** &mdash; Agentic issues launch AI sessions; non-agentic "todo" items skip the agent entirely
+- **Issue kinds** &mdash; Agentic issues launch AI sessions; non-agentic "todo" items skip the agent entirely; orchestrator issues launch a coordinating agent that breaks a goal into bork issues, spawns them via `bork issue start`, and monitors their agents
 - **Multi-project view** &mdash; Register multiple projects and view them in stacked swimlanes with a collapsible project sidebar
 - **Zero-dependency state** &mdash; JSON file persistence with atomic writes, no database
 
@@ -196,7 +196,7 @@ bork issue show bork-3
 bork issue delete bork-3
 ```
 
-**Create options:** `--column` (todo, in-progress, code-review, done), `--agent` (opencode, claude, codex, pi), `--mode` (plan, build, yolo), `--prompt`, `--kind` (agentic, todo).
+**Create options:** `--column` (todo, in-progress, code-review, done), `--agent` (opencode, claude, codex, pi), `--mode` (plan, build, yolo), `--prompt`, `--kind` (agentic, todo, orchestrator).
 
 **Start options:** `--prompt`, `--agent` (opencode, claude, codex), `--mode` (plan, build, yolo), `--slug`, `--no-worktree`, `--project` (registered project name or path). `bork issue start` defaults to build mode and creates a worktree with a slug generated from the title.
 
@@ -307,6 +307,7 @@ default_agent    = "claude"                          # alias for agent_kind, mor
 agents           = ["opencode", "claude", "codex", "pi"]   # allowed agent picker entries (order matters)
 default_prompt   = "Check AGENTS.md for project context and start working on the issue."
 review_prompt    = "Read the diff and summarize findings."  # body for auto-imported review-requested PRs (bork prepends the PR number + link)
+orchestrator_prompt = "Coordinate the work across issues." # body for orchestrator issues (bork appends the planning file path)
 done_session_ttl = 300                               # seconds a Done tmux session lingers
 debug            = false                             # enable debug-only keybindings
 ```

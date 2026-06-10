@@ -16,6 +16,7 @@ pub struct AppConfig {
     pub agent_kind: AgentKind,
     pub default_prompt: Option<String>,
     pub review_prompt: Option<String>,
+    pub orchestrator_prompt: Option<String>,
     pub done_session_ttl: u64,
     pub debug: bool,
     /// Allowed agents for this project, if explicitly configured.
@@ -72,6 +73,14 @@ pub const DEFAULT_PROMPT_FALLBACK: &str = "The source code is in main/. Use `bor
 
 pub const DEFAULT_REVIEW_PROMPT: &str = "Read the diff, check for correctness, regressions, missing tests, and edge cases. Summarize your findings. Use any code review skills that might be installed. Categorize call outs in High, Medium, Low importance. Add file name, linenumber to each call out.";
 
+pub const DEFAULT_ORCHESTRATOR_PROMPT: &str = "You are an orchestrator agent: you coordinate work across multiple bork issues instead of writing code yourself. \
+Maintain a planning file (path given below) that holds the overarching goal, a task breakdown, and a status log; keep it updated as work progresses. \
+Break the goal into discrete issues and spawn each one with `bork issue start \"Title\" --project <name-or-path> --prompt \"Details...\"`, giving every issue a rich, self-contained prompt. \
+Monitor progress with `bork issue list --json` and `bork issue show <id> --json`. \
+Inspect a running agent's output with `tmux capture-pane -p -t <project>-<issue-id>`, and if an agent is heading in the wrong direction, nudge it with `tmux send-keys -t <project>-<issue-id> 'your message' Enter`. \
+If this issue has a Linear ticket linked, keep it updated as milestones complete. \
+Do not create a worktree for yourself; the issues you spawn get their own worktrees.";
+
 impl Default for AppConfig {
     fn default() -> Self {
         let project_root = find_project_root();
@@ -81,6 +90,7 @@ impl Default for AppConfig {
             agent_kind: AgentKind::OpenCode,
             default_prompt: None,
             review_prompt: None,
+            orchestrator_prompt: None,
             done_session_ttl: DEFAULT_DONE_SESSION_TTL,
             debug: false,
             agents_allowlist: None,
@@ -153,6 +163,7 @@ pub struct PartialConfig {
     pub agent_kind: Option<AgentKind>,
     pub default_prompt: Option<String>,
     pub review_prompt: Option<String>,
+    pub orchestrator_prompt: Option<String>,
     pub done_session_ttl: Option<u64>,
     pub debug: Option<bool>,
     pub agents_allowlist: Option<Vec<AgentKind>>,
@@ -205,6 +216,7 @@ impl PartialConfig {
             agent_kind: other.agent_kind.or(self.agent_kind),
             default_prompt: other.default_prompt.or(self.default_prompt),
             review_prompt: other.review_prompt.or(self.review_prompt),
+            orchestrator_prompt: other.orchestrator_prompt.or(self.orchestrator_prompt),
             done_session_ttl: other.done_session_ttl.or(self.done_session_ttl),
             debug: other.debug.or(self.debug),
             agents_allowlist: other.agents_allowlist.or(self.agents_allowlist),
@@ -246,6 +258,7 @@ fn materialize(merged: PartialConfig, project_root: &Path) -> AppConfig {
         agent_kind: merged.agent_kind.unwrap_or(AgentKind::OpenCode),
         default_prompt: merged.default_prompt,
         review_prompt: merged.review_prompt,
+        orchestrator_prompt: merged.orchestrator_prompt,
         done_session_ttl: merged.done_session_ttl.unwrap_or(DEFAULT_DONE_SESSION_TTL),
         debug: merged.debug.unwrap_or(false),
         agents_allowlist: merged.agents_allowlist,
@@ -306,6 +319,11 @@ fn partial_from_table(table: &Table) -> PartialConfig {
         .and_then(|v| v.as_str())
         .map(str::to_string);
 
+    let orchestrator_prompt = table
+        .get("orchestrator_prompt")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
     let done_session_ttl = table.get("done_session_ttl").and_then(|v| v.as_u64());
     let debug = table.get("debug").and_then(|v| v.as_bool());
 
@@ -323,6 +341,7 @@ fn partial_from_table(table: &Table) -> PartialConfig {
         agent_kind,
         default_prompt,
         review_prompt,
+        orchestrator_prompt,
         done_session_ttl,
         debug,
         agents_allowlist,
@@ -471,6 +490,36 @@ review_prompt = "Review the thing"
     fn merge_empty_layers_leave_review_prompt_unset() {
         let cfg = merge_to_app("", "");
         assert!(cfg.review_prompt.is_none());
+    }
+
+    #[test]
+    fn parse_partial_orchestrator_prompt() {
+        let p = parse_partial(r#"orchestrator_prompt = "Coordinate the swarm""#);
+        assert_eq!(
+            p.orchestrator_prompt.as_deref(),
+            Some("Coordinate the swarm")
+        );
+    }
+
+    #[test]
+    fn merge_project_orchestrator_prompt_overrides_global() {
+        let cfg = merge_to_app(
+            r#"orchestrator_prompt = "from global""#,
+            r#"orchestrator_prompt = "from project""#,
+        );
+        assert_eq!(cfg.orchestrator_prompt.as_deref(), Some("from project"));
+    }
+
+    #[test]
+    fn merge_global_orchestrator_prompt_used_when_project_unset() {
+        let cfg = merge_to_app(r#"orchestrator_prompt = "from global""#, "");
+        assert_eq!(cfg.orchestrator_prompt.as_deref(), Some("from global"));
+    }
+
+    #[test]
+    fn merge_empty_layers_leave_orchestrator_prompt_unset() {
+        let cfg = merge_to_app("", "");
+        assert!(cfg.orchestrator_prompt.is_none());
     }
 
     #[test]

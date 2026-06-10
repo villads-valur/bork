@@ -31,7 +31,11 @@ pub fn render_card(frame: &mut Frame, ctx: &CardContext, area: Rect, card_size: 
         return;
     }
 
-    let border_style = styles::card_border_style(ctx.selected);
+    let border_style = if ctx.issue.kind == IssueKind::Orchestrator {
+        styles::orchestrator_card_border_style(ctx.selected)
+    } else {
+        styles::card_border_style(ctx.selected)
+    };
     let title_style = styles::card_title_style(ctx.selected);
 
     let id_text = format!(" {} ", ctx.issue.id);
@@ -170,6 +174,14 @@ fn format_status_line(ctx: &CardContext) -> Line<'static> {
     if is_review {
         spans.push(Span::raw(" "));
         spans.push(Span::styled("review", Style::default().fg(Color::Yellow)));
+    }
+
+    if ctx.issue.kind == IssueKind::Orchestrator {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            "\u{25c6} orch",
+            styles::orchestrator_badge_style(),
+        ));
     }
 
     let git_spans = format_git_status(ctx.git_status);

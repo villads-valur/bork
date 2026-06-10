@@ -169,6 +169,7 @@ pub struct UpdateOptions {
     pub agent_kind: Option<AgentKind>,
     pub agent_mode: Option<AgentMode>,
     pub prompt: Option<String>,
+    pub kind: Option<IssueKind>,
 }
 
 pub fn update_issue(
@@ -209,6 +210,9 @@ pub fn update_issue(
         } else {
             issue.prompt = Some(prompt);
         }
+    }
+    if let Some(kind) = opts.kind {
+        issue.set_kind(kind);
     }
 
     let updated = issue.clone();
@@ -310,6 +314,13 @@ pub fn attach_pr(project_root: &Path, issue_id: &str, pr_number: u32) -> anyhow:
 
     let issue = &mut state.issues[idx];
 
+    if issue.kind == IssueKind::Orchestrator {
+        anyhow::bail!(
+            "Cannot attach a PR to '{}': orchestrator issues have no PR links",
+            issue.id
+        );
+    }
+
     if !issue.has_pr_number(pr_number) {
         issue.github_pr_links.push(crate::types::LinkedGithubPr {
             number: pr_number,
@@ -334,6 +345,7 @@ pub fn move_issue(project_root: &Path, issue_id: &str, column: Column) -> anyhow
             agent_kind: None,
             agent_mode: None,
             prompt: None,
+            kind: None,
         },
     )
 }
@@ -468,6 +480,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                kind: None,
             },
         )
         .unwrap();
@@ -503,6 +516,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                kind: None,
             },
         )
         .unwrap();
@@ -537,11 +551,89 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                kind: None,
             },
         )
         .unwrap();
 
         assert!(updated.done_at.is_none());
+    }
+
+    #[test]
+    fn update_kind_to_orchestrator_clears_stale_state() {
+        let dir = setup_project();
+        let root = dir.path();
+
+        create_issue(
+            root,
+            CreateOptions {
+                title: "Convert me".into(),
+                column: None,
+                agent_kind: None,
+                agent_mode: None,
+                prompt: None,
+                kind: None,
+            },
+        )
+        .unwrap();
+
+        // Simulate an issue that already ran: worktree, session, and a PR link.
+        let mut state = config::load_state(root);
+        state.issues[0].worktree = Some("test-1-convert-me".into());
+        state.issues[0].session_id = Some("ses_abc".into());
+        state.issues[0]
+            .github_pr_links
+            .push(crate::types::LinkedGithubPr {
+                number: 42,
+                imported: false,
+                import_source: None,
+            });
+        config::save_state(&state, root).unwrap();
+
+        let updated = update_issue(
+            root,
+            "test-1",
+            UpdateOptions {
+                title: None,
+                column: None,
+                agent_kind: None,
+                agent_mode: None,
+                prompt: None,
+                kind: Some(IssueKind::Orchestrator),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(updated.kind, IssueKind::Orchestrator);
+        assert!(updated.worktree.is_none());
+        assert!(updated.session_id.is_none());
+        assert!(updated.github_pr_links.is_empty());
+    }
+
+    #[test]
+    fn attach_pr_rejects_orchestrator_issue() {
+        let dir = setup_project();
+        let root = dir.path();
+
+        create_issue(
+            root,
+            CreateOptions {
+                title: "Coordinate".into(),
+                column: None,
+                agent_kind: None,
+                agent_mode: None,
+                prompt: None,
+                kind: Some(IssueKind::Orchestrator),
+            },
+        )
+        .unwrap();
+
+        let result = attach_pr(root, "test-1", 42);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("orchestrator"));
+
+        let state = config::load_state(root);
+        assert!(state.issues[0].github_pr_links.is_empty());
     }
 
     #[test]
@@ -761,6 +853,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                kind: None,
             },
         );
         assert!(result.is_err());

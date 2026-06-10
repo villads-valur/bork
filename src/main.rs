@@ -241,19 +241,24 @@ fn spawn_pr_poll_worker(
 const AGENTS_START_HERE: &str = "\
 Start here (for AI agents):
   bork issue list                List the kanban board (use --json to parse)
-  bork issue create \"<title>\"    Add an issue (its agent runs in a worktree)
+  bork issue create \"<title>\"    Add an issue to the board
   bork issue start \"<title>\"     Create issue + worktree + agent in one step
                                  (--no-worktree to skip it, --base <branch> to
                                   pick the worktree's base; defaults to main)
   bork worktree <id> <slug>      Create the git worktree for an issue
                                  (--base <branch> to pick its base branch)
 
-  Each issue runs one coding agent. Pick which and how with:
+  Agentic issues each run one coding agent. Pick which and how with:
     --agent   opencode (default), claude, codex     # must be on your PATH
     --mode    plan (read-only), build, yolo          # yolo: claude/codex only
+    --kind    agentic (default), todo, orchestrator  # todo: no agent;
+                                                     # orchestrator: plans,
+                                                     # spawns + monitors issues
+                                                     # from the project root
 
   Defaults + allowlist live in ~/.config/bork/config.toml
-  (default_agent, agents = [...]); per-project override in .bork/config.toml.";
+  (default_agent, agents = [...], orchestrator_prompt);
+  per-project override in .bork/config.toml.";
 
 /// One-line pointer shown before Options on every subcommand `--help`, so the
 /// quickstart is discoverable at any level without repeating the full block.
@@ -411,7 +416,7 @@ enum IssueCommand {
         #[arg(long)]
         prompt: Option<String>,
 
-        /// Issue kind (agentic, todo)
+        /// Issue kind (agentic, todo, orchestrator)
         #[arg(long, value_parser = parse_issue_kind)]
         kind: Option<IssueKind>,
     },
@@ -474,6 +479,10 @@ enum IssueCommand {
         /// Update prompt text (empty string clears it)
         #[arg(long)]
         prompt: Option<String>,
+
+        /// Change issue kind (agentic, todo, orchestrator)
+        #[arg(long, value_parser = parse_issue_kind)]
+        kind: Option<IssueKind>,
     },
 
     /// Delete an issue
@@ -559,8 +568,9 @@ fn parse_issue_kind(s: &str) -> Result<IssueKind, String> {
     match s.to_lowercase().as_str() {
         "agentic" => Ok(IssueKind::Agentic),
         "todo" | "non-agentic" | "nonagentic" => Ok(IssueKind::NonAgentic),
+        "orchestrator" | "orch" | "planner" => Ok(IssueKind::Orchestrator),
         _ => Err(format!(
-            "Unknown issue kind '{}'. Options: agentic, todo",
+            "Unknown issue kind '{}'. Options: agentic, todo, orchestrator",
             s
         )),
     }
@@ -743,6 +753,7 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
             agent,
             mode,
             prompt,
+            kind,
         } => {
             let issue = ops::update_issue(
                 &project_root,
@@ -753,6 +764,7 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
                     agent_kind: agent,
                     agent_mode: mode,
                     prompt,
+                    kind,
                 },
             )?;
             println!("Updated {}: \"{}\"", issue.id, issue.title);

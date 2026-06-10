@@ -483,7 +483,9 @@ impl Project {
 
     pub fn auto_assign_worktrees(&mut self) -> bool {
         let assignments: Vec<(usize, String)> = (0..self.issues.len())
-            .filter(|&i| self.issues[i].worktree.is_none())
+            .filter(|&i| {
+                self.issues[i].worktree.is_none() && self.issues[i].kind != IssueKind::Orchestrator
+            })
             .filter_map(|i| self.detect_worktree(&self.issues[i]).map(|wt| (i, wt)))
             .collect();
 
@@ -1245,10 +1247,11 @@ impl DialogState {
         if self.linear_available {
             fields.push(DialogField::Linear);
         }
-        if self.github_available {
+        // Orchestrators coordinate other issues and have no PR of their own.
+        if self.github_available && self.kind != IssueKind::Orchestrator {
             fields.push(DialogField::GithubPr);
         }
-        if self.kind == IssueKind::Agentic {
+        if self.kind.is_agentic() {
             fields.push(DialogField::Agent);
             if !self.available_agents.is_empty() && self.agent_kind.has_modes() {
                 fields.push(DialogField::Mode);
@@ -1274,10 +1277,10 @@ impl DialogState {
         if linear_available {
             idx += 1;
         }
-        if github_available {
+        if github_available && kind != IssueKind::Orchestrator {
             idx += 1;
         }
-        if kind == IssueKind::Agentic {
+        if kind.is_agentic() {
             idx += 1;
             // Mirror `ordered_fields`: the Mode field only exists for agents
             // with modes (Pi is single-mode and hides it).
@@ -1318,18 +1321,19 @@ impl DialogState {
     pub fn push_char(&mut self, c: char) {
         match self.current_field() {
             DialogField::Kind => {
+                const KIND_ORDER: [IssueKind; 3] = [
+                    IssueKind::Agentic,
+                    IssueKind::Orchestrator,
+                    IssueKind::NonAgentic,
+                ];
+                let idx = KIND_ORDER.iter().position(|k| *k == self.kind).unwrap_or(0);
                 match c {
-                    ' ' => {
-                        self.kind = match self.kind {
-                            IssueKind::Agentic => IssueKind::NonAgentic,
-                            IssueKind::NonAgentic => IssueKind::Agentic,
-                        };
-                    }
-                    'h' => self.kind = IssueKind::Agentic,
-                    'l' => self.kind = IssueKind::NonAgentic,
+                    ' ' => self.kind = KIND_ORDER[(idx + 1) % KIND_ORDER.len()],
+                    'h' => self.kind = KIND_ORDER[idx.saturating_sub(1)],
+                    'l' => self.kind = KIND_ORDER[(idx + 1).min(KIND_ORDER.len() - 1)],
                     _ => {}
                 }
-                if self.kind == IssueKind::Agentic {
+                if self.kind.is_agentic() {
                     self.agent_kind =
                         Self::resolve_agent_kind(self.agent_kind, &self.available_agents);
                     self.agent_mode =
@@ -2041,6 +2045,7 @@ mod tests {
             agent_kind: AgentKind::OpenCode,
             default_prompt: None,
             review_prompt: None,
+            orchestrator_prompt: None,
             done_session_ttl: DEFAULT_DONE_SESSION_TTL,
             debug: false,
             agents_allowlist: None,
@@ -2363,6 +2368,20 @@ mod tests {
             .insert("bork-8".into(), "bork-8/init-cli".into());
         let changed = app.project_mut().auto_assign_worktrees();
         assert!(!changed);
+    }
+
+    #[test]
+    fn test_auto_assign_skips_orchestrator_issues() {
+        let mut issue = test_issue("bork-8", Column::InProgress);
+        issue.kind = IssueKind::Orchestrator;
+        let mut app = test_app(vec![issue]);
+        app.project_mut()
+            .live
+            .worktree_branches
+            .insert("bork-8".into(), "bork-8/init-cli".into());
+        let changed = app.project_mut().auto_assign_worktrees();
+        assert!(!changed);
+        assert!(app.project().issues[0].worktree.is_none());
     }
 
     #[test]
@@ -2957,6 +2976,74 @@ mod tests {
         assert_eq!(d.kind, IssueKind::Agentic);
         // Agentic, no linear: Kind(0), Agent(1), Mode(2), Title(3)
         assert_eq!(d.focused_field, 3);
+    }
+
+    #[test]
+    fn dialog_kind_space_cycles_three_kinds() {
+        let mut d = opencode_dialog();
+        d.focused_field = 0; // Kind field
+        d.push_char(' ');
+        assert_eq!(d.kind, IssueKind::Orchestrator);
+        d.push_char(' ');
+        assert_eq!(d.kind, IssueKind::NonAgentic);
+        d.push_char(' ');
+        assert_eq!(d.kind, IssueKind::Agentic);
+    }
+
+    #[test]
+    fn dialog_kind_h_l_move_and_clamp() {
+        let mut d = opencode_dialog();
+        d.focused_field = 0; // Kind field
+        d.push_char('l');
+        assert_eq!(d.kind, IssueKind::Orchestrator);
+        d.push_char('l');
+        assert_eq!(d.kind, IssueKind::NonAgentic);
+        d.push_char('l');
+        assert_eq!(d.kind, IssueKind::NonAgentic);
+        d.push_char('h');
+        assert_eq!(d.kind, IssueKind::Orchestrator);
+        d.push_char('h');
+        assert_eq!(d.kind, IssueKind::Agentic);
+        d.push_char('h');
+        assert_eq!(d.kind, IssueKind::Agentic);
+    }
+
+    #[test]
+    fn dialog_orchestrator_hides_github_pr_field_keeps_agent() {
+        let mut d = DialogState::new(
+            crate::types::AgentKind::OpenCode,
+            crate::types::AgentKind::ALL.to_vec(),
+            true,
+            true,
+        );
+        d.kind = IssueKind::Orchestrator;
+        assert_eq!(
+            d.ordered_fields(),
+            vec![
+                DialogField::Kind,
+                DialogField::Linear,
+                DialogField::Agent,
+                DialogField::Mode,
+                DialogField::Title,
+                DialogField::Prompt,
+            ]
+        );
+    }
+
+    #[test]
+    fn dialog_from_orchestrator_issue_focuses_title() {
+        let mut issue = test_issue("bork-1", Column::Todo);
+        issue.kind = IssueKind::Orchestrator;
+        let d = DialogState::from_issue(
+            &issue,
+            0,
+            crate::types::AgentKind::ALL.to_vec(),
+            true,
+            true,
+            &std::collections::HashMap::new(),
+            &[],
+        );
+        assert_eq!(d.ordered_fields()[d.focused_field], DialogField::Title);
     }
 
     #[test]
@@ -4620,6 +4707,7 @@ mod tests {
             agent_kind: AgentKind::OpenCode,
             default_prompt: None,
             review_prompt: None,
+            orchestrator_prompt: None,
             done_session_ttl: DEFAULT_DONE_SESSION_TTL,
             debug: false,
             agents_allowlist: None,
