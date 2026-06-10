@@ -247,6 +247,8 @@ Start here (for AI agents):
                                   pick the worktree's base; defaults to main)
   bork worktree <id> <slug>      Create the git worktree for an issue
                                  (--base <branch> to pick its base branch)
+  bork issue archive <id>        Kill session + teardown + remove worktree
+                                 (--force to discard uncommitted changes)
 
   Agentic issues each run one coding agent. Pick which and how with:
     --agent   opencode (default), claude, codex     # must be on your PATH
@@ -354,6 +356,12 @@ enum Command {
         command: IntegrationCommand,
     },
 
+    /// Get or set project configuration
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+
     /// Update bork to the latest version (git pull + cargo build)
     Update {
         /// Only check whether a new version is available; don't pull or build.
@@ -379,6 +387,31 @@ enum ProjectCommand {
     Remove {
         /// Path to project container
         path: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCommand {
+    /// Show all resolved config values (global + project merged)
+    List,
+
+    /// Print the resolved value of a single key
+    Get {
+        /// Config key (e.g. auto_import_reviews)
+        key: String,
+    },
+
+    /// Set a config key in the project (or global with --global)
+    Set {
+        /// Config key (e.g. auto_import_reviews)
+        key: String,
+
+        /// Value to set (e.g. true, false, "text")
+        value: String,
+
+        /// Write to the global config (~/.config/bork/config.toml)
+        #[arg(long)]
+        global: bool,
     },
 }
 
@@ -483,6 +516,16 @@ enum IssueCommand {
         /// Change issue kind (agentic, todo, orchestrator)
         #[arg(long, value_parser = parse_issue_kind)]
         kind: Option<IssueKind>,
+    },
+
+    /// Archive an issue: kill its session, run teardown, remove its worktree
+    Archive {
+        /// Issue ID (e.g. bork-1)
+        id: String,
+
+        /// Proceed past a failing teardown script and discard uncommitted changes
+        #[arg(long)]
+        force: bool,
     },
 
     /// Delete an issue
@@ -622,6 +665,7 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Project { command }) => run_project_command(command),
         Some(Command::Issue { command }) => run_issue_command(command),
         Some(Command::Integration { command }) => run_integration_command(command),
+        Some(Command::Config { command }) => run_config_command(command),
         Some(Command::Update { check }) => {
             if check {
                 update::run_check_command()
@@ -679,6 +723,113 @@ fn run_project_command(command: ProjectCommand) -> anyhow::Result<()> {
             } else {
                 println!("No project registered at {}", target.display());
             }
+            Ok(())
+        }
+    }
+}
+
+/// Settable scalar config keys and their value kinds, used by `bork config`
+/// for validation and display. Dotted `[agent.*]` keys are intentionally
+/// excluded; edit those by hand.
+#[derive(Clone, Copy)]
+enum ConfigKeyKind {
+    Bool,
+    U64,
+    Str,
+    Agent,
+}
+
+const CONFIG_KEYS: &[(&str, ConfigKeyKind)] = &[
+    ("auto_import_reviews", ConfigKeyKind::Bool),
+    ("auto_import_authored_prs", ConfigKeyKind::Bool),
+    ("debug", ConfigKeyKind::Bool),
+    ("done_session_ttl", ConfigKeyKind::U64),
+    ("agent_kind", ConfigKeyKind::Agent),
+    ("default_prompt", ConfigKeyKind::Str),
+    ("review_prompt", ConfigKeyKind::Str),
+    ("orchestrator_prompt", ConfigKeyKind::Str),
+];
+
+fn config_key_kind(key: &str) -> Option<ConfigKeyKind> {
+    CONFIG_KEYS
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, kind)| *kind)
+}
+
+/// Validate `value` against `kind` and return the TOML literal to write.
+fn toml_literal_for(kind: ConfigKeyKind, value: &str) -> anyhow::Result<String> {
+    match kind {
+        ConfigKeyKind::Bool => match value {
+            "true" | "false" => Ok(value.to_string()),
+            _ => anyhow::bail!("expected 'true' or 'false', got '{}'", value),
+        },
+        ConfigKeyKind::U64 => {
+            value
+                .parse::<u64>()
+                .map_err(|_| anyhow::anyhow!("expected a non-negative integer, got '{}'", value))?;
+            Ok(value.to_string())
+        }
+        ConfigKeyKind::Agent => match AgentKind::parse(value) {
+            Some(_) => Ok(format!("\"{}\"", value)),
+            None => anyhow::bail!("unknown agent '{}'", value),
+        },
+        ConfigKeyKind::Str => {
+            let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+            Ok(format!("\"{}\"", escaped))
+        }
+    }
+}
+
+/// Resolve the value of a config key from a materialized `AppConfig`.
+fn resolved_config_value(config: &config::AppConfig, key: &str) -> Option<String> {
+    match key {
+        "auto_import_reviews" => Some(config.auto_import_reviews.to_string()),
+        "auto_import_authored_prs" => Some(config.auto_import_authored_prs.to_string()),
+        "debug" => Some(config.debug.to_string()),
+        "done_session_ttl" => Some(config.done_session_ttl.to_string()),
+        "agent_kind" => Some(config.agent_kind.to_string()),
+        "default_prompt" => Some(config.default_prompt.clone().unwrap_or_default()),
+        "review_prompt" => Some(config.review_prompt.clone().unwrap_or_default()),
+        "orchestrator_prompt" => Some(config.orchestrator_prompt.clone().unwrap_or_default()),
+        _ => None,
+    }
+}
+
+fn run_config_command(command: ConfigCommand) -> anyhow::Result<()> {
+    let project_root = config::find_project_root();
+    let config = config::load_config_from(&project_root);
+
+    match command {
+        ConfigCommand::List => {
+            for (key, _) in CONFIG_KEYS {
+                let value = resolved_config_value(&config, key).unwrap_or_default();
+                println!("{} = {}", key, value);
+            }
+            Ok(())
+        }
+        ConfigCommand::Get { key } => {
+            let Some(value) = resolved_config_value(&config, &key) else {
+                anyhow::bail!("unknown config key '{}'", key);
+            };
+            println!("{}", value);
+            Ok(())
+        }
+        ConfigCommand::Set { key, value, global } => {
+            let Some(kind) = config_key_kind(&key) else {
+                anyhow::bail!(
+                    "unknown config key '{}'. Settable keys: {}",
+                    key,
+                    CONFIG_KEYS
+                        .iter()
+                        .map(|(k, _)| *k)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            };
+            let literal = toml_literal_for(kind, &value)?;
+            let path = config::set_config_value(&project_root, global, &key, &literal)?;
+            println!("Set {} = {} in {}", key, literal, path.display());
             Ok(())
         }
     }
@@ -768,6 +919,17 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
                 },
             )?;
             println!("Updated {}: \"{}\"", issue.id, issue.title);
+            Ok(())
+        }
+        IssueCommand::Archive { id, force } => {
+            let report = ops::archive_issue(&project_root, &id, force)?;
+            println!("Archived {}: \"{}\"", report.issue_id, report.title);
+            if let Some(worktree_dir) = report.worktree_removed {
+                println!("Removed worktree: {}/", worktree_dir);
+            }
+            if report.session_killed {
+                println!("Killed session: {}", report.session_name);
+            }
             Ok(())
         }
         IssueCommand::Delete { id } => {
@@ -1668,6 +1830,12 @@ fn run_tui() -> anyhow::Result<()> {
                     let new_state = config::load_state(&project.config.project_root);
                     project.merge_external_state(new_state);
                     project.last_state_mtime = current_mtime;
+                    needs_redraw = true;
+                }
+
+                let current_config_mtime = config::config_mtime(&project.config.project_root);
+                if current_config_mtime != project.last_config_mtime {
+                    project.reload_config();
                     needs_redraw = true;
                 }
             }

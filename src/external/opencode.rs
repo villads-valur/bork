@@ -54,6 +54,14 @@ pub fn launch_session(
         write_prompt_file(&prompt_path, contents)?;
     }
 
+    // Fresh sessions with a worktree run the configured setup script inside
+    // the worktree first; `&&` ensures the agent only starts if it succeeds
+    // and its output stays visible in the agent window.
+    let agent_cmd = match setup_prefix(issue, config) {
+        Some(prefix) => format!("{} && {}", prefix, agent_cmd),
+        None => agent_cmd,
+    };
+
     tmux::send_keys(&session_name, &agent_cmd)?;
 
     // Second window: bare terminal for ad-hoc commands
@@ -71,6 +79,24 @@ pub fn launch_session(
     };
 
     Ok((session_name, agent_session_id))
+}
+
+/// Build the setup-script prefix for a launch command, if applicable.
+/// Only fresh sessions (no session_id to resume) for issues with an assigned
+/// worktree run the setup script. The script itself is user-authored shell
+/// and is inserted verbatim; the worktree dir is escaped. The tmux session's
+/// cwd is the project root, so the relative worktree dir resolves correctly.
+fn setup_prefix(issue: &Issue, config: &AppConfig) -> Option<String> {
+    if issue.session_id.is_some() {
+        return None;
+    }
+    let worktree = issue.worktree.as_deref()?;
+    let script = config.setup_script.as_deref()?;
+    Some(format!(
+        "(cd '{}' && {})",
+        shell_escape_single_quotes(worktree),
+        script
+    ))
 }
 
 /// Path for an issue's staged prompt file, scoped to its session name so
@@ -1085,8 +1111,12 @@ mod tests {
             default_prompt: Some("The source code is in main/.".to_string()),
             review_prompt: None,
             orchestrator_prompt: None,
+            setup_script: None,
+            teardown_script: None,
             done_session_ttl: 300,
             debug: false,
+            auto_import_reviews: true,
+            auto_import_authored_prs: true,
             agents_allowlist: None,
             agent_launch: std::collections::HashMap::new(),
         }
@@ -1412,6 +1442,58 @@ mod tests {
         );
         assert_eq!(parse_pi_session_id_from_filename("not-a-session.txt"), None);
         assert_eq!(parse_pi_session_id_from_filename("123_short.jsonl"), None);
+    }
+
+    // --- setup_prefix ---
+
+    #[test]
+    fn setup_prefix_for_fresh_session_with_worktree() {
+        let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        issue.worktree = Some("bork-1-fix-bug".to_string());
+        let mut config = test_config();
+        config.setup_script = Some("npm install".to_string());
+        assert_eq!(
+            setup_prefix(&issue, &config),
+            Some("(cd 'bork-1-fix-bug' && npm install)".to_string())
+        );
+    }
+
+    #[test]
+    fn setup_prefix_skipped_on_resume() {
+        let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        issue.worktree = Some("bork-1-fix-bug".to_string());
+        issue.session_id = Some("ses_abc123".to_string());
+        let mut config = test_config();
+        config.setup_script = Some("npm install".to_string());
+        assert_eq!(setup_prefix(&issue, &config), None);
+    }
+
+    #[test]
+    fn setup_prefix_skipped_without_worktree() {
+        let issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        let mut config = test_config();
+        config.setup_script = Some("npm install".to_string());
+        assert_eq!(setup_prefix(&issue, &config), None);
+    }
+
+    #[test]
+    fn setup_prefix_skipped_without_config() {
+        let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        issue.worktree = Some("bork-1-fix-bug".to_string());
+        let config = test_config();
+        assert_eq!(setup_prefix(&issue, &config), None);
+    }
+
+    #[test]
+    fn setup_prefix_escapes_worktree_dir() {
+        let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        issue.worktree = Some("it's-a-dir".to_string());
+        let mut config = test_config();
+        config.setup_script = Some("bin/setup".to_string());
+        assert_eq!(
+            setup_prefix(&issue, &config),
+            Some("(cd 'it'\\''s-a-dir' && bin/setup)".to_string())
+        );
     }
 
     #[test]

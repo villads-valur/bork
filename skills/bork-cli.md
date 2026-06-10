@@ -47,7 +47,7 @@ bork issue start "Add API route" --project my-api --prompt "Implement this in my
 bork issue start "Investigate flaky test" --no-worktree --prompt "Find the root cause"
 ```
 
-This creates an agentic issue, creates a git worktree by default, moves the issue to In Progress, and starts the configured agent in a tmux session.
+This creates an agentic issue, creates a git worktree by default, moves the issue to In Progress, and starts the configured agent in a tmux session. If the project configures a `setup_script`, it runs inside the worktree before the agent starts.
 
 Options:
 - `--prompt`: agent prompt text
@@ -86,6 +86,17 @@ bork issue move bork-1 todo
 
 Moving to `done` sets a completion timestamp. Moving away from `done` clears it.
 
+### Archive an issue
+
+Use this to clean up when an issue's work is merged. It kills the agent's tmux session, runs the project's `teardown_script` (if configured) inside the worktree, removes the worktree, and moves the issue to Done.
+
+```bash
+bork issue archive bork-1
+bork issue archive bork-1 --force    # proceed past a failing teardown, discard uncommitted changes
+```
+
+Without `--force`, the archive aborts if the teardown script fails or the worktree has uncommitted changes.
+
 ### Delete an issue
 
 ```bash
@@ -116,7 +127,7 @@ This sets the PR number on the issue so the TUI can display PR status (checks, r
 2. The new agent works in the created worktree
 3. Link a PR when ready: `bork integration attach-pr bork-1 123`
 4. Move to review: `bork issue move bork-1 code-review`
-5. Mark done: `bork issue move bork-1 done`
+5. When merged, clean up: `bork issue archive bork-1` (kills session, runs teardown, removes worktree, marks Done)
 
 ## Column values
 

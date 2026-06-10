@@ -89,16 +89,22 @@ git -C main worktree list
 
 ## Removing a worktree
 
-When work is done and merged:
+When work is done and merged, archive the issue. This kills its tmux session, runs the project's `teardown_script` (if configured) inside the worktree, removes the worktree, and moves the issue to Done:
+
+```bash
+bork issue archive {issue-id}
+```
+
+Or forcefully if there are uncommitted changes or the teardown script fails:
+
+```bash
+bork issue archive {issue-id} --force
+```
+
+To remove a worktree manually without touching the issue:
 
 ```bash
 git -C main worktree remove ../{worktree-dir}
-```
-
-Or forcefully if there are uncommitted changes:
-
-```bash
-git -C main worktree remove --force ../{worktree-dir}
 ```
 
 ## Managing issues from CLI

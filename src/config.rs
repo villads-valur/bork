@@ -17,8 +17,19 @@ pub struct AppConfig {
     pub default_prompt: Option<String>,
     pub review_prompt: Option<String>,
     pub orchestrator_prompt: Option<String>,
+    /// Shell command run inside a fresh issue worktree before the agent
+    /// starts (e.g. dependency install). Prepended to the agent launch
+    /// command with `&&`, so the agent only starts if setup succeeds.
+    pub setup_script: Option<String>,
+    /// Shell command run inside a worktree right before it is removed by
+    /// `bork issue archive` (e.g. stopping services, dropping databases).
+    pub teardown_script: Option<String>,
     pub done_session_ttl: u64,
     pub debug: bool,
+    /// Auto-create issues from PRs the user has been requested to review.
+    pub auto_import_reviews: bool,
+    /// Auto-create issues from PRs the user has authored.
+    pub auto_import_authored_prs: bool,
     /// Allowed agents for this project, if explicitly configured.
     /// `None` means "no restriction; use whatever is installed".
     pub agents_allowlist: Option<Vec<AgentKind>>,
@@ -91,8 +102,12 @@ impl Default for AppConfig {
             default_prompt: None,
             review_prompt: None,
             orchestrator_prompt: None,
+            setup_script: None,
+            teardown_script: None,
             done_session_ttl: DEFAULT_DONE_SESSION_TTL,
             debug: false,
+            auto_import_reviews: true,
+            auto_import_authored_prs: true,
             agents_allowlist: None,
             agent_launch: HashMap::new(),
         }
@@ -164,8 +179,12 @@ pub struct PartialConfig {
     pub default_prompt: Option<String>,
     pub review_prompt: Option<String>,
     pub orchestrator_prompt: Option<String>,
+    pub setup_script: Option<String>,
+    pub teardown_script: Option<String>,
     pub done_session_ttl: Option<u64>,
     pub debug: Option<bool>,
+    pub auto_import_reviews: Option<bool>,
+    pub auto_import_authored_prs: Option<bool>,
     pub agents_allowlist: Option<Vec<AgentKind>>,
     /// Per-agent launch overrides parsed from `[agent.<name>]` sections.
     pub agent_launch: HashMap<AgentKind, PartialAgentLaunch>,
@@ -217,8 +236,14 @@ impl PartialConfig {
             default_prompt: other.default_prompt.or(self.default_prompt),
             review_prompt: other.review_prompt.or(self.review_prompt),
             orchestrator_prompt: other.orchestrator_prompt.or(self.orchestrator_prompt),
+            setup_script: other.setup_script.or(self.setup_script),
+            teardown_script: other.teardown_script.or(self.teardown_script),
             done_session_ttl: other.done_session_ttl.or(self.done_session_ttl),
             debug: other.debug.or(self.debug),
+            auto_import_reviews: other.auto_import_reviews.or(self.auto_import_reviews),
+            auto_import_authored_prs: other
+                .auto_import_authored_prs
+                .or(self.auto_import_authored_prs),
             agents_allowlist: other.agents_allowlist.or(self.agents_allowlist),
             agent_launch,
         }
@@ -259,8 +284,12 @@ fn materialize(merged: PartialConfig, project_root: &Path) -> AppConfig {
         default_prompt: merged.default_prompt,
         review_prompt: merged.review_prompt,
         orchestrator_prompt: merged.orchestrator_prompt,
+        setup_script: merged.setup_script,
+        teardown_script: merged.teardown_script,
         done_session_ttl: merged.done_session_ttl.unwrap_or(DEFAULT_DONE_SESSION_TTL),
         debug: merged.debug.unwrap_or(false),
+        auto_import_reviews: merged.auto_import_reviews.unwrap_or(true),
+        auto_import_authored_prs: merged.auto_import_authored_prs.unwrap_or(true),
         agents_allowlist: merged.agents_allowlist,
         agent_launch,
     }
@@ -324,8 +353,22 @@ fn partial_from_table(table: &Table) -> PartialConfig {
         .and_then(|v| v.as_str())
         .map(str::to_string);
 
+    let setup_script = table
+        .get("setup_script")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    let teardown_script = table
+        .get("teardown_script")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
     let done_session_ttl = table.get("done_session_ttl").and_then(|v| v.as_u64());
     let debug = table.get("debug").and_then(|v| v.as_bool());
+    let auto_import_reviews = table.get("auto_import_reviews").and_then(|v| v.as_bool());
+    let auto_import_authored_prs = table
+        .get("auto_import_authored_prs")
+        .and_then(|v| v.as_bool());
 
     let agents_allowlist = table.get("agents").and_then(|v| v.as_list()).map(|items| {
         items
@@ -342,8 +385,12 @@ fn partial_from_table(table: &Table) -> PartialConfig {
         default_prompt,
         review_prompt,
         orchestrator_prompt,
+        setup_script,
+        teardown_script,
         done_session_ttl,
         debug,
+        auto_import_reviews,
+        auto_import_authored_prs,
         agents_allowlist,
         agent_launch,
     }
@@ -415,6 +462,91 @@ pub fn save_state(state: &AppState, project_root: &Path) -> anyhow::Result<()> {
     fs::rename(&tmp_path, &path)?;
 
     Ok(())
+}
+
+/// Modification time of a project's `.bork/config.toml`, if it exists.
+/// Used by the TUI to pick up `bork config set` edits without a restart.
+pub fn config_mtime(project_root: &Path) -> Option<SystemTime> {
+    fs::metadata(config_path(project_root))
+        .ok()?
+        .modified()
+        .ok()
+}
+
+/// Set a single top-level scalar `key = value` in a config file, in place.
+///
+/// If the key already exists at the top level it is replaced; otherwise it is
+/// inserted before the first `[section]` header (or appended if there is none).
+/// Comments and unknown lines are preserved. `global` selects the global config
+/// file (`~/.config/bork/config.toml`) instead of the project file.
+pub fn set_config_value(
+    project_root: &Path,
+    global: bool,
+    key: &str,
+    value: &str,
+) -> anyhow::Result<PathBuf> {
+    let path = if global {
+        global_config_path()
+    } else {
+        config_path(project_root)
+    };
+
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    let new_line = format!("{} = {}", key, value);
+    let updated = upsert_toml_line(&existing, key, &new_line);
+
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
+    fs::write(&tmp_path, updated)?;
+    fs::rename(&tmp_path, &path)?;
+
+    Ok(path)
+}
+
+/// Replace an existing top-level `key = ...` line with `new_line`, or insert it
+/// before the first section header. Only top-level (pre-first-section) keys are
+/// matched so we never accidentally edit a key inside a `[section]`.
+fn upsert_toml_line(contents: &str, key: &str, new_line: &str) -> String {
+    let mut lines: Vec<String> = contents.lines().map(str::to_string).collect();
+    let mut insert_at = lines.len();
+    let mut found = false;
+
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('[') {
+            // Top-level keys can only appear before the first section.
+            insert_at = i;
+            break;
+        }
+        if line_key(trimmed) == Some(key) {
+            found = true;
+            insert_at = i;
+            break;
+        }
+    }
+
+    if found {
+        lines[insert_at] = new_line.to_string();
+    } else {
+        lines.insert(insert_at, new_line.to_string());
+    }
+
+    let mut out = lines.join("\n");
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Extract the bare key from a `key = value` line, ignoring comments and blanks.
+fn line_key(trimmed: &str) -> Option<&str> {
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+    let (k, _) = trimmed.split_once('=')?;
+    Some(k.trim())
 }
 
 #[cfg(test)]
@@ -523,6 +655,43 @@ review_prompt = "Review the thing"
     }
 
     #[test]
+    fn parse_partial_setup_and_teardown_scripts() {
+        let p = parse_partial(
+            r#"
+setup_script = "npm install && cp .env.example .env"
+teardown_script = "docker compose down"
+"#,
+        );
+        assert_eq!(
+            p.setup_script.as_deref(),
+            Some("npm install && cp .env.example .env")
+        );
+        assert_eq!(p.teardown_script.as_deref(), Some("docker compose down"));
+    }
+
+    #[test]
+    fn merge_project_setup_script_overrides_global() {
+        let cfg = merge_to_app(
+            r#"setup_script = "global-setup""#,
+            r#"setup_script = "project-setup""#,
+        );
+        assert_eq!(cfg.setup_script.as_deref(), Some("project-setup"));
+    }
+
+    #[test]
+    fn merge_global_setup_script_used_when_project_unset() {
+        let cfg = merge_to_app(r#"setup_script = "global-setup""#, "");
+        assert_eq!(cfg.setup_script.as_deref(), Some("global-setup"));
+    }
+
+    #[test]
+    fn merge_empty_layers_leave_scripts_unset() {
+        let cfg = merge_to_app("", "");
+        assert!(cfg.setup_script.is_none());
+        assert!(cfg.teardown_script.is_none());
+    }
+
+    #[test]
     fn parse_partial_default_agent_alias() {
         let p = parse_partial(r#"default_agent = "claude""#);
         assert_eq!(p.agent_kind, Some(AgentKind::Claude));
@@ -541,6 +710,8 @@ review_prompt = "Review the thing"
         assert!(p.agent_kind.is_none());
         assert!(p.default_prompt.is_none());
         assert!(p.review_prompt.is_none());
+        assert!(p.setup_script.is_none());
+        assert!(p.teardown_script.is_none());
         assert!(p.done_session_ttl.is_none());
         assert!(p.debug.is_none());
         assert!(p.agents_allowlist.is_none());
@@ -576,6 +747,95 @@ agent_kind = "opencode"
     fn parse_partial_debug_quoted_true() {
         let p = parse_partial(r#"debug = "true""#);
         assert_eq!(p.debug, Some(true));
+    }
+
+    #[test]
+    fn parse_partial_auto_import_flags() {
+        let p = parse_partial(
+            r#"
+auto_import_reviews = false
+auto_import_authored_prs = true
+"#,
+        );
+        assert_eq!(p.auto_import_reviews, Some(false));
+        assert_eq!(p.auto_import_authored_prs, Some(true));
+    }
+
+    #[test]
+    fn auto_import_flags_default_to_true() {
+        let cfg = merge_to_app("", "");
+        assert!(cfg.auto_import_reviews);
+        assert!(cfg.auto_import_authored_prs);
+    }
+
+    #[test]
+    fn auto_import_reviews_project_overrides_global() {
+        let cfg = merge_to_app(
+            r#"auto_import_reviews = true"#,
+            r#"auto_import_reviews = false"#,
+        );
+        assert!(!cfg.auto_import_reviews);
+        // The unset flag still defaults on.
+        assert!(cfg.auto_import_authored_prs);
+    }
+
+    #[test]
+    fn upsert_replaces_existing_top_level_key() {
+        let out = upsert_toml_line(
+            "project_name = \"bork\"\nauto_import_reviews = true\n",
+            "auto_import_reviews",
+            "auto_import_reviews = false",
+        );
+        assert_eq!(
+            out,
+            "project_name = \"bork\"\nauto_import_reviews = false\n"
+        );
+    }
+
+    #[test]
+    fn upsert_inserts_before_first_section() {
+        let out = upsert_toml_line(
+            "project_name = \"bork\"\n\n[agent.claude]\nargs = [\"--foo\"]\n",
+            "auto_import_reviews",
+            "auto_import_reviews = false",
+        );
+        assert_eq!(
+            out,
+            "project_name = \"bork\"\n\nauto_import_reviews = false\n[agent.claude]\nargs = [\"--foo\"]\n"
+        );
+    }
+
+    #[test]
+    fn upsert_appends_when_key_absent_and_no_section() {
+        let out = upsert_toml_line("project_name = \"bork\"\n", "debug", "debug = true");
+        assert_eq!(out, "project_name = \"bork\"\ndebug = true\n");
+    }
+
+    #[test]
+    fn upsert_does_not_touch_same_key_inside_section() {
+        // A key named like ours but nested in a section must not be matched.
+        let out = upsert_toml_line(
+            "project_name = \"bork\"\n[agent.claude]\ndebug = false\n",
+            "debug",
+            "debug = true",
+        );
+        assert_eq!(
+            out,
+            "project_name = \"bork\"\ndebug = true\n[agent.claude]\ndebug = false\n"
+        );
+    }
+
+    #[test]
+    fn upsert_preserves_comments() {
+        let out = upsert_toml_line(
+            "# top comment\nproject_name = \"bork\"\n",
+            "auto_import_reviews",
+            "auto_import_reviews = false",
+        );
+        assert_eq!(
+            out,
+            "# top comment\nproject_name = \"bork\"\nauto_import_reviews = false\n"
+        );
     }
 
     #[test]
