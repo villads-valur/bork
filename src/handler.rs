@@ -1065,16 +1065,20 @@ fn handle_sidebar(app: &mut App, action: Action) -> PostAction {
         }
         Action::SidebarDown => {
             if let Some(ref mut sidebar) = app.sidebar {
-                if sidebar.selected + 1 < app.projects.len() {
-                    sidebar.selected += 1;
+                if !app.projects.is_empty() {
+                    sidebar.selected = (sidebar.selected + 1) % app.projects.len();
                 }
             }
             PostAction::None
         }
         Action::SidebarUp => {
             if let Some(ref mut sidebar) = app.sidebar {
-                if sidebar.selected > 0 {
-                    sidebar.selected -= 1;
+                if !app.projects.is_empty() {
+                    if sidebar.selected == 0 {
+                        sidebar.selected = app.projects.len() - 1;
+                    } else {
+                        sidebar.selected -= 1;
+                    }
                 }
             }
             PostAction::None
@@ -2319,12 +2323,15 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_navigation_bounds() {
+    fn sidebar_navigation_wraps_around() {
         let mut app = test_multi_app();
         app.sidebar.as_mut().unwrap().focused = true;
         app.input_mode = InputMode::Sidebar;
 
         handle_sidebar(&mut app, Action::SidebarUp);
+        assert_eq!(app.sidebar.as_ref().unwrap().selected, 2);
+
+        handle_sidebar(&mut app, Action::SidebarDown);
         assert_eq!(app.sidebar.as_ref().unwrap().selected, 0);
 
         handle_sidebar(&mut app, Action::SidebarDown);
@@ -2334,7 +2341,7 @@ mod tests {
         assert_eq!(app.sidebar.as_ref().unwrap().selected, 2);
 
         handle_sidebar(&mut app, Action::SidebarDown);
-        assert_eq!(app.sidebar.as_ref().unwrap().selected, 2);
+        assert_eq!(app.sidebar.as_ref().unwrap().selected, 0);
     }
 
     #[test]
