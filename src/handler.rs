@@ -323,7 +323,7 @@ fn handle_normal(
             };
             let issue = app.context_project(ctx).issues[idx].clone();
 
-            if issue.kind == IssueKind::NonAgentic {
+            if !issue.kind.is_agentic() {
                 app.open_edit_dialog(&issue, idx, ctx);
                 return PostAction::None;
             }
@@ -724,18 +724,35 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
             return;
         };
         if idx < p.issues.len() {
+            let session_name = p.issues[idx].session_name(&p.config.project_name);
+            let detached_worktree = p.issues[idx].worktree.clone();
+
             p.issues[idx].title = title;
             p.issues[idx].prompt = prompt;
             p.issues[idx].agent_kind = dialog.agent_kind;
             p.issues[idx].agent_mode = dialog.agent_mode;
-            p.issues[idx].kind = dialog.kind;
+            let crossed_orchestrator_boundary = p.issues[idx].set_kind(dialog.kind);
 
             apply_linear_fields(&mut p.issues[idx], &dialog);
             apply_pr_fields(&mut p.issues[idx], &dialog);
 
             let updated_id = p.issues[idx].id.clone();
             p.mark_dirty();
-            app.set_message(format!("Updated {}", updated_id));
+
+            if crossed_orchestrator_boundary {
+                // A live session would otherwise be re-attached with the old
+                // kind's prompt and cwd.
+                let _ = tmux::kill_session(&session_name);
+                match detached_worktree.filter(|_| dialog.kind == IssueKind::Orchestrator) {
+                    Some(wt) => app.set_message(format!(
+                        "Updated {} (session reset; worktree {} detached, remove it manually)",
+                        updated_id, wt
+                    )),
+                    None => app.set_message(format!("Updated {} (session reset)", updated_id)),
+                }
+            } else {
+                app.set_message(format!("Updated {}", updated_id));
+            }
         }
         return;
     }
@@ -790,7 +807,8 @@ fn apply_linear_fields(issue: &mut Issue, dialog: &crate::app::DialogState) {
 }
 
 fn apply_pr_fields(issue: &mut Issue, dialog: &crate::app::DialogState) {
-    if dialog.github_pr_cleared {
+    // Orchestrators have no PR field; drop any links left from a kind change.
+    if dialog.kind == IssueKind::Orchestrator || dialog.github_pr_cleared {
         issue.github_pr_links.clear();
     } else if !dialog.github_prs.is_empty() {
         issue.github_pr_links = dialog
@@ -1060,16 +1078,20 @@ fn handle_sidebar(app: &mut App, action: Action) -> PostAction {
         }
         Action::SidebarDown => {
             if let Some(ref mut sidebar) = app.sidebar {
-                if sidebar.selected + 1 < app.projects.len() {
-                    sidebar.selected += 1;
+                if !app.projects.is_empty() {
+                    sidebar.selected = (sidebar.selected + 1) % app.projects.len();
                 }
             }
             PostAction::None
         }
         Action::SidebarUp => {
             if let Some(ref mut sidebar) = app.sidebar {
-                if sidebar.selected > 0 {
-                    sidebar.selected -= 1;
+                if !app.projects.is_empty() {
+                    if sidebar.selected == 0 {
+                        sidebar.selected = app.projects.len() - 1;
+                    } else {
+                        sidebar.selected -= 1;
+                    }
                 }
             }
             PostAction::None
@@ -1258,8 +1280,13 @@ mod tests {
             agent_kind: crate::types::AgentKind::OpenCode,
             default_prompt: Some("Check AGENTS.md for context.".to_string()),
             review_prompt: None,
+            orchestrator_prompt: None,
+            setup_script: None,
+            teardown_script: None,
             done_session_ttl: DEFAULT_DONE_SESSION_TTL,
             debug: false,
+            auto_import_reviews: true,
+            auto_import_authored_prs: true,
             agents_allowlist: None,
             agent_launch: std::collections::HashMap::new(),
         }
@@ -2107,8 +2134,13 @@ mod tests {
             agent_kind: crate::types::AgentKind::OpenCode,
             default_prompt: None,
             review_prompt: None,
+            orchestrator_prompt: None,
+            setup_script: None,
+            teardown_script: None,
             done_session_ttl: DEFAULT_DONE_SESSION_TTL,
             debug: false,
+            auto_import_reviews: true,
+            auto_import_authored_prs: true,
             agents_allowlist: None,
             agent_launch: std::collections::HashMap::new(),
         }
@@ -2173,12 +2205,15 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_navigation_bounds() {
+    fn sidebar_navigation_wraps_around() {
         let mut app = test_multi_app();
         app.sidebar.as_mut().unwrap().focused = true;
         app.input_mode = InputMode::Sidebar;
 
         handle_sidebar(&mut app, Action::SidebarUp);
+        assert_eq!(app.sidebar.as_ref().unwrap().selected, 2);
+
+        handle_sidebar(&mut app, Action::SidebarDown);
         assert_eq!(app.sidebar.as_ref().unwrap().selected, 0);
 
         handle_sidebar(&mut app, Action::SidebarDown);
@@ -2188,7 +2223,7 @@ mod tests {
         assert_eq!(app.sidebar.as_ref().unwrap().selected, 2);
 
         handle_sidebar(&mut app, Action::SidebarDown);
-        assert_eq!(app.sidebar.as_ref().unwrap().selected, 2);
+        assert_eq!(app.sidebar.as_ref().unwrap().selected, 0);
     }
 
     #[test]

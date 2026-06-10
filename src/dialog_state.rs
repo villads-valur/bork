@@ -229,10 +229,11 @@ impl DialogState {
         if self.linear_available {
             fields.push(DialogField::Linear);
         }
-        if self.github_available {
+        // Orchestrators coordinate other issues and have no PR of their own.
+        if self.github_available && self.kind != IssueKind::Orchestrator {
             fields.push(DialogField::GithubPr);
         }
-        if self.kind == IssueKind::Agentic {
+        if self.kind.is_agentic() {
             fields.push(DialogField::Agent);
             if !self.available_agents.is_empty() && self.agent_kind.has_modes() {
                 fields.push(DialogField::Mode);
@@ -258,10 +259,10 @@ impl DialogState {
         if linear_available {
             idx += 1;
         }
-        if github_available {
+        if github_available && kind != IssueKind::Orchestrator {
             idx += 1;
         }
-        if kind == IssueKind::Agentic {
+        if kind.is_agentic() {
             idx += 1;
             // Mirror `ordered_fields`: the Mode field only exists for agents
             // with modes (Pi is single-mode and hides it).
@@ -302,18 +303,19 @@ impl DialogState {
     pub fn push_char(&mut self, c: char) {
         match self.current_field() {
             DialogField::Kind => {
+                const KIND_ORDER: [IssueKind; 3] = [
+                    IssueKind::Agentic,
+                    IssueKind::Orchestrator,
+                    IssueKind::NonAgentic,
+                ];
+                let idx = KIND_ORDER.iter().position(|k| *k == self.kind).unwrap_or(0);
                 match c {
-                    ' ' => {
-                        self.kind = match self.kind {
-                            IssueKind::Agentic => IssueKind::NonAgentic,
-                            IssueKind::NonAgentic => IssueKind::Agentic,
-                        };
-                    }
-                    'h' => self.kind = IssueKind::Agentic,
-                    'l' => self.kind = IssueKind::NonAgentic,
+                    ' ' => self.kind = KIND_ORDER[(idx + 1) % KIND_ORDER.len()],
+                    'h' => self.kind = KIND_ORDER[idx.saturating_sub(1)],
+                    'l' => self.kind = KIND_ORDER[(idx + 1).min(KIND_ORDER.len() - 1)],
                     _ => {}
                 }
-                if self.kind == IssueKind::Agentic {
+                if self.kind.is_agentic() {
                     self.agent_kind =
                         Self::resolve_agent_kind(self.agent_kind, &self.available_agents);
                     self.agent_mode =

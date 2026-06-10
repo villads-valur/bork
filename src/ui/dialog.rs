@@ -12,7 +12,8 @@ use crate::types::{AgentKind, AgentMode, IssueKind, PrStatus};
 use crate::ui::styles;
 
 const DIALOG_HEIGHT: u16 = 34;
-const DIALOG_MIN_WIDTH: u16 = 44;
+// Wide enough for the Kind row's three radio options plus the field label.
+const DIALOG_MIN_WIDTH: u16 = 54;
 const DIALOG_MAX_WIDTH: u16 = 80;
 const PROMPT_VISIBLE_LINES: usize = 12;
 
@@ -23,7 +24,9 @@ pub fn render_dialog(frame: &mut Frame, app: &App) {
     };
 
     let area = frame.area();
-    let width = (area.width * 60 / 100).clamp(DIALOG_MIN_WIDTH, DIALOG_MAX_WIDTH);
+    let width = (area.width * 60 / 100)
+        .clamp(DIALOG_MIN_WIDTH, DIALOG_MAX_WIDTH)
+        .min(area.width);
     let height = DIALOG_HEIGHT.min(area.height);
     let x = area.width.saturating_sub(width) / 2;
     let y = area.height.saturating_sub(height) / 2;
@@ -81,7 +84,7 @@ pub fn render_dialog(frame: &mut Frame, app: &App) {
         next_row += 2;
     }
 
-    if dialog.github_available {
+    if dialog.github_available && dialog.kind != IssueKind::Orchestrator {
         let github_area = Rect::new(inner.x + 1, inner.y + next_row, inner.width - 2, 1);
         render_github_pr_field(
             frame,
@@ -93,7 +96,7 @@ pub fn render_dialog(frame: &mut Frame, app: &App) {
         next_row += 2;
     }
 
-    if dialog.kind == IssueKind::Agentic {
+    if dialog.kind.is_agentic() {
         if !dialog.available_agents.is_empty() {
             let agent_area = Rect::new(inner.x + 1, inner.y + next_row, inner.width - 2, 1);
             render_agent_field(
@@ -391,34 +394,32 @@ fn render_kind_field(
     let unselected_style = styles::dim_style();
     let indicator = |selected: bool| if selected { "\u{25cf}" } else { "\u{25cb}" };
 
-    let is_agentic = kind == IssueKind::Agentic;
-    let is_todo = kind == IssueKind::NonAgentic;
+    let options = [
+        (IssueKind::Agentic, "Agentic"),
+        (IssueKind::Orchestrator, "Orchestrator"),
+        (IssueKind::NonAgentic, "Todo"),
+    ];
 
-    let line = Line::from(vec![
-        Span::styled(
-            format!("{:<width$}", "Kind:", width = label_width),
-            label_style,
-        ),
-        Span::styled(
-            format!("[{} Agentic]", indicator(is_agentic)),
-            if is_agentic {
+    let mut spans = vec![Span::styled(
+        format!("{:<width$}", "Kind:", width = label_width),
+        label_style,
+    )];
+    for (i, (option, label)) in options.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        let selected = kind == *option;
+        spans.push(Span::styled(
+            format!("[{} {}]", indicator(selected), label),
+            if selected {
                 selected_style
             } else {
                 unselected_style
             },
-        ),
-        Span::raw("  "),
-        Span::styled(
-            format!("[{} Todo]", indicator(is_todo)),
-            if is_todo {
-                selected_style
-            } else {
-                unselected_style
-            },
-        ),
-    ]);
+        ));
+    }
 
-    frame.render_widget(Paragraph::new(line), area);
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_agent_field(

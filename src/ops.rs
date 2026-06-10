@@ -3,8 +3,10 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{self, AppState};
+use crate::external::tmux;
 use crate::types::{AgentKind, AgentMode, Column, Issue, IssueKind};
 use crate::ui::styles::truncate;
+use crate::worktree;
 
 pub fn next_issue_id(issues: &[Issue], project_name: &str) -> String {
     next_issue_id_after(issues, project_name, 0)
@@ -155,6 +157,7 @@ pub struct UpdateOptions {
     pub agent_kind: Option<AgentKind>,
     pub agent_mode: Option<AgentMode>,
     pub prompt: Option<String>,
+    pub kind: Option<IssueKind>,
 }
 
 pub fn update_issue(
@@ -194,6 +197,14 @@ pub fn update_issue(
             issue.prompt = None;
         } else {
             issue.prompt = Some(prompt);
+        }
+    }
+    if let Some(kind) = opts.kind {
+        if issue.set_kind(kind) {
+            // Kill any live session so it isn't re-attached with the old
+            // kind's prompt and cwd. Best effort; the session may not exist.
+            let config = config::load_config_from(project_root);
+            let _ = tmux::kill_session(&issue.session_name(&config.project_name));
         }
     }
 
@@ -296,6 +307,13 @@ pub fn attach_pr(project_root: &Path, issue_id: &str, pr_number: u32) -> anyhow:
 
     let issue = &mut state.issues[idx];
 
+    if issue.kind == IssueKind::Orchestrator {
+        anyhow::bail!(
+            "Cannot attach a PR to '{}': orchestrator issues have no PR links",
+            issue.id
+        );
+    }
+
     if !issue.has_pr_number(pr_number) {
         issue.github_pr_links.push(crate::types::LinkedGithubPr {
             number: pr_number,
@@ -320,8 +338,69 @@ pub fn move_issue(project_root: &Path, issue_id: &str, column: Column) -> anyhow
             agent_kind: None,
             agent_mode: None,
             prompt: None,
+            kind: None,
         },
     )
+}
+
+pub struct ArchiveReport {
+    pub issue_id: String,
+    pub title: String,
+    pub session_name: String,
+    pub session_killed: bool,
+    pub worktree_removed: Option<String>,
+}
+
+/// Archive an issue: kill its agent session, run the teardown script, remove
+/// its worktree, and move it to Done.
+///
+/// `force` lets the archive proceed past a failing teardown script and
+/// discards uncommitted changes in the worktree.
+pub fn archive_issue(
+    project_root: &Path,
+    issue_id: &str,
+    force: bool,
+) -> anyhow::Result<ArchiveReport> {
+    let app_config = config::load_config_from(project_root);
+    let state = config::load_state(project_root);
+
+    let idx = find_issue_index(&state.issues, issue_id)
+        .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", issue_id))?;
+    let issue = state.issues[idx].clone();
+
+    let session_name = issue.session_name(&app_config.project_name);
+    let session_killed = tmux::session_exists(&session_name);
+    if session_killed {
+        let _ = tmux::kill_session(&session_name);
+    }
+
+    let worktree_removed = match issue.worktree.as_deref() {
+        Some(dir) => {
+            worktree::remove_worktree_in(&app_config, dir, force)?;
+            Some(dir.to_string())
+        }
+        None => None,
+    };
+
+    // Reload state so we don't clobber concurrent updates made while the
+    // teardown script and git removal were running.
+    let mut state = config::load_state(project_root);
+    if let Some(saved) = state.issues.iter_mut().find(|i| i.id == issue.id) {
+        saved.worktree = None;
+        if saved.column != Column::Done {
+            saved.column = Column::Done;
+            saved.done_at = Some(now_epoch());
+        }
+    }
+    config::save_state(&state, project_root)?;
+
+    Ok(ArchiveReport {
+        issue_id: issue.id,
+        title: issue.title,
+        session_name,
+        session_killed,
+        worktree_removed,
+    })
 }
 
 /// Load state and return a JSON snapshot of all issues (for machine consumption).
@@ -491,6 +570,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                kind: None,
             },
         )
         .unwrap();
@@ -526,6 +606,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                kind: None,
             },
         )
         .unwrap();
@@ -560,11 +641,89 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                kind: None,
             },
         )
         .unwrap();
 
         assert!(updated.done_at.is_none());
+    }
+
+    #[test]
+    fn update_kind_to_orchestrator_clears_stale_state() {
+        let dir = setup_project();
+        let root = dir.path();
+
+        create_issue(
+            root,
+            CreateOptions {
+                title: "Convert me".into(),
+                column: None,
+                agent_kind: None,
+                agent_mode: None,
+                prompt: None,
+                kind: None,
+            },
+        )
+        .unwrap();
+
+        // Simulate an issue that already ran: worktree, session, and a PR link.
+        let mut state = config::load_state(root);
+        state.issues[0].worktree = Some("test-1-convert-me".into());
+        state.issues[0].session_id = Some("ses_abc".into());
+        state.issues[0]
+            .github_pr_links
+            .push(crate::types::LinkedGithubPr {
+                number: 42,
+                imported: false,
+                import_source: None,
+            });
+        config::save_state(&state, root).unwrap();
+
+        let updated = update_issue(
+            root,
+            "test-1",
+            UpdateOptions {
+                title: None,
+                column: None,
+                agent_kind: None,
+                agent_mode: None,
+                prompt: None,
+                kind: Some(IssueKind::Orchestrator),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(updated.kind, IssueKind::Orchestrator);
+        assert!(updated.worktree.is_none());
+        assert!(updated.session_id.is_none());
+        assert!(updated.github_pr_links.is_empty());
+    }
+
+    #[test]
+    fn attach_pr_rejects_orchestrator_issue() {
+        let dir = setup_project();
+        let root = dir.path();
+
+        create_issue(
+            root,
+            CreateOptions {
+                title: "Coordinate".into(),
+                column: None,
+                agent_kind: None,
+                agent_mode: None,
+                prompt: None,
+                kind: Some(IssueKind::Orchestrator),
+            },
+        )
+        .unwrap();
+
+        let result = attach_pr(root, "test-1", 42);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("orchestrator"));
+
+        let state = config::load_state(root);
+        assert!(state.issues[0].github_pr_links.is_empty());
     }
 
     #[test]
@@ -784,6 +943,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                kind: None,
             },
         );
         assert!(result.is_err());
@@ -808,6 +968,90 @@ mod tests {
         .unwrap();
 
         assert!(show_issue(root, "TEST-1", false).is_ok());
+    }
+
+    #[test]
+    fn archive_without_worktree_moves_to_done() {
+        let dir = setup_project();
+        let root = dir.path();
+
+        create_issue(
+            root,
+            CreateOptions {
+                title: "Archive me".into(),
+                column: Some(Column::InProgress),
+                agent_kind: None,
+                agent_mode: None,
+                prompt: None,
+                kind: None,
+            },
+        )
+        .unwrap();
+
+        let report = archive_issue(root, "test-1", false).unwrap();
+        assert_eq!(report.issue_id, "test-1");
+        assert_eq!(report.title, "Archive me");
+        assert!(report.worktree_removed.is_none());
+
+        let state = config::load_state(root);
+        let issue = state.issues.iter().find(|i| i.id == "test-1").unwrap();
+        assert_eq!(issue.column, Column::Done);
+        assert!(issue.done_at.is_some());
+        assert!(issue.worktree.is_none());
+    }
+
+    #[test]
+    fn archive_orchestrator_issue_moves_to_done() {
+        let dir = setup_project();
+        let root = dir.path();
+
+        create_issue(
+            root,
+            CreateOptions {
+                title: "Coordinate".into(),
+                column: Some(Column::InProgress),
+                agent_kind: None,
+                agent_mode: None,
+                prompt: None,
+                kind: Some(IssueKind::Orchestrator),
+            },
+        )
+        .unwrap();
+
+        let report = archive_issue(root, "test-1", false).unwrap();
+        assert!(report.worktree_removed.is_none());
+
+        let state = config::load_state(root);
+        let issue = state.issues.iter().find(|i| i.id == "test-1").unwrap();
+        assert_eq!(issue.column, Column::Done);
+        assert_eq!(issue.kind, IssueKind::Orchestrator);
+    }
+
+    #[test]
+    fn archive_nonexistent_fails() {
+        let dir = setup_project();
+        assert!(archive_issue(dir.path(), "nope-99", false).is_err());
+    }
+
+    #[test]
+    fn archive_is_case_insensitive() {
+        let dir = setup_project();
+        let root = dir.path();
+
+        create_issue(
+            root,
+            CreateOptions {
+                title: "Case test".into(),
+                column: None,
+                agent_kind: None,
+                agent_mode: None,
+                prompt: None,
+                kind: None,
+            },
+        )
+        .unwrap();
+
+        assert!(archive_issue(root, "TEST-1", false).is_ok());
     }
 
     #[test]

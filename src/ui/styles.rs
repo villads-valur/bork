@@ -38,6 +38,20 @@ pub fn card_border_style(selected: bool) -> Style {
     }
 }
 
+/// Orchestrator cards get a magenta border so they stand out on the board.
+/// Selection still wins, keeping the cursor visible.
+pub fn orchestrator_card_border_style(selected: bool) -> Style {
+    if selected {
+        Style::default().fg(ACCENT)
+    } else {
+        Style::default().fg(Color::Magenta)
+    }
+}
+
+pub fn orchestrator_badge_style() -> Style {
+    Style::default().fg(Color::Magenta)
+}
+
 pub fn card_title_style(selected: bool) -> Style {
     if selected {
         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)

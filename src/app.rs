@@ -10,8 +10,8 @@ const BUSY_MIN_VISIBLE: Duration = Duration::from_millis(250);
 use crate::config::{AppConfig, AppState, DEFAULT_REVIEW_PROMPT};
 use crate::external::linear::LinearIssue;
 use crate::types::{
-    AgentKind, AgentStatus, AgentStatusInfo, Column, Issue, LinkedGithubPr, PrImportSource,
-    PrState, PrStatus, WorktreeStatus,
+    AgentKind, AgentStatus, AgentStatusInfo, Column, Issue, IssueKind, LinkedGithubPr,
+    PrImportSource, PrState, PrStatus, WorktreeStatus,
 };
 
 pub type ProjectId = PathBuf;
@@ -76,6 +76,7 @@ pub struct Project {
     pub state_dirty: bool,
     pub base_issues: Vec<Issue>,
     pub last_state_mtime: Option<SystemTime>,
+    pub last_config_mtime: Option<SystemTime>,
 }
 
 impl Project {
@@ -91,6 +92,7 @@ impl Project {
         let last_state_mtime = crate::config::state_mtime(&config.project_root);
         let id = std::fs::canonicalize(&config.project_root)
             .unwrap_or_else(|_| config.project_root.clone());
+        let last_config_mtime = crate::config::config_mtime(&config.project_root);
         Project {
             id,
             issues,
@@ -104,7 +106,16 @@ impl Project {
             state_dirty: false,
             base_issues,
             last_state_mtime,
+            last_config_mtime,
         }
+    }
+
+    /// Re-read the layered config from disk, replacing `self.config`. Used to
+    /// pick up `bork config set` edits without a TUI restart. Leaves
+    /// `available_agents` (resolved at startup) untouched.
+    pub fn reload_config(&mut self) {
+        self.config = crate::config::load_config_from(&self.config.project_root);
+        self.last_config_mtime = crate::config::config_mtime(&self.config.project_root);
     }
 
     pub fn id(&self) -> ProjectId {
@@ -493,7 +504,9 @@ impl Project {
 
     pub fn auto_assign_worktrees(&mut self) -> bool {
         let assignments: Vec<(usize, String)> = (0..self.issues.len())
-            .filter(|&i| self.issues[i].worktree.is_none())
+            .filter(|&i| {
+                self.issues[i].worktree.is_none() && self.issues[i].kind != IssueKind::Orchestrator
+            })
             .filter_map(|i| self.detect_worktree(&self.issues[i]).map(|wt| (i, wt)))
             .collect();
 
@@ -705,7 +718,12 @@ impl Project {
         let mut new_pr_numbers: HashSet<u32> = HashSet::new();
 
         // Import authored PRs
-        for pr in &self.live.user_prs {
+        let authored_prs: &[PrStatus] = if self.config.auto_import_authored_prs {
+            &self.live.user_prs
+        } else {
+            &[]
+        };
+        for pr in authored_prs {
             if !should_import(
                 pr,
                 &claimed_branches,
@@ -721,7 +739,12 @@ impl Project {
         }
 
         // Import review-requested PRs
-        for pr in &self.live.review_requested_prs {
+        let review_prs: &[PrStatus] = if self.config.auto_import_reviews {
+            &self.live.review_requested_prs
+        } else {
+            &[]
+        };
+        for pr in review_prs {
             if !should_import(
                 pr,
                 &claimed_branches,
@@ -1548,8 +1571,13 @@ mod tests {
             agent_kind: AgentKind::OpenCode,
             default_prompt: None,
             review_prompt: None,
+            orchestrator_prompt: None,
+            setup_script: None,
+            teardown_script: None,
             done_session_ttl: DEFAULT_DONE_SESSION_TTL,
             debug: false,
+            auto_import_reviews: true,
+            auto_import_authored_prs: true,
             agents_allowlist: None,
             agent_launch: std::collections::HashMap::new(),
         }
@@ -1852,6 +1880,20 @@ mod tests {
     }
 
     #[test]
+    fn test_auto_assign_skips_orchestrator_issues() {
+        let mut issue = test_issue("bork-8", Column::InProgress);
+        issue.kind = IssueKind::Orchestrator;
+        let mut app = test_app(vec![issue]);
+        app.project_mut()
+            .live
+            .worktree_branches
+            .insert("bork-8".into(), "bork-8/init-cli".into());
+        let changed = app.project_mut().auto_assign_worktrees();
+        assert!(!changed);
+        assert!(app.project().issues[0].worktree.is_none());
+    }
+
+    #[test]
     fn test_auto_assign_returns_false_when_no_match() {
         let mut app = test_app(vec![test_issue("bork-99", Column::InProgress)]);
         app.project_mut()
@@ -2109,6 +2151,63 @@ mod tests {
         assert_eq!(app.project().issues[0].title, "PR #1");
         assert_eq!(app.project().issues[0].column, Column::CodeReview);
         assert!(app.project().issues[0].has_pr_number(1));
+    }
+
+    #[test]
+    fn sync_prs_skips_authored_when_disabled() {
+        let mut app = test_app(vec![]);
+        app.project_mut().config.auto_import_authored_prs = false;
+        app.project_mut().live.user_prs = vec![test_pr(1, "feature/new")];
+        app.project_mut().live.pr_poll_done = true;
+
+        assert!(!app.project_mut().sync_prs_as_issues().0);
+        assert!(app.project().issues.is_empty());
+    }
+
+    #[test]
+    fn sync_prs_skips_reviews_when_disabled() {
+        let mut app = test_app(vec![]);
+        app.project_mut().config.auto_import_reviews = false;
+        app.project_mut().live.review_requested_prs = vec![test_pr(7, "someones/branch")];
+        app.project_mut().live.pr_poll_done = true;
+
+        assert!(!app.project_mut().sync_prs_as_issues().0);
+        assert!(app.project().issues.is_empty());
+    }
+
+    #[test]
+    fn sync_prs_imports_reviews_when_enabled() {
+        let mut app = test_app(vec![]);
+        app.project_mut().live.review_requested_prs = vec![test_pr(7, "someones/branch")];
+        app.project_mut().live.pr_poll_done = true;
+
+        assert!(app.project_mut().sync_prs_as_issues().0);
+        assert_eq!(app.project().issues.len(), 1);
+        assert_eq!(
+            app.project().issues[0].primary_pr_import_source(),
+            Some(PrImportSource::ReviewRequested)
+        );
+    }
+
+    #[test]
+    fn sync_prs_disabled_reviews_still_complete_existing() {
+        // Throwaway-repo case: auto-import off, but a previously imported
+        // review issue should still move to Done once the review clears.
+        let mut existing = test_issue("bork-1", Column::CodeReview);
+        existing.github_pr_links = vec![LinkedGithubPr {
+            number: 7,
+            imported: true,
+            import_source: Some(PrImportSource::ReviewRequested),
+        }];
+        let mut app = test_app(vec![existing]);
+        app.project_mut().config.auto_import_reviews = false;
+        // PR #7 no longer in the live review set.
+        app.project_mut().live.review_requested_prs = vec![];
+        app.project_mut().live.pr_poll_done = true;
+
+        let (changed, _) = app.project_mut().sync_prs_as_issues();
+        assert!(changed);
+        assert_eq!(app.project().issues[0].column, Column::Done);
     }
 
     #[test]
@@ -2443,6 +2542,74 @@ mod tests {
         assert_eq!(d.kind, IssueKind::Agentic);
         // Agentic, no linear: Kind(0), Agent(1), Mode(2), Title(3)
         assert_eq!(d.focused_field, 3);
+    }
+
+    #[test]
+    fn dialog_kind_space_cycles_three_kinds() {
+        let mut d = opencode_dialog();
+        d.focused_field = 0; // Kind field
+        d.push_char(' ');
+        assert_eq!(d.kind, IssueKind::Orchestrator);
+        d.push_char(' ');
+        assert_eq!(d.kind, IssueKind::NonAgentic);
+        d.push_char(' ');
+        assert_eq!(d.kind, IssueKind::Agentic);
+    }
+
+    #[test]
+    fn dialog_kind_h_l_move_and_clamp() {
+        let mut d = opencode_dialog();
+        d.focused_field = 0; // Kind field
+        d.push_char('l');
+        assert_eq!(d.kind, IssueKind::Orchestrator);
+        d.push_char('l');
+        assert_eq!(d.kind, IssueKind::NonAgentic);
+        d.push_char('l');
+        assert_eq!(d.kind, IssueKind::NonAgentic);
+        d.push_char('h');
+        assert_eq!(d.kind, IssueKind::Orchestrator);
+        d.push_char('h');
+        assert_eq!(d.kind, IssueKind::Agentic);
+        d.push_char('h');
+        assert_eq!(d.kind, IssueKind::Agentic);
+    }
+
+    #[test]
+    fn dialog_orchestrator_hides_github_pr_field_keeps_agent() {
+        let mut d = DialogState::new(
+            crate::types::AgentKind::OpenCode,
+            crate::types::AgentKind::ALL.to_vec(),
+            true,
+            true,
+        );
+        d.kind = IssueKind::Orchestrator;
+        assert_eq!(
+            d.ordered_fields(),
+            vec![
+                DialogField::Kind,
+                DialogField::Linear,
+                DialogField::Agent,
+                DialogField::Mode,
+                DialogField::Title,
+                DialogField::Prompt,
+            ]
+        );
+    }
+
+    #[test]
+    fn dialog_from_orchestrator_issue_focuses_title() {
+        let mut issue = test_issue("bork-1", Column::Todo);
+        issue.kind = IssueKind::Orchestrator;
+        let d = DialogState::from_issue(
+            &issue,
+            0,
+            crate::types::AgentKind::ALL.to_vec(),
+            true,
+            true,
+            &std::collections::HashMap::new(),
+            &[],
+        );
+        assert_eq!(d.ordered_fields()[d.focused_field], DialogField::Title);
     }
 
     #[test]
@@ -4106,8 +4273,13 @@ mod tests {
             agent_kind: AgentKind::OpenCode,
             default_prompt: None,
             review_prompt: None,
+            orchestrator_prompt: None,
+            setup_script: None,
+            teardown_script: None,
             done_session_ttl: DEFAULT_DONE_SESSION_TTL,
             debug: false,
+            auto_import_reviews: true,
+            auto_import_authored_prs: true,
             agents_allowlist: None,
             agent_launch: std::collections::HashMap::new(),
         }

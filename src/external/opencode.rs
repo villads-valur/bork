@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::config::{self, AppConfig};
 use crate::error::AppError;
 use crate::external::{github, tmux};
-use crate::types::{AgentKind, AgentMode, Issue, LinkedGithubPr, LinkedLinear};
+use crate::types::{AgentKind, AgentMode, Issue, IssueKind, LinkedGithubPr, LinkedLinear};
 
 /// Launch an agent session for an issue.
 /// Creates a tmux session with two windows:
@@ -54,6 +54,14 @@ pub fn launch_session(
         write_prompt_file(&prompt_path, contents)?;
     }
 
+    // Fresh sessions with a worktree run the configured setup script inside
+    // the worktree first; `&&` ensures the agent only starts if it succeeds
+    // and its output stays visible in the agent window.
+    let agent_cmd = match setup_prefix(issue, config) {
+        Some(prefix) => format!("{} && {}", prefix, agent_cmd),
+        None => agent_cmd,
+    };
+
     tmux::send_keys(&session_name, &agent_cmd)?;
 
     // Second window: bare terminal for ad-hoc commands
@@ -71,6 +79,24 @@ pub fn launch_session(
     };
 
     Ok((session_name, agent_session_id))
+}
+
+/// Build the setup-script prefix for a launch command, if applicable.
+/// Only fresh sessions (no session_id to resume) for issues with an assigned
+/// worktree run the setup script. The script itself is user-authored shell
+/// and is inserted verbatim; the worktree dir is escaped. The tmux session's
+/// cwd is the project root, so the relative worktree dir resolves correctly.
+fn setup_prefix(issue: &Issue, config: &AppConfig) -> Option<String> {
+    if issue.session_id.is_some() {
+        return None;
+    }
+    let worktree = issue.worktree.as_deref()?;
+    let script = config.setup_script.as_deref()?;
+    Some(format!(
+        "(cd '{}' && {})",
+        shell_escape_single_quotes(worktree),
+        script
+    ))
 }
 
 /// Path for an issue's staged prompt file, scoped to its session name so
@@ -110,10 +136,17 @@ fn build_agent_cmd(
     // since resume paths skip the prompt entirely. Returned verbatim (no shell
     // escaping) because it's staged to a file and read back via `"$(cat ...)"`.
     let build_prompt_contents = || {
-        let default_prompt = config
-            .default_prompt
-            .as_deref()
-            .unwrap_or(config::DEFAULT_PROMPT_FALLBACK);
+        let default_prompt = if issue.kind == IssueKind::Orchestrator {
+            config
+                .orchestrator_prompt
+                .as_deref()
+                .unwrap_or(config::DEFAULT_ORCHESTRATOR_PROMPT)
+        } else {
+            config
+                .default_prompt
+                .as_deref()
+                .unwrap_or(config::DEFAULT_PROMPT_FALLBACK)
+        };
         let main_worktree = config.project_root.join("main");
         let mut prompt = build_prompt(
             &issue.id,
@@ -130,6 +163,12 @@ fn build_agent_cmd(
             prompt.push_str("\n\nAssigned worktree: ");
             prompt.push_str(worktree);
             prompt.push_str(". Do all work for this issue inside that directory.");
+        }
+        if issue.kind == IssueKind::Orchestrator {
+            prompt.push_str(&format!(
+                "\n\nMaintain your plan in plans/{}/planning.md, relative to the project root (the directory containing main/).",
+                issue.id
+            ));
         }
         prompt
     };
@@ -1059,8 +1098,13 @@ mod tests {
             agent_kind: AgentKind::OpenCode,
             default_prompt: Some("The source code is in main/.".to_string()),
             review_prompt: None,
+            orchestrator_prompt: None,
+            setup_script: None,
+            teardown_script: None,
             done_session_ttl: 300,
             debug: false,
+            auto_import_reviews: true,
+            auto_import_authored_prs: true,
             agents_allowlist: None,
             agent_launch: std::collections::HashMap::new(),
         }
@@ -1121,6 +1165,43 @@ mod tests {
         let prompt = prompt.unwrap();
         assert!(prompt.contains("Assigned worktree: bork-1-fix-bug"));
         assert!(prompt.contains("inside that directory"));
+    }
+
+    #[test]
+    fn orchestrator_prompt_uses_orchestrator_template() {
+        let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        issue.kind = crate::types::IssueKind::Orchestrator;
+        let config = test_config();
+        let (_, _, prompt) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let prompt = prompt.unwrap();
+        assert!(prompt.contains("orchestrator agent"));
+        assert!(prompt.contains("bork issue start"));
+        assert!(prompt.contains("plans/bork-1/planning.md"));
+        assert!(!prompt.contains("Assigned worktree"));
+        // The regular default prompt is not used for orchestrators.
+        assert!(!prompt.contains("The source code is in main/."));
+    }
+
+    #[test]
+    fn orchestrator_prompt_respects_config_override() {
+        let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        issue.kind = crate::types::IssueKind::Orchestrator;
+        let mut config = test_config();
+        config.orchestrator_prompt = Some("Custom orchestration rules".to_string());
+        let (_, _, prompt) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let prompt = prompt.unwrap();
+        assert!(prompt.contains("Custom orchestration rules"));
+        assert!(prompt.contains("plans/bork-1/planning.md"));
+    }
+
+    #[test]
+    fn agentic_prompt_does_not_use_orchestrator_template() {
+        let issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        let config = test_config();
+        let (_, _, prompt) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let prompt = prompt.unwrap();
+        assert!(prompt.contains("The source code is in main/."));
+        assert!(!prompt.contains("planning.md"));
     }
 
     #[test]
@@ -1349,6 +1430,73 @@ mod tests {
         );
         assert_eq!(parse_pi_session_id_from_filename("not-a-session.txt"), None);
         assert_eq!(parse_pi_session_id_from_filename("123_short.jsonl"), None);
+    }
+
+    // --- setup_prefix ---
+
+    #[test]
+    fn setup_prefix_for_fresh_session_with_worktree() {
+        let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        issue.worktree = Some("bork-1-fix-bug".to_string());
+        let mut config = test_config();
+        config.setup_script = Some("npm install".to_string());
+        assert_eq!(
+            setup_prefix(&issue, &config),
+            Some("(cd 'bork-1-fix-bug' && npm install)".to_string())
+        );
+    }
+
+    #[test]
+    fn setup_prefix_skipped_on_resume() {
+        let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        issue.worktree = Some("bork-1-fix-bug".to_string());
+        issue.session_id = Some("ses_abc123".to_string());
+        let mut config = test_config();
+        config.setup_script = Some("npm install".to_string());
+        assert_eq!(setup_prefix(&issue, &config), None);
+    }
+
+    #[test]
+    fn setup_prefix_skipped_without_worktree() {
+        let issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        let mut config = test_config();
+        config.setup_script = Some("npm install".to_string());
+        assert_eq!(setup_prefix(&issue, &config), None);
+    }
+
+    #[test]
+    fn setup_prefix_skipped_for_orchestrator() {
+        // Orchestrators never have a worktree (set_kind clears it,
+        // auto_assign and `bork worktree` skip them), so setup_script
+        // must not run for their launches.
+        let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        issue.kind = crate::types::IssueKind::Orchestrator;
+        issue.worktree = None;
+        let mut config = test_config();
+        config.setup_script = Some("npm install".to_string());
+        assert_eq!(setup_prefix(&issue, &config), None);
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(!cmd.contains("npm install"));
+    }
+
+    #[test]
+    fn setup_prefix_skipped_without_config() {
+        let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        issue.worktree = Some("bork-1-fix-bug".to_string());
+        let config = test_config();
+        assert_eq!(setup_prefix(&issue, &config), None);
+    }
+
+    #[test]
+    fn setup_prefix_escapes_worktree_dir() {
+        let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        issue.worktree = Some("it's-a-dir".to_string());
+        let mut config = test_config();
+        config.setup_script = Some("bin/setup".to_string());
+        assert_eq!(
+            setup_prefix(&issue, &config),
+            Some("(cd 'it'\\''s-a-dir' && bin/setup)".to_string())
+        );
     }
 
     #[test]
