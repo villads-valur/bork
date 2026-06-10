@@ -134,6 +134,9 @@ bork --help
 | `bork issue delete <id>` | Delete an issue |
 | `bork integration attach-linear <id> <identifier>` | Link a Linear ticket to an issue (can attach multiple) |
 | `bork integration attach-pr <id> <number>` | Link a GitHub PR to an issue (can attach multiple) |
+| `bork config list` | Show all resolved config values |
+| `bork config get <key>` | Print a resolved config value |
+| `bork config set <key> <value>` | Set a config value (`--global` for the global file) |
 | `bork update` | Pull latest from `main` and rebuild |
 | `bork update --check` | Check whether a new version is available without pulling |
 
@@ -313,11 +316,26 @@ default_prompt   = "Check AGENTS.md for project context and start working on the
 review_prompt    = "Read the diff and summarize findings."  # body for auto-imported review-requested PRs (bork prepends the PR number + link)
 setup_script     = "npm install"                     # run inside a fresh worktree before its agent starts
 teardown_script  = "docker compose down"             # run inside a worktree before `bork issue archive` removes it
+auto_import_reviews      = true                      # auto-create issues from PRs you're asked to review
+auto_import_authored_prs = true                      # auto-create issues from PRs you authored
 done_session_ttl = 300                               # seconds a Done tmux session lingers
 debug            = false                             # enable debug-only keybindings
 ```
 
+Set `auto_import_reviews = false` (or `auto_import_authored_prs = false`) on a throwaway clone of a repo where you don't want to be pestered by PRs. Existing imported issues keep their lifecycle (completed reviews still move to Done); only new auto-imports stop. Manual import from the PR picker still works.
+
 Resolution order (highest wins): built-in defaults → `~/.config/bork/config.toml` → `<project>/.bork/config.toml` → CLI flags.
+
+You can also read and write these keys from the CLI without editing files by hand:
+
+```bash
+bork config list                              # show all resolved values
+bork config get auto_import_reviews           # print a single resolved value
+bork config set auto_import_reviews false     # write to <project>/.bork/config.toml
+bork config set default_agent claude --global # write to ~/.config/bork/config.toml
+```
+
+A running TUI picks up project config changes within ~2 seconds.
 
 ### Worktree Setup & Teardown Scripts
 

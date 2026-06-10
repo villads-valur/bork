@@ -77,6 +77,7 @@ pub struct Project {
     pub state_dirty: bool,
     pub base_issues: Vec<Issue>,
     pub last_state_mtime: Option<SystemTime>,
+    pub last_config_mtime: Option<SystemTime>,
 }
 
 impl Project {
@@ -90,6 +91,7 @@ impl Project {
         }
         let base_issues = issues.clone();
         let last_state_mtime = crate::config::state_mtime(&config.project_root);
+        let last_config_mtime = crate::config::config_mtime(&config.project_root);
         Project {
             issues,
             config,
@@ -102,7 +104,16 @@ impl Project {
             state_dirty: false,
             base_issues,
             last_state_mtime,
+            last_config_mtime,
         }
+    }
+
+    /// Re-read the layered config from disk, replacing `self.config`. Used to
+    /// pick up `bork config set` edits without a TUI restart. Leaves
+    /// `available_agents` (resolved at startup) untouched.
+    pub fn reload_config(&mut self) {
+        self.config = crate::config::load_config_from(&self.config.project_root);
+        self.last_config_mtime = crate::config::config_mtime(&self.config.project_root);
     }
 
     pub fn id(&self) -> ProjectId {
@@ -695,7 +706,12 @@ impl Project {
         let mut new_pr_numbers: HashSet<u32> = HashSet::new();
 
         // Import authored PRs
-        for pr in &self.live.user_prs {
+        let authored_prs: &[PrStatus] = if self.config.auto_import_authored_prs {
+            &self.live.user_prs
+        } else {
+            &[]
+        };
+        for pr in authored_prs {
             if !should_import(
                 pr,
                 &claimed_branches,
@@ -735,7 +751,12 @@ impl Project {
         }
 
         // Import review-requested PRs
-        for pr in &self.live.review_requested_prs {
+        let review_prs: &[PrStatus] = if self.config.auto_import_reviews {
+            &self.live.review_requested_prs
+        } else {
+            &[]
+        };
+        for pr in review_prs {
             if !should_import(
                 pr,
                 &claimed_branches,
@@ -2045,6 +2066,8 @@ mod tests {
             teardown_script: None,
             done_session_ttl: DEFAULT_DONE_SESSION_TTL,
             debug: false,
+            auto_import_reviews: true,
+            auto_import_authored_prs: true,
             agents_allowlist: None,
             agent_launch: std::collections::HashMap::new(),
         }
@@ -2625,6 +2648,63 @@ mod tests {
         assert_eq!(app.project().issues[0].title, "PR #1");
         assert_eq!(app.project().issues[0].column, Column::CodeReview);
         assert!(app.project().issues[0].has_pr_number(1));
+    }
+
+    #[test]
+    fn sync_prs_skips_authored_when_disabled() {
+        let mut app = test_app(vec![]);
+        app.project_mut().config.auto_import_authored_prs = false;
+        app.project_mut().live.user_prs = vec![test_pr(1, "feature/new")];
+        app.project_mut().live.pr_poll_done = true;
+
+        assert!(!app.project_mut().sync_prs_as_issues().0);
+        assert!(app.project().issues.is_empty());
+    }
+
+    #[test]
+    fn sync_prs_skips_reviews_when_disabled() {
+        let mut app = test_app(vec![]);
+        app.project_mut().config.auto_import_reviews = false;
+        app.project_mut().live.review_requested_prs = vec![test_pr(7, "someones/branch")];
+        app.project_mut().live.pr_poll_done = true;
+
+        assert!(!app.project_mut().sync_prs_as_issues().0);
+        assert!(app.project().issues.is_empty());
+    }
+
+    #[test]
+    fn sync_prs_imports_reviews_when_enabled() {
+        let mut app = test_app(vec![]);
+        app.project_mut().live.review_requested_prs = vec![test_pr(7, "someones/branch")];
+        app.project_mut().live.pr_poll_done = true;
+
+        assert!(app.project_mut().sync_prs_as_issues().0);
+        assert_eq!(app.project().issues.len(), 1);
+        assert_eq!(
+            app.project().issues[0].primary_pr_import_source(),
+            Some(PrImportSource::ReviewRequested)
+        );
+    }
+
+    #[test]
+    fn sync_prs_disabled_reviews_still_complete_existing() {
+        // Throwaway-repo case: auto-import off, but a previously imported
+        // review issue should still move to Done once the review clears.
+        let mut existing = test_issue("bork-1", Column::CodeReview);
+        existing.github_pr_links = vec![LinkedGithubPr {
+            number: 7,
+            imported: true,
+            import_source: Some(PrImportSource::ReviewRequested),
+        }];
+        let mut app = test_app(vec![existing]);
+        app.project_mut().config.auto_import_reviews = false;
+        // PR #7 no longer in the live review set.
+        app.project_mut().live.review_requested_prs = vec![];
+        app.project_mut().live.pr_poll_done = true;
+
+        let (changed, _) = app.project_mut().sync_prs_as_issues();
+        assert!(changed);
+        assert_eq!(app.project().issues[0].column, Column::Done);
     }
 
     #[test]
@@ -4626,6 +4706,8 @@ mod tests {
             teardown_script: None,
             done_session_ttl: DEFAULT_DONE_SESSION_TTL,
             debug: false,
+            auto_import_reviews: true,
+            auto_import_authored_prs: true,
             agents_allowlist: None,
             agent_launch: std::collections::HashMap::new(),
         }
