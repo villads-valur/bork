@@ -464,21 +464,15 @@ pub fn set_config_value(
 /// matched so we never accidentally edit a key inside a `[section]`.
 fn upsert_toml_line(contents: &str, key: &str, new_line: &str) -> String {
     let mut lines: Vec<String> = contents.lines().map(str::to_string).collect();
-    let mut in_section = false;
     let mut insert_at = lines.len();
     let mut found = false;
 
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim_start();
         if trimmed.starts_with('[') {
-            if !in_section {
-                insert_at = i;
-            }
-            in_section = true;
-            continue;
-        }
-        if in_section {
-            continue;
+            // Top-level keys can only appear before the first section.
+            insert_at = i;
+            break;
         }
         if line_key(trimmed) == Some(key) {
             found = true;

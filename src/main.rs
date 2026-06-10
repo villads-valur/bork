@@ -785,13 +785,10 @@ fn run_config_command(command: ConfigCommand) -> anyhow::Result<()> {
             Ok(())
         }
         ConfigCommand::Get { key } => {
-            if config_key_kind(&key).is_none() {
+            let Some(value) = resolved_config_value(&config, &key) else {
                 anyhow::bail!("unknown config key '{}'", key);
-            }
-            match resolved_config_value(&config, &key) {
-                Some(value) => println!("{}", value),
-                None => anyhow::bail!("unknown config key '{}'", key),
-            }
+            };
+            println!("{}", value);
             Ok(())
         }
         ConfigCommand::Set { key, value, global } => {

@@ -705,7 +705,7 @@ impl Project {
 
         let mut new_pr_numbers: HashSet<u32> = HashSet::new();
 
-        // Import authored PRs (skip when disabled for this project)
+        // Import authored PRs
         let authored_prs: &[PrStatus] = if self.config.auto_import_authored_prs {
             &self.live.user_prs
         } else {
@@ -750,7 +750,7 @@ impl Project {
             });
         }
 
-        // Import review-requested PRs (skip when disabled for this project)
+        // Import review-requested PRs
         let review_prs: &[PrStatus] = if self.config.auto_import_reviews {
             &self.live.review_requested_prs
         } else {
