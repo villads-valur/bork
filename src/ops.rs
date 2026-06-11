@@ -45,16 +45,53 @@ fn now_epoch() -> u64 {
 pub struct ListOptions {
     pub column: Option<Column>,
     pub json: bool,
+    /// When set, restrict output to the connected component of links that
+    /// contains this issue id (the anchor plus everything reachable via links).
+    pub linked: Option<String>,
+}
+
+/// Connected component of the link graph containing `anchor` (BFS over
+/// `linked_issues`). Returns lowercased ids, including the anchor itself.
+pub fn linked_component(issues: &[Issue], anchor: &str) -> std::collections::HashSet<String> {
+    use std::collections::HashSet;
+    let by_id: std::collections::HashMap<String, &Issue> =
+        issues.iter().map(|i| (i.id.to_lowercase(), i)).collect();
+    let mut seen = HashSet::new();
+    let mut queue = vec![anchor.to_lowercase()];
+    while let Some(id) = queue.pop() {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        if let Some(issue) = by_id.get(&id) {
+            for linked in &issue.linked_issues {
+                let next = linked.to_lowercase();
+                if !seen.contains(&next) {
+                    queue.push(next);
+                }
+            }
+        }
+    }
+    seen
 }
 
 pub fn list_issues(project_root: &Path, opts: &ListOptions) -> anyhow::Result<String> {
     let state = config::load_state(project_root);
     let config = config::load_config_from(project_root);
 
+    let component = opts
+        .linked
+        .as_deref()
+        .map(|anchor| linked_component(&state.issues, anchor));
+
     let issues: Vec<&Issue> = state
         .issues
         .iter()
         .filter(|i| opts.column.is_none() || Some(i.column) == opts.column)
+        .filter(|i| {
+            component
+                .as_ref()
+                .is_none_or(|c| c.contains(&i.id.to_lowercase()))
+        })
         .collect();
 
     if opts.json {
@@ -221,9 +258,71 @@ pub fn delete_issue(project_root: &Path, issue_id: &str) -> anyhow::Result<Issue
         .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", issue_id))?;
 
     let removed = state.issues.remove(idx);
+    remove_link_references(&mut state.issues, &removed.id);
     config::save_state(&state, project_root)?;
 
     Ok(removed)
+}
+
+/// Drop `removed_id` from every issue's `linked_issues`, keeping links symmetric
+/// after an issue is deleted or archived.
+pub fn remove_link_references(issues: &mut [Issue], removed_id: &str) {
+    for issue in issues.iter_mut() {
+        issue
+            .linked_issues
+            .retain(|l| !l.eq_ignore_ascii_case(removed_id));
+    }
+}
+
+/// Tie two issues together. Links are symmetric: each issue records the other's
+/// id. Both issues must exist in the same project; self-links are rejected.
+pub fn link_issues(project_root: &Path, a: &str, b: &str) -> anyhow::Result<(String, String)> {
+    let mut state = config::load_state(project_root);
+
+    let idx_a = find_issue_index(&state.issues, a)
+        .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", a))?;
+    let idx_b = find_issue_index(&state.issues, b)
+        .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", b))?;
+
+    if idx_a == idx_b {
+        anyhow::bail!("Cannot link an issue to itself");
+    }
+
+    let id_a = state.issues[idx_a].id.clone();
+    let id_b = state.issues[idx_b].id.clone();
+
+    if !state.issues[idx_a].is_linked_to(&id_b) {
+        state.issues[idx_a].linked_issues.push(id_b.clone());
+    }
+    if !state.issues[idx_b].is_linked_to(&id_a) {
+        state.issues[idx_b].linked_issues.push(id_a.clone());
+    }
+
+    config::save_state(&state, project_root)?;
+    Ok((id_a, id_b))
+}
+
+/// Remove a symmetric link between two issues.
+pub fn unlink_issues(project_root: &Path, a: &str, b: &str) -> anyhow::Result<(String, String)> {
+    let mut state = config::load_state(project_root);
+
+    let idx_a = find_issue_index(&state.issues, a)
+        .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", a))?;
+    let idx_b = find_issue_index(&state.issues, b)
+        .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", b))?;
+
+    let id_a = state.issues[idx_a].id.clone();
+    let id_b = state.issues[idx_b].id.clone();
+
+    state.issues[idx_a]
+        .linked_issues
+        .retain(|l| !l.eq_ignore_ascii_case(&id_b));
+    state.issues[idx_b]
+        .linked_issues
+        .retain(|l| !l.eq_ignore_ascii_case(&id_a));
+
+    config::save_state(&state, project_root)?;
+    Ok((id_a, id_b))
 }
 
 pub fn show_issue(project_root: &Path, issue_id: &str, json: bool) -> anyhow::Result<String> {
@@ -262,6 +361,9 @@ pub fn show_issue(project_root: &Path, issue_id: &str, json: bool) -> anyhow::Re
             .map(|n| format!("#{}", n))
             .collect();
         let _ = writeln!(out, "PR:       {}", nums.join(", "));
+    }
+    if !issue.linked_issues.is_empty() {
+        let _ = writeln!(out, "Linked:   {}", issue.linked_issues.join(", "));
     }
 
     Ok(out.trim_end().to_string())
@@ -323,6 +425,79 @@ pub fn attach_pr(project_root: &Path, issue_id: &str, pr_number: u32) -> anyhow:
     }
 
     let updated = issue.clone();
+    config::save_state(&state, project_root)?;
+
+    Ok(updated)
+}
+
+pub fn detach_linear(
+    project_root: &Path,
+    issue_id: &str,
+    linear_identifier: &str,
+) -> anyhow::Result<Issue> {
+    let mut state = config::load_state(project_root);
+
+    let idx = find_issue_index(&state.issues, issue_id)
+        .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", issue_id))?;
+
+    let identifier = linear_identifier.to_uppercase();
+    let issue = &mut state.issues[idx];
+
+    let before = issue.linear_links.len();
+    issue.linear_links.retain(|l| l.identifier != identifier);
+    if issue.linear_links.len() == before {
+        anyhow::bail!("Issue '{}' has no Linear link '{}'", issue.id, identifier);
+    }
+
+    let updated = issue.clone();
+    config::save_state(&state, project_root)?;
+
+    Ok(updated)
+}
+
+pub fn detach_pr(project_root: &Path, issue_id: &str, pr_number: u32) -> anyhow::Result<Issue> {
+    let mut state = config::load_state(project_root);
+
+    let idx = find_issue_index(&state.issues, issue_id)
+        .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", issue_id))?;
+
+    let issue = &mut state.issues[idx];
+
+    let before = issue.github_pr_links.len();
+    issue.github_pr_links.retain(|l| l.number != pr_number);
+    if issue.github_pr_links.len() == before {
+        anyhow::bail!("Issue '{}' has no PR link #{}", issue.id, pr_number);
+    }
+
+    let updated = issue.clone();
+    config::save_state(&state, project_root)?;
+
+    Ok(updated)
+}
+
+pub fn clear_linear(project_root: &Path, issue_id: &str) -> anyhow::Result<Issue> {
+    let mut state = config::load_state(project_root);
+
+    let idx = find_issue_index(&state.issues, issue_id)
+        .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", issue_id))?;
+
+    state.issues[idx].linear_links.clear();
+
+    let updated = state.issues[idx].clone();
+    config::save_state(&state, project_root)?;
+
+    Ok(updated)
+}
+
+pub fn clear_pr(project_root: &Path, issue_id: &str) -> anyhow::Result<Issue> {
+    let mut state = config::load_state(project_root);
+
+    let idx = find_issue_index(&state.issues, issue_id)
+        .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", issue_id))?;
+
+    state.issues[idx].github_pr_links.clear();
+
+    let updated = state.issues[idx].clone();
     config::save_state(&state, project_root)?;
 
     Ok(updated)
@@ -482,6 +657,7 @@ mod tests {
             &ListOptions {
                 column: None,
                 json: false,
+                linked: None,
             },
         )
         .unwrap();
@@ -516,6 +692,7 @@ mod tests {
             &ListOptions {
                 column: None,
                 json: false,
+                linked: None,
             },
         )
         .unwrap();
@@ -752,6 +929,7 @@ mod tests {
             &ListOptions {
                 column: None,
                 json: false,
+                linked: None,
             },
         )
         .unwrap();
@@ -847,6 +1025,7 @@ mod tests {
             &ListOptions {
                 column: Some(Column::Todo),
                 json: false,
+                linked: None,
             },
         )
         .unwrap();
@@ -877,6 +1056,7 @@ mod tests {
             &ListOptions {
                 column: None,
                 json: true,
+                linked: None,
             },
         )
         .unwrap();
@@ -1078,5 +1258,182 @@ mod tests {
 
     fn test_issue(id: &str, column: Column) -> Issue {
         Issue::new(id, format!("Test {}", id), column, AgentKind::OpenCode)
+    }
+
+    fn seed_issues(root: &Path, ids: &[&str]) {
+        let issues = ids.iter().map(|id| test_issue(id, Column::Todo)).collect();
+        config::save_state(&AppState { issues }, root).unwrap();
+    }
+
+    #[test]
+    fn link_is_symmetric() {
+        let dir = setup_project();
+        let root = dir.path();
+        seed_issues(root, &["test-1", "test-2"]);
+
+        link_issues(root, "test-1", "test-2").unwrap();
+
+        let state = config::load_state(root);
+        assert!(state.issues[0].is_linked_to("test-2"));
+        assert!(state.issues[1].is_linked_to("test-1"));
+    }
+
+    #[test]
+    fn link_is_idempotent_and_case_insensitive() {
+        let dir = setup_project();
+        let root = dir.path();
+        seed_issues(root, &["test-1", "test-2"]);
+
+        link_issues(root, "test-1", "test-2").unwrap();
+        link_issues(root, "TEST-1", "TEST-2").unwrap();
+
+        let state = config::load_state(root);
+        assert_eq!(state.issues[0].linked_issues.len(), 1);
+        assert_eq!(state.issues[1].linked_issues.len(), 1);
+    }
+
+    #[test]
+    fn link_rejects_self() {
+        let dir = setup_project();
+        let root = dir.path();
+        seed_issues(root, &["test-1"]);
+
+        assert!(link_issues(root, "test-1", "test-1").is_err());
+    }
+
+    #[test]
+    fn link_rejects_missing_issue() {
+        let dir = setup_project();
+        let root = dir.path();
+        seed_issues(root, &["test-1"]);
+
+        assert!(link_issues(root, "test-1", "test-99").is_err());
+    }
+
+    #[test]
+    fn unlink_removes_both_sides() {
+        let dir = setup_project();
+        let root = dir.path();
+        seed_issues(root, &["test-1", "test-2"]);
+        link_issues(root, "test-1", "test-2").unwrap();
+
+        unlink_issues(root, "test-1", "test-2").unwrap();
+
+        let state = config::load_state(root);
+        assert!(state.issues[0].linked_issues.is_empty());
+        assert!(state.issues[1].linked_issues.is_empty());
+    }
+
+    #[test]
+    fn delete_strips_link_references() {
+        let dir = setup_project();
+        let root = dir.path();
+        seed_issues(root, &["test-1", "test-2", "test-3"]);
+        link_issues(root, "test-1", "test-2").unwrap();
+        link_issues(root, "test-2", "test-3").unwrap();
+
+        delete_issue(root, "test-2").unwrap();
+
+        let state = config::load_state(root);
+        assert!(state.issues.iter().all(|i| !i.is_linked_to("test-2")));
+    }
+
+    #[test]
+    fn linked_component_spans_chain() {
+        let dir = setup_project();
+        let root = dir.path();
+        seed_issues(root, &["test-1", "test-2", "test-3", "test-4"]);
+        link_issues(root, "test-1", "test-2").unwrap();
+        link_issues(root, "test-2", "test-3").unwrap();
+
+        let state = config::load_state(root);
+        let component = linked_component(&state.issues, "test-1");
+
+        assert!(component.contains("test-1"));
+        assert!(component.contains("test-2"));
+        assert!(component.contains("test-3"));
+        assert!(!component.contains("test-4"));
+    }
+
+    #[test]
+    fn detach_linear_removes_matching_link() {
+        let dir = setup_project();
+        let root = dir.path();
+        seed_issues(root, &["test-1"]);
+        attach_linear(root, "test-1", "VIL-1").unwrap();
+        attach_linear(root, "test-1", "VIL-2").unwrap();
+
+        let updated = detach_linear(root, "test-1", "vil-1").unwrap();
+
+        assert_eq!(updated.linear_identifiers(), vec!["VIL-2"]);
+    }
+
+    #[test]
+    fn detach_linear_errors_when_not_linked() {
+        let dir = setup_project();
+        let root = dir.path();
+        seed_issues(root, &["test-1"]);
+
+        assert!(detach_linear(root, "test-1", "VIL-1").is_err());
+    }
+
+    #[test]
+    fn detach_pr_removes_matching_link() {
+        let dir = setup_project();
+        let root = dir.path();
+        seed_issues(root, &["test-1"]);
+        attach_pr(root, "test-1", 41).unwrap();
+        attach_pr(root, "test-1", 42).unwrap();
+
+        let updated = detach_pr(root, "test-1", 41).unwrap();
+
+        assert_eq!(updated.pr_numbers(), vec![42]);
+    }
+
+    #[test]
+    fn detach_pr_errors_when_not_linked() {
+        let dir = setup_project();
+        let root = dir.path();
+        seed_issues(root, &["test-1"]);
+
+        assert!(detach_pr(root, "test-1", 42).is_err());
+    }
+
+    #[test]
+    fn clear_linear_and_pr_remove_all_links() {
+        let dir = setup_project();
+        let root = dir.path();
+        seed_issues(root, &["test-1"]);
+        attach_linear(root, "test-1", "VIL-1").unwrap();
+        attach_linear(root, "test-1", "VIL-2").unwrap();
+        attach_pr(root, "test-1", 42).unwrap();
+
+        let updated = clear_linear(root, "test-1").unwrap();
+        assert!(updated.linear_links.is_empty());
+
+        let updated = clear_pr(root, "test-1").unwrap();
+        assert!(updated.github_pr_links.is_empty());
+    }
+
+    #[test]
+    fn list_linked_filters_to_component() {
+        let dir = setup_project();
+        let root = dir.path();
+        seed_issues(root, &["test-1", "test-2", "test-3"]);
+        link_issues(root, "test-1", "test-2").unwrap();
+
+        let output = list_issues(
+            root,
+            &ListOptions {
+                column: None,
+                json: false,
+                linked: Some("test-1".into()),
+            },
+        )
+        .unwrap();
+
+        assert!(output.contains("test-1"));
+        assert!(output.contains("test-2"));
+        assert!(!output.contains("test-3"));
     }
 }

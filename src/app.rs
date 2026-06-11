@@ -30,6 +30,7 @@ pub enum InputMode {
     Dialog,
     Search,
     LinearPicker,
+    LinkPicker,
     Help,
     DebugInspector,
     Sidebar,
@@ -70,6 +71,10 @@ pub struct Project {
     pub available_agents: Vec<AgentKind>,
     pub selected_column: usize,
     pub selected_row: [usize; 4],
+    /// When set, the board shows only the connected component of links that
+    /// contains this issue id (the anchor itself plus everything reachable
+    /// through `linked_issues`). Cleared with the same key or Esc.
+    pub link_filter: Option<String>,
     pub linear_available: bool,
     pub tuicr_available: bool,
     pub live: LiveState,
@@ -100,6 +105,7 @@ impl Project {
             available_agents: AgentKind::ALL.to_vec(),
             selected_column: 0,
             selected_row: [0; 4],
+            link_filter: None,
             linear_available: false,
             tuicr_available: false,
             live: LiveState::default(),
@@ -176,6 +182,7 @@ impl Project {
             // No local changes pending, safe to fully replace
             self.issues = file_issues.clone();
             self.base_issues = file_issues;
+            self.clear_stale_link_filter();
             self.clamp_all_rows("");
             return;
         }
@@ -215,18 +222,68 @@ impl Project {
         }
 
         self.base_issues = file_issues;
+        self.clear_stale_link_filter();
         self.clamp_all_rows("");
+    }
+
+    /// Drop the link filter when its anchor issue no longer exists (e.g. it was
+    /// deleted via the CLI while the filter was active), so the board doesn't
+    /// get stuck showing nothing.
+    fn clear_stale_link_filter(&mut self) {
+        let stale = self.link_filter.as_deref().is_some_and(|anchor| {
+            !self
+                .issues
+                .iter()
+                .any(|i| i.id.eq_ignore_ascii_case(anchor))
+        });
+        if stale {
+            self.link_filter = None;
+        }
     }
 
     pub fn issues_in_column(&self, column: Column, query: &str) -> Vec<(usize, &Issue)> {
         let query = query.to_lowercase();
+        let component = self
+            .link_filter
+            .as_deref()
+            .map(|anchor| self.linked_component(anchor));
         self.issues
             .iter()
             .enumerate()
             .filter(|(_, issue)| {
-                issue.column == column && (query.is_empty() || self.issue_matches(issue, &query))
+                issue.column == column
+                    && (query.is_empty() || self.issue_matches(issue, &query))
+                    && component
+                        .as_ref()
+                        .is_none_or(|c| c.contains(&issue.id.to_lowercase()))
             })
             .collect()
+    }
+
+    /// Connected component of the link graph containing `anchor` (BFS over
+    /// `linked_issues`). Returns lowercased ids, including the anchor itself.
+    pub fn linked_component(&self, anchor: &str) -> HashSet<String> {
+        let by_id: HashMap<String, &Issue> = self
+            .issues
+            .iter()
+            .map(|i| (i.id.to_lowercase(), i))
+            .collect();
+        let mut seen = HashSet::new();
+        let mut queue = vec![anchor.to_lowercase()];
+        while let Some(id) = queue.pop() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            if let Some(issue) = by_id.get(&id) {
+                for linked in &issue.linked_issues {
+                    let next = linked.to_lowercase();
+                    if !seen.contains(&next) {
+                        queue.push(next);
+                    }
+                }
+            }
+        }
+        seen
     }
 
     fn issue_matches(&self, issue: &Issue, query: &str) -> bool {
@@ -999,6 +1056,15 @@ pub struct LinearPickerState {
     pub selected: usize,
 }
 
+#[derive(Debug)]
+pub struct LinkPickerState {
+    /// The issue being linked from. Candidates are other issues in the same
+    /// project; Enter toggles a link with the highlighted candidate.
+    pub anchor_id: String,
+    pub search: String,
+    pub selected: usize,
+}
+
 #[derive(Debug, Clone)]
 pub enum ConfirmAction {
     KillSession {
@@ -1048,6 +1114,7 @@ fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
     merge_field!(session_id);
     merge_field!(linear_links);
     merge_field!(github_pr_links);
+    merge_field!(linked_issues);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1082,6 +1149,7 @@ pub struct App {
     pub linear_picker: Option<LinearPickerState>,
     pub linear_picker_context: LinearPickerContext,
     pub picker_tab: ImportSource,
+    pub link_picker: Option<LinkPickerState>,
     pub debug_inspector_json: Option<String>,
     pub debug_inspector_scroll: usize,
     pub update_available: bool,
@@ -1111,6 +1179,7 @@ impl App {
             linear_picker: None,
             linear_picker_context: LinearPickerContext::Import,
             picker_tab: ImportSource::Linear,
+            link_picker: None,
             debug_inspector_json: None,
             debug_inspector_scroll: 0,
             update_available: false,
@@ -1542,7 +1611,13 @@ impl App {
         self.input_mode = InputMode::Normal;
     }
 
-    pub fn clear_search(&mut self, _ctx: &ActionContext) {
+    pub fn clear_search(&mut self, ctx: &ActionContext) {
+        // Esc clears the link filter first, then the search query, so a single
+        // press peels off one filter at a time.
+        if self.active_project().link_filter.is_some() {
+            self.clear_link_filter(ctx);
+            return;
+        }
         if !self.search_query.is_empty() {
             self.search_query.clear();
             for project in &mut self.projects {
@@ -1553,6 +1628,112 @@ impl App {
 
     pub fn has_active_search(&self) -> bool {
         !self.search_query.is_empty()
+    }
+
+    /// Toggle the board filter to the selected issue's connected link component.
+    /// Pressing it again on a filtered board clears the filter.
+    pub fn toggle_link_filter(&mut self, ctx: &ActionContext) {
+        let query = self.search_query.clone();
+        let project = self.context_project_mut(ctx);
+        if project.link_filter.is_some() {
+            project.link_filter = None;
+            project.clamp_all_rows(&query);
+            return;
+        }
+        let Some(issue) = project.selected_issue(&query) else {
+            return;
+        };
+        if !issue.has_links() {
+            self.set_warning("Issue has no links to filter by");
+            return;
+        }
+        let anchor = issue.id.clone();
+        let project = self.context_project_mut(ctx);
+        project.link_filter = Some(anchor);
+        project.clamp_all_rows(&query);
+    }
+
+    pub fn clear_link_filter(&mut self, ctx: &ActionContext) {
+        let query = self.search_query.clone();
+        let project = self.context_project_mut(ctx);
+        project.link_filter = None;
+        project.clamp_all_rows(&query);
+    }
+
+    pub fn open_link_picker(&mut self, ctx: &ActionContext) {
+        let query = self.search_query.clone();
+        let Some(issue) = self.context_project(ctx).selected_issue(&query) else {
+            return;
+        };
+        let anchor_id = issue.id.clone();
+        self.link_picker = Some(LinkPickerState {
+            anchor_id,
+            search: String::new(),
+            selected: 0,
+        });
+        self.input_mode = InputMode::LinkPicker;
+    }
+
+    pub fn close_link_picker(&mut self) {
+        self.link_picker = None;
+        self.input_mode = InputMode::Normal;
+    }
+
+    /// Candidate issues for the link picker: every other issue in the anchor's
+    /// project, filtered by the picker search (matches id or title).
+    pub fn link_picker_candidates(&self) -> Vec<(String, String, bool)> {
+        let Some(picker) = &self.link_picker else {
+            return Vec::new();
+        };
+        let project = self.active_project();
+        let anchor = project
+            .issues
+            .iter()
+            .find(|i| i.id.eq_ignore_ascii_case(&picker.anchor_id));
+        let query = picker.search.to_lowercase();
+        project
+            .issues
+            .iter()
+            .filter(|i| !i.id.eq_ignore_ascii_case(&picker.anchor_id))
+            .filter(|i| {
+                query.is_empty()
+                    || i.id.to_lowercase().contains(&query)
+                    || i.title.to_lowercase().contains(&query)
+            })
+            .map(|i| {
+                let linked = anchor.is_some_and(|a| a.is_linked_to(&i.id));
+                (i.id.clone(), i.title.clone(), linked)
+            })
+            .collect()
+    }
+
+    pub fn link_picker_move_down(&mut self) {
+        let count = self.link_picker_candidates().len();
+        if let Some(picker) = &mut self.link_picker {
+            if count > 0 && picker.selected + 1 < count {
+                picker.selected += 1;
+            }
+        }
+    }
+
+    pub fn link_picker_move_up(&mut self) {
+        if let Some(picker) = &mut self.link_picker {
+            picker.selected = picker.selected.saturating_sub(1);
+        }
+    }
+
+    pub fn link_picker_push_char(&mut self, c: char) {
+        if let Some(picker) = &mut self.link_picker {
+            picker.search.push(c);
+            picker.selected = 0;
+        }
+    }
+
+    pub fn link_picker_delete_char(&mut self) {
+        if let Some(picker) = &mut self.link_picker {
+            picker.search.pop();
+            picker.selected = 0;
+        }
     }
 }
 
@@ -4974,5 +5155,104 @@ mod tests {
     fn clear_expired_message_noop_when_no_message() {
         let mut app = test_app(vec![]);
         assert!(!app.clear_expired_message());
+    }
+
+    fn linked_issue(id: &str, links: &[&str]) -> Issue {
+        let mut issue = test_issue(id, Column::Todo);
+        issue.linked_issues = links.iter().map(|s| s.to_string()).collect();
+        issue
+    }
+
+    #[test]
+    fn toggle_link_filter_sets_and_clears_anchor() {
+        let mut app = test_app(vec![
+            linked_issue("bork-1", &["bork-2"]),
+            linked_issue("bork-2", &["bork-1"]),
+        ]);
+        let ctx = app.action_context();
+
+        app.toggle_link_filter(&ctx);
+        assert_eq!(app.active_project().link_filter.as_deref(), Some("bork-1"));
+
+        app.toggle_link_filter(&ctx);
+        assert!(app.active_project().link_filter.is_none());
+    }
+
+    #[test]
+    fn toggle_link_filter_warns_without_links() {
+        let mut app = test_app(vec![test_issue("bork-1", Column::Todo)]);
+        let ctx = app.action_context();
+
+        app.toggle_link_filter(&ctx);
+        assert!(app.active_project().link_filter.is_none());
+        assert!(app.message.is_some());
+    }
+
+    #[test]
+    fn link_filter_hides_unconnected_issues() {
+        let mut app = test_app(vec![
+            linked_issue("bork-1", &["bork-2"]),
+            linked_issue("bork-2", &["bork-1"]),
+            test_issue("bork-3", Column::Todo),
+        ]);
+        let ctx = app.action_context();
+        app.toggle_link_filter(&ctx);
+
+        let visible = app.active_project().issues_in_column(Column::Todo, "");
+        let ids: Vec<&str> = visible.iter().map(|(_, i)| i.id.as_str()).collect();
+        assert!(ids.contains(&"bork-1"));
+        assert!(ids.contains(&"bork-2"));
+        assert!(!ids.contains(&"bork-3"));
+    }
+
+    #[test]
+    fn external_merge_clears_stale_link_filter() {
+        let mut app = test_app(vec![
+            linked_issue("bork-1", &["bork-2"]),
+            linked_issue("bork-2", &["bork-1"]),
+        ]);
+        let ctx = app.action_context();
+        app.toggle_link_filter(&ctx);
+        assert!(app.active_project().link_filter.is_some());
+
+        // Simulate the anchor being deleted externally (e.g. `bork issue delete`).
+        let remaining = vec![linked_issue("bork-2", &[])];
+        app.active_project_mut()
+            .merge_external_state(AppState { issues: remaining });
+
+        assert!(app.active_project().link_filter.is_none());
+    }
+
+    #[test]
+    fn external_merge_keeps_link_filter_when_anchor_survives() {
+        let mut app = test_app(vec![
+            linked_issue("bork-1", &["bork-2"]),
+            linked_issue("bork-2", &["bork-1"]),
+        ]);
+        let ctx = app.action_context();
+        app.toggle_link_filter(&ctx);
+
+        let same = vec![
+            linked_issue("bork-1", &["bork-2"]),
+            linked_issue("bork-2", &["bork-1"]),
+        ];
+        app.active_project_mut()
+            .merge_external_state(AppState { issues: same });
+
+        assert_eq!(app.active_project().link_filter.as_deref(), Some("bork-1"));
+    }
+
+    #[test]
+    fn link_picker_candidates_exclude_anchor() {
+        let mut app = test_app(vec![
+            test_issue("bork-1", Column::Todo),
+            test_issue("bork-2", Column::Todo),
+        ]);
+        let ctx = app.action_context();
+        app.open_link_picker(&ctx);
+
+        let candidates = app.link_picker_candidates();
+        let ids: Vec<&str> = candidates.iter().map(|(id, _, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["bork-2"]);
     }
 }

@@ -141,12 +141,24 @@ pub fn highlight_spans(text: &str, query: &str, base_style: Style) -> Vec<Span<'
     spans
 }
 
+fn link_badge(issue: &Issue) -> Option<Span<'static>> {
+    if !issue.has_links() {
+        return None;
+    }
+    Some(Span::styled(
+        format!("\u{221e}{}", issue.linked_issues.len()),
+        Style::default().fg(Color::Cyan),
+    ))
+}
+
 fn format_status_line(ctx: &CardContext) -> Line<'static> {
     if ctx.issue.kind == IssueKind::NonAgentic {
-        return Line::from(vec![
-            Span::raw("  "),
-            Span::styled("Todo", styles::dim_style()),
-        ]);
+        let mut spans = vec![Span::raw("  "), Span::styled("Todo", styles::dim_style())];
+        if let Some(badge) = link_badge(ctx.issue) {
+            spans.push(Span::raw(" "));
+            spans.push(badge);
+        }
+        return Line::from(spans);
     }
 
     let status_color = styles::agent_status_color(&ctx.agent_status);
@@ -182,6 +194,11 @@ fn format_status_line(ctx: &CardContext) -> Line<'static> {
             "\u{25c6} orch",
             styles::orchestrator_badge_style(),
         ));
+    }
+
+    if let Some(badge) = link_badge(ctx.issue) {
+        spans.push(Span::raw(" "));
+        spans.push(badge);
     }
 
     let git_spans = format_git_status(ctx.git_status);

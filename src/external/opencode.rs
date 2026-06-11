@@ -127,9 +127,10 @@ fn build_agent_cmd(
     prompt_path_str: &str,
 ) -> (String, Option<String>, Option<String>) {
     let env_prefix = format!(
-        "export BORK_SESSION='{}' BORK_STATUS_DIR='{}'",
+        "export BORK_SESSION='{}' BORK_STATUS_DIR='{}' BORK_ISSUE_ID='{}'",
         shell_escape_single_quotes(session_name),
         shell_escape_single_quotes(status_dir_str),
+        shell_escape_single_quotes(&issue.id),
     );
 
     // Builds the full issue prompt text. Lazy: only invoked for fresh sessions,

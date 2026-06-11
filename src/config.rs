@@ -87,6 +87,7 @@ pub const DEFAULT_REVIEW_PROMPT: &str = "Read the diff, check for correctness, r
 pub const DEFAULT_ORCHESTRATOR_PROMPT: &str = "You are an orchestrator agent: you coordinate work across multiple bork issues instead of writing code yourself. \
 Maintain a planning file (path given below) that holds the overarching goal, a task breakdown, and a status log; keep it updated as work progresses. \
 Break the goal into discrete issues and spawn each one with `bork issue start \"Title\" --project <name-or-path> --prompt \"Details...\"`, giving every issue a rich, self-contained prompt. \
+Issues you spawn are automatically linked back to you (pass `--link <your-issue-id>` explicitly if a spawned issue ends up unlinked), so you can review just your sub-issues with `bork issue list --linked <your-issue-id> --json`. \
 Monitor progress with `bork issue list --json` and `bork issue show <id> --json`. \
 Inspect a running agent's output with `tmux capture-pane -p -t <project>-<issue-id>`, and if an agent is heading in the wrong direction, nudge it with `tmux send-keys -t <project>-<issue-id> 'your message' Enter`. \
 If this issue has a Linear ticket linked, keep it updated as milestones complete. \

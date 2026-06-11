@@ -297,6 +297,11 @@ pub struct Issue {
     #[serde(default)]
     pub github_pr_links: Vec<LinkedGithubPr>,
 
+    /// IDs of other issues in the same project this one is tied to.
+    /// Links are symmetric: each side stores the other's id.
+    #[serde(default)]
+    pub linked_issues: Vec<String>,
+
     // --- Legacy singular fields (read-only, for migration from old state.json) ---
     #[serde(default, skip_serializing)]
     pub linear_id: Option<String>,
@@ -337,6 +342,7 @@ impl Issue {
             session_id: None,
             linear_links: Vec::new(),
             github_pr_links: Vec::new(),
+            linked_issues: Vec::new(),
             linear_id: None,
             linear_identifier: None,
             linear_url: None,
@@ -451,6 +457,16 @@ impl Issue {
     #[allow(dead_code)] // Used for deduplication when importing Linear issues
     pub fn has_linear_id(&self, id: &str) -> bool {
         self.linear_links.iter().any(|l| l.id == id)
+    }
+
+    pub fn has_links(&self) -> bool {
+        !self.linked_issues.is_empty()
+    }
+
+    pub fn is_linked_to(&self, id: &str) -> bool {
+        self.linked_issues
+            .iter()
+            .any(|l| l.eq_ignore_ascii_case(id))
     }
 }
 

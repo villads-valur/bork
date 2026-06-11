@@ -71,6 +71,10 @@ pub fn handle_action(
             handle_linear_picker(app, action, ctx, ch.linear_wake_tx, ch.pr_wake_tx);
             PostAction::None
         }
+        InputMode::LinkPicker => {
+            handle_link_picker(app, action, ctx);
+            PostAction::None
+        }
         InputMode::Help => {
             handle_help(app, action);
             PostAction::None
@@ -227,6 +231,15 @@ fn handle_normal(
 
         Action::OpenLinearPicker => {
             app.open_import_picker(ctx);
+            PostAction::None
+        }
+
+        Action::ToggleLinkFilter => {
+            app.toggle_link_filter(ctx);
+            PostAction::None
+        }
+        Action::OpenLinkPicker => {
+            app.open_link_picker(ctx);
             PostAction::None
         }
 
@@ -901,6 +914,58 @@ fn handle_linear_picker(
     }
 }
 
+fn handle_link_picker(app: &mut App, action: Action, ctx: &ActionContext) {
+    match action {
+        Action::LinkPickerClose => app.close_link_picker(),
+        Action::LinkPickerDown => app.link_picker_move_down(),
+        Action::LinkPickerUp => app.link_picker_move_up(),
+        Action::LinkPickerChar(c) => app.link_picker_push_char(c),
+        Action::LinkPickerBackspace => app.link_picker_delete_char(),
+        Action::LinkPickerSelect => toggle_selected_link(app, ctx),
+        _ => {}
+    }
+}
+
+/// Toggle a symmetric link between the picker anchor and the highlighted
+/// candidate, mutating both issues in memory. The dirty flag flushes to disk.
+fn toggle_selected_link(app: &mut App, ctx: &ActionContext) {
+    let Some(picker) = &app.link_picker else {
+        return;
+    };
+    let candidates = app.link_picker_candidates();
+    let Some((candidate_id, _, _)) = candidates.get(picker.selected) else {
+        return;
+    };
+    let anchor_id = picker.anchor_id.clone();
+    let candidate_id = candidate_id.clone();
+
+    let project = app.context_project_mut(ctx);
+    let already_linked = project
+        .issues
+        .iter()
+        .find(|i| i.id.eq_ignore_ascii_case(&anchor_id))
+        .is_some_and(|a| a.is_linked_to(&candidate_id));
+
+    for issue in &mut project.issues {
+        if issue.id.eq_ignore_ascii_case(&anchor_id) {
+            issue
+                .linked_issues
+                .retain(|l| !l.eq_ignore_ascii_case(&candidate_id));
+            if !already_linked {
+                issue.linked_issues.push(candidate_id.clone());
+            }
+        } else if issue.id.eq_ignore_ascii_case(&candidate_id) {
+            issue
+                .linked_issues
+                .retain(|l| !l.eq_ignore_ascii_case(&anchor_id));
+            if !already_linked {
+                issue.linked_issues.push(anchor_id.clone());
+            }
+        }
+    }
+    project.mark_dirty();
+}
+
 fn attach_linear_to_dialog(app: &mut App, _ctx: &ActionContext) {
     let filtered = app.filtered_linear_issues();
     let selected_idx = app.linear_picker.as_ref().map(|p| p.selected).unwrap_or(0);
@@ -1222,7 +1287,14 @@ fn handle_confirm(
 
                         let q = app.search_query.clone();
                         if let Some(p) = app.find_project_mut(&project_id) {
-                            p.issues.remove(issue_index);
+                            let removed = p.issues.remove(issue_index);
+                            crate::ops::remove_link_references(&mut p.issues, &removed.id);
+                            if p.link_filter
+                                .as_deref()
+                                .is_some_and(|a| a.eq_ignore_ascii_case(&removed.id))
+                            {
+                                p.link_filter = None;
+                            }
                             p.clamp_all_rows(&q);
                             p.mark_dirty();
                         }

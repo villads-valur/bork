@@ -460,6 +460,10 @@ enum IssueCommand {
         /// Filter by column (todo, in-progress, code-review, done)
         #[arg(long, value_parser = parse_column)]
         column: Option<Column>,
+
+        /// Show only issues linked to this issue id (its connected component)
+        #[arg(long)]
+        linked: Option<String>,
     },
 
     /// Create a new issue
@@ -520,6 +524,11 @@ enum IssueCommand {
         /// Project name or path to start the issue in. Defaults to current project.
         #[arg(long)]
         project: Option<String>,
+
+        /// Tie the new issue to an existing issue id (symmetric link). Defaults
+        /// to the spawning issue when run from inside an agent session.
+        #[arg(long)]
+        link: Option<String>,
     },
 
     /// Update an existing issue
@@ -607,6 +616,54 @@ enum IntegrationCommand {
 
         /// GitHub PR number
         pr_number: u32,
+    },
+
+    /// Unlink a Linear ticket from an issue
+    DetachLinear {
+        /// Issue ID (e.g. bork-1)
+        issue_id: String,
+
+        /// Linear issue identifier (e.g. VIL-123)
+        linear_identifier: String,
+    },
+
+    /// Unlink a GitHub PR from an issue
+    DetachPr {
+        /// Issue ID (e.g. bork-1)
+        issue_id: String,
+
+        /// GitHub PR number
+        pr_number: u32,
+    },
+
+    /// Remove all Linear links from an issue
+    ClearLinear {
+        /// Issue ID (e.g. bork-1)
+        issue_id: String,
+    },
+
+    /// Remove all PR links from an issue
+    ClearPr {
+        /// Issue ID (e.g. bork-1)
+        issue_id: String,
+    },
+
+    /// Tie two bork issues together (symmetric link)
+    Link {
+        /// First issue ID (e.g. bork-1)
+        issue_a: String,
+
+        /// Second issue ID (e.g. bork-3)
+        issue_b: String,
+    },
+
+    /// Remove a link between two bork issues
+    Unlink {
+        /// First issue ID (e.g. bork-1)
+        issue_a: String,
+
+        /// Second issue ID (e.g. bork-3)
+        issue_b: String,
     },
 }
 
@@ -881,8 +938,19 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
     let project_root = config::find_project_root();
 
     match command {
-        IssueCommand::List { json, column } => {
-            let output = ops::list_issues(&project_root, &ops::ListOptions { column, json })?;
+        IssueCommand::List {
+            json,
+            column,
+            linked,
+        } => {
+            let output = ops::list_issues(
+                &project_root,
+                &ops::ListOptions {
+                    column,
+                    json,
+                    linked,
+                },
+            )?;
             println!("{}", output);
             Ok(())
         }
@@ -917,6 +985,7 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
             no_worktree,
             base,
             project,
+            link,
         } => {
             let project_root = resolve_start_project_root(project.as_deref())?;
             let report = start_issue(
@@ -929,11 +998,15 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
                     slug,
                     no_worktree,
                     base_branch: base,
+                    link,
                 },
             )?;
             println!("Started {}: \"{}\"", report.issue_id, report.title);
             if let Some(worktree_dir) = report.worktree_dir {
                 println!("Worktree: {}/", worktree_dir);
+            }
+            if let Some(linked) = report.linked_to {
+                println!("Linked:   {}", linked);
             }
             println!("Session:  {}", report.session_name);
             println!("Attach:   tmux attach -t {}", report.session_name);
@@ -1000,6 +1073,9 @@ struct StartIssueOptions {
     slug: Option<String>,
     no_worktree: bool,
     base_branch: Option<String>,
+    /// Explicit issue id to link the new issue to. Falls back to `BORK_ISSUE_ID`
+    /// (the spawning agent's issue) when None.
+    link: Option<String>,
 }
 
 struct StartIssueReport {
@@ -1007,6 +1083,7 @@ struct StartIssueReport {
     title: String,
     worktree_dir: Option<String>,
     session_name: String,
+    linked_to: Option<String>,
 }
 
 fn resolve_start_project_root(project: Option<&str>) -> anyhow::Result<PathBuf> {
@@ -1074,6 +1151,15 @@ fn start_issue(project_root: &Path, opts: StartIssueOptions) -> anyhow::Result<S
     let (session_name, agent_session_id) = external::opencode::launch_session(&issue, &config)
         .map_err(|e| anyhow::anyhow!("Failed to launch agent: {e}"))?;
 
+    // Resolve the link target: explicit --link wins, else the spawning agent's
+    // issue from BORK_ISSUE_ID. Only link when the target exists in this same
+    // project (cross-project spawns won't resolve and are skipped).
+    let explicit_link = opts.link.is_some();
+    let link_target = opts
+        .link
+        .or_else(|| std::env::var("BORK_ISSUE_ID").ok())
+        .filter(|id| !id.is_empty() && !id.eq_ignore_ascii_case(&issue.id));
+
     // Reload state so we don't clobber concurrent updates that happened during launch
     let mut state = config::load_state(project_root);
     if let Some(saved) = state.issues.iter_mut().find(|i| i.id == issue.id) {
@@ -1086,11 +1172,37 @@ fn start_issue(project_root: &Path, opts: StartIssueOptions) -> anyhow::Result<S
     }
     config::save_state(&state, project_root)?;
 
+    let linked_to = link_target.and_then(|target| {
+        let target_exists = state
+            .issues
+            .iter()
+            .any(|i| i.id.eq_ignore_ascii_case(&target));
+        if !target_exists {
+            // An env-derived target missing here means a cross-project spawn:
+            // skip quietly. An explicit --link miss is a user error worth noting.
+            if explicit_link {
+                eprintln!(
+                    "Warning: --link target '{}' not found in this project; issue not linked",
+                    target
+                );
+            }
+            return None;
+        }
+        match ops::link_issues(project_root, &issue.id, &target) {
+            Ok((_, other)) => Some(other),
+            Err(e) => {
+                eprintln!("Warning: failed to link {} to {}: {}", issue.id, target, e);
+                None
+            }
+        }
+    });
+
     Ok(StartIssueReport {
         issue_id: issue.id,
         title: issue.title,
         worktree_dir,
         session_name,
+        linked_to,
     })
 }
 
@@ -1116,6 +1228,46 @@ fn run_integration_command(command: IntegrationCommand) -> anyhow::Result<()> {
         } => {
             let issue = ops::attach_pr(&project_root, &issue_id, pr_number)?;
             println!("Linked {} to PR #{}", issue.id, pr_number);
+            Ok(())
+        }
+        IntegrationCommand::DetachLinear {
+            issue_id,
+            linear_identifier,
+        } => {
+            let issue = ops::detach_linear(&project_root, &issue_id, &linear_identifier)?;
+            println!(
+                "Unlinked Linear {} from {}",
+                linear_identifier.to_uppercase(),
+                issue.id
+            );
+            Ok(())
+        }
+        IntegrationCommand::DetachPr {
+            issue_id,
+            pr_number,
+        } => {
+            let issue = ops::detach_pr(&project_root, &issue_id, pr_number)?;
+            println!("Unlinked PR #{} from {}", pr_number, issue.id);
+            Ok(())
+        }
+        IntegrationCommand::ClearLinear { issue_id } => {
+            let issue = ops::clear_linear(&project_root, &issue_id)?;
+            println!("Removed all Linear links from {}", issue.id);
+            Ok(())
+        }
+        IntegrationCommand::ClearPr { issue_id } => {
+            let issue = ops::clear_pr(&project_root, &issue_id)?;
+            println!("Removed all PR links from {}", issue.id);
+            Ok(())
+        }
+        IntegrationCommand::Link { issue_a, issue_b } => {
+            let (a, b) = ops::link_issues(&project_root, &issue_a, &issue_b)?;
+            println!("Linked {} <-> {}", a, b);
+            Ok(())
+        }
+        IntegrationCommand::Unlink { issue_a, issue_b } => {
+            let (a, b) = ops::unlink_issues(&project_root, &issue_a, &issue_b)?;
+            println!("Unlinked {} <-> {}", a, b);
             Ok(())
         }
     }

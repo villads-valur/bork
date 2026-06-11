@@ -101,7 +101,11 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     // Overlay modes: footer is handled by the overlay itself
     if matches!(
         app.input_mode,
-        InputMode::Dialog | InputMode::LinearPicker | InputMode::Help | InputMode::DebugInspector
+        InputMode::Dialog
+            | InputMode::LinearPicker
+            | InputMode::LinkPicker
+            | InputMode::Help
+            | InputMode::DebugInspector
     ) {
         return;
     }
@@ -115,6 +119,22 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         };
         let left = Line::from(Span::styled(format!(" {msg}"), Style::default().fg(color)));
         frame.render_widget(Paragraph::new(left), area);
+        render_right_indicators(frame, app, area);
+        return;
+    }
+
+    // Active link filter indicator
+    if let Some(anchor) = &app.active_project().link_filter {
+        let line = Line::from(vec![
+            Span::styled(
+                format!(" \u{221e} linked: {}", anchor),
+                Style::default().fg(styles::ACCENT),
+            ),
+            Span::raw("  "),
+            Span::styled("f/Esc", styles::statusbar_key_style()),
+            Span::styled(":clear", styles::statusbar_desc_style()),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
         render_right_indicators(frame, app, area);
         return;
     }

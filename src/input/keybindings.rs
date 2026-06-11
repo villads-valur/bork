@@ -21,6 +21,7 @@ pub fn map_key_to_action(
         }
         InputMode::Search => map_search_key(key),
         InputMode::LinearPicker => map_linear_picker_key(key),
+        InputMode::LinkPicker => map_link_picker_key(key),
         InputMode::Help => map_help_key(key),
         InputMode::DebugInspector => map_debug_inspector_key(key),
         InputMode::Sidebar => map_sidebar_key(key),
@@ -86,6 +87,9 @@ fn map_normal_key(key: KeyEvent, swimlane_count: usize) -> Action {
         KeyCode::Char('?') => Action::ShowHelp,
         KeyCode::Esc => Action::ClearSearch,
         KeyCode::Char('I') => Action::OpenLinearPicker,
+
+        KeyCode::Char('f') => Action::ToggleLinkFilter,
+        KeyCode::Char('c') => Action::OpenLinkPicker,
 
         _ => Action::Noop,
     }
@@ -160,6 +164,27 @@ fn map_linear_picker_key(key: KeyEvent) -> Action {
         KeyCode::Right => Action::PickerSwitchTab,
         KeyCode::Backspace => Action::LinearPickerBackspace,
         KeyCode::Char(c) => Action::LinearPickerChar(c),
+        _ => Action::Noop,
+    }
+}
+
+fn map_link_picker_key(key: KeyEvent) -> Action {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return match key.code {
+            KeyCode::Char('c') => Action::LinkPickerClose,
+            KeyCode::Char('n') => Action::LinkPickerDown,
+            KeyCode::Char('p') => Action::LinkPickerUp,
+            _ => Action::Noop,
+        };
+    }
+
+    match key.code {
+        KeyCode::Esc => Action::LinkPickerClose,
+        KeyCode::Enter => Action::LinkPickerSelect,
+        KeyCode::Down => Action::LinkPickerDown,
+        KeyCode::Up => Action::LinkPickerUp,
+        KeyCode::Backspace => Action::LinkPickerBackspace,
+        KeyCode::Char(c) => Action::LinkPickerChar(c),
         _ => Action::Noop,
     }
 }
@@ -408,6 +433,44 @@ mod tests {
         assert_eq!(
             map_normal_key(key(KeyCode::Char('I')), 1),
             Action::OpenLinearPicker
+        );
+    }
+
+    #[test]
+    fn normal_links() {
+        assert_eq!(
+            map_normal_key(key(KeyCode::Char('f')), 1),
+            Action::ToggleLinkFilter
+        );
+        assert_eq!(
+            map_normal_key(key(KeyCode::Char('c')), 1),
+            Action::OpenLinkPicker
+        );
+    }
+
+    #[test]
+    fn link_picker_keys() {
+        assert_eq!(
+            map_link_picker_key(key(KeyCode::Esc)),
+            Action::LinkPickerClose
+        );
+        assert_eq!(map_link_picker_key(ctrl('c')), Action::LinkPickerClose);
+        assert_eq!(
+            map_link_picker_key(key(KeyCode::Enter)),
+            Action::LinkPickerSelect
+        );
+        assert_eq!(
+            map_link_picker_key(key(KeyCode::Down)),
+            Action::LinkPickerDown
+        );
+        assert_eq!(map_link_picker_key(key(KeyCode::Up)), Action::LinkPickerUp);
+        assert_eq!(
+            map_link_picker_key(key(KeyCode::Char('a'))),
+            Action::LinkPickerChar('a')
+        );
+        assert_eq!(
+            map_link_picker_key(key(KeyCode::Backspace)),
+            Action::LinkPickerBackspace
         );
     }
 
