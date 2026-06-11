@@ -471,6 +471,15 @@ impl Project {
         self.live.listening_ports.get(&session_name)
     }
 
+    /// True when any issue in this project has a tmux session listening on a port
+    /// (i.e. a dev env is running). Mirrors the per-card 🔌 condition.
+    pub fn has_listening_ports(&self) -> bool {
+        self.issues.iter().any(|issue| {
+            self.listening_ports_for(issue)
+                .is_some_and(|ports| !ports.is_empty())
+        })
+    }
+
     pub fn worktree_for<'a>(&self, issue: &'a Issue) -> Option<&'a str> {
         issue.worktree.as_deref()
     }
@@ -1663,6 +1672,34 @@ mod tests {
                 .detect_worktree(&app.project().issues[0].clone()),
             None
         );
+    }
+
+    #[test]
+    fn has_listening_ports_true_when_issue_session_has_ports() {
+        let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
+        let session = app.project().issues[0].session_name(&app.project().config.project_name);
+        app.project_mut()
+            .live
+            .listening_ports
+            .insert(session, vec![3000]);
+        assert!(app.project().has_listening_ports());
+    }
+
+    #[test]
+    fn has_listening_ports_false_when_no_ports() {
+        let app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
+        assert!(!app.project().has_listening_ports());
+    }
+
+    #[test]
+    fn has_listening_ports_false_for_empty_port_list() {
+        let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
+        let session = app.project().issues[0].session_name(&app.project().config.project_name);
+        app.project_mut()
+            .live
+            .listening_ports
+            .insert(session, vec![]);
+        assert!(!app.project().has_listening_ports());
     }
 
     #[test]
