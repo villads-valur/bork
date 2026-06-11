@@ -947,20 +947,18 @@ fn toggle_selected_link(app: &mut App, ctx: &ActionContext) {
         .is_some_and(|a| a.is_linked_to(&candidate_id));
 
     for issue in &mut project.issues {
-        if issue.id.eq_ignore_ascii_case(&anchor_id) {
-            issue
-                .linked_issues
-                .retain(|l| !l.eq_ignore_ascii_case(&candidate_id));
-            if !already_linked {
-                issue.linked_issues.push(candidate_id.clone());
-            }
+        let other = if issue.id.eq_ignore_ascii_case(&anchor_id) {
+            &candidate_id
         } else if issue.id.eq_ignore_ascii_case(&candidate_id) {
-            issue
-                .linked_issues
-                .retain(|l| !l.eq_ignore_ascii_case(&anchor_id));
-            if !already_linked {
-                issue.linked_issues.push(anchor_id.clone());
-            }
+            &anchor_id
+        } else {
+            continue;
+        };
+        issue
+            .linked_issues
+            .retain(|l| !l.eq_ignore_ascii_case(other));
+        if !already_linked {
+            issue.linked_issues.push(other.clone());
         }
     }
     project.mark_dirty();

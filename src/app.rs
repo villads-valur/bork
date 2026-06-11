@@ -263,27 +263,7 @@ impl Project {
     /// Connected component of the link graph containing `anchor` (BFS over
     /// `linked_issues`). Returns lowercased ids, including the anchor itself.
     pub fn linked_component(&self, anchor: &str) -> HashSet<String> {
-        let by_id: HashMap<String, &Issue> = self
-            .issues
-            .iter()
-            .map(|i| (i.id.to_lowercase(), i))
-            .collect();
-        let mut seen = HashSet::new();
-        let mut queue = vec![anchor.to_lowercase()];
-        while let Some(id) = queue.pop() {
-            if !seen.insert(id.clone()) {
-                continue;
-            }
-            if let Some(issue) = by_id.get(&id) {
-                for linked in &issue.linked_issues {
-                    let next = linked.to_lowercase();
-                    if !seen.contains(&next) {
-                        queue.push(next);
-                    }
-                }
-            }
-        }
-        seen
+        crate::ops::linked_component(&self.issues, anchor)
     }
 
     fn issue_matches(&self, issue: &Issue, query: &str) -> bool {
@@ -1634,20 +1614,18 @@ impl App {
     /// Pressing it again on a filtered board clears the filter.
     pub fn toggle_link_filter(&mut self, ctx: &ActionContext) {
         let query = self.search_query.clone();
-        let project = self.context_project_mut(ctx);
-        if project.link_filter.is_some() {
-            project.link_filter = None;
-            project.clamp_all_rows(&query);
+        if self.context_project(ctx).link_filter.is_some() {
+            self.clear_link_filter(ctx);
             return;
         }
-        let Some(issue) = project.selected_issue(&query) else {
-            return;
+        let anchor = match self.context_project(ctx).selected_issue(&query) {
+            Some(issue) if issue.has_links() => issue.id.clone(),
+            Some(_) => {
+                self.set_warning("Issue has no links to filter by");
+                return;
+            }
+            None => return,
         };
-        if !issue.has_links() {
-            self.set_warning("Issue has no links to filter by");
-            return;
-        }
-        let anchor = issue.id.clone();
         let project = self.context_project_mut(ctx);
         project.link_filter = Some(anchor);
         project.clamp_all_rows(&query);
@@ -1710,7 +1688,7 @@ impl App {
     pub fn link_picker_move_down(&mut self) {
         let count = self.link_picker_candidates().len();
         if let Some(picker) = &mut self.link_picker {
-            if count > 0 && picker.selected + 1 < count {
+            if picker.selected + 1 < count {
                 picker.selected += 1;
             }
         }

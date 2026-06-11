@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -52,10 +53,8 @@ pub struct ListOptions {
 
 /// Connected component of the link graph containing `anchor` (BFS over
 /// `linked_issues`). Returns lowercased ids, including the anchor itself.
-pub fn linked_component(issues: &[Issue], anchor: &str) -> std::collections::HashSet<String> {
-    use std::collections::HashSet;
-    let by_id: std::collections::HashMap<String, &Issue> =
-        issues.iter().map(|i| (i.id.to_lowercase(), i)).collect();
+pub fn linked_component(issues: &[Issue], anchor: &str) -> HashSet<String> {
+    let by_id: HashMap<String, &Issue> = issues.iter().map(|i| (i.id.to_lowercase(), i)).collect();
     let mut seen = HashSet::new();
     let mut queue = vec![anchor.to_lowercase()];
     while let Some(id) = queue.pop() {
