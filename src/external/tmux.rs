@@ -65,35 +65,13 @@ pub fn ensure_bork_session(project_name: &str) -> Result<EnsureResult, AppError>
         }
 
         // Hide the tmux status bar so our ratatui footer is the only chrome
-        let _ = Command::new("tmux")
-            .args(["set-option", "-t", session_name, "status", "off"])
-            .stderr(Stdio::null())
-            .status();
+        set_option(session_name, "status", "off");
 
         // Forward terminal title changes to the outer terminal (e.g. Ghostty tab title)
-        let _ = Command::new("tmux")
-            .args(["set-option", "-t", session_name, "set-titles", "on"])
-            .stderr(Stdio::null())
-            .status();
-        let _ = Command::new("tmux")
-            .args([
-                "set-option",
-                "-t",
-                session_name,
-                "set-titles-string",
-                "#{pane_title}",
-            ])
-            .stderr(Stdio::null())
-            .status();
+        set_option(session_name, "set-titles", "on");
+        set_option(session_name, "set-titles-string", "#{pane_title}");
 
-        // Forward modifier-bearing keys (Shift+Enter, Ctrl+Enter, etc.) through to bork.
-        // Without this, tmux collapses Shift+Enter into plain Enter and our keybinding
-        // mapping never sees the modifier. `always` is stricter than `on` and is supported
-        // on tmux >= 3.2; older versions silently ignore the option.
-        let _ = Command::new("tmux")
-            .args(["set-option", "-t", session_name, "extended-keys", "always"])
-            .stderr(Stdio::null())
-            .status();
+        configure_extended_keys(session_name);
 
         // Bind Ctrl+q to detach (scoped to this tmux server, not the user's outer tmux)
         let _ = Command::new("tmux")
@@ -187,50 +165,32 @@ pub fn create_session(name: &str, cwd: &Path) -> Result<(), AppError> {
     }
 
     // Show a minimal status bar with detach hint
-    let _ = Command::new("tmux")
-        .args(["set-option", "-t", name, "status", "on"])
-        .stderr(Stdio::null())
-        .status();
-    let _ = Command::new("tmux")
-        .args([
-            "set-option",
-            "-t",
-            name,
-            "status-style",
-            "bg=default,fg=colour8",
-        ])
-        .stderr(Stdio::null())
-        .status();
-    let _ = Command::new("tmux")
-        .args(["set-option", "-t", name, "status-left", ""])
-        .stderr(Stdio::null())
-        .status();
-    let _ = Command::new("tmux")
-        .args([
-            "set-option",
-            "-t",
-            name,
-            "status-right",
-            " Ctrl+q: back to board ",
-        ])
-        .stderr(Stdio::null())
-        .status();
-    let _ = Command::new("tmux")
-        .args([
-            "set-option",
-            "-t",
-            name,
-            "status-right-style",
-            "bg=default,fg=colour8",
-        ])
-        .stderr(Stdio::null())
-        .status();
-    let _ = Command::new("tmux")
-        .args(["set-option", "-t", name, "status-justify", "right"])
-        .stderr(Stdio::null())
-        .status();
+    set_option(name, "status", "on");
+    set_option(name, "status-style", "bg=default,fg=colour8");
+    set_option(name, "status-left", "");
+    set_option(name, "status-right", " Ctrl+q: back to board ");
+    set_option(name, "status-right-style", "bg=default,fg=colour8");
+    set_option(name, "status-justify", "right");
+    configure_extended_keys(name);
 
     Ok(())
+}
+
+/// Best-effort `tmux set-option`; failures are ignored (styling/key options are
+/// non-critical and unsupported values are silently ignored on older tmux).
+fn set_option(session_name: &str, option: &str, value: &str) {
+    let _ = Command::new("tmux")
+        .args(["set-option", "-t", session_name, option, value])
+        .stderr(Stdio::null())
+        .status();
+}
+
+fn configure_extended_keys(session_name: &str) {
+    // Forward modifier-bearing keys (Shift+Enter, Ctrl+Enter, etc.) through to bork.
+    // Crossterm expects CSI-u; tmux's default xterm format emits CSI 27;...~
+    // sequences for Shift+Enter, which crossterm 0.29 does not parse.
+    set_option(session_name, "extended-keys", "always");
+    set_option(session_name, "extended-keys-format", "csi-u");
 }
 
 pub fn kill_session(name: &str) -> Result<(), AppError> {
