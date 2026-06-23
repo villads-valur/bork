@@ -5,7 +5,7 @@ use std::thread;
 
 use crate::app::{
     ActionContext, App, ConfirmAction, ImportSource, InputMode, LinearPickerContext, MessageKind,
-    ProjectId,
+    Project, ProjectId,
 };
 use crate::config::{self, AppConfig};
 use crate::external::{github, opencode, tmux, tuicr};
@@ -88,6 +88,33 @@ pub fn handle_action(
     }
 }
 
+/// Report the result of a mark action: the new marked count, or a warning when
+/// there was no issue under the cursor.
+fn report_mark(app: &mut App, count: Option<usize>) {
+    match count {
+        Some(count) => app.set_message(format!("{} issues marked", count)),
+        None => app.set_warning("No issue selected"),
+    }
+}
+
+/// Run a column-move on the active project and, when issues were marked, report
+/// how many moved. `suffix` is appended to the bulk message (e.g. " to done").
+fn bulk_move(
+    app: &mut App,
+    ctx: &ActionContext,
+    query: &str,
+    suffix: &str,
+    move_fn: fn(&mut Project, &str) -> usize,
+) {
+    let p = app.context_project_mut(ctx);
+    let was_bulk = !p.marked_issues.is_empty();
+    let moved = move_fn(p, query);
+    p.mark_dirty();
+    if was_bulk {
+        app.set_message(format!("Moved {} marked issues{}", moved, suffix));
+    }
+}
+
 fn handle_normal(
     app: &mut App,
     action: Action,
@@ -136,15 +163,11 @@ fn handle_normal(
         }
 
         Action::MoveIssueRight => {
-            let p = app.context_project_mut(ctx);
-            p.move_issue_right(&q);
-            p.mark_dirty();
+            bulk_move(app, ctx, &q, "", Project::move_issue_right);
             PostAction::None
         }
         Action::MoveIssueLeft => {
-            let p = app.context_project_mut(ctx);
-            p.move_issue_left(&q);
-            p.mark_dirty();
+            bulk_move(app, ctx, &q, "", Project::move_issue_left);
             PostAction::None
         }
         Action::MoveIssueUp => {
@@ -160,15 +183,22 @@ fn handle_normal(
             PostAction::None
         }
         Action::MoveToDone => {
-            let p = app.context_project_mut(ctx);
-            p.move_to_done(&q);
-            p.mark_dirty();
+            bulk_move(app, ctx, &q, " to done", Project::move_to_done);
             PostAction::None
         }
         Action::MoveToTodo => {
-            let p = app.context_project_mut(ctx);
-            p.move_to_todo(&q);
-            p.mark_dirty();
+            bulk_move(app, ctx, &q, " to todo", Project::move_to_todo);
+            PostAction::None
+        }
+
+        Action::ToggleMark => {
+            let count = app.context_project_mut(ctx).toggle_mark(&q);
+            report_mark(app, count);
+            PostAction::None
+        }
+        Action::MarkLinkedComponent => {
+            let count = app.context_project_mut(ctx).mark_linked_component(&q);
+            report_mark(app, count);
             PostAction::None
         }
 
@@ -1293,6 +1323,7 @@ fn handle_confirm(
                             {
                                 p.link_filter = None;
                             }
+                            p.marked_issues.remove(&removed.id.to_lowercase());
                             p.clamp_all_rows(&q);
                             p.mark_dirty();
                         }

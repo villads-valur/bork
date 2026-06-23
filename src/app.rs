@@ -71,6 +71,7 @@ pub struct Project {
     pub available_agents: Vec<AgentKind>,
     pub selected_column: usize,
     pub selected_row: [usize; 4],
+    pub marked_issues: HashSet<String>,
     /// When set, the board shows only the connected component of links that
     /// contains this issue id (the anchor itself plus everything reachable
     /// through `linked_issues`). Cleared with the same key or Esc.
@@ -105,6 +106,7 @@ impl Project {
             available_agents: AgentKind::ALL.to_vec(),
             selected_column: 0,
             selected_row: [0; 4],
+            marked_issues: HashSet::new(),
             link_filter: None,
             linear_available: false,
             tuicr_available: false,
@@ -183,6 +185,7 @@ impl Project {
             self.issues = file_issues.clone();
             self.base_issues = file_issues;
             self.clear_stale_link_filter();
+            self.clear_stale_marks();
             self.clamp_all_rows("");
             return;
         }
@@ -223,6 +226,7 @@ impl Project {
 
         self.base_issues = file_issues;
         self.clear_stale_link_filter();
+        self.clear_stale_marks();
         self.clamp_all_rows("");
     }
 
@@ -239,6 +243,11 @@ impl Project {
         if stale {
             self.link_filter = None;
         }
+    }
+
+    fn clear_stale_marks(&mut self) {
+        let ids: HashSet<String> = self.issues.iter().map(|i| i.id.to_lowercase()).collect();
+        self.marked_issues.retain(|id| ids.contains(id));
     }
 
     pub fn issues_in_column(&self, column: Column, query: &str) -> Vec<(usize, &Issue)> {
@@ -389,38 +398,92 @@ impl Project {
         }
     }
 
-    pub fn move_issue_right(&mut self, query: &str) {
-        let Some(idx) = self.selected_issue_index(query) else {
-            return;
-        };
-        let Some(next) = self.issues[idx].column.next() else {
-            return;
-        };
-        self.move_issue_to_column(idx, next);
+    pub fn toggle_mark(&mut self, query: &str) -> Option<usize> {
+        let issue_id = self.selected_issue(query)?.id.to_lowercase();
+        if !self.marked_issues.insert(issue_id.clone()) {
+            self.marked_issues.remove(&issue_id);
+        }
+        Some(self.marked_issues.len())
     }
 
-    pub fn move_issue_left(&mut self, query: &str) {
-        let Some(idx) = self.selected_issue_index(query) else {
-            return;
-        };
-        let Some(prev) = self.issues[idx].column.prev() else {
-            return;
-        };
-        self.move_issue_to_column(idx, prev);
+    pub fn mark_linked_component(&mut self, query: &str) -> Option<usize> {
+        let issue_id = self.selected_issue(query)?.id.clone();
+        for linked_id in self.linked_component(&issue_id) {
+            self.marked_issues.insert(linked_id);
+        }
+        Some(self.marked_issues.len())
     }
 
-    pub fn move_to_done(&mut self, query: &str) {
-        let Some(idx) = self.selected_issue_index(query) else {
-            return;
-        };
-        self.move_issue_to_column(idx, Column::Done);
+    pub fn clear_marks(&mut self) {
+        self.marked_issues.clear();
     }
 
-    pub fn move_to_todo(&mut self, query: &str) {
+    fn marked_issue_indices(&self) -> Vec<usize> {
+        self.issues
+            .iter()
+            .enumerate()
+            .filter(|(_, issue)| self.marked_issues.contains(&issue.id.to_lowercase()))
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    pub fn move_issue_right(&mut self, query: &str) -> usize {
+        if !self.marked_issues.is_empty() {
+            return self.move_marked(query, |column| column.next());
+        }
+        self.move_selected(query, |column| column.next())
+    }
+
+    pub fn move_issue_left(&mut self, query: &str) -> usize {
+        if !self.marked_issues.is_empty() {
+            return self.move_marked(query, |column| column.prev());
+        }
+        self.move_selected(query, |column| column.prev())
+    }
+
+    pub fn move_to_done(&mut self, query: &str) -> usize {
+        if !self.marked_issues.is_empty() {
+            return self.move_marked(query, |_| Some(Column::Done));
+        }
+        self.move_selected(query, |_| Some(Column::Done))
+    }
+
+    pub fn move_to_todo(&mut self, query: &str) -> usize {
+        if !self.marked_issues.is_empty() {
+            return self.move_marked(query, |_| Some(Column::Todo));
+        }
+        self.move_selected(query, |_| Some(Column::Todo))
+    }
+
+    /// Move the selected issue to the column produced by `target`. Returns the
+    /// number of issues moved (0 or 1).
+    fn move_selected(&mut self, query: &str, target: impl Fn(Column) -> Option<Column>) -> usize {
         let Some(idx) = self.selected_issue_index(query) else {
-            return;
+            return 0;
         };
-        self.move_issue_to_column(idx, Column::Todo);
+        let Some(target) = target(self.issues[idx].column) else {
+            return 0;
+        };
+        self.move_issue_to_column(idx, target);
+        1
+    }
+
+    /// Move every marked issue to the column produced by `target`, skipping any
+    /// that have no valid target. Clears the marks afterward and returns the
+    /// number of issues actually moved.
+    fn move_marked(&mut self, query: &str, target: impl Fn(Column) -> Option<Column>) -> usize {
+        let mut moved = 0;
+        for idx in self.marked_issue_indices() {
+            let column = self.issues[idx].column;
+            let Some(target) = target(column).filter(|t| *t != column) else {
+                continue;
+            };
+            self.move_issue_to_column(idx, target);
+            moved += 1;
+        }
+        self.clear_marks();
+        self.clamp_all_rows(query);
+        moved
     }
 
     pub fn move_issue_up(&mut self, query: &str) {
@@ -1601,8 +1664,11 @@ impl App {
     }
 
     pub fn clear_search(&mut self, ctx: &ActionContext) {
-        // Esc clears the link filter first, then the search query, so a single
-        // press peels off one filter at a time.
+        if !self.active_project().marked_issues.is_empty() {
+            self.context_project_mut(ctx).clear_marks();
+            return;
+        }
+        // Esc peels off one active board filter at a time.
         if self.active_project().link_filter.is_some() {
             self.clear_link_filter(ctx);
             return;

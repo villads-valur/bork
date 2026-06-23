@@ -43,6 +43,18 @@ fn now_epoch() -> u64 {
         .as_secs()
 }
 
+fn move_issue_in_state(issue: &mut Issue, column: Column) {
+    let was_done = issue.column == Column::Done;
+    let now_done = column == Column::Done;
+    issue.column = column;
+
+    if now_done && !was_done {
+        issue.done_at = Some(now_epoch());
+    } else if !now_done && was_done {
+        issue.done_at = None;
+    }
+}
+
 pub struct ListOptions {
     pub column: Option<Column>,
     pub json: bool,
@@ -212,15 +224,7 @@ pub fn update_issue(
         issue.title = title;
     }
     if let Some(column) = opts.column {
-        let was_done = issue.column == Column::Done;
-        let now_done = column == Column::Done;
-        issue.column = column;
-
-        if now_done && !was_done {
-            issue.done_at = Some(now_epoch());
-        } else if !now_done && was_done {
-            issue.done_at = None;
-        }
+        move_issue_in_state(issue, column);
     }
     if let Some(agent_kind) = opts.agent_kind {
         issue.agent_kind = agent_kind;
@@ -502,19 +506,54 @@ pub fn clear_pr(project_root: &Path, issue_id: &str) -> anyhow::Result<Issue> {
     Ok(updated)
 }
 
+pub struct MoveIssuesReport {
+    pub moved: Vec<Issue>,
+    pub skipped: Vec<String>,
+}
+
+#[cfg(test)]
 pub fn move_issue(project_root: &Path, issue_id: &str, column: Column) -> anyhow::Result<Issue> {
-    update_issue(
-        project_root,
-        issue_id,
-        UpdateOptions {
-            title: None,
-            column: Some(column),
-            agent_kind: None,
-            agent_mode: None,
-            prompt: None,
-            kind: None,
-        },
-    )
+    let report = move_issues(project_root, &[issue_id.to_string()], None, column)?;
+    report
+        .moved
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", issue_id))
+}
+
+pub fn move_issues(
+    project_root: &Path,
+    issue_ids: &[String],
+    linked: Option<&str>,
+    column: Column,
+) -> anyhow::Result<MoveIssuesReport> {
+    let mut state = config::load_state(project_root);
+    let mut targets: HashSet<String> = issue_ids.iter().map(|id| id.to_lowercase()).collect();
+    let mut skipped = Vec::new();
+
+    if let Some(anchor) = linked {
+        if find_issue_index(&state.issues, anchor).is_some() {
+            targets.extend(linked_component(&state.issues, anchor));
+        } else {
+            skipped.push(anchor.to_string());
+        }
+    }
+
+    let mut moved = Vec::new();
+    for id in targets {
+        let Some(idx) = find_issue_index(&state.issues, &id) else {
+            skipped.push(id);
+            continue;
+        };
+        move_issue_in_state(&mut state.issues[idx], column);
+        moved.push(state.issues[idx].clone());
+    }
+
+    if !moved.is_empty() {
+        config::save_state(&state, project_root)?;
+    }
+
+    Ok(MoveIssuesReport { moved, skipped })
 }
 
 pub struct ArchiveReport {

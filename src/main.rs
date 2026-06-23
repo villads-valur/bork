@@ -587,14 +587,18 @@ enum IssueCommand {
         json: bool,
     },
 
-    /// Move an issue to a column
+    /// Move issues to a column
     Move {
-        /// Issue ID (e.g. bork-1)
-        id: String,
+        /// Issue IDs followed by the target column, unless --to is used
+        args: Vec<String>,
+
+        /// Move all issues linked to this issue id (its connected component)
+        #[arg(long)]
+        linked: Option<String>,
 
         /// Target column (todo, in-progress, code-review, done)
-        #[arg(value_parser = parse_column)]
-        column: Column,
+        #[arg(long, value_parser = parse_column)]
+        to: Option<Column>,
     },
 }
 
@@ -1057,9 +1061,30 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
             println!("{}", output);
             Ok(())
         }
-        IssueCommand::Move { id, column } => {
-            let issue = ops::move_issue(&project_root, &id, column)?;
-            println!("Moved {} to {}", issue.id, issue.column);
+        IssueCommand::Move {
+            mut args,
+            linked,
+            to,
+        } => {
+            let to = match to {
+                Some(column) => column,
+                None => {
+                    let Some(column) = args.pop() else {
+                        anyhow::bail!("provide a target column or --to <column>");
+                    };
+                    parse_column(&column).map_err(|err| anyhow::anyhow!(err))?
+                }
+            };
+            let ids = args;
+            if ids.is_empty() && linked.is_none() {
+                anyhow::bail!("provide at least one issue id or --linked <id>");
+            }
+
+            let report = ops::move_issues(&project_root, &ids, linked.as_deref(), to)?;
+            println!("Moved {} issues to {}", report.moved.len(), to);
+            if !report.skipped.is_empty() {
+                eprintln!("Skipped missing issues: {}", report.skipped.join(", "));
+            }
             Ok(())
         }
     }

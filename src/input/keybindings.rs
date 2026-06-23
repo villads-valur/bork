@@ -71,6 +71,8 @@ fn map_normal_key(key: KeyEvent, swimlane_count: usize) -> Action {
         KeyCode::Char('J') => Action::MoveIssueDown,
         KeyCode::Char('D') => Action::MoveToDone,
         KeyCode::Char('T') => Action::MoveToTodo,
+        KeyCode::Char(' ') => Action::ToggleMark,
+        KeyCode::Char('m') => Action::MarkLinkedComponent,
 
         KeyCode::Char('g') => Action::ScrollToTop,
         KeyCode::Char('G') => Action::ScrollToBottom,

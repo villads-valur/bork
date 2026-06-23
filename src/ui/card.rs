@@ -16,6 +16,7 @@ pub const CARD_HEIGHT_MEDIUM: u16 = 5;
 pub struct CardContext<'a> {
     pub issue: &'a Issue,
     pub selected: bool,
+    pub marked: bool,
     pub session_alive: bool,
     pub agent_status: AgentStatus,
     pub activity: Option<&'a str>,
@@ -32,13 +33,17 @@ pub fn render_card(frame: &mut Frame, ctx: &CardContext, area: Rect, card_size: 
     }
 
     let border_style = if ctx.issue.kind == IssueKind::Orchestrator {
-        styles::orchestrator_card_border_style(ctx.selected)
+        styles::orchestrator_card_border_style(ctx.selected, ctx.marked)
     } else {
-        styles::card_border_style(ctx.selected)
+        styles::card_border_style(ctx.selected, ctx.marked)
     };
     let title_style = styles::card_title_style(ctx.selected);
 
-    let id_text = format!(" {} ", ctx.issue.id);
+    let id_text = if ctx.marked {
+        format!(" [x] {} ", ctx.issue.id)
+    } else {
+        format!(" {} ", ctx.issue.id)
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)

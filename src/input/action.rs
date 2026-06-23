@@ -23,6 +23,8 @@ pub enum Action {
     MoveIssueDown,
     MoveToDone,
     MoveToTodo,
+    ToggleMark,
+    MarkLinkedComponent,
     ScrollToTop,
     ScrollToBottom,
     SyncPRs,
