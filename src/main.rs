@@ -39,7 +39,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
-use app::{App, InputMode, ProjectId};
+use app::{App, InputMode, Project, ProjectId};
 use global_config::ReloadResult;
 use handler::{ActionResult, PostAction};
 use input::map_key_to_action;
@@ -79,6 +79,19 @@ fn wait_while_suspended(suspended: &AtomicBool) {
     while suspended.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(200));
     }
+}
+
+fn flush_project_state(project: &mut Project) {
+    let current_mtime = config::state_mtime(&project.config.project_root);
+    if current_mtime != project.last_state_mtime {
+        if let Some(new_state) = config::try_load_state(&project.config.project_root) {
+            project.merge_external_state(new_state);
+        }
+    }
+
+    let _ = config::save_state(&project.to_state(), &project.config.project_root);
+    project.state_dirty = false;
+    project.update_base_snapshot();
 }
 
 /// Single shared `tmux list-sessions` poller. Tmux sessions are server-global,
@@ -1639,12 +1652,7 @@ fn run_tui() -> anyhow::Result<()> {
                                 popup_title,
                             } => {
                                 if app.project().state_dirty {
-                                    let _ = config::save_state(
-                                        &app.project().to_state(),
-                                        &app.project().config.project_root,
-                                    );
-                                    app.project_mut().state_dirty = false;
-                                    app.project_mut().update_base_snapshot();
+                                    flush_project_state(app.project_mut());
                                 }
                                 open_tmux_popup(
                                     &mut terminal,
@@ -1686,12 +1694,7 @@ fn run_tui() -> anyhow::Result<()> {
                                     app.debug_inspector_json = None;
                                     app.input_mode = InputMode::Normal;
                                     if app.project().state_dirty {
-                                        let _ = config::save_state(
-                                            &app.project().to_state(),
-                                            &app.project().config.project_root,
-                                        );
-                                        app.project_mut().state_dirty = false;
-                                        app.project_mut().update_base_snapshot();
+                                        flush_project_state(app.project_mut());
                                     }
 
                                     let old_focused = app.focused_project.clone();
@@ -1804,12 +1807,7 @@ fn run_tui() -> anyhow::Result<()> {
 
         if let Some((session_name, popup_title)) = pending_popup_session.take() {
             // Flush state before yielding terminal to tmux popup (could last a long time)
-            let _ = config::save_state(
-                &app.project().to_state(),
-                &app.project().config.project_root,
-            );
-            app.project_mut().state_dirty = false;
-            app.project_mut().update_base_snapshot();
+            flush_project_state(app.project_mut());
             open_tmux_popup(
                 &mut terminal,
                 &session_name,
@@ -2211,9 +2209,7 @@ fn run_tui() -> anyhow::Result<()> {
         // --- Flush dirty state to disk (once per tick, not per action) ---
         for project in &mut app.projects {
             if project.state_dirty {
-                let _ = config::save_state(&project.to_state(), &project.config.project_root);
-                project.state_dirty = false;
-                project.update_base_snapshot();
+                flush_project_state(project);
             }
         }
 
@@ -2224,9 +2220,9 @@ fn run_tui() -> anyhow::Result<()> {
 
     shared.shutdown.store(true, Ordering::Relaxed);
 
-    for project in &app.projects {
+    for project in &mut app.projects {
         if project.state_dirty {
-            let _ = config::save_state(&project.to_state(), &project.config.project_root);
+            flush_project_state(project);
         }
     }
     lock::release_lock(&lock_root);
@@ -2380,6 +2376,51 @@ mod tests {
         assert_eq!(parse_issue_kind("planner"), Ok(IssueKind::Orchestrator));
         assert_eq!(parse_issue_kind("todo"), Ok(IssueKind::NonAgentic));
         assert!(parse_issue_kind("bogus").is_err());
+    }
+
+    #[test]
+    fn flush_project_state_merges_external_issue_before_save() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = config::AppConfig {
+            project_name: "bork".to_string(),
+            project_root: dir.path().to_path_buf(),
+            ..config::AppConfig::default()
+        };
+
+        let issue_a = types::Issue::new(
+            "bork-1".to_string(),
+            "Existing".to_string(),
+            Column::Todo,
+            AgentKind::OpenCode,
+        );
+        let initial_state = config::AppState {
+            issues: vec![issue_a.clone()],
+        };
+        config::save_state(&initial_state, dir.path()).unwrap();
+
+        let mut project = Project::new(config, initial_state);
+        project.mark_dirty();
+
+        let issue_b = types::Issue::new(
+            "bork-2".to_string(),
+            "Created externally".to_string(),
+            Column::Todo,
+            AgentKind::OpenCode,
+        );
+        config::save_state(
+            &config::AppState {
+                issues: vec![issue_a, issue_b],
+            },
+            dir.path(),
+        )
+        .unwrap();
+        project.last_state_mtime = Some(SystemTime::UNIX_EPOCH);
+
+        flush_project_state(&mut project);
+
+        let state = config::load_state(dir.path());
+        let ids: Vec<&str> = state.issues.iter().map(|issue| issue.id.as_str()).collect();
+        assert_eq!(ids, vec!["bork-1", "bork-2"]);
     }
 
     // The wrapper tmux session name must never collide with agent session names.
