@@ -81,11 +81,11 @@ const SECTIONS: &[Section] = &[
         bindings: &[
             ("/", "Search"),
             ("P", "Sync PRs"),
-            ("p", "Prune worktrees"),
+            ("W", "Prune worktrees"),
             ("o", "Open PR in browser"),
             ("O", "Open in Linear"),
             ("I", "Import from Linear"),
-            ("W", "Assign worktree"),
+            ("w", "Assign worktree"),
             ("q", "Quit"),
         ],
     },

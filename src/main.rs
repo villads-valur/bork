@@ -2436,7 +2436,7 @@ fn maybe_auto_prune_message(app: &mut app::App) -> Option<String> {
             continue;
         }
         return Some(format!(
-            "{} ({} worktrees): press p to prune",
+            "{} ({} worktrees): press W to prune",
             project.config.project_name, count
         ));
     }

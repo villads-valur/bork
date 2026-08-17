@@ -98,10 +98,10 @@ fn map_normal_key(key: KeyEvent, swimlane_count: usize) -> Action {
         KeyCode::Char('R') => Action::OpenReviewPR,
 
         KeyCode::Char('P') => Action::SyncPRs,
-        KeyCode::Char('p') => Action::OpenPruneDialog,
         KeyCode::Char('o') => Action::OpenPR,
         KeyCode::Char('O') => Action::OpenLinear,
-        KeyCode::Char('W') => Action::AssignWorktree,
+        KeyCode::Char('w') => Action::AssignWorktree,
+        KeyCode::Char('W') => Action::OpenPruneDialog,
 
         KeyCode::Char('/') => Action::SearchStart,
         KeyCode::Char('?') => Action::ShowHelp,
@@ -447,8 +447,12 @@ mod tests {
             Action::OpenLinear
         );
         assert_eq!(
-            map_normal_key(key(KeyCode::Char('W')), 1),
+            map_normal_key(key(KeyCode::Char('w')), 1),
             Action::AssignWorktree
+        );
+        assert_eq!(
+            map_normal_key(key(KeyCode::Char('W')), 1),
+            Action::OpenPruneDialog
         );
         assert_eq!(
             map_normal_key(key(KeyCode::Char('I')), 1),
