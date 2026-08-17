@@ -836,6 +836,7 @@ mod tests {
             worktree: None,
             done_at: None,
             session_id: None,
+            pruned_at: None,
             linear_links: Vec::new(),
             github_pr_links: Vec::new(),
             linear_id: None,
@@ -857,6 +858,8 @@ mod tests {
             done_session_ttl: 300,
             debug: false,
             agents_allowlist: None,
+            prune_threshold: crate::config::DEFAULT_PRUNE_THRESHOLD,
+            auto_prune_check_interval: crate::config::DEFAULT_AUTO_PRUNE_CHECK_INTERVAL,
         }
     }
 

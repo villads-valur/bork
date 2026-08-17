@@ -19,9 +19,16 @@ pub struct AppConfig {
     /// Allowed agents for this project, if explicitly configured.
     /// `None` means "no restriction; use whatever is installed".
     pub agents_allowlist: Option<Vec<AgentKind>>,
+    /// Auto-prompt threshold: prompt the user to prune when on-disk worktree
+    /// count meets or exceeds this number.
+    pub prune_threshold: u64,
+    /// Minimum seconds between auto-prune prompts.
+    pub auto_prune_check_interval: u64,
 }
 
 pub const DEFAULT_DONE_SESSION_TTL: u64 = 300;
+pub const DEFAULT_PRUNE_THRESHOLD: u64 = 10;
+pub const DEFAULT_AUTO_PRUNE_CHECK_INTERVAL: u64 = 86_400;
 
 pub const DEFAULT_PROMPT_FALLBACK: &str = "The source code is in main/. Use `bork worktree <issue-id> <slug>` to create worktrees for new issues.";
 
@@ -36,6 +43,8 @@ impl Default for AppConfig {
             done_session_ttl: DEFAULT_DONE_SESSION_TTL,
             debug: false,
             agents_allowlist: None,
+            prune_threshold: DEFAULT_PRUNE_THRESHOLD,
+            auto_prune_check_interval: DEFAULT_AUTO_PRUNE_CHECK_INTERVAL,
         }
     }
 }
@@ -43,6 +52,9 @@ impl Default for AppConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppState {
     pub issues: Vec<Issue>,
+    /// Unix timestamp of the last completed prune. `None` if never pruned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_prune_at: Option<u64>,
 }
 
 /// Walk up from cwd looking for a `.bork/` directory.
@@ -106,6 +118,8 @@ pub struct PartialConfig {
     pub done_session_ttl: Option<u64>,
     pub debug: Option<bool>,
     pub agents_allowlist: Option<Vec<AgentKind>>,
+    pub prune_threshold: Option<u64>,
+    pub auto_prune_check_interval: Option<u64>,
 }
 
 impl PartialConfig {
@@ -118,6 +132,10 @@ impl PartialConfig {
             done_session_ttl: other.done_session_ttl.or(self.done_session_ttl),
             debug: other.debug.or(self.debug),
             agents_allowlist: other.agents_allowlist.or(self.agents_allowlist),
+            prune_threshold: other.prune_threshold.or(self.prune_threshold),
+            auto_prune_check_interval: other
+                .auto_prune_check_interval
+                .or(self.auto_prune_check_interval),
         }
     }
 }
@@ -150,6 +168,10 @@ fn materialize(merged: PartialConfig, project_root: &Path) -> AppConfig {
         done_session_ttl: merged.done_session_ttl.unwrap_or(DEFAULT_DONE_SESSION_TTL),
         debug: merged.debug.unwrap_or(false),
         agents_allowlist: merged.agents_allowlist,
+        prune_threshold: merged.prune_threshold.unwrap_or(DEFAULT_PRUNE_THRESHOLD),
+        auto_prune_check_interval: merged
+            .auto_prune_check_interval
+            .unwrap_or(DEFAULT_AUTO_PRUNE_CHECK_INTERVAL),
     }
 }
 
@@ -211,6 +233,11 @@ fn partial_from_table(table: &Table) -> PartialConfig {
             .collect::<Vec<_>>()
     });
 
+    let prune_threshold = table.get("prune_threshold").and_then(|v| v.as_u64());
+    let auto_prune_check_interval = table
+        .get("auto_prune_check_interval")
+        .and_then(|v| v.as_u64());
+
     PartialConfig {
         project_name,
         agent_kind,
@@ -218,6 +245,8 @@ fn partial_from_table(table: &Table) -> PartialConfig {
         done_session_ttl,
         debug,
         agents_allowlist,
+        prune_threshold,
+        auto_prune_check_interval,
     }
 }
 
@@ -420,5 +449,46 @@ debug = true
         assert_eq!(cfg.done_session_ttl, DEFAULT_DONE_SESSION_TTL);
         assert!(!cfg.debug);
         assert!(cfg.agents_allowlist.is_none());
+        assert_eq!(cfg.prune_threshold, DEFAULT_PRUNE_THRESHOLD);
+        assert_eq!(
+            cfg.auto_prune_check_interval,
+            DEFAULT_AUTO_PRUNE_CHECK_INTERVAL
+        );
+    }
+
+    #[test]
+    fn parse_partial_prune_keys() {
+        let p = parse_partial(
+            r#"
+prune_threshold = 15
+auto_prune_check_interval = 3600
+"#,
+        );
+        assert_eq!(p.prune_threshold, Some(15));
+        assert_eq!(p.auto_prune_check_interval, Some(3600));
+    }
+
+    #[test]
+    fn state_roundtrips_last_prune_at() {
+        let state = AppState {
+            issues: Vec::new(),
+            last_prune_at: Some(1_700_000_000),
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let roundtrip: AppState = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip.last_prune_at, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn state_without_last_prune_at_defaults_to_none() {
+        let state: AppState = serde_json::from_str(r#"{"issues":[]}"#).unwrap();
+        assert_eq!(state.last_prune_at, None);
+    }
+
+    #[test]
+    fn state_omits_last_prune_at_when_none() {
+        let state = AppState::default();
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(!json.contains("last_prune_at"));
     }
 }

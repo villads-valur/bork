@@ -12,6 +12,7 @@ use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 
 use crate::config::{AppConfig, AppState};
 use crate::external::linear::LinearIssue;
+use crate::prune::{PruneAction, PruneCandidate};
 use crate::types::{
     AgentKind, AgentMode, AgentStatus, AgentStatusInfo, Column, Issue, IssueKind, LinkedGithubPr,
     PrImportSource, PrState, PrStatus, WorktreeStatus,
@@ -20,7 +21,7 @@ use crate::ui::styles;
 
 pub type ProjectId = PathBuf;
 
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -37,6 +38,7 @@ pub enum InputMode {
     Help,
     DebugInspector,
     Sidebar,
+    PruneDialog,
 }
 
 #[derive(Default)]
@@ -77,6 +79,11 @@ pub struct Project {
     pub state_dirty: bool,
     pub base_issues: Vec<Issue>,
     pub last_state_mtime: Option<SystemTime>,
+    /// Unix timestamp of the last completed prune, persisted in state.json.
+    pub last_prune_at: Option<u64>,
+    /// Most recent time we ran the auto-prune threshold check for this
+    /// project. Ephemeral; throttles both the check and its toast.
+    pub last_auto_prune_check: Option<Instant>,
 }
 
 impl Project {
@@ -102,6 +109,8 @@ impl Project {
             state_dirty: false,
             base_issues,
             last_state_mtime,
+            last_prune_at: state.last_prune_at,
+            last_auto_prune_check: None,
         }
     }
 
@@ -146,9 +155,23 @@ impl Project {
         self.state_dirty = true;
     }
 
+    /// Names of all known worktrees other than `main/`, deduped across the
+    /// live and frozen git poll caches. This is the single definition of
+    /// "a prunable worktree" — the prune dialog and the auto-prune prompt
+    /// both count from here.
+    pub fn prunable_worktree_names(&self) -> HashSet<&String> {
+        self.live
+            .worktree_branches
+            .keys()
+            .chain(self.live.frozen_worktree_branches.keys())
+            .filter(|n| n.as_str() != "main")
+            .collect()
+    }
+
     pub fn to_state(&self) -> AppState {
         AppState {
             issues: self.issues.clone(),
+            last_prune_at: self.last_prune_at,
         }
     }
 
@@ -158,6 +181,9 @@ impl Project {
     }
 
     pub fn merge_external_state(&mut self, file_state: AppState) {
+        // Timestamps only move forward, so the later value wins regardless
+        // of whether it came from memory or an external writer.
+        self.last_prune_at = self.last_prune_at.max(file_state.last_prune_at);
         let file_issues = file_state.issues;
 
         if !self.state_dirty {
@@ -492,7 +518,7 @@ impl Project {
         }
 
         for (i, wt) in assignments {
-            self.issues[i].worktree = Some(wt.clone());
+            self.issues[i].attach_worktree(wt.clone());
             if self.issues[i].column == Column::Done {
                 self.freeze_worktree_status(&wt);
             }
@@ -718,6 +744,7 @@ impl Project {
                 worktree: None,
                 done_at: None,
                 session_id: None,
+                pruned_at: None,
                 linear_links: Vec::new(),
                 github_pr_links: vec![LinkedGithubPr {
                     number: pr.number,
@@ -760,6 +787,7 @@ impl Project {
                 worktree: None,
                 done_at: None,
                 session_id: None,
+                pruned_at: None,
                 linear_links: Vec::new(),
                 github_pr_links: vec![LinkedGithubPr {
                     number: pr.number,
@@ -995,6 +1023,77 @@ pub struct ActionContext {
 pub struct LinearPickerState {
     pub search: String,
     pub selected: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct PruneDialogState {
+    pub project_id: ProjectId,
+    pub candidates: Vec<PruneCandidate>,
+    pub selected: usize,
+    pub error: Option<String>,
+}
+
+impl PruneDialogState {
+    pub fn new(project_id: ProjectId, candidates: Vec<PruneCandidate>) -> Self {
+        Self {
+            project_id,
+            candidates,
+            selected: 0,
+            error: None,
+        }
+    }
+
+    pub fn move_up(&mut self) {
+        if self.selected > 0 {
+            self.selected -= 1;
+        }
+    }
+
+    pub fn move_down(&mut self) {
+        if self.selected + 1 < self.candidates.len() {
+            self.selected += 1;
+        }
+    }
+
+    pub fn toggle_current(&mut self) {
+        let Some(candidate) = self.candidates.get_mut(self.selected) else {
+            return;
+        };
+        candidate.action = match candidate.action {
+            PruneAction::Keep => PruneAction::Remove,
+            PruneAction::Remove => PruneAction::Keep,
+        };
+        self.error = None;
+    }
+
+    pub fn select_all_remove(&mut self) {
+        self.set_all(PruneAction::Remove);
+    }
+
+    pub fn select_all_keep(&mut self) {
+        self.set_all(PruneAction::Keep);
+    }
+
+    fn set_all(&mut self, action: PruneAction) {
+        for candidate in &mut self.candidates {
+            candidate.action = action;
+        }
+        self.error = None;
+    }
+
+    pub fn remove_count(&self) -> usize {
+        self.candidates
+            .iter()
+            .filter(|c| c.action == PruneAction::Remove)
+            .count()
+    }
+
+    pub fn dirty_remove_count(&self) -> usize {
+        self.candidates
+            .iter()
+            .filter(|c| c.action == PruneAction::Remove && c.is_dirty())
+            .count()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1518,6 +1617,7 @@ pub struct App {
     pub confirm_message: Option<String>,
     pub pending_confirm: Option<ConfirmAction>,
     pub dialog: Option<DialogState>,
+    pub prune_dialog: Option<PruneDialogState>,
     pub should_quit: bool,
     pub message: Option<(String, MessageKind)>,
     pub message_set_at: Option<Instant>,
@@ -1549,6 +1649,7 @@ impl App {
             confirm_message: None,
             pending_confirm: None,
             dialog: None,
+            prune_dialog: None,
             should_quit: false,
             message: None,
             message_set_at: None,
@@ -1835,6 +1936,21 @@ impl App {
         self.input_mode = InputMode::Normal;
     }
 
+    pub fn open_prune_dialog(&mut self, ctx: &ActionContext) {
+        let candidates = crate::prune::scan_candidates(self.context_project(ctx));
+        if candidates.is_empty() {
+            self.set_message("No worktrees to prune");
+            return;
+        }
+        self.prune_dialog = Some(PruneDialogState::new(ctx.project_id.clone(), candidates));
+        self.input_mode = InputMode::PruneDialog;
+    }
+
+    pub fn close_prune_dialog(&mut self) {
+        self.prune_dialog = None;
+        self.input_mode = InputMode::Normal;
+    }
+
     pub fn open_import_picker(&mut self, ctx: &ActionContext) {
         self.open_import_picker_with_context(LinearPickerContext::Import, ctx);
     }
@@ -2022,6 +2138,8 @@ mod tests {
             done_session_ttl: DEFAULT_DONE_SESSION_TTL,
             debug: false,
             agents_allowlist: None,
+            prune_threshold: crate::config::DEFAULT_PRUNE_THRESHOLD,
+            auto_prune_check_interval: crate::config::DEFAULT_AUTO_PRUNE_CHECK_INTERVAL,
         }
     }
 
@@ -2037,6 +2155,7 @@ mod tests {
             worktree: None,
             done_at: None,
             session_id: None,
+            pruned_at: None,
             linear_links: Vec::new(),
             github_pr_links: Vec::new(),
             linear_id: None,
@@ -2062,7 +2181,10 @@ mod tests {
     }
 
     fn test_app(issues: Vec<Issue>) -> App {
-        let state = AppState { issues };
+        let state = AppState {
+            issues,
+            last_prune_at: None,
+        };
         App::new(test_config(), state)
     }
 
@@ -2352,6 +2474,24 @@ mod tests {
         let changed = app.project_mut().auto_assign_worktrees();
         assert!(!changed);
         assert!(app.project().issues[0].worktree.is_none());
+    }
+
+    #[test]
+    fn test_auto_assign_clears_pruned_at() {
+        let mut issue = test_issue("bork-8", Column::InProgress);
+        issue.pruned_at = Some(1_700_000_000);
+        let mut app = test_app(vec![issue]);
+        app.project_mut()
+            .live
+            .worktree_branches
+            .insert("bork-8".into(), "bork-8/init-cli".into());
+        let changed = app.project_mut().auto_assign_worktrees();
+        assert!(changed);
+        assert_eq!(app.project().issues[0].worktree, Some("bork-8".into()));
+        assert!(
+            app.project().issues[0].pruned_at.is_none(),
+            "pruned_at should clear when a new worktree gets attached"
+        );
     }
 
     #[test]
@@ -3004,6 +3144,7 @@ mod tests {
         let mut issue = test_issue("bork-1", Column::Done);
         issue.done_at = None;
         let state = AppState {
+            last_prune_at: None,
             issues: vec![issue],
         };
         let app = App::new(test_config(), state);
@@ -3018,6 +3159,7 @@ mod tests {
         let mut issue = test_issue("bork-1", Column::Done);
         issue.done_at = Some(1000);
         let state = AppState {
+            last_prune_at: None,
             issues: vec![issue],
         };
         let app = App::new(test_config(), state);
@@ -3029,6 +3171,7 @@ mod tests {
         let mut issue = test_issue("bork-1", Column::Todo);
         issue.done_at = None;
         let state = AppState {
+            last_prune_at: None,
             issues: vec![issue],
         };
         let app = App::new(test_config(), state);
@@ -4208,6 +4351,7 @@ mod tests {
         let mut app = App::new(
             test_config_named("alpha"),
             AppState {
+                last_prune_at: None,
                 issues: vec![
                     test_issue_titled("alpha-1", "Fix login", Column::Todo),
                     test_issue_titled("alpha-2", "Add feature", Column::Todo),
@@ -4217,6 +4361,7 @@ mod tests {
         app.add_background_project(
             test_config_named("beta"),
             AppState {
+                last_prune_at: None,
                 issues: vec![
                     test_issue_titled("beta-1", "Fix crash", Column::Todo),
                     test_issue_titled("beta-2", "Dark mode", Column::Todo),
@@ -4267,6 +4412,7 @@ mod tests {
         let mut app = App::new(
             test_config_named("alpha"),
             AppState {
+                last_prune_at: None,
                 issues: vec![
                     test_issue_titled("alpha-1", "Fix login", Column::Todo),
                     test_issue_titled("alpha-2", "Add feature", Column::Todo),
@@ -4276,6 +4422,7 @@ mod tests {
         app.add_background_project(
             test_config_named("beta"),
             AppState {
+                last_prune_at: None,
                 issues: vec![
                     test_issue_titled("beta-1", "Fix crash", Column::Todo),
                     test_issue_titled("beta-2", "Dark mode", Column::Todo),
@@ -4306,6 +4453,7 @@ mod tests {
         let mut app = App::new(
             test_config_named("alpha"),
             AppState {
+                last_prune_at: None,
                 issues: vec![
                     test_issue_titled("alpha-1", "Fix login", Column::Todo),
                     test_issue_titled("alpha-2", "Add feature", Column::Todo),
@@ -4315,6 +4463,7 @@ mod tests {
         app.add_background_project(
             test_config_named("beta"),
             AppState {
+                last_prune_at: None,
                 issues: vec![test_issue_titled("beta-1", "Fix crash", Column::Todo)],
             },
         );
@@ -4342,6 +4491,7 @@ mod tests {
         let mut app = App::new(
             test_config_named("alpha"),
             AppState {
+                last_prune_at: None,
                 issues: vec![
                     test_issue_titled("alpha-1", "Fix login", Column::Todo),
                     test_issue_titled("alpha-2", "Add feature", Column::Todo),
@@ -4351,6 +4501,7 @@ mod tests {
         app.add_background_project(
             test_config_named("beta"),
             AppState {
+                last_prune_at: None,
                 issues: vec![test_issue_titled("beta-1", "Fix crash", Column::Todo)],
             },
         );
@@ -4569,6 +4720,8 @@ mod tests {
             done_session_ttl: DEFAULT_DONE_SESSION_TTL,
             debug: false,
             agents_allowlist: None,
+            prune_threshold: crate::config::DEFAULT_PRUNE_THRESHOLD,
+            auto_prune_check_interval: crate::config::DEFAULT_AUTO_PRUNE_CHECK_INTERVAL,
         }
     }
 
@@ -4576,12 +4729,14 @@ mod tests {
         let mut app = App::new(
             test_config_named("alpha"),
             AppState {
+                last_prune_at: None,
                 issues: vec![test_issue("alpha-1", Column::Todo)],
             },
         );
         app.add_background_project(
             test_config_named("beta"),
             AppState {
+                last_prune_at: None,
                 issues: vec![
                     test_issue("beta-1", Column::Todo),
                     test_issue("beta-2", Column::InProgress),
@@ -4591,6 +4746,7 @@ mod tests {
         app.add_background_project(
             test_config_named("gamma"),
             AppState {
+                last_prune_at: None,
                 issues: vec![test_issue("gamma-1", Column::CodeReview)],
             },
         );
@@ -4691,7 +4847,7 @@ mod tests {
     fn add_background_project() {
         let mut app = test_app(vec![test_issue("a-1", Column::Todo)]);
         assert_eq!(app.projects.len(), 1);
-        app.add_background_project(test_config_named("other"), AppState { issues: vec![] });
+        app.add_background_project(test_config_named("other"), AppState::default());
         assert_eq!(app.projects.len(), 2);
         assert_eq!(app.projects[1].config.project_name, "other");
     }
@@ -4702,7 +4858,7 @@ mod tests {
         app.enable_sidebar();
         assert!(app.sidebar.is_none());
 
-        app.add_background_project(test_config_named("b"), AppState { issues: vec![] });
+        app.add_background_project(test_config_named("b"), AppState::default());
         app.enable_sidebar();
         assert!(app.sidebar.is_some());
     }
@@ -4762,7 +4918,7 @@ mod tests {
         let mut app = test_multi_app();
         let original_focused = app.focused_project.clone();
 
-        app.add_background_project(test_config_named("delta"), AppState { issues: vec![] });
+        app.add_background_project(test_config_named("delta"), AppState::default());
 
         assert_eq!(app.focused_project, original_focused);
         assert_eq!(app.project().config.project_name, "alpha");
@@ -4996,6 +5152,7 @@ mod tests {
 
     fn test_project(issues: Vec<Issue>) -> Project {
         let state = AppState {
+            last_prune_at: None,
             issues: issues.clone(),
         };
         let mut project = Project::new(test_config(), state);
@@ -5006,11 +5163,30 @@ mod tests {
     }
 
     #[test]
+    fn merge_takes_later_last_prune_at() {
+        let mut project = test_project(vec![]);
+        project.last_prune_at = Some(100);
+
+        // External writer recorded a later prune.
+        let file_state = AppState {
+            last_prune_at: Some(200),
+            issues: vec![],
+        };
+        project.merge_external_state(file_state);
+        assert_eq!(project.last_prune_at, Some(200));
+
+        // A file without the field never regresses the in-memory value.
+        project.merge_external_state(AppState::default());
+        assert_eq!(project.last_prune_at, Some(200));
+    }
+
+    #[test]
     fn merge_clean_state_replaces_entirely() {
         let mut project = test_project(vec![test_issue("a", Column::Todo)]);
         assert!(!project.state_dirty);
 
         let file_state = AppState {
+            last_prune_at: None,
             issues: vec![test_issue("b", Column::InProgress)],
         };
         project.merge_external_state(file_state);
@@ -5026,6 +5202,7 @@ mod tests {
         project.mark_dirty();
 
         let file_state = AppState {
+            last_prune_at: None,
             issues: vec![
                 test_issue("a", Column::Todo),
                 test_issue("b", Column::InProgress),
@@ -5048,6 +5225,7 @@ mod tests {
         project.mark_dirty();
 
         let file_state = AppState {
+            last_prune_at: None,
             issues: vec![test_issue("a", Column::Todo)],
         };
         project.merge_external_state(file_state);
@@ -5069,6 +5247,7 @@ mod tests {
         let mut file_issue = original;
         file_issue.title = "Renamed externally".to_string();
         let file_state = AppState {
+            last_prune_at: None,
             issues: vec![file_issue],
         };
         project.merge_external_state(file_state);
@@ -5094,6 +5273,7 @@ mod tests {
 
         // External file still only has "a"
         let file_state = AppState {
+            last_prune_at: None,
             issues: vec![test_issue("a", Column::Todo)],
         };
         project.merge_external_state(file_state);
@@ -5118,6 +5298,7 @@ mod tests {
 
         // External change removes 2 issues
         let file_state = AppState {
+            last_prune_at: None,
             issues: vec![test_issue("a", Column::Todo)],
         };
         project.merge_external_state(file_state);
@@ -5133,7 +5314,7 @@ mod tests {
             test_issue("b", Column::InProgress),
         ]);
 
-        let file_state = AppState { issues: vec![] };
+        let file_state = AppState::default();
         project.merge_external_state(file_state);
 
         assert!(project.issues.is_empty());
@@ -5144,6 +5325,7 @@ mod tests {
         let mut project = test_project(vec![]);
 
         let file_state = AppState {
+            last_prune_at: None,
             issues: vec![test_issue("new", Column::Todo)],
         };
         project.merge_external_state(file_state);
@@ -5161,6 +5343,7 @@ mod tests {
         let mut project = test_project(issues.clone());
 
         let file_state = AppState {
+            last_prune_at: None,
             issues: issues.clone(),
         };
         project.merge_external_state(file_state);
@@ -5178,6 +5361,7 @@ mod tests {
             test_issue("b", Column::InProgress),
         ];
         let file_state = AppState {
+            last_prune_at: None,
             issues: new_issues.clone(),
         };
         project.merge_external_state(file_state);
@@ -5261,5 +5445,216 @@ mod tests {
     fn clear_expired_message_noop_when_no_message() {
         let mut app = test_app(vec![]);
         assert!(!app.clear_expired_message());
+    }
+
+    // ================================================================
+    // PruneDialogState
+    // ================================================================
+
+    use crate::prune::PruneCandidate;
+
+    // Orphan + clean => seeded action is Remove.
+    fn make_candidate(name: &str) -> PruneCandidate {
+        PruneCandidate::new(name.to_string(), None, None, false)
+    }
+
+    // Dirty => seeded action is Keep.
+    fn make_dirty_candidate(name: &str) -> PruneCandidate {
+        PruneCandidate::new(
+            name.to_string(),
+            Some(crate::types::WorktreeStatus {
+                staged: 0,
+                unstaged: 1,
+            }),
+            None,
+            false,
+        )
+    }
+
+    fn make_prune_dialog(candidates: Vec<PruneCandidate>) -> PruneDialogState {
+        PruneDialogState::new(std::path::PathBuf::from("/x"), candidates)
+    }
+
+    #[test]
+    fn prune_dialog_new_seeds_actions_from_defaults() {
+        let dialog = make_prune_dialog(vec![
+            make_candidate("a"),
+            make_dirty_candidate("b"),
+            make_candidate("c"),
+        ]);
+        assert_eq!(dialog.candidates[0].action, PruneAction::Remove);
+        assert_eq!(dialog.candidates[1].action, PruneAction::Keep);
+        assert_eq!(dialog.candidates[2].action, PruneAction::Remove);
+        assert_eq!(dialog.selected, 0);
+        assert!(dialog.error.is_none());
+    }
+
+    #[test]
+    fn prune_dialog_move_up_at_top_is_noop() {
+        let mut dialog = make_prune_dialog(vec![make_candidate("a"), make_candidate("b")]);
+        assert_eq!(dialog.selected, 0);
+        dialog.move_up();
+        assert_eq!(dialog.selected, 0);
+    }
+
+    #[test]
+    fn prune_dialog_move_down_stops_at_last_row() {
+        let mut dialog = make_prune_dialog(vec![make_candidate("a"), make_candidate("b")]);
+        dialog.move_down();
+        dialog.move_down();
+        dialog.move_down();
+        assert_eq!(dialog.selected, 1);
+    }
+
+    #[test]
+    fn prune_dialog_move_up_after_down_returns() {
+        let mut dialog = make_prune_dialog(vec![make_candidate("a"), make_candidate("b")]);
+        dialog.move_down();
+        assert_eq!(dialog.selected, 1);
+        dialog.move_up();
+        assert_eq!(dialog.selected, 0);
+    }
+
+    #[test]
+    fn prune_dialog_toggle_current_flips_action_and_clears_error() {
+        let mut dialog = make_prune_dialog(vec![make_candidate("a")]);
+        dialog.error = Some("old".into());
+        dialog.toggle_current();
+        assert_eq!(dialog.candidates[0].action, PruneAction::Keep);
+        assert!(dialog.error.is_none());
+        dialog.toggle_current();
+        assert_eq!(dialog.candidates[0].action, PruneAction::Remove);
+    }
+
+    #[test]
+    fn prune_dialog_toggle_with_no_rows_is_safe() {
+        let mut dialog = make_prune_dialog(vec![]);
+        // selected = 0 but no rows; toggle must not panic.
+        dialog.toggle_current();
+        assert!(dialog.candidates.is_empty());
+    }
+
+    #[test]
+    fn prune_dialog_select_all_remove_and_keep_clear_error() {
+        let mut dialog = make_prune_dialog(vec![make_candidate("a"), make_dirty_candidate("b")]);
+        dialog.error = Some("err".into());
+        dialog.select_all_keep();
+        assert!(dialog
+            .candidates
+            .iter()
+            .all(|c| c.action == PruneAction::Keep));
+        assert!(dialog.error.is_none());
+
+        dialog.error = Some("err2".into());
+        dialog.select_all_remove();
+        assert!(dialog
+            .candidates
+            .iter()
+            .all(|c| c.action == PruneAction::Remove));
+        assert!(dialog.error.is_none());
+    }
+
+    #[test]
+    fn prune_dialog_counts_track_selection() {
+        let mut dialog = make_prune_dialog(vec![
+            make_candidate("clean"),
+            make_dirty_candidate("dirty"),
+            make_candidate("also-clean"),
+        ]);
+        // Defaults: clean rows Remove, dirty row Keep.
+        assert_eq!(dialog.remove_count(), 2);
+        assert_eq!(dialog.dirty_remove_count(), 0);
+
+        dialog.select_all_remove();
+        assert_eq!(dialog.remove_count(), 3);
+        assert_eq!(dialog.dirty_remove_count(), 1);
+
+        dialog.select_all_keep();
+        assert_eq!(dialog.remove_count(), 0);
+        assert_eq!(dialog.dirty_remove_count(), 0);
+    }
+
+    // ================================================================
+    // scan_candidates
+    // ================================================================
+
+    #[test]
+    fn scan_candidates_excludes_main() {
+        let mut app = test_app(vec![]);
+        app.project_mut()
+            .live
+            .worktree_branches
+            .insert("main".into(), "main".into());
+        app.project_mut()
+            .live
+            .worktree_branches
+            .insert("wt-1".into(), "feature/x".into());
+        let candidates = crate::prune::scan_candidates(app.project());
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].worktree, "wt-1");
+    }
+
+    #[test]
+    fn scan_candidates_dedups_live_and_frozen() {
+        let mut app = test_app(vec![]);
+        app.project_mut()
+            .live
+            .worktree_branches
+            .insert("wt-1".into(), "b1".into());
+        // Same worktree also appears as frozen (e.g. issue moved to Done).
+        app.project_mut()
+            .live
+            .frozen_worktree_branches
+            .insert("wt-1".into(), "b1".into());
+        let candidates = crate::prune::scan_candidates(app.project());
+        assert_eq!(candidates.len(), 1, "dup should be collapsed");
+    }
+
+    #[test]
+    fn scan_candidates_includes_frozen_only_entries() {
+        let mut app = test_app(vec![]);
+        app.project_mut()
+            .live
+            .frozen_worktree_branches
+            .insert("wt-frozen".into(), "old/branch".into());
+        let candidates = crate::prune::scan_candidates(app.project());
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].worktree, "wt-frozen");
+    }
+
+    #[test]
+    fn scan_candidates_links_to_matching_issue() {
+        let issue = test_issue_with_worktree("bork-1", Column::Done, "wt-1");
+        let mut app = test_app(vec![issue]);
+        app.project_mut()
+            .live
+            .worktree_branches
+            .insert("wt-1".into(), "feature/x".into());
+        let candidates = crate::prune::scan_candidates(app.project());
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].issue_id.as_deref(), Some("bork-1"));
+        assert_eq!(candidates[0].issue_column, Some(Column::Done));
+        // Done + clean + no session => default Remove
+        assert_eq!(candidates[0].action, PruneAction::Remove);
+    }
+
+    #[test]
+    fn scan_candidates_sorts_by_worktree_name() {
+        let mut app = test_app(vec![]);
+        app.project_mut()
+            .live
+            .worktree_branches
+            .insert("zebra".into(), "z".into());
+        app.project_mut()
+            .live
+            .worktree_branches
+            .insert("alpha".into(), "a".into());
+        app.project_mut()
+            .live
+            .worktree_branches
+            .insert("mango".into(), "m".into());
+        let candidates = crate::prune::scan_candidates(app.project());
+        let names: Vec<&str> = candidates.iter().map(|c| c.worktree.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "mango", "zebra"]);
     }
 }

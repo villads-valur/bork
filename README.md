@@ -134,6 +134,7 @@ bork --help
 | `bork integration attach-pr <id> <number>` | Link a GitHub PR to an issue (can attach multiple) |
 | `bork update` | Pull latest from `main` and rebuild |
 | `bork update --check` | Check whether a new version is available without pulling |
+| `bork prune` | Prune stale worktrees (interactive; `--dry-run`, `--yes`, `--include`, `--exclude`) |
 
 ### `bork init`
 

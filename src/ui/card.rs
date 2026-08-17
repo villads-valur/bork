@@ -190,8 +190,9 @@ fn format_bottom_line(
     let has_linear = issue.has_linear();
     let has_missing_branch = branch.is_none();
     let has_ports = ports.is_some_and(|p| !p.is_empty());
+    let pruned_indicator = pruned_indicator_text(issue);
 
-    if !has_linear && !has_missing_branch && !has_ports {
+    if !has_linear && !has_missing_branch && !has_ports && pruned_indicator.is_none() {
         return Line::from("");
     }
 
@@ -255,6 +256,15 @@ fn format_bottom_line(
         right_width += 1;
     }
 
+    if let Some(text) = pruned_indicator.as_deref() {
+        if !right_spans.is_empty() {
+            right_spans.insert(0, Span::raw(" "));
+            right_width += 1;
+        }
+        right_spans.insert(0, Span::styled(text.to_string(), styles::dim_style()));
+        right_width += text.len();
+    }
+
     if !right_spans.is_empty() {
         let total = left_width + right_width + 1;
         let gap = if total < max_width {
@@ -268,6 +278,36 @@ fn format_bottom_line(
     }
 
     Line::from(left_spans)
+}
+
+/// "pruned 3d ago" indicator. Only shown when the issue has been pruned and
+/// no new worktree has been attached since.
+fn pruned_indicator_text(issue: &Issue) -> Option<String> {
+    if issue.worktree.is_some() {
+        return None;
+    }
+    let pruned_at = issue.pruned_at?;
+    let now = crate::app::unix_now();
+    Some(format!(
+        "pruned {}",
+        humanize_age(now.saturating_sub(pruned_at))
+    ))
+}
+
+pub(crate) fn humanize_age(secs: u64) -> String {
+    if secs < 60 {
+        return "just now".to_string();
+    }
+    if secs < 3600 {
+        return format!("{}m ago", secs / 60);
+    }
+    if secs < 86_400 {
+        return format!("{}h ago", secs / 3600);
+    }
+    if secs < 30 * 86_400 {
+        return format!("{}d ago", secs / 86_400);
+    }
+    format!("{}mo ago", secs / (30 * 86_400))
 }
 
 fn format_git_status(status: Option<&WorktreeStatus>) -> Vec<Span<'static>> {
@@ -439,6 +479,80 @@ fn format_pr_compact(pr: Option<&PrStatus>, issue: &Issue) -> Line<'static> {
 mod tests {
     use super::*;
     use ratatui::style::Color;
+
+    #[test]
+    fn humanize_age_seconds() {
+        assert_eq!(humanize_age(0), "just now");
+        assert_eq!(humanize_age(30), "just now");
+    }
+
+    #[test]
+    fn humanize_age_minutes() {
+        assert_eq!(humanize_age(60), "1m ago");
+        assert_eq!(humanize_age(3599), "59m ago");
+    }
+
+    #[test]
+    fn humanize_age_hours() {
+        assert_eq!(humanize_age(3600), "1h ago");
+        assert_eq!(humanize_age(86_399), "23h ago");
+    }
+
+    #[test]
+    fn humanize_age_days() {
+        assert_eq!(humanize_age(86_400), "1d ago");
+        assert_eq!(humanize_age(7 * 86_400), "7d ago");
+    }
+
+    #[test]
+    fn humanize_age_months() {
+        assert_eq!(humanize_age(30 * 86_400), "1mo ago");
+        assert_eq!(humanize_age(90 * 86_400), "3mo ago");
+    }
+
+    fn issue_for_prune_indicator(worktree: Option<&str>, pruned_at: Option<u64>) -> Issue {
+        Issue {
+            id: "bork-1".into(),
+            title: "t".into(),
+            kind: crate::types::IssueKind::Agentic,
+            column: crate::types::Column::Done,
+            agent_kind: crate::types::AgentKind::OpenCode,
+            agent_mode: crate::types::AgentMode::Plan,
+            prompt: None,
+            worktree: worktree.map(String::from),
+            done_at: None,
+            session_id: None,
+            pruned_at,
+            linear_links: Vec::new(),
+            github_pr_links: Vec::new(),
+            linear_id: None,
+            linear_identifier: None,
+            linear_url: None,
+            linear_imported: false,
+            pr_number: None,
+            pr_imported: false,
+            pr_import_source: None,
+        }
+    }
+
+    #[test]
+    fn pruned_indicator_none_when_worktree_still_attached() {
+        let issue = issue_for_prune_indicator(Some("wt"), Some(1_700_000_000));
+        assert!(pruned_indicator_text(&issue).is_none());
+    }
+
+    #[test]
+    fn pruned_indicator_none_when_never_pruned() {
+        let issue = issue_for_prune_indicator(None, None);
+        assert!(pruned_indicator_text(&issue).is_none());
+    }
+
+    #[test]
+    fn pruned_indicator_set_when_pruned_and_detached() {
+        let issue = issue_for_prune_indicator(None, Some(0));
+        let text = pruned_indicator_text(&issue).expect("expected pruned indicator");
+        assert!(text.starts_with("pruned "));
+    }
 
     #[test]
     fn highlight_spans_no_query_returns_single_span() {

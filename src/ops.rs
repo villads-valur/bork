@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::config::{self, AppState};
+use crate::config;
 use crate::types::{AgentKind, AgentMode, Column, Issue, IssueKind};
 
 pub fn next_issue_id(issues: &[Issue], project_name: &str) -> String {
@@ -146,6 +146,7 @@ pub fn create_issue(project_root: &Path, opts: CreateOptions) -> anyhow::Result<
             None
         },
         session_id: None,
+        pruned_at: None,
         linear_links: Vec::new(),
         github_pr_links: Vec::new(),
         linear_id: None,
@@ -342,9 +343,7 @@ pub fn move_issue(project_root: &Path, issue_id: &str, column: Column) -> anyhow
 #[allow(dead_code)] // Useful debugging/scripting utility; not yet wired to a CLI subcommand
 pub fn dump_state(project_root: &Path) -> anyhow::Result<String> {
     let state = config::load_state(project_root);
-    Ok(serde_json::to_string_pretty(&AppState {
-        issues: state.issues,
-    })?)
+    Ok(serde_json::to_string_pretty(&state)?)
 }
 
 #[cfg(test)]
@@ -821,6 +820,7 @@ mod tests {
             worktree: None,
             done_at: None,
             session_id: None,
+            pruned_at: None,
             linear_links: Vec::new(),
             github_pr_links: Vec::new(),
             linear_id: None,

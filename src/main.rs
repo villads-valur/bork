@@ -9,6 +9,7 @@ mod init;
 mod input;
 mod lock;
 mod ops;
+mod prune;
 mod toml_lite;
 mod types;
 mod ui;
@@ -69,6 +70,10 @@ const PORT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const LINEAR_POLL_INTERVAL: Duration = Duration::from_secs(45);
 const PR_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const STATE_POLL_TICKS: usize = 40; // 40 * 50ms = 2s
+/// Minimum interval between auto-prune checks (and thus toasts) for the same
+/// project. Keeps the tick loop from counting worktrees constantly and the
+/// message from re-flashing once the threshold is hit.
+const PRUNE_PROMPT_MIN_GAP: Duration = Duration::from_secs(300);
 
 struct SessionPollResult {
     sessions: HashSet<String>,
@@ -305,6 +310,25 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
+
+    /// Prune stale worktrees from the project on disk.
+    Prune {
+        /// Print what would be removed without touching anything
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip the interactive prompt and remove all default-Remove candidates
+        #[arg(long)]
+        yes: bool,
+
+        /// Force-include extra worktree directory names in the removal set
+        #[arg(long)]
+        include: Vec<String>,
+
+        /// Skip these worktree directory names
+        #[arg(long)]
+        exclude: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -519,8 +543,129 @@ fn main() -> anyhow::Result<()> {
                 update::run_update()
             }
         }
+        Some(Command::Prune {
+            dry_run,
+            yes,
+            include,
+            exclude,
+        }) => run_prune_command(dry_run, yes, &include, &exclude),
         None => run_tui(),
     }
+}
+
+fn run_prune_command(
+    dry_run: bool,
+    yes: bool,
+    include: &[String],
+    exclude: &[String],
+) -> anyhow::Result<()> {
+    use crate::prune::{
+        apply_outcome_to_issues, execute_removals, partition_selection, PruneAction,
+        PruneCandidate, RemoveOutcome,
+    };
+    use std::collections::HashSet;
+    use std::io::Write;
+
+    let config = config::load_config();
+    let mut state = config::load_state(&config.project_root);
+
+    let poll = external::git::poll_all_worktrees(&config.project_root, &HashSet::new());
+
+    let mut candidates: Vec<PruneCandidate> = poll
+        .branches
+        .keys()
+        .filter(|n| n.as_str() != "main")
+        .map(|name| {
+            let issue = state
+                .issues
+                .iter()
+                .find(|i| i.worktree.as_deref() == Some(name.as_str()));
+            // The CLI can't see tmux sessions, so session_alive is false;
+            // git's dirty refusal still protects in-flight work.
+            PruneCandidate::new(name.clone(), poll.statuses.get(name).cloned(), issue, false)
+        })
+        .collect();
+    candidates.sort_by(|a, b| a.worktree.cmp(&b.worktree));
+
+    if candidates.is_empty() {
+        println!("No prunable worktrees found.");
+        return Ok(());
+    }
+
+    let include_set: HashSet<&str> = include.iter().map(String::as_str).collect();
+    let exclude_set: HashSet<&str> = exclude.iter().map(String::as_str).collect();
+    for c in &mut candidates {
+        if exclude_set.contains(c.worktree.as_str()) {
+            c.action = PruneAction::Keep;
+        } else if include_set.contains(c.worktree.as_str()) {
+            c.action = PruneAction::Remove;
+        }
+    }
+
+    println!("Worktrees:");
+    for c in &candidates {
+        let marker = match c.action {
+            PruneAction::Remove => "[remove]",
+            PruneAction::Keep => "[keep]  ",
+        };
+        let dirty = if c.is_dirty() { " (dirty)" } else { "" };
+        let issue = c.issue_id.as_deref().unwrap_or("(orphan)");
+        println!("  {marker} {:<32}  {issue}{dirty}", c.worktree);
+    }
+
+    let (to_remove, dirty_names) = partition_selection(&candidates);
+    if !dirty_names.is_empty() {
+        eprintln!(
+            "Refusing: dirty worktrees can't be pruned: {}",
+            dirty_names.join(", ")
+        );
+        anyhow::bail!("aborting; clean or stash these worktrees first");
+    }
+
+    if dry_run {
+        println!(
+            "\nDry run: {} worktree(s) would be removed",
+            to_remove.len()
+        );
+        return Ok(());
+    }
+
+    if to_remove.is_empty() {
+        println!("\nNothing to prune.");
+        return Ok(());
+    }
+
+    if !yes {
+        print!(
+            "\nProceed and remove {} worktree(s)? [y/N] ",
+            to_remove.len()
+        );
+        std::io::stdout().flush().ok();
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let answer = input.trim().to_lowercase();
+        if answer != "y" && answer != "yes" {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let outcome = execute_removals(&config.project_root, &to_remove);
+
+    for result in &outcome.results {
+        match &result.outcome {
+            RemoveOutcome::Removed => println!("Removed: {}", result.worktree),
+            RemoveOutcome::Failed(msg) => println!("Failed: {} ({})", result.worktree, msg),
+        }
+    }
+
+    let now = app::unix_now();
+    apply_outcome_to_issues(&mut state.issues, &outcome, now);
+    state.last_prune_at = Some(now);
+    config::save_state(&state, &config.project_root)?;
+
+    println!("\nDone. Pruned {} worktree(s).", outcome.removed_count());
+    Ok(())
 }
 
 fn run_project_command(command: ProjectCommand) -> anyhow::Result<()> {
@@ -1090,6 +1235,17 @@ fn run_tui() -> anyhow::Result<()> {
                 }
             }
 
+            if let Some((project_id, outcome)) = result.prune_outcome {
+                if let Some(project) = app.find_project_mut(&project_id) {
+                    let now = app::unix_now();
+                    prune::apply_outcome_to_issues(&mut project.issues, &outcome, now);
+                    project.last_prune_at = Some(now);
+                    project.mark_dirty();
+                    // Reset cooldown so we don't immediately re-prompt.
+                    project.last_auto_prune_check = Some(std::time::Instant::now());
+                }
+            }
+
             if let Some(session_name) = result.session_to_open {
                 if let Some(popup_title) = result.popup_title {
                     pending_popup_session = Some((session_name, popup_title));
@@ -1428,6 +1584,13 @@ fn run_tui() -> anyhow::Result<()> {
             }
         }
 
+        // --- Auto-prune prompt: surface a toast when there are a lot of
+        // worktrees on disk and we haven't prompted recently. ---
+        if let Some(msg) = maybe_auto_prune_message(&mut app) {
+            app.set_message(msg);
+            needs_redraw = true;
+        }
+
         // --- Flush dirty state to disk (once per tick, not per action) ---
         for project in &mut app.projects {
             if project.state_dirty {
@@ -1465,6 +1628,43 @@ fn push_kitty_flags<W: io::Write>(out: &mut W) {
 
 fn pop_kitty_flags<W: io::Write>(out: &mut W) {
     let _ = execute!(out, PopKeyboardEnhancementFlags);
+}
+
+/// Check every visible project for a worktree count above its prune threshold
+/// and return a single toast string suggesting a prune (taking the first
+/// project that qualifies). Runs every tick, so the cheap timestamp gates
+/// come first; `last_auto_prune_check` is stamped on every real check, which
+/// throttles both the counting work and the toast to once per gap.
+fn maybe_auto_prune_message(app: &mut app::App) -> Option<String> {
+    let now_inst = std::time::Instant::now();
+    let now_secs = app::unix_now();
+
+    for project in &mut app.projects {
+        if project.config.prune_threshold == 0 {
+            continue;
+        }
+        if let Some(prev) = project.last_auto_prune_check {
+            if now_inst.duration_since(prev) < PRUNE_PROMPT_MIN_GAP {
+                continue;
+            }
+        }
+        // Honour the per-project interval since the last completed prune.
+        if let Some(last) = project.last_prune_at {
+            if now_secs.saturating_sub(last) < project.config.auto_prune_check_interval {
+                continue;
+            }
+        }
+        project.last_auto_prune_check = Some(now_inst);
+        let count = project.prunable_worktree_names().len();
+        if (count as u64) < project.config.prune_threshold {
+            continue;
+        }
+        return Some(format!(
+            "{} ({} worktrees): press p to prune",
+            project.config.project_name, count
+        ));
+    }
+    None
 }
 
 fn open_tmux_popup(
