@@ -1,6 +1,7 @@
 mod agent_config;
 mod app;
 mod config;
+mod dialog_state;
 mod error;
 mod external;
 mod global_config;
@@ -20,13 +21,13 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command as StdCommand, Stdio};
+use std::process::Command as StdCommand;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use crossterm::{
     event::{
         self, Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
@@ -39,7 +40,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
-use app::{App, InputMode, ProjectId};
+use app::{App, InputMode, Project, ProjectId};
 use global_config::ReloadResult;
 use handler::{ActionResult, PostAction};
 use input::map_key_to_action;
@@ -66,7 +67,9 @@ const KITTY_KEYBOARD_FLAGS: KeyboardEnhancementFlags =
 const TICK_RATE: Duration = Duration::from_millis(50);
 const TMUX_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const GIT_POLL_INTERVAL: Duration = Duration::from_secs(5);
-const PORT_POLL_INTERVAL: Duration = Duration::from_secs(5);
+// `lsof -iTCP` scans every process and routinely takes 100ms+ on macOS, so the
+// port poll runs at a slower cadence than the other pollers.
+const PORT_POLL_INTERVAL: Duration = Duration::from_secs(10);
 const LINEAR_POLL_INTERVAL: Duration = Duration::from_secs(45);
 const PR_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const STATE_POLL_TICKS: usize = 40; // 40 * 50ms = 2s
@@ -75,31 +78,66 @@ const STATE_POLL_TICKS: usize = 40; // 40 * 50ms = 2s
 /// message from re-flashing once the threshold is hit.
 const PRUNE_PROMPT_MIN_GAP: Duration = Duration::from_secs(300);
 
-struct SessionPollResult {
-    sessions: HashSet<String>,
-    agent_statuses: HashMap<String, AgentStatusInfo>,
+/// Sleep while polling is suspended (e.g. a tmux popup owns the terminal).
+/// Keeps workers from spawning subprocesses nobody will consume.
+fn wait_while_suspended(suspended: &AtomicBool) {
+    while suspended.load(Ordering::Relaxed) {
+        thread::sleep(Duration::from_millis(200));
+    }
 }
 
-fn spawn_session_status_worker(
-    status_dir: PathBuf,
-    shutdown: Arc<AtomicBool>,
-) -> mpsc::Receiver<SessionPollResult> {
+fn flush_project_state(project: &mut Project) {
+    let current_mtime = config::state_mtime(&project.config.project_root);
+    if current_mtime != project.last_state_mtime {
+        if let Some(new_state) = config::try_load_state(&project.config.project_root) {
+            project.merge_external_state(new_state);
+        }
+    }
+
+    let _ = config::save_state(&project.to_state(), &project.config.project_root);
+    project.state_dirty = false;
+    project.update_base_snapshot();
+}
+
+/// Single shared `tmux list-sessions` poller. Tmux sessions are server-global,
+/// so one worker serves every project/swimlane instead of N identical polls.
+fn spawn_tmux_session_worker(
+    suspended: Arc<AtomicBool>,
+    wake_rx: mpsc::Receiver<()>,
+) -> mpsc::Receiver<HashSet<String>> {
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || loop {
-        if shutdown.load(Ordering::Relaxed) {
-            break;
-        }
+        wait_while_suspended(&suspended);
         let sessions = external::tmux::list_sessions();
-        let agent_statuses = read_agent_statuses(&status_dir);
-        let result = SessionPollResult {
-            sessions,
-            agent_statuses,
-        };
-        if tx.send(result).is_err() {
+        if tx.send(sessions).is_err() {
             break;
         }
-        thread::sleep(TMUX_POLL_INTERVAL);
+        if !sleep_with_wake(&wake_rx, TMUX_POLL_INTERVAL) {
+            break;
+        }
+    });
+
+    rx
+}
+
+/// Per-project poller for the agent status files in `.bork/agent-status/`.
+fn spawn_agent_status_worker(
+    status_dir: PathBuf,
+    suspended: Arc<AtomicBool>,
+    wake_rx: mpsc::Receiver<()>,
+) -> mpsc::Receiver<HashMap<String, AgentStatusInfo>> {
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || loop {
+        wait_while_suspended(&suspended);
+        let agent_statuses = read_agent_statuses(&status_dir);
+        if tx.send(agent_statuses).is_err() {
+            break;
+        }
+        if !sleep_with_wake(&wake_rx, TMUX_POLL_INTERVAL) {
+            break;
+        }
     });
 
     rx
@@ -107,6 +145,7 @@ fn spawn_session_status_worker(
 
 fn spawn_port_poll_worker(
     sessions: Arc<Mutex<HashSet<String>>>,
+    suspended: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
 ) -> mpsc::Receiver<PortPollResult> {
     let (tx, rx) = mpsc::channel();
@@ -115,6 +154,7 @@ fn spawn_port_poll_worker(
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
+        wait_while_suspended(&suspended);
         let sessions = sessions.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let ports = external::ports::poll_listening_ports(&sessions);
         if tx.send(PortPollResult { ports }).is_err() {
@@ -153,11 +193,13 @@ fn read_agent_statuses(status_dir: &Path) -> HashMap<String, AgentStatusInfo> {
 fn spawn_git_status_worker(
     project_root: PathBuf,
     skip: Arc<Mutex<HashSet<String>>>,
+    suspended: Arc<AtomicBool>,
     wake_rx: mpsc::Receiver<()>,
 ) -> mpsc::Receiver<GitPollResult> {
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || loop {
+        wait_while_suspended(&suspended);
         let skip_set = skip.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let result = external::git::poll_all_worktrees(&project_root, &skip_set);
         if tx.send(result).is_err() {
@@ -174,23 +216,26 @@ fn spawn_git_status_worker(
 /// Sleep until `interval` elapses or `wake_rx` signals.
 /// Returns `false` if the wake channel disconnected (caller should exit).
 fn sleep_with_wake(wake_rx: &mpsc::Receiver<()>, interval: Duration) -> bool {
-    let deadline = Instant::now() + interval;
-    loop {
-        if Instant::now() >= deadline {
-            return true;
+    match wake_rx.recv_timeout(interval) {
+        Ok(()) => {
+            // Drain queued wakes so mashing a refresh key triggers one
+            // poll round, not N back-to-back rounds.
+            while wake_rx.try_recv().is_ok() {}
+            true
         }
-        match wake_rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(()) => return true,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => return false,
-        }
+        Err(mpsc::RecvTimeoutError::Timeout) => true,
+        Err(mpsc::RecvTimeoutError::Disconnected) => false,
     }
 }
 
-fn spawn_linear_worker(wake_rx: mpsc::Receiver<()>) -> mpsc::Receiver<LinearPollResult> {
+fn spawn_linear_worker(
+    suspended: Arc<AtomicBool>,
+    wake_rx: mpsc::Receiver<()>,
+) -> mpsc::Receiver<LinearPollResult> {
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || loop {
+        wait_while_suspended(&suspended);
         let issues = external::linear::fetch_assigned_issues().unwrap_or_default();
         if tx.send(LinearPollResult { issues }).is_err() {
             break;
@@ -205,11 +250,13 @@ fn spawn_linear_worker(wake_rx: mpsc::Receiver<()>) -> mpsc::Receiver<LinearPoll
 
 fn spawn_pr_poll_worker(
     main_worktree: PathBuf,
+    suspended: Arc<AtomicBool>,
     wake_rx: mpsc::Receiver<()>,
 ) -> mpsc::Receiver<PrPollResult> {
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || loop {
+        wait_while_suspended(&suspended);
         // Run the 4 independent gh api calls in parallel
         let result = thread::scope(|s| {
             let prs_handle = s.spawn(|| {
@@ -239,6 +286,61 @@ fn spawn_pr_poll_worker(
     rx
 }
 
+/// Quickstart block shown before Options on the top-level `bork --help`.
+/// Aimed at AI agents driving bork from the CLI: where to start, plus the
+/// --agent / --mode knobs. Kept accurate against external/opencode.rs and
+/// config.rs.
+const AGENTS_START_HERE: &str = "\
+Start here (for AI agents):
+  bork issue list                List the kanban board (use --json to parse)
+  bork issue create \"<title>\"    Add an issue to the board
+  bork issue start \"<title>\"     Create issue + worktree + agent in one step
+                                 (--no-worktree to skip it, --base <branch> to
+                                  pick the worktree's base; defaults to main)
+  bork worktree <id> <slug>      Create the git worktree for an issue
+                                 (--base <branch> to pick its base branch)
+  bork issue archive <id>        Kill session + teardown + remove worktree
+                                 (--force to discard uncommitted changes)
+
+  Agentic issues each run one coding agent. Pick which and how with:
+    --agent   opencode (default), claude, codex     # must be on your PATH
+    --mode    plan (read-only), build, yolo          # yolo: claude/codex only
+    --kind    agentic (default), todo, orchestrator  # todo: no agent;
+                                                     # orchestrator: plans,
+                                                     # spawns + monitors issues
+                                                     # from the project root
+
+  Defaults + allowlist live in ~/.config/bork/config.toml
+  (default_agent, agents = [...], orchestrator_prompt);
+  per-project override in .bork/config.toml.";
+
+/// One-line pointer shown before Options on every subcommand `--help`, so the
+/// quickstart is discoverable at any level without repeating the full block.
+const AGENTS_POINTER: &str =
+    "Agents: run 'bork --help' for the AI-agent quickstart (--agent / --mode).";
+
+/// Build a help template that injects `agents_block` between the usage line and
+/// the auto-generated argument/command listing. clap only substitutes its own
+/// tags (`{all-args}`, `{usage}`, ...), so the agents text is interpolated here
+/// rather than left as a placeholder. Mirrors Harbor's "Start here" layout:
+/// the block sits up top, before Commands and Options.
+fn help_template_with_agents(agents_block: &str) -> String {
+    format!(
+        "{{about-with-newline}}\n\
+         {{usage-heading}} {{usage}}\n\n\
+         {agents_block}\n\n\
+         {{all-args}}{{after-help}}"
+    )
+}
+
+/// Apply the agents help template to a command and, recursively, to all of its
+/// subcommands. The root gets the full quickstart; every nested command gets
+/// the one-line pointer.
+fn apply_agents_help(cmd: clap::Command, agents_block: &str) -> clap::Command {
+    cmd.help_template(help_template_with_agents(agents_block))
+        .mut_subcommands(|sub| apply_agents_help(sub, AGENTS_POINTER))
+}
+
 #[derive(Parser)]
 #[command(
     name = "bork",
@@ -265,7 +367,7 @@ enum Command {
         agent: AgentKindArg,
     },
 
-    /// Install agent status hooks (OpenCode plugin + Claude Code/Codex hooks)
+    /// Install agent status hooks (OpenCode/Pi plugins + Claude Code/Codex hooks)
     Install,
 
     /// Remove agent status hooks
@@ -282,6 +384,10 @@ enum Command {
         /// Create the issue if it doesn't exist (with this title)
         #[arg(long)]
         title: Option<String>,
+
+        /// Branch to base the new worktree on (defaults to main/master)
+        #[arg(long)]
+        base: Option<String>,
     },
 
     /// Manage registered bork projects
@@ -300,6 +406,12 @@ enum Command {
     Integration {
         #[command(subcommand)]
         command: IntegrationCommand,
+    },
+
+    /// Get or set project configuration
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
     },
 
     /// Update bork to the latest version (git pull + cargo build)
@@ -350,6 +462,31 @@ enum ProjectCommand {
 }
 
 #[derive(Subcommand)]
+enum ConfigCommand {
+    /// Show all resolved config values (global + project merged)
+    List,
+
+    /// Print the resolved value of a single key
+    Get {
+        /// Config key (e.g. auto_import_reviews)
+        key: String,
+    },
+
+    /// Set a config key in the project (or global with --global)
+    Set {
+        /// Config key (e.g. auto_import_reviews)
+        key: String,
+
+        /// Value to set (e.g. true, false, "text")
+        value: String,
+
+        /// Write to the global config (~/.config/bork/config.toml)
+        #[arg(long)]
+        global: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum IssueCommand {
     /// List all issues
     List {
@@ -360,6 +497,10 @@ enum IssueCommand {
         /// Filter by column (todo, in-progress, code-review, done)
         #[arg(long, value_parser = parse_column)]
         column: Option<Column>,
+
+        /// Show only issues linked to this issue id (its connected component)
+        #[arg(long)]
+        linked: Option<String>,
     },
 
     /// Create a new issue
@@ -371,7 +512,7 @@ enum IssueCommand {
         #[arg(long, value_parser = parse_column)]
         column: Option<Column>,
 
-        /// Agent kind (opencode, claude, codex)
+        /// Agent kind (opencode, claude, codex, pi)
         #[arg(long, value_parser = parse_agent_kind)]
         agent: Option<AgentKind>,
 
@@ -383,9 +524,48 @@ enum IssueCommand {
         #[arg(long)]
         prompt: Option<String>,
 
-        /// Issue kind (agentic, todo)
+        /// Issue kind (agentic, todo, orchestrator)
         #[arg(long, value_parser = parse_issue_kind)]
         kind: Option<IssueKind>,
+    },
+
+    /// Create an issue, create a worktree, and start its agent session
+    Start {
+        /// Issue title
+        title: String,
+
+        /// Prompt text for the agent
+        #[arg(long)]
+        prompt: Option<String>,
+
+        /// Agent kind (opencode, claude, codex)
+        #[arg(long, value_parser = parse_agent_kind)]
+        agent: Option<AgentKind>,
+
+        /// Agent mode (plan, build, yolo). Defaults to build.
+        #[arg(long, value_parser = parse_agent_mode)]
+        mode: Option<AgentMode>,
+
+        /// Branch/worktree slug. Defaults to a slug generated from the title.
+        #[arg(long)]
+        slug: Option<String>,
+
+        /// Skip creating a git worktree before launching the agent
+        #[arg(long)]
+        no_worktree: bool,
+
+        /// Branch to base the new worktree on (defaults to main/master)
+        #[arg(long)]
+        base: Option<String>,
+
+        /// Project name or path to start the issue in. Defaults to current project.
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Tie the new issue to an existing issue id (symmetric link). Defaults
+        /// to the spawning issue when run from inside an agent session.
+        #[arg(long)]
+        link: Option<String>,
     },
 
     /// Update an existing issue
@@ -401,7 +581,7 @@ enum IssueCommand {
         #[arg(long, value_parser = parse_column)]
         column: Option<Column>,
 
-        /// Change agent kind (opencode, claude, codex)
+        /// Change agent kind (opencode, claude, codex, pi)
         #[arg(long, value_parser = parse_agent_kind)]
         agent: Option<AgentKind>,
 
@@ -412,6 +592,20 @@ enum IssueCommand {
         /// Update prompt text (empty string clears it)
         #[arg(long)]
         prompt: Option<String>,
+
+        /// Change issue kind (agentic, todo, orchestrator)
+        #[arg(long, value_parser = parse_issue_kind)]
+        kind: Option<IssueKind>,
+    },
+
+    /// Archive an issue: kill its session, run teardown, remove its worktree
+    Archive {
+        /// Issue ID (e.g. bork-1)
+        id: String,
+
+        /// Proceed past a failing teardown script and discard uncommitted changes
+        #[arg(long)]
+        force: bool,
     },
 
     /// Delete an issue
@@ -430,14 +624,18 @@ enum IssueCommand {
         json: bool,
     },
 
-    /// Move an issue to a column
+    /// Move issues to a column
     Move {
-        /// Issue ID (e.g. bork-1)
-        id: String,
+        /// Issue IDs followed by the target column, unless --to is used
+        args: Vec<String>,
+
+        /// Move all issues linked to this issue id (its connected component)
+        #[arg(long)]
+        linked: Option<String>,
 
         /// Target column (todo, in-progress, code-review, done)
-        #[arg(value_parser = parse_column)]
-        column: Column,
+        #[arg(long, value_parser = parse_column)]
+        to: Option<Column>,
     },
 }
 
@@ -460,6 +658,54 @@ enum IntegrationCommand {
         /// GitHub PR number
         pr_number: u32,
     },
+
+    /// Unlink a Linear ticket from an issue
+    DetachLinear {
+        /// Issue ID (e.g. bork-1)
+        issue_id: String,
+
+        /// Linear issue identifier (e.g. VIL-123)
+        linear_identifier: String,
+    },
+
+    /// Unlink a GitHub PR from an issue
+    DetachPr {
+        /// Issue ID (e.g. bork-1)
+        issue_id: String,
+
+        /// GitHub PR number
+        pr_number: u32,
+    },
+
+    /// Remove all Linear links from an issue
+    ClearLinear {
+        /// Issue ID (e.g. bork-1)
+        issue_id: String,
+    },
+
+    /// Remove all PR links from an issue
+    ClearPr {
+        /// Issue ID (e.g. bork-1)
+        issue_id: String,
+    },
+
+    /// Tie two bork issues together (symmetric link)
+    Link {
+        /// First issue ID (e.g. bork-1)
+        issue_a: String,
+
+        /// Second issue ID (e.g. bork-3)
+        issue_b: String,
+    },
+
+    /// Remove a link between two bork issues
+    Unlink {
+        /// First issue ID (e.g. bork-1)
+        issue_a: String,
+
+        /// Second issue ID (e.g. bork-3)
+        issue_b: String,
+    },
 }
 
 fn parse_column(s: &str) -> Result<Column, String> {
@@ -476,8 +722,12 @@ fn parse_column(s: &str) -> Result<Column, String> {
 }
 
 fn parse_agent_kind(s: &str) -> Result<AgentKind, String> {
-    AgentKind::parse(s)
-        .ok_or_else(|| format!("Unknown agent '{}'. Options: opencode, claude, codex", s))
+    AgentKind::parse(s).ok_or_else(|| {
+        format!(
+            "Unknown agent '{}'. Options: opencode, claude, codex, pi",
+            s
+        )
+    })
 }
 
 fn parse_agent_mode(s: &str) -> Result<AgentMode, String> {
@@ -493,8 +743,9 @@ fn parse_issue_kind(s: &str) -> Result<IssueKind, String> {
     match s.to_lowercase().as_str() {
         "agentic" => Ok(IssueKind::Agentic),
         "todo" | "non-agentic" | "nonagentic" => Ok(IssueKind::NonAgentic),
+        "orchestrator" | "orch" | "planner" => Ok(IssueKind::Orchestrator),
         _ => Err(format!(
-            "Unknown issue kind '{}'. Options: agentic, todo",
+            "Unknown issue kind '{}'. Options: agentic, todo, orchestrator",
             s
         )),
     }
@@ -505,6 +756,7 @@ enum AgentKindArg {
     Opencode,
     Claude,
     Codex,
+    Pi,
 }
 
 impl From<AgentKindArg> for AgentKind {
@@ -513,12 +765,15 @@ impl From<AgentKindArg> for AgentKind {
             AgentKindArg::Opencode => AgentKind::OpenCode,
             AgentKindArg::Claude => AgentKind::Claude,
             AgentKindArg::Codex => AgentKind::Codex,
+            AgentKindArg::Pi => AgentKind::Pi,
         }
     }
 }
 
 fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let command = apply_agents_help(Cli::command(), AGENTS_START_HERE);
+    let matches = command.get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
     match cli.command {
         Some(Command::Init {
@@ -532,10 +787,17 @@ fn main() -> anyhow::Result<()> {
             issue_id,
             slug,
             title,
-        }) => worktree::run_worktree(&issue_id, slug.as_deref(), title.as_deref()),
+            base,
+        }) => worktree::run_worktree(
+            &issue_id,
+            slug.as_deref(),
+            title.as_deref(),
+            base.as_deref(),
+        ),
         Some(Command::Project { command }) => run_project_command(command),
         Some(Command::Issue { command }) => run_issue_command(command),
         Some(Command::Integration { command }) => run_integration_command(command),
+        Some(Command::Config { command }) => run_config_command(command),
         Some(Command::Update { check }) => {
             if check {
                 update::run_check_command()
@@ -719,12 +981,138 @@ fn run_project_command(command: ProjectCommand) -> anyhow::Result<()> {
     }
 }
 
+/// Settable scalar config keys and their value kinds, used by `bork config`
+/// for validation and display. Dotted `[agent.*]` keys are intentionally
+/// excluded; edit those by hand.
+#[derive(Clone, Copy)]
+enum ConfigKeyKind {
+    Bool,
+    U64,
+    Str,
+    Agent,
+}
+
+const CONFIG_KEYS: &[(&str, ConfigKeyKind)] = &[
+    ("auto_import_reviews", ConfigKeyKind::Bool),
+    ("auto_import_authored_prs", ConfigKeyKind::Bool),
+    ("debug", ConfigKeyKind::Bool),
+    ("done_session_ttl", ConfigKeyKind::U64),
+    ("agent_kind", ConfigKeyKind::Agent),
+    ("default_prompt", ConfigKeyKind::Str),
+    ("review_prompt", ConfigKeyKind::Str),
+    ("orchestrator_prompt", ConfigKeyKind::Str),
+];
+
+fn config_key_kind(key: &str) -> Option<ConfigKeyKind> {
+    CONFIG_KEYS
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, kind)| *kind)
+}
+
+/// Validate `value` against `kind` and return the TOML literal to write.
+fn toml_literal_for(kind: ConfigKeyKind, value: &str) -> anyhow::Result<String> {
+    match kind {
+        ConfigKeyKind::Bool => match value {
+            "true" | "false" => Ok(value.to_string()),
+            _ => anyhow::bail!("expected 'true' or 'false', got '{}'", value),
+        },
+        ConfigKeyKind::U64 => {
+            value
+                .parse::<u64>()
+                .map_err(|_| anyhow::anyhow!("expected a non-negative integer, got '{}'", value))?;
+            Ok(value.to_string())
+        }
+        ConfigKeyKind::Agent => match AgentKind::parse(value) {
+            Some(_) => Ok(format!("\"{}\"", value)),
+            None => anyhow::bail!("unknown agent '{}'", value),
+        },
+        ConfigKeyKind::Str => {
+            // toml_lite is line-based: raw newlines inside a quoted string
+            // corrupt the value on read-back, so escape control chars too
+            // (the reader understands \n, \r, and \t).
+            let escaped = value
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+                .replace('\t', "\\t");
+            Ok(format!("\"{}\"", escaped))
+        }
+    }
+}
+
+/// Resolve the value of a config key from a materialized `AppConfig`.
+fn resolved_config_value(config: &config::AppConfig, key: &str) -> Option<String> {
+    match key {
+        "auto_import_reviews" => Some(config.auto_import_reviews.to_string()),
+        "auto_import_authored_prs" => Some(config.auto_import_authored_prs.to_string()),
+        "debug" => Some(config.debug.to_string()),
+        "done_session_ttl" => Some(config.done_session_ttl.to_string()),
+        "agent_kind" => Some(config.agent_kind.to_string()),
+        "default_prompt" => Some(config.default_prompt.clone().unwrap_or_default()),
+        "review_prompt" => Some(config.review_prompt.clone().unwrap_or_default()),
+        "orchestrator_prompt" => Some(config.orchestrator_prompt.clone().unwrap_or_default()),
+        _ => None,
+    }
+}
+
+fn run_config_command(command: ConfigCommand) -> anyhow::Result<()> {
+    let project_root = config::find_project_root();
+    let config = config::load_config_from(&project_root);
+
+    match command {
+        ConfigCommand::List => {
+            for (key, _) in CONFIG_KEYS {
+                let value = resolved_config_value(&config, key).unwrap_or_default();
+                println!("{} = {}", key, value);
+            }
+            Ok(())
+        }
+        ConfigCommand::Get { key } => {
+            let Some(value) = resolved_config_value(&config, &key) else {
+                anyhow::bail!("unknown config key '{}'", key);
+            };
+            println!("{}", value);
+            Ok(())
+        }
+        ConfigCommand::Set { key, value, global } => {
+            let Some(kind) = config_key_kind(&key) else {
+                anyhow::bail!(
+                    "unknown config key '{}'. Settable keys: {}",
+                    key,
+                    CONFIG_KEYS
+                        .iter()
+                        .map(|(k, _)| *k)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            };
+            let literal = toml_literal_for(kind, &value)?;
+            let path = config::set_config_value(&project_root, global, &key, &literal)?;
+            println!("Set {} = {} in {}", key, literal, path.display());
+            Ok(())
+        }
+    }
+}
+
 fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
     let project_root = config::find_project_root();
 
     match command {
-        IssueCommand::List { json, column } => {
-            let output = ops::list_issues(&project_root, &ops::ListOptions { column, json })?;
+        IssueCommand::List {
+            json,
+            column,
+            linked,
+        } => {
+            let output = ops::list_issues(
+                &project_root,
+                &ops::ListOptions {
+                    column,
+                    json,
+                    linked,
+                },
+            )?;
             println!("{}", output);
             Ok(())
         }
@@ -750,6 +1138,42 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
             println!("Created {}: \"{}\"", issue.id, issue.title);
             Ok(())
         }
+        IssueCommand::Start {
+            title,
+            prompt,
+            agent,
+            mode,
+            slug,
+            no_worktree,
+            base,
+            project,
+            link,
+        } => {
+            let project_root = resolve_start_project_root(project.as_deref())?;
+            let report = start_issue(
+                &project_root,
+                StartIssueOptions {
+                    title,
+                    prompt,
+                    agent_kind: agent,
+                    agent_mode: mode,
+                    slug,
+                    no_worktree,
+                    base_branch: base,
+                    link,
+                },
+            )?;
+            println!("Started {}: \"{}\"", report.issue_id, report.title);
+            if let Some(worktree_dir) = report.worktree_dir {
+                println!("Worktree: {}/", worktree_dir);
+            }
+            if let Some(linked) = report.linked_to {
+                println!("Linked:   {}", linked);
+            }
+            println!("Session:  {}", report.session_name);
+            println!("Attach:   tmux attach -t {}", report.session_name);
+            Ok(())
+        }
         IssueCommand::Update {
             id,
             title,
@@ -757,6 +1181,7 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
             agent,
             mode,
             prompt,
+            kind,
         } => {
             let issue = ops::update_issue(
                 &project_root,
@@ -767,9 +1192,21 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
                     agent_kind: agent,
                     agent_mode: mode,
                     prompt,
+                    kind,
                 },
             )?;
             println!("Updated {}: \"{}\"", issue.id, issue.title);
+            Ok(())
+        }
+        IssueCommand::Archive { id, force } => {
+            let report = ops::archive_issue(&project_root, &id, force)?;
+            println!("Archived {}: \"{}\"", report.issue_id, report.title);
+            if let Some(worktree_dir) = report.worktree_removed {
+                println!("Removed worktree: {}/", worktree_dir);
+            }
+            if report.session_killed {
+                println!("Killed session: {}", report.session_name);
+            }
             Ok(())
         }
         IssueCommand::Delete { id } => {
@@ -782,12 +1219,174 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
             println!("{}", output);
             Ok(())
         }
-        IssueCommand::Move { id, column } => {
-            let issue = ops::move_issue(&project_root, &id, column)?;
-            println!("Moved {} to {}", issue.id, issue.column);
+        IssueCommand::Move {
+            mut args,
+            linked,
+            to,
+        } => {
+            let to = match to {
+                Some(column) => column,
+                None => {
+                    let Some(column) = args.pop() else {
+                        anyhow::bail!("provide a target column or --to <column>");
+                    };
+                    parse_column(&column).map_err(|err| anyhow::anyhow!(err))?
+                }
+            };
+            let ids = args;
+            if ids.is_empty() && linked.is_none() {
+                anyhow::bail!("provide at least one issue id or --linked <id>");
+            }
+
+            let report = ops::move_issues(&project_root, &ids, linked.as_deref(), to)?;
+            println!("Moved {} issues to {}", report.moved.len(), to);
+            if !report.skipped.is_empty() {
+                eprintln!("Skipped missing issues: {}", report.skipped.join(", "));
+            }
             Ok(())
         }
     }
+}
+
+struct StartIssueOptions {
+    title: String,
+    prompt: Option<String>,
+    agent_kind: Option<AgentKind>,
+    agent_mode: Option<AgentMode>,
+    slug: Option<String>,
+    no_worktree: bool,
+    base_branch: Option<String>,
+    /// Explicit issue id to link the new issue to. Falls back to `BORK_ISSUE_ID`
+    /// (the spawning agent's issue) when None.
+    link: Option<String>,
+}
+
+struct StartIssueReport {
+    issue_id: String,
+    title: String,
+    worktree_dir: Option<String>,
+    session_name: String,
+    linked_to: Option<String>,
+}
+
+fn resolve_start_project_root(project: Option<&str>) -> anyhow::Result<PathBuf> {
+    let Some(project) = project else {
+        return Ok(config::find_project_root());
+    };
+
+    let project_path = Path::new(project);
+    if project_path.exists() {
+        if let Some(root) = find_project_root_from(project_path) {
+            return Ok(root);
+        }
+    }
+
+    global_config::prune_stale_projects();
+    global_config::list_projects()
+        .into_iter()
+        .find(|entry| entry.name == project)
+        .map(|entry| entry.path)
+        .ok_or_else(|| anyhow::anyhow!("Project '{}' not found", project))
+}
+
+fn find_project_root_from(path: &Path) -> Option<PathBuf> {
+    let mut dir = if path.is_file() { path.parent()? } else { path };
+
+    loop {
+        if dir.join(".bork").is_dir() {
+            return Some(dir.to_path_buf());
+        }
+        dir = dir.parent()?;
+    }
+}
+
+fn start_issue(project_root: &Path, opts: StartIssueOptions) -> anyhow::Result<StartIssueReport> {
+    let config = config::load_config_from(project_root);
+    let mut issue = ops::create_issue(
+        project_root,
+        ops::CreateOptions {
+            title: opts.title.clone(),
+            column: None,
+            agent_kind: opts.agent_kind,
+            agent_mode: Some(opts.agent_mode.unwrap_or(AgentMode::Build)),
+            prompt: opts.prompt,
+            kind: Some(IssueKind::Agentic),
+        },
+    )?;
+
+    let worktree_dir = if opts.no_worktree {
+        None
+    } else {
+        let slug = opts
+            .slug
+            .unwrap_or_else(|| worktree::slugify_title(&opts.title));
+        let result = worktree::create_worktree_in(
+            &config,
+            &issue.id,
+            Some(&slug),
+            None,
+            opts.base_branch.as_deref(),
+        )?;
+        issue.worktree = Some(result.worktree_dir.clone());
+        Some(result.worktree_dir)
+    };
+
+    let (session_name, agent_session_id) = external::opencode::launch_session(&issue, &config)
+        .map_err(|e| anyhow::anyhow!("Failed to launch agent: {e}"))?;
+
+    // Resolve the link target: explicit --link wins, else the spawning agent's
+    // issue from BORK_ISSUE_ID. Only link when the target exists in this same
+    // project (cross-project spawns won't resolve and are skipped).
+    let explicit_link = opts.link.is_some();
+    let link_target = opts
+        .link
+        .or_else(|| std::env::var("BORK_ISSUE_ID").ok())
+        .filter(|id| !id.is_empty() && !id.eq_ignore_ascii_case(&issue.id));
+
+    // Reload state so we don't clobber concurrent updates that happened during launch
+    let mut state = config::load_state(project_root);
+    if let Some(saved) = state.issues.iter_mut().find(|i| i.id == issue.id) {
+        if saved.column == Column::Todo {
+            saved.column = Column::InProgress;
+        }
+        if let Some(sid) = agent_session_id {
+            saved.session_id = Some(sid);
+        }
+    }
+    config::save_state(&state, project_root)?;
+
+    let linked_to = link_target.and_then(|target| {
+        let target_exists = state
+            .issues
+            .iter()
+            .any(|i| i.id.eq_ignore_ascii_case(&target));
+        if !target_exists {
+            // An env-derived target missing here means a cross-project spawn:
+            // skip quietly. An explicit --link miss is a user error worth noting.
+            if explicit_link {
+                eprintln!(
+                    "Warning: --link target '{}' not found in this project; issue not linked",
+                    target
+                );
+            }
+            return None;
+        }
+        match ops::link_issues(project_root, &issue.id, &target) {
+            Ok((_, other)) => Some(other),
+            Err(e) => {
+                eprintln!("Warning: failed to link {} to {}: {}", issue.id, target, e);
+                None
+            }
+        }
+    });
+
+    Ok(StartIssueReport {
+        issue_id: issue.id,
+        title: issue.title,
+        worktree_dir,
+        session_name,
+        linked_to,
+    })
 }
 
 fn run_integration_command(command: IntegrationCommand) -> anyhow::Result<()> {
@@ -814,20 +1413,66 @@ fn run_integration_command(command: IntegrationCommand) -> anyhow::Result<()> {
             println!("Linked {} to PR #{}", issue.id, pr_number);
             Ok(())
         }
+        IntegrationCommand::DetachLinear {
+            issue_id,
+            linear_identifier,
+        } => {
+            let issue = ops::detach_linear(&project_root, &issue_id, &linear_identifier)?;
+            println!(
+                "Unlinked Linear {} from {}",
+                linear_identifier.to_uppercase(),
+                issue.id
+            );
+            Ok(())
+        }
+        IntegrationCommand::DetachPr {
+            issue_id,
+            pr_number,
+        } => {
+            let issue = ops::detach_pr(&project_root, &issue_id, pr_number)?;
+            println!("Unlinked PR #{} from {}", pr_number, issue.id);
+            Ok(())
+        }
+        IntegrationCommand::ClearLinear { issue_id } => {
+            let issue = ops::clear_linear(&project_root, &issue_id)?;
+            println!("Removed all Linear links from {}", issue.id);
+            Ok(())
+        }
+        IntegrationCommand::ClearPr { issue_id } => {
+            let issue = ops::clear_pr(&project_root, &issue_id)?;
+            println!("Removed all PR links from {}", issue.id);
+            Ok(())
+        }
+        IntegrationCommand::Link { issue_a, issue_b } => {
+            let (a, b) = ops::link_issues(&project_root, &issue_a, &issue_b)?;
+            println!("Linked {} <-> {}", a, b);
+            Ok(())
+        }
+        IntegrationCommand::Unlink { issue_a, issue_b } => {
+            let (a, b) = ops::unlink_issues(&project_root, &issue_a, &issue_b)?;
+            println!("Unlinked {} <-> {}", a, b);
+            Ok(())
+        }
     }
 }
 
 struct SharedWorkers {
+    tmux_rx: mpsc::Receiver<HashSet<String>>,
+    tmux_wake_tx: mpsc::Sender<()>,
     port_rx: mpsc::Receiver<PortPollResult>,
     port_sessions: Arc<Mutex<HashSet<String>>>,
     linear_rx: Option<mpsc::Receiver<LinearPollResult>>,
     linear_wake_tx: mpsc::Sender<()>,
     linear_wake_rx: Option<mpsc::Receiver<()>>,
     shutdown: Arc<AtomicBool>,
+    /// While set, all pollers idle instead of spawning subprocesses. Used when
+    /// the terminal is handed over to a tmux popup or external editor.
+    poll_suspended: Arc<AtomicBool>,
 }
 
 struct ProjectWorkers {
-    session_rx: mpsc::Receiver<SessionPollResult>,
+    session_rx: mpsc::Receiver<HashMap<String, AgentStatusInfo>>,
+    session_wake_tx: mpsc::Sender<()>,
     git_rx: mpsc::Receiver<GitPollResult>,
     git_wake_tx: mpsc::Sender<()>,
     git_skip_set: Arc<Mutex<HashSet<String>>>,
@@ -837,38 +1482,56 @@ struct ProjectWorkers {
 
 fn spawn_shared_workers() -> SharedWorkers {
     let shutdown = Arc::new(AtomicBool::new(false));
+    let poll_suspended = Arc::new(AtomicBool::new(false));
+
+    let (tmux_wake_tx, tmux_wake_rx) = mpsc::channel::<()>();
+    let tmux_rx = spawn_tmux_session_worker(poll_suspended.clone(), tmux_wake_rx);
 
     let port_sessions = Arc::new(Mutex::new(HashSet::<String>::new()));
-    let port_rx = spawn_port_poll_worker(port_sessions.clone(), shutdown.clone());
+    let port_rx = spawn_port_poll_worker(
+        port_sessions.clone(),
+        poll_suspended.clone(),
+        shutdown.clone(),
+    );
 
     let (linear_wake_tx, linear_wake_rx) = mpsc::channel::<()>();
 
     SharedWorkers {
+        tmux_rx,
+        tmux_wake_tx,
         port_rx,
         port_sessions,
         linear_rx: None,
         linear_wake_tx,
         linear_wake_rx: Some(linear_wake_rx),
         shutdown,
+        poll_suspended,
     }
 }
 
-fn spawn_project_workers(project: &app::Project, shutdown: &Arc<AtomicBool>) -> ProjectWorkers {
+fn spawn_project_workers(project: &app::Project, suspended: &Arc<AtomicBool>) -> ProjectWorkers {
     let project_root = project.config.project_root.clone();
 
     let status_dir = config::agent_status_dir(&project_root);
-    let session_rx = spawn_session_status_worker(status_dir, shutdown.clone());
+    let (session_wake_tx, session_wake_rx) = mpsc::channel::<()>();
+    let session_rx = spawn_agent_status_worker(status_dir, suspended.clone(), session_wake_rx);
 
     let git_skip_set = Arc::new(Mutex::new(project.done_worktree_names()));
     let (git_wake_tx, git_wake_rx) = mpsc::channel::<()>();
-    let git_rx = spawn_git_status_worker(project_root.clone(), git_skip_set.clone(), git_wake_rx);
+    let git_rx = spawn_git_status_worker(
+        project_root.clone(),
+        git_skip_set.clone(),
+        suspended.clone(),
+        git_wake_rx,
+    );
 
     let (pr_wake_tx, pr_wake_rx) = mpsc::channel::<()>();
     let main_worktree = project_root.join("main");
-    let pr_rx = spawn_pr_poll_worker(main_worktree, pr_wake_rx);
+    let pr_rx = spawn_pr_poll_worker(main_worktree, suspended.clone(), pr_wake_rx);
 
     ProjectWorkers {
         session_rx,
+        session_wake_tx,
         git_rx,
         git_wake_tx,
         git_skip_set,
@@ -881,6 +1544,7 @@ const ACTIVITY_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 fn spawn_activity_poller(
     projects: Vec<(ProjectId, PathBuf)>,
+    suspended: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
 ) -> mpsc::Receiver<HashMap<ProjectId, bool>> {
     let (tx, rx) = mpsc::channel();
@@ -889,6 +1553,7 @@ fn spawn_activity_poller(
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
+        wait_while_suspended(&suspended);
         let mut activity: HashMap<ProjectId, bool> = HashMap::new();
         for (id, root) in &projects {
             let status_dir = root.join(".bork").join("agent-status");
@@ -1006,11 +1671,16 @@ fn run_tui() -> anyhow::Result<()> {
     }
     app.enable_sidebar();
 
+    // Clean up tmp files left behind by writers that crashed mid-save.
+    for project in &app.projects {
+        config::sweep_stale_tmp_files(&project.config.project_root);
+    }
+
     // --- Workers ---
     let (action_tx, action_rx) = mpsc::channel::<ActionResult>();
     let (reload_tx, reload_rx) = mpsc::channel::<ReloadResult>();
     let mut shared = spawn_shared_workers();
-    let mut workers = spawn_project_workers(app.project(), &shared.shutdown);
+    let mut workers = spawn_project_workers(app.project(), &shared.poll_suspended);
     let mut swimlane_workers: HashMap<ProjectId, ProjectWorkers> = HashMap::new();
 
     // --- Activity poller for sidebar markers ---
@@ -1022,6 +1692,7 @@ fn run_tui() -> anyhow::Result<()> {
             .collect();
         Some(spawn_activity_poller(
             project_paths,
+            shared.poll_suspended.clone(),
             shared.shutdown.clone(),
         ))
     } else {
@@ -1065,7 +1736,9 @@ fn run_tui() -> anyhow::Result<()> {
     let mut last_update_cache_mtime = update::cache_mtime_secs();
 
     let mut pending_popup_session: Option<(String, String)> = None;
-    let mut pending_popup_for_launch: Option<(usize, ProjectId, String, bool)> = None; // (issue_index, project_id, popup_title, open_popup)
+    // Launches in flight, keyed by issue ID so concurrent launches can't get
+    // their results crossed: (project_id, popup_title, open_popup).
+    let mut pending_popup_for_launch: HashMap<String, (ProjectId, String, bool)> = HashMap::new();
     let mut needs_redraw = true;
     let mut state_poll_counter: usize = 0;
 
@@ -1089,6 +1762,9 @@ fn run_tui() -> anyhow::Result<()> {
                         break;
                     }
                 };
+                if let Event::Resize(..) = event {
+                    needs_redraw = true;
+                }
                 if let Event::Key(key) = event {
                     if key.kind == KeyEventKind::Press {
                         needs_redraw = true;
@@ -1100,11 +1776,16 @@ fn run_tui() -> anyhow::Result<()> {
                             app.visible_swimlane_count(),
                         );
                         let ctx = app.action_context();
+                        // Route wakes to the active swimlane's workers, not the
+                        // focused project's: refresh actions in a swimlane must
+                        // wake that lane's pollers.
+                        let active_workers =
+                            swimlane_workers.get(&ctx.project_id).unwrap_or(&workers);
                         let ch = handler::ActionChannels {
                             action_tx: &action_tx,
-                            pr_wake_tx: &workers.pr_wake_tx,
+                            pr_wake_tx: &active_workers.pr_wake_tx,
                             linear_wake_tx: &shared.linear_wake_tx,
-                            git_wake_tx: &workers.git_wake_tx,
+                            git_wake_tx: &active_workers.git_wake_tx,
                             reload_tx: &reload_tx,
                         };
                         let post_action = handler::handle_action(&mut app, action, &ctx, &ch);
@@ -1116,38 +1797,33 @@ fn run_tui() -> anyhow::Result<()> {
                                 popup_title,
                             } => {
                                 if app.project().state_dirty {
-                                    let _ = config::save_state(
-                                        &app.project().to_state(),
-                                        &app.project().config.project_root,
-                                    );
-                                    app.project_mut().state_dirty = false;
-                                    app.project_mut().update_base_snapshot();
+                                    flush_project_state(app.project_mut());
                                 }
                                 open_tmux_popup(
                                     &mut terminal,
                                     &session_name,
                                     &popup_title,
                                     &app.project().config.project_name,
+                                    &shared.poll_suspended,
                                 )?;
                                 app.message = None;
                             }
                             PostAction::LaunchAndOpenPopup {
-                                issue_index,
+                                issue_id,
                                 popup_title,
                                 open_popup,
                             } => {
-                                pending_popup_for_launch = Some((
-                                    issue_index,
-                                    app.active_project_id(),
-                                    popup_title,
-                                    open_popup,
-                                ));
+                                pending_popup_for_launch.insert(
+                                    issue_id,
+                                    (app.active_project_id(), popup_title, open_popup),
+                                );
                             }
                             PostAction::OpenEditor { initial_content } => {
                                 if let Some(edited) = open_external_editor(
                                     &mut terminal,
                                     &initial_content,
                                     &app.project().config.project_name,
+                                    &shared.poll_suspended,
                                 )? {
                                     if let Some(dialog) = app.dialog.as_mut() {
                                         dialog.set_prompt_text(&edited);
@@ -1163,28 +1839,25 @@ fn run_tui() -> anyhow::Result<()> {
                                     app.debug_inspector_json = None;
                                     app.input_mode = InputMode::Normal;
                                     if app.project().state_dirty {
-                                        let _ = config::save_state(
-                                            &app.project().to_state(),
-                                            &app.project().config.project_root,
-                                        );
-                                        app.project_mut().state_dirty = false;
-                                        app.project_mut().update_base_snapshot();
+                                        flush_project_state(app.project_mut());
                                     }
 
                                     let old_focused = app.focused_project.clone();
                                     app.focused_project = id.clone();
                                     app.focused_swimlane = 0;
 
-                                    let old_workers = if let Some(existing) =
-                                        swimlane_workers.remove(&id)
-                                    {
-                                        std::mem::replace(&mut workers, existing)
-                                    } else {
-                                        std::mem::replace(
-                                            &mut workers,
-                                            spawn_project_workers(app.project(), &shared.shutdown),
-                                        )
-                                    };
+                                    let old_workers =
+                                        if let Some(existing) = swimlane_workers.remove(&id) {
+                                            std::mem::replace(&mut workers, existing)
+                                        } else {
+                                            std::mem::replace(
+                                                &mut workers,
+                                                spawn_project_workers(
+                                                    app.project(),
+                                                    &shared.poll_suspended,
+                                                ),
+                                            )
+                                        };
 
                                     let still_swimlane = app
                                         .sidebar
@@ -1220,8 +1893,10 @@ fn run_tui() -> anyhow::Result<()> {
             break;
         }
 
+        let mut action_results_arrived = false;
         while let Ok(result) = action_rx.try_recv() {
             needs_redraw = true;
+            action_results_arrived = true;
             app.busy_count = app.busy_count.saturating_sub(1);
             app.show_message(result.message, result.message_kind);
 
@@ -1246,43 +1921,55 @@ fn run_tui() -> anyhow::Result<()> {
                 }
             }
 
-            if let Some(session_name) = result.session_to_open {
-                if let Some(popup_title) = result.popup_title {
-                    pending_popup_session = Some((session_name, popup_title));
-                } else if let Some((launch_idx, proj_id, popup_title, open_popup)) =
-                    pending_popup_for_launch.take()
-                {
-                    if let Some(proj_pos) = app.projects.iter().position(|p| p.id() == proj_id) {
-                        if launch_idx < app.projects[proj_pos].issues.len() {
-                            if app.projects[proj_pos].issues[launch_idx].column
-                                == types::Column::Todo
+            if let Some(launch_id) = result.launched_issue_id {
+                app.launches_in_flight.remove(&launch_id);
+                let pending = pending_popup_for_launch.remove(&launch_id);
+                // Only act on a successful launch; failures already surfaced
+                // their error message above.
+                if let Some(session_name) = result.session_to_open {
+                    if let Some((proj_id, popup_title, open_popup)) = pending {
+                        if let Some(project) = app.find_project_mut(&proj_id) {
+                            if let Some(issue) =
+                                project.issues.iter_mut().find(|i| i.id == launch_id)
                             {
-                                app.projects[proj_pos].issues[launch_idx].column =
-                                    types::Column::InProgress;
-                                app.projects[proj_pos].mark_dirty();
+                                if issue.column == types::Column::Todo {
+                                    issue.column = types::Column::InProgress;
+                                    project.mark_dirty();
+                                }
                             }
                         }
-                    }
-                    if open_popup {
-                        pending_popup_session = Some((session_name, popup_title));
+                        if open_popup {
+                            pending_popup_session = Some((session_name, popup_title));
+                        }
                     }
                 }
+            } else if let Some(session_name) = result.session_to_open {
+                if let Some(popup_title) = result.popup_title {
+                    pending_popup_session = Some((session_name, popup_title));
+                }
+            }
+        }
+
+        // Completed actions usually changed tmux session state (launch, kill,
+        // terminal). Wake the session pollers so cards update within ms, not
+        // a full 2s poll interval.
+        if action_results_arrived {
+            let _ = shared.tmux_wake_tx.send(());
+            let _ = workers.session_wake_tx.send(());
+            for sw in swimlane_workers.values() {
+                let _ = sw.session_wake_tx.send(());
             }
         }
 
         if let Some((session_name, popup_title)) = pending_popup_session.take() {
             // Flush state before yielding terminal to tmux popup (could last a long time)
-            let _ = config::save_state(
-                &app.project().to_state(),
-                &app.project().config.project_root,
-            );
-            app.project_mut().state_dirty = false;
-            app.project_mut().update_base_snapshot();
+            flush_project_state(app.project_mut());
             open_tmux_popup(
                 &mut terminal,
                 &session_name,
                 &popup_title,
                 &app.project().config.project_name,
+                &shared.poll_suspended,
             )?;
             app.message = None;
             needs_redraw = true;
@@ -1299,8 +1986,10 @@ fn run_tui() -> anyhow::Result<()> {
             for id in &active_swimlanes {
                 if !swimlane_workers.contains_key(id) {
                     if let Some(project) = app.find_project(id) {
-                        swimlane_workers
-                            .insert(id.clone(), spawn_project_workers(project, &shared.shutdown));
+                        swimlane_workers.insert(
+                            id.clone(),
+                            spawn_project_workers(project, &shared.poll_suspended),
+                        );
                     }
                 }
             }
@@ -1309,19 +1998,38 @@ fn run_tui() -> anyhow::Result<()> {
             swimlane_workers.clear();
         }
 
-        while let Ok(poll) = workers.session_rx.try_recv() {
-            needs_redraw = true;
+        // Drain all queued poll results but only redraw when data changed:
+        // workers send every interval regardless, and undiffed assignment
+        // would rebuild the whole widget tree every 2s while idle.
+        let mut sessions_changed = false;
+
+        // Shared: tmux sessions are server-global, distribute to all projects.
+        while let Ok(sessions) = shared.tmux_rx.try_recv() {
+            for project in &mut app.projects {
+                if project.live.active_sessions != sessions {
+                    project.live.active_sessions = sessions.clone();
+                    sessions_changed = true;
+                    needs_redraw = true;
+                }
+            }
+        }
+
+        while let Ok(statuses) = workers.session_rx.try_recv() {
             let live = &mut app.project_mut().live;
-            live.active_sessions = poll.sessions;
-            live.agent_statuses = poll.agent_statuses;
+            if live.agent_statuses != statuses {
+                live.agent_statuses = statuses;
+                needs_redraw = true;
+            }
         }
 
         // --- Shared: port data (distributed to all projects) ---
         while let Ok(port_result) = shared.port_rx.try_recv() {
             for project in &mut app.projects {
-                project.live.listening_ports = port_result.ports.clone();
+                if project.live.listening_ports != port_result.ports {
+                    project.live.listening_ports = port_result.ports.clone();
+                    needs_redraw = true;
+                }
             }
-            needs_redraw = true;
         }
 
         // --- Auto-kill Done sessions past TTL ---
@@ -1347,26 +2055,41 @@ fn run_tui() -> anyhow::Result<()> {
 
         let mut git_data_changed = false;
         while let Ok(git_result) = workers.git_rx.try_recv() {
-            needs_redraw = true;
-            git_data_changed = true;
             let live = &mut app.project_mut().live;
-            live.worktree_statuses = git_result.statuses;
-            live.worktree_branches = git_result.branches;
-            live.git_poll_done = true;
+            // The first poll must always register (sets git_poll_done) even
+            // when the data matches the empty default.
+            if !live.git_poll_done
+                || live.worktree_statuses != git_result.statuses
+                || live.worktree_branches != git_result.branches
+            {
+                live.worktree_statuses = git_result.statuses;
+                live.worktree_branches = git_result.branches;
+                live.git_poll_done = true;
+                git_data_changed = true;
+                needs_redraw = true;
+            }
         }
 
         let mut pr_data_changed = false;
         while let Ok(pr_result) = workers.pr_rx.try_recv() {
+            let live = &mut app.project_mut().live;
+            let changed = !live.pr_poll_done
+                || live.pr_statuses != pr_result.prs
+                || live.user_prs != pr_result.user_prs
+                || live.review_requested_prs != pr_result.review_requested_prs;
+            if pr_result.github_user.is_some() && live.github_user != pr_result.github_user {
+                live.github_user = pr_result.github_user;
+                needs_redraw = true;
+            }
+            if !changed {
+                continue;
+            }
             needs_redraw = true;
             pr_data_changed = true;
-            let live = &mut app.project_mut().live;
             live.pr_statuses = pr_result.prs;
             live.user_prs = pr_result.user_prs;
             live.review_requested_prs = pr_result.review_requested_prs;
             live.pr_poll_done = true;
-            if pr_result.github_user.is_some() {
-                live.github_user = pr_result.github_user;
-            }
 
             let p = app.project_mut();
             let pr_titles: Vec<(u32, String)> = p
@@ -1398,8 +2121,12 @@ fn run_tui() -> anyhow::Result<()> {
             }
         }
 
-        // --- Auto-assign worktrees (only when git data changed) ---
-        if git_data_changed {
+        // --- Auto-assign worktrees ---
+        // Runs when git data changed OR when issues changed (state_dirty):
+        // a freshly created issue whose worktree already exists must be
+        // assigned even if the git poll data is identical. Gated on
+        // git_poll_done so an empty pre-poll branch map can't wipe worktrees.
+        if git_data_changed || (app.project().state_dirty && app.project().live.git_poll_done) {
             let mut worktree_changed = app.project_mut().auto_assign_worktrees();
             worktree_changed = app.project_mut().clear_stale_worktrees() || worktree_changed;
             if worktree_changed {
@@ -1410,22 +2137,19 @@ fn run_tui() -> anyhow::Result<()> {
 
         // --- Update git skip set when issues changed columns or git data arrived ---
         if git_data_changed || app.project().state_dirty {
-            if let Ok(mut skip) = workers.git_skip_set.lock() {
-                *skip = app.project().done_worktree_names();
-            }
+            let mut skip = workers
+                .git_skip_set
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *skip = app.project().done_worktree_names();
         }
 
-        // --- Update check ---
-        // Latest result from the periodic worker, or `bork update --check` in
-        // another terminal (detected via cache file mtime).
+        // --- Update check (periodic worker results) ---
+        // The `bork update --check` cache-mtime poll lives in the 2s state
+        // poll block below; no need to stat the file every 50ms tick.
         let mut new_update_available: Option<bool> = None;
         while let Ok(available) = update_check_rx.try_recv() {
             new_update_available = Some(available);
-        }
-        let mtime = update::cache_mtime_secs();
-        if mtime != last_update_cache_mtime {
-            last_update_cache_mtime = mtime;
-            new_update_available = Some(update::cached_update_available());
         }
         if let Some(available) = new_update_available {
             if app.update_available != available {
@@ -1448,7 +2172,8 @@ fn run_tui() -> anyhow::Result<()> {
                 p.linear_available = true;
             }
             if let Some(wake_rx) = shared.linear_wake_rx.take() {
-                shared.linear_rx = Some(spawn_linear_worker(wake_rx));
+                shared.linear_rx =
+                    Some(spawn_linear_worker(shared.poll_suspended.clone(), wake_rx));
             }
         }
         if let Some(ref rx) = shared.linear_rx {
@@ -1486,42 +2211,56 @@ fn run_tui() -> anyhow::Result<()> {
             let Some(proj_pos) = app.projects.iter().position(|p| p.id() == *proj_id) else {
                 continue;
             };
-            while let Ok(poll) = sw.session_rx.try_recv() {
-                needs_redraw = true;
+            while let Ok(statuses) = sw.session_rx.try_recv() {
                 let live = &mut app.projects[proj_pos].live;
-                live.active_sessions = poll.sessions;
-                live.agent_statuses = poll.agent_statuses;
+                if live.agent_statuses != statuses {
+                    live.agent_statuses = statuses;
+                    needs_redraw = true;
+                }
             }
             let mut sw_git_changed = false;
             while let Ok(git_result) = sw.git_rx.try_recv() {
-                needs_redraw = true;
-                sw_git_changed = true;
                 let live = &mut app.projects[proj_pos].live;
-                live.worktree_statuses = git_result.statuses;
-                live.worktree_branches = git_result.branches;
-                live.git_poll_done = true;
+                if !live.git_poll_done
+                    || live.worktree_statuses != git_result.statuses
+                    || live.worktree_branches != git_result.branches
+                {
+                    live.worktree_statuses = git_result.statuses;
+                    live.worktree_branches = git_result.branches;
+                    live.git_poll_done = true;
+                    sw_git_changed = true;
+                    needs_redraw = true;
+                }
             }
-            if sw_git_changed {
+            let sw_state_dirty =
+                app.projects[proj_pos].state_dirty && app.projects[proj_pos].live.git_poll_done;
+            if sw_git_changed || sw_state_dirty {
                 let changed = app.projects[proj_pos].auto_assign_worktrees();
                 let stale = app.projects[proj_pos].clear_stale_worktrees();
                 if changed || stale {
                     app.projects[proj_pos].mark_dirty();
                 }
-                if let Ok(mut skip) = sw.git_skip_set.lock() {
-                    *skip = app.projects[proj_pos].done_worktree_names();
-                }
+                let mut skip = sw.git_skip_set.lock().unwrap_or_else(|e| e.into_inner());
+                *skip = app.projects[proj_pos].done_worktree_names();
             }
             let mut sw_pr_changed = false;
             while let Ok(pr_result) = sw.pr_rx.try_recv() {
-                needs_redraw = true;
-                sw_pr_changed = true;
                 let live = &mut app.projects[proj_pos].live;
-                live.pr_statuses = pr_result.prs;
-                live.user_prs = pr_result.user_prs;
-                live.review_requested_prs = pr_result.review_requested_prs;
-                live.pr_poll_done = true;
-                if pr_result.github_user.is_some() {
+                if pr_result.github_user.is_some() && live.github_user != pr_result.github_user {
                     live.github_user = pr_result.github_user;
+                    needs_redraw = true;
+                }
+                if !live.pr_poll_done
+                    || live.pr_statuses != pr_result.prs
+                    || live.user_prs != pr_result.user_prs
+                    || live.review_requested_prs != pr_result.review_requested_prs
+                {
+                    live.pr_statuses = pr_result.prs;
+                    live.user_prs = pr_result.user_prs;
+                    live.review_requested_prs = pr_result.review_requested_prs;
+                    live.pr_poll_done = true;
+                    sw_pr_changed = true;
+                    needs_redraw = true;
                 }
             }
             if sw_pr_changed {
@@ -1535,8 +2274,13 @@ fn run_tui() -> anyhow::Result<()> {
             }
         }
 
-        // Rebuild shared port sessions from all projects' active sessions
-        if let Ok(mut port_sess) = shared.port_sessions.lock() {
+        // Rebuild shared port sessions, but only when session data actually
+        // changed; no need to take the lock 20x/sec against the port worker.
+        if sessions_changed {
+            let mut port_sess = shared
+                .port_sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             port_sess.clear();
             for project in &app.projects {
                 port_sess.extend(project.live.active_sessions.iter().cloned());
@@ -1563,7 +2307,11 @@ fn run_tui() -> anyhow::Result<()> {
 
         if app.is_busy_visible() {
             app.spinner_tick = app.spinner_tick.wrapping_add(1);
-            needs_redraw = true;
+            // The spinner advances one frame every 2 ticks; redraw only when
+            // the visible frame actually changes.
+            if app.spinner_tick.is_multiple_of(2) {
+                needs_redraw = true;
+            }
         }
         if app.tick_busy_visibility() {
             needs_redraw = true;
@@ -1573,12 +2321,42 @@ fn run_tui() -> anyhow::Result<()> {
         state_poll_counter += 1;
         if state_poll_counter >= STATE_POLL_TICKS {
             state_poll_counter = 0;
+
+            // Pick up `bork update --check` runs from other terminals.
+            let mtime = update::cache_mtime_secs();
+            if mtime != last_update_cache_mtime {
+                last_update_cache_mtime = mtime;
+                let available = update::cached_update_available();
+                if app.update_available != available {
+                    app.update_available = available;
+                    needs_redraw = true;
+                }
+            }
+
             for project in &mut app.projects {
                 let current_mtime = config::state_mtime(&project.config.project_root);
                 if current_mtime != project.last_state_mtime {
-                    let new_state = config::load_state(&project.config.project_root);
-                    project.merge_external_state(new_state);
+                    // Skip the merge when the file is unreadable/corrupt:
+                    // merging a defaulted empty state would wipe the board.
+                    if let Some(new_state) = config::try_load_state(&project.config.project_root) {
+                        project.merge_external_state(new_state);
+                        // Issues created externally (e.g. `bork issue create`)
+                        // may already have a matching worktree on disk.
+                        if project.live.git_poll_done {
+                            let changed = project.auto_assign_worktrees();
+                            let stale = project.clear_stale_worktrees();
+                            if changed || stale {
+                                project.mark_dirty();
+                            }
+                        }
+                    }
                     project.last_state_mtime = current_mtime;
+                    needs_redraw = true;
+                }
+
+                let current_config_mtime = config::config_mtime(&project.config.project_root);
+                if current_config_mtime != project.last_config_mtime {
+                    project.reload_config();
                     needs_redraw = true;
                 }
             }
@@ -1594,9 +2372,7 @@ fn run_tui() -> anyhow::Result<()> {
         // --- Flush dirty state to disk (once per tick, not per action) ---
         for project in &mut app.projects {
             if project.state_dirty {
-                let _ = config::save_state(&project.to_state(), &project.config.project_root);
-                project.state_dirty = false;
-                project.update_base_snapshot();
+                flush_project_state(project);
             }
         }
 
@@ -1607,9 +2383,9 @@ fn run_tui() -> anyhow::Result<()> {
 
     shared.shutdown.store(true, Ordering::Relaxed);
 
-    for project in &app.projects {
+    for project in &mut app.projects {
         if project.state_dirty {
-            let _ = config::save_state(&project.to_state(), &project.config.project_root);
+            flush_project_state(project);
         }
     }
     lock::release_lock(&lock_root);
@@ -1667,12 +2443,32 @@ fn maybe_auto_prune_message(app: &mut app::App) -> Option<String> {
     None
 }
 
+/// RAII guard that pauses worker polling for its lifetime. Used while the
+/// terminal is handed over to a tmux popup or external editor, so workers
+/// don't keep spawning subprocesses and queueing results nobody consumes.
+struct SuspendGuard<'a>(&'a AtomicBool);
+
+impl<'a> SuspendGuard<'a> {
+    fn new(flag: &'a AtomicBool) -> Self {
+        flag.store(true, Ordering::Relaxed);
+        SuspendGuard(flag)
+    }
+}
+
+impl Drop for SuspendGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
 fn open_tmux_popup(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     session_name: &str,
     title: &str,
     project_name: &str,
+    suspended: &AtomicBool,
 ) -> anyhow::Result<()> {
+    let _guard = SuspendGuard::new(suspended);
     pop_kitty_flags(terminal.backend_mut());
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -1695,7 +2491,9 @@ fn open_external_editor(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     initial_content: &str,
     project_name: &str,
+    suspended: &AtomicBool,
 ) -> anyhow::Result<Option<String>> {
+    let _guard = SuspendGuard::new(suspended);
     let Some((editor_cmd, editor_args)) = resolve_editor() else {
         return Err(anyhow::anyhow!("No editor found. Set $EDITOR or $VISUAL."));
     };
@@ -1743,13 +2541,7 @@ fn resolve_editor() -> Option<(String, Vec<String>)> {
         }
     }
     for name in ["vim", "nvim", "vi", "nano"] {
-        if StdCommand::new("which")
-            .arg(name)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
-        {
+        if agent_config::command_exists(name) {
             return Some((name.to_string(), vec![]));
         }
     }
@@ -1759,6 +2551,79 @@ fn resolve_editor() -> Option<(String, Vec<String>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn toml_literal_escapes_control_chars_for_roundtrip() {
+        let literal =
+            toml_literal_for(ConfigKeyKind::Str, "line one\nline two\twith \"quotes\"").unwrap();
+        assert_eq!(literal, r#""line one\nline two\twith \"quotes\"""#);
+
+        // The escaped literal must survive a toml_lite read-back.
+        let table = toml_lite::parse(&format!("orchestrator_prompt = {}", literal));
+        assert_eq!(
+            table.get("orchestrator_prompt").and_then(|v| v.as_str()),
+            Some("line one\nline two\twith \"quotes\"")
+        );
+    }
+
+    #[test]
+    fn parse_issue_kind_accepts_orchestrator_aliases() {
+        assert_eq!(
+            parse_issue_kind("orchestrator"),
+            Ok(IssueKind::Orchestrator)
+        );
+        assert_eq!(parse_issue_kind("orch"), Ok(IssueKind::Orchestrator));
+        assert_eq!(parse_issue_kind("planner"), Ok(IssueKind::Orchestrator));
+        assert_eq!(parse_issue_kind("todo"), Ok(IssueKind::NonAgentic));
+        assert!(parse_issue_kind("bogus").is_err());
+    }
+
+    #[test]
+    fn flush_project_state_merges_external_issue_before_save() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = config::AppConfig {
+            project_name: "bork".to_string(),
+            project_root: dir.path().to_path_buf(),
+            ..config::AppConfig::default()
+        };
+
+        let issue_a = types::Issue::new(
+            "bork-1".to_string(),
+            "Existing".to_string(),
+            Column::Todo,
+            AgentKind::OpenCode,
+        );
+        let initial_state = config::AppState {
+            issues: vec![issue_a.clone()],
+            ..Default::default()
+        };
+        config::save_state(&initial_state, dir.path()).unwrap();
+
+        let mut project = Project::new(config, initial_state);
+        project.mark_dirty();
+
+        let issue_b = types::Issue::new(
+            "bork-2".to_string(),
+            "Created externally".to_string(),
+            Column::Todo,
+            AgentKind::OpenCode,
+        );
+        config::save_state(
+            &config::AppState {
+                issues: vec![issue_a, issue_b],
+                ..Default::default()
+            },
+            dir.path(),
+        )
+        .unwrap();
+        project.last_state_mtime = Some(SystemTime::UNIX_EPOCH);
+
+        flush_project_state(&mut project);
+
+        let state = config::load_state(dir.path());
+        let ids: Vec<&str> = state.issues.iter().map(|issue| issue.id.as_str()).collect();
+        assert_eq!(ids, vec!["bork-1", "bork-2"]);
+    }
 
     // The wrapper tmux session name must never collide with agent session names.
     // Agent sessions follow the pattern "{project_name}-{issue_id}" where
@@ -1796,37 +2661,93 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_flag_stops_session_worker() {
-        let shutdown = Arc::new(AtomicBool::new(true));
+    fn find_project_root_from_container_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".bork")).unwrap();
+
+        assert_eq!(
+            find_project_root_from(dir.path()),
+            Some(dir.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn find_project_root_from_nested_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let nested = dir.path().join("main").join("src");
+        std::fs::create_dir_all(dir.path().join(".bork")).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(
+            find_project_root_from(&nested),
+            Some(dir.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn agent_status_worker_exits_when_wake_channel_disconnects() {
         let dir = std::env::temp_dir().join(format!("bork-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
 
-        let rx = spawn_session_status_worker(dir.clone(), shutdown);
+        let (wake_tx, wake_rx) = mpsc::channel::<()>();
+        let suspended = Arc::new(AtomicBool::new(false));
+        let rx = spawn_agent_status_worker(dir.clone(), suspended, wake_rx);
 
-        // Worker should exit quickly since shutdown is already set.
-        // If it doesn't, recv will time out.
-        let result = rx.recv_timeout(Duration::from_secs(2));
-        // Either we get a result (worker did one iteration) or disconnected (worker exited)
-        // The key is it doesn't hang.
+        // First result arrives from the initial poll.
         assert!(
-            result.is_ok() || result.is_err(),
-            "worker should not hang when shutdown is set"
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "worker should deliver an initial poll result"
         );
-        // The channel should disconnect shortly after
+
+        // Dropping the wake sender disconnects the channel; the worker must
+        // notice during its sleep and exit, closing the result channel.
+        drop(wake_tx);
+        assert!(
+            matches!(
+                rx.recv_timeout(Duration::from_secs(5)),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            ),
+            "worker should exit once the wake channel disconnects"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn shutdown_flag_stops_port_worker() {
         let shutdown = Arc::new(AtomicBool::new(true));
+        let suspended = Arc::new(AtomicBool::new(false));
         let sessions = Arc::new(Mutex::new(HashSet::<String>::new()));
 
-        let rx = spawn_port_poll_worker(sessions, shutdown);
+        let rx = spawn_port_poll_worker(sessions, suspended, shutdown);
 
-        let result = rx.recv_timeout(Duration::from_secs(2));
+        // Shutdown is pre-set, so the worker must exit before polling and
+        // disconnect the channel instead of delivering a result.
         assert!(
-            result.is_ok() || result.is_err(),
-            "worker should not hang when shutdown is set"
+            matches!(
+                rx.recv_timeout(Duration::from_secs(5)),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            ),
+            "worker should exit without polling when shutdown is set"
         );
+    }
+
+    #[test]
+    fn sleep_with_wake_drains_queued_wakes() {
+        let (wake_tx, wake_rx) = mpsc::channel::<()>();
+        // Queue several wakes (user mashing a refresh key).
+        for _ in 0..5 {
+            wake_tx.send(()).unwrap();
+        }
+        assert!(sleep_with_wake(&wake_rx, Duration::from_secs(5)));
+        // All queued wakes were consumed by the single wake-up.
+        assert!(wake_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn sleep_with_wake_returns_false_on_disconnect() {
+        let (wake_tx, wake_rx) = mpsc::channel::<()>();
+        drop(wake_tx);
+        assert!(!sleep_with_wake(&wake_rx, Duration::from_secs(5)));
     }
 }

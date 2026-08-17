@@ -20,11 +20,11 @@
 
 ## Overview
 
-Bork is a terminal UI for managing multiple AI coding sessions. It gives you a 4-column kanban board where each issue maps to a git worktree and a tmux session running [OpenCode](https://opencode.ai), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), or [Codex](https://developers.openai.com/codex). Switch between sessions with a keypress, see agent status at a glance, and keep your work organized. Register multiple projects and view them side-by-side in stacked swimlanes.
+Bork is a terminal UI for managing multiple AI coding sessions. It gives you a 4-column kanban board where each issue maps to a git worktree and a tmux session running [OpenCode](https://opencode.ai), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://developers.openai.com/codex), or [Pi](https://pi.dev). Switch between sessions with a keypress, see agent status at a glance, and keep your work organized. Register multiple projects and view them side-by-side in stacked swimlanes.
 
 ## Quickstart
 
-You need [tmux](https://github.com/tmux/tmux), [git](https://git-scm.com/), a [Rust toolchain](https://rustup.rs/), and at least one AI coding agent ([OpenCode](https://opencode.ai), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), or [Codex](https://developers.openai.com/codex)).
+You need [tmux](https://github.com/tmux/tmux), [git](https://git-scm.com/), a [Rust toolchain](https://rustup.rs/), and at least one AI coding agent ([OpenCode](https://opencode.ai), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://developers.openai.com/codex), or [Pi](https://pi.dev)).
 
 **1. Install bork**
 
@@ -58,7 +58,7 @@ Press `n` to create an issue, `Enter` to launch an agent session. You're up and 
 ## Features
 
 - **4-column kanban board** &mdash; To Do, In Progress, Code Review, Done
-- **AI agent sessions** &mdash; Launch OpenCode, Claude Code, or Codex per issue in tmux popups
+- **AI agent sessions** &mdash; Launch OpenCode, Claude Code, Codex, or Pi per issue in tmux popups
 - **Session resumption** &mdash; Closing a tmux popup and reopening it continues the same conversation, not a fresh one
 - **Real-time status monitoring** &mdash; See agent state on each card (Idle, Busy, Waiting, Error)
 - **GitHub PR status** &mdash; Background polling shows checks, review status, and diff stats on cards
@@ -71,7 +71,7 @@ Press `n` to create an issue, `Enter` to launch an agent session. You're up and 
 - **Linear integration** &mdash; Import and attach multiple Linear issues per card, sync state bidirectionally, open in Linear with a keypress
 - **Auto-import PRs** &mdash; Open PRs authored by you are automatically added to the Code Review column
 - **Search and filter** &mdash; Type `/` to fuzzy-filter the board by title or issue ID
-- **Issue kinds** &mdash; Agentic issues launch AI sessions; non-agentic "todo" items skip the agent entirely
+- **Issue kinds** &mdash; Agentic issues launch AI sessions; non-agentic "todo" items skip the agent entirely; orchestrator issues launch a coordinating agent that breaks a goal into bork issues, spawns them via `bork issue start`, and monitors their agents
 - **Multi-project view** &mdash; Register multiple projects and view them in stacked swimlanes with a collapsible project sidebar
 - **Zero-dependency state** &mdash; JSON file persistence with atomic writes, no database
 
@@ -83,7 +83,7 @@ Press `n` to create an issue, `Enter` to launch an agent session. You're up and 
 | [git](https://git-scm.com/) | Worktree status and branch detection |
 | [gh](https://cli.github.com/) | GitHub PR status polling (optional) |
 | [linear](https://linear.app/docs/cli) | Linear issue import and sync (optional) |
-| [OpenCode](https://opencode.ai), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), or [Codex](https://developers.openai.com/codex) | AI coding agent (at least one) |
+| [OpenCode](https://opencode.ai), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://developers.openai.com/codex), or [Pi](https://pi.dev) | AI coding agent (at least one) |
 | [Rust toolchain](https://rustup.rs/) | Building from source |
 
 ## Installation
@@ -126,12 +126,17 @@ bork --help
 | `bork project remove [path]` | Unregister a project |
 | `bork issue list` | List all issues (`--json` for structured output) |
 | `bork issue create <title>` | Create a new issue |
+| `bork issue start <title>` | Create an issue, create a worktree, and start its agent |
 | `bork issue show <id>` | Show issue details |
 | `bork issue update <id>` | Update issue fields |
 | `bork issue move <id> <column>` | Move an issue to a column |
+| `bork issue archive <id>` | Kill session, run teardown, remove worktree, move to Done |
 | `bork issue delete <id>` | Delete an issue |
 | `bork integration attach-linear <id> <identifier>` | Link a Linear ticket to an issue (can attach multiple) |
 | `bork integration attach-pr <id> <number>` | Link a GitHub PR to an issue (can attach multiple) |
+| `bork config list` | Show all resolved config values |
+| `bork config get <key>` | Print a resolved config value |
+| `bork config set <key> <value>` | Set a config value (`--global` for the global file) |
 | `bork update` | Pull latest from `main` and rebuild |
 | `bork update --check` | Check whether a new version is available without pulling |
 | `bork prune` | Prune stale worktrees (interactive; `--dry-run`, `--yes`, `--include`, `--exclude`) |
@@ -147,6 +152,7 @@ bork init https://github.com/owner/repo   # HTTPS URL
 bork init owner/repo myproject            # Custom directory name
 bork init owner/repo --agent claude       # Use Claude Code instead of OpenCode
 bork init owner/repo --agent codex        # Use Codex instead of OpenCode
+bork init owner/repo --agent pi           # Use Pi instead of OpenCode
 ```
 
 This creates:
@@ -173,6 +179,9 @@ Bork ships with hooks that report agent status (Idle, Busy, Waiting, Error) back
 - **OpenCode**: Installs as a plugin
 - **Claude Code**: Adds hooks to `settings.json`
 - **Codex**: Adds hooks to `~/.codex/hooks.json` and enables `features.codex_hooks = true` in `~/.codex/config.toml`
+- **Pi**: Installs a status extension to `~/.pi/agent/extensions/bork-status.ts`
+
+`bork install` also deploys the `worktree` and `bork-cli` skills into the project at `.claude/skills/` (Claude Code) and `.agents/skills/` (the cross-agent standard read by Pi and others).
 
 These are installed automatically by `bork init`. Use `bork install` / `bork uninstall` to manage them manually.
 
@@ -182,15 +191,22 @@ Bork exposes its kanban board through the command line so you (or your AI agents
 
 ```bash
 bork issue create "Fix auth bug" --agent claude --prompt "Check the login flow"
+bork issue start "Add search" --prompt "Implement search in a separate worktree"
+bork issue start "Add API route" --project my-api --prompt "Implement this in my-api"
 bork issue list --column in-progress
 bork issue list --json                    # machine-readable output
 bork issue move bork-3 code-review
 bork issue update bork-3 --title "Fix OAuth flow"
 bork issue show bork-3
+bork issue archive bork-3                 # cleanup when work is merged
 bork issue delete bork-3
 ```
 
-**Create options:** `--column` (todo, in-progress, code-review, done), `--agent` (opencode, claude, codex), `--mode` (plan, build, yolo), `--prompt`, `--kind` (agentic, todo).
+**Create options:** `--column` (todo, in-progress, code-review, done), `--agent` (opencode, claude, codex, pi), `--mode` (plan, build, yolo), `--prompt`, `--kind` (agentic, todo, orchestrator).
+
+**Start options:** `--prompt`, `--agent` (opencode, claude, codex), `--mode` (plan, build, yolo), `--slug`, `--no-worktree`, `--project` (registered project name or path). `bork issue start` defaults to build mode and creates a worktree with a slug generated from the title. If a `setup_script` is configured, it runs inside the worktree before the agent starts.
+
+**Archive options:** `bork issue archive <id> [--force]` kills the issue's tmux session, runs the configured `teardown_script` inside the worktree, removes the worktree, and moves the issue to Done. `--force` proceeds past a failing teardown and discards uncommitted changes.
 
 **Integration commands** link external tickets and PRs to existing issues. You can attach multiple Linear issues and/or GitHub PRs to a single bork issue:
 
@@ -296,13 +312,45 @@ Bork uses a single config schema in two layered locations. Project values overri
 project_name     = "myproject"                       # project file only
 agent_kind       = "opencode"                        # default agent for this project
 default_agent    = "claude"                          # alias for agent_kind, more natural in the global file
-agents           = ["opencode", "claude", "codex"]   # allowed agent picker entries (order matters)
+agents           = ["opencode", "claude", "codex", "pi"]   # allowed agent picker entries (order matters)
 default_prompt   = "Check AGENTS.md for project context and start working on the issue."
+review_prompt    = "Read the diff and summarize findings."  # body for auto-imported review-requested PRs (bork prepends the PR number + link)
+orchestrator_prompt = "Coordinate the work across issues." # body for orchestrator issues (bork appends the planning file path)
+setup_script     = "npm install"                     # run inside a fresh worktree before its agent starts
+teardown_script  = "docker compose down"             # run inside a worktree before `bork issue archive` removes it
+auto_import_reviews      = true                      # auto-create issues from PRs you're asked to review
+auto_import_authored_prs = true                      # auto-create issues from PRs you authored
 done_session_ttl = 300                               # seconds a Done tmux session lingers
 debug            = false                             # enable debug-only keybindings
 ```
 
+Set `auto_import_reviews = false` (or `auto_import_authored_prs = false`) on a throwaway clone of a repo where you don't want to be pestered by PRs. Existing imported issues keep their lifecycle (completed reviews still move to Done); only new auto-imports stop. Manual import from the PR picker still works.
+
 Resolution order (highest wins): built-in defaults → `~/.config/bork/config.toml` → `<project>/.bork/config.toml` → CLI flags.
+
+You can also read and write these keys from the CLI without editing files by hand:
+
+```bash
+bork config list                              # show all resolved values
+bork config get auto_import_reviews           # print a single resolved value
+bork config set auto_import_reviews false     # write to <project>/.bork/config.toml
+bork config set default_agent claude --global # write to ~/.config/bork/config.toml
+```
+
+A running TUI picks up project config changes within ~2 seconds.
+
+### Worktree Setup & Teardown Scripts
+
+Fresh git worktrees are bare checkouts: no installed dependencies, no untracked config like `.env`. `setup_script` fixes that. When an agent session is launched for an issue with a worktree, the script runs inside that worktree first, chained with `&&` so the agent only starts if setup succeeds. Output is visible in the agent's tmux window. Resumed sessions skip it.
+
+`teardown_script` is the mirror hook: `bork issue archive <id>` runs it inside the worktree before removal, for cleanup that `git worktree remove` can't do (stopping services, dropping per-worktree databases). A failing teardown aborts the archive unless `--force` is passed.
+
+```toml
+setup_script    = "npm install && cp ../main/.env .env"
+teardown_script = "docker compose down"
+```
+
+Both keys accept a single shell command line and can live in either config layer. Scripts should be idempotent — setup may run again if a session is recreated for an existing worktree.
 
 ### Agent Picker
 
@@ -311,6 +359,31 @@ The new/edit issue dialog includes an Agent field that lets you pick which codin
 `agents` and `default_agent` (or `agent_kind`) are both optional. Without them, bork auto-detects every installed agent via `which`. A project-level `agents = [...]` overrides the global allowlist for that project, useful for locking a team to a specific agent.
 
 > Note: `~/.config/bork/agents.toml` from earlier versions is no longer read. Move its keys into `~/.config/bork/config.toml`.
+
+### Agent Launch Args
+
+Per-agent invocation args can be customized in either layer. Useful for flags bork doesn't know about, or for replacing the built-in mode flags entirely.
+
+```toml
+# Always append `--verbose` to every Claude invocation.
+[agent.claude]
+args = ["--verbose"]
+
+# Replace bork's built-in "plan" mode flags for Claude. Set to `[]` to
+# launch without any mode flags.
+[agent.claude.mode.plan]
+args = ["--dangerously-skip-permissions"]
+
+# Dotted-key form is also supported, equivalent to a section header.
+agent.codex.mode.yolo.args = ["--dangerously-bypass-approvals-and-sandbox"]
+```
+
+Semantics:
+- `[agent.<name>].args` are always appended after bork's own flags.
+- `[agent.<name>.mode.<mode>].args` *replace* bork's built-in flags for that agent/mode. Omit the key to keep the defaults; set to `[]` to launch with no mode flags.
+- Pi has a single mode and no built-in mode flags, so `[agent.pi]` args always apply; `[agent.pi.mode.<mode>]` keys are effectively a way to inject extra flags (e.g. a plan-mode extension via `--extension`).
+- Project config overrides global config per key.
+- Each configured arg is shell-escaped individually, so values containing spaces or quotes are passed through safely.
 
 ### State
 

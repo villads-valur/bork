@@ -1,5 +1,4 @@
 use std::path::Path;
-use std::process::{Command, Stdio};
 
 use crate::config;
 use crate::types::AgentKind;
@@ -49,13 +48,20 @@ fn load_layered_prefs(project_root: Option<&Path>) -> AgentPreferences {
     }
 }
 
-fn command_exists(command: &str) -> bool {
-    Command::new("which")
-        .arg(command)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+/// In-process `which`: scan $PATH for an executable file. Avoids spawning a
+/// subprocess per agent at startup (these checks run before the first frame).
+pub(crate) fn command_exists(command: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|dir| is_executable(&dir.join(command)))
+}
+
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
 }
 
 fn resolve_with_installed(prefs: AgentPreferences, installed: &[AgentKind]) -> AgentSelection {
@@ -123,6 +129,25 @@ mod tests {
         };
         let selection = resolve_with_installed(prefs, &[AgentKind::OpenCode, AgentKind::Claude]);
         assert_eq!(selection.default_agent, Some(AgentKind::Claude));
+    }
+
+    #[test]
+    fn resolve_with_installed_includes_pi_when_installed() {
+        let prefs = AgentPreferences::default();
+        let selection = resolve_with_installed(prefs, &[AgentKind::Pi]);
+        assert_eq!(selection.available, vec![AgentKind::Pi]);
+        assert_eq!(selection.default_agent, Some(AgentKind::Pi));
+    }
+
+    #[test]
+    fn resolve_with_installed_hides_pi_when_not_installed() {
+        let prefs = AgentPreferences {
+            enabled: Some(vec![AgentKind::Pi, AgentKind::OpenCode]),
+            default_agent: Some(AgentKind::Pi),
+        };
+        let selection = resolve_with_installed(prefs, &[AgentKind::OpenCode]);
+        assert_eq!(selection.available, vec![AgentKind::OpenCode]);
+        assert_eq!(selection.default_agent, Some(AgentKind::OpenCode));
     }
 
     #[test]

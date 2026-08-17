@@ -3,13 +3,15 @@ use std::path::{Path, PathBuf};
 
 const OPENCODE_PLUGIN: &str = include_str!("../../plugins/bork-status.ts");
 
+const PI_EXTENSION: &str = include_str!("../../plugins/bork-status-pi.ts");
+
 const CLAUDE_HOOKS: &str = r#"{
   "UserPromptSubmit": [
     {
       "hooks": [
         {
           "type": "command",
-          "command": "cat > /dev/null; [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"Busy\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\""
+          "command": "cat > /dev/null; { [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"Busy\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\"; } || true"
         }
       ]
     }
@@ -20,7 +22,7 @@ const CLAUDE_HOOKS: &str = r#"{
       "hooks": [
         {
           "type": "command",
-          "command": "TOOL=$(cat | grep -o '\"tool_name\":\"[^\"]*\"' | head -1 | cut -d'\"' -f4); [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"Busy\",\"activity\":\"%s\",\"updated_at\":%s}' \"$TOOL\" \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\""
+          "command": "TOOL=$(cat | grep -o '\"tool_name\":\"[^\"]*\"' | head -1 | cut -d'\"' -f4); { [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"Busy\",\"activity\":\"%s\",\"updated_at\":%s}' \"$TOOL\" \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\"; } || true"
         }
       ]
     }
@@ -31,7 +33,7 @@ const CLAUDE_HOOKS: &str = r#"{
       "hooks": [
         {
           "type": "command",
-          "command": "cat > /dev/null; [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"WaitingInput\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\""
+          "command": "cat > /dev/null; { [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"WaitingInput\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\"; } || true"
         }
       ]
     },
@@ -40,7 +42,7 @@ const CLAUDE_HOOKS: &str = r#"{
       "hooks": [
         {
           "type": "command",
-          "command": "cat > /dev/null; [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"WaitingApproval\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\""
+          "command": "cat > /dev/null; { [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"WaitingApproval\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\"; } || true"
         }
       ]
     }
@@ -50,7 +52,7 @@ const CLAUDE_HOOKS: &str = r#"{
       "hooks": [
         {
           "type": "command",
-          "command": "cat > /dev/null; [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"Idle\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\""
+          "command": "cat > /dev/null; { [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"Idle\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\"; } || true"
         }
       ]
     }
@@ -60,7 +62,7 @@ const CLAUDE_HOOKS: &str = r#"{
       "hooks": [
         {
           "type": "command",
-          "command": "cat > /dev/null; [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"WaitingInput\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\""
+          "command": "cat > /dev/null; { [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"WaitingInput\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\"; } || true"
         }
       ]
     }
@@ -70,7 +72,7 @@ const CLAUDE_HOOKS: &str = r#"{
       "hooks": [
         {
           "type": "command",
-          "command": "cat > /dev/null; [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"WaitingPermission\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\""
+          "command": "cat > /dev/null; { [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"WaitingPermission\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\"; } || true"
         }
       ]
     }
@@ -86,7 +88,7 @@ const CODEX_HOOKS: &str = r#"{
         "hooks": [
           {
             "type": "command",
-            "command": "cat > /dev/null; [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"Idle\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\""
+            "command": "cat > /dev/null; { [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"Idle\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\"; } || true"
           }
         ]
       }
@@ -96,7 +98,7 @@ const CODEX_HOOKS: &str = r#"{
         "hooks": [
           {
             "type": "command",
-            "command": "cat > /dev/null; [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"Busy\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\""
+            "command": "cat > /dev/null; { [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"Busy\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\"; } || true"
           }
         ]
       }
@@ -107,7 +109,7 @@ const CODEX_HOOKS: &str = r#"{
         "hooks": [
           {
             "type": "command",
-            "command": "cat > /dev/null; [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"Busy\",\"activity\":\"Bash\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\""
+            "command": "cat > /dev/null; { [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"Busy\",\"activity\":\"Bash\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\"; } || true"
           }
         ]
       }
@@ -117,7 +119,7 @@ const CODEX_HOOKS: &str = r#"{
         "hooks": [
           {
             "type": "command",
-            "command": "cat > /dev/null; [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"Idle\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\""
+            "command": "cat > /dev/null; { [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"Idle\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\"; } || true"
           }
         ]
       }
@@ -131,9 +133,15 @@ pub fn install() -> anyhow::Result<()> {
     install_opencode_plugin()?;
     install_claude_hooks()?;
     install_codex_hooks()?;
+    install_pi_extension()?;
     install_skills();
     println!("bork hooks installed successfully");
     Ok(())
+}
+
+/// Whether `path` already exists and holds exactly `content`.
+fn file_has_content(path: &Path, content: &str) -> bool {
+    fs::read_to_string(path).is_ok_and(|existing| existing == content)
 }
 
 fn install_skills() {
@@ -147,20 +155,23 @@ fn install_skills() {
         ("bork-cli", crate::init::BORK_CLI_SKILL),
     ];
 
-    for (name, content) in &skills {
-        let skill_dir = project_root.join(format!(".claude/skills/{}", name));
-        let skill_path = skill_dir.join("SKILL.md");
+    // `.claude/skills/` is read by Claude Code; `.agents/skills/` is the
+    // cross-agent standard that Pi (and other harnesses) discover. Deploy to
+    // both so every supported agent picks up bork's skills.
+    let skill_roots = [".claude/skills", ".agents/skills"];
 
-        if skill_path.exists() {
-            if let Ok(existing) = fs::read_to_string(&skill_path) {
-                if existing == *content {
-                    continue;
-                }
+    for root in &skill_roots {
+        for (name, content) in &skills {
+            let skill_dir = project_root.join(format!("{}/{}", root, name));
+            let skill_path = skill_dir.join("SKILL.md");
+
+            if file_has_content(&skill_path, content) {
+                continue;
             }
-        }
 
-        if fs::create_dir_all(&skill_dir).is_ok() {
-            let _ = fs::write(&skill_path, content);
+            if fs::create_dir_all(&skill_dir).is_ok() {
+                let _ = fs::write(&skill_path, content);
+            }
         }
     }
 }
@@ -170,6 +181,7 @@ pub fn uninstall() -> anyhow::Result<()> {
     uninstall_opencode_plugin()?;
     uninstall_claude_hooks()?;
     uninstall_codex_hooks()?;
+    uninstall_pi_extension()?;
     println!("bork hooks uninstalled successfully");
     Ok(())
 }
@@ -206,6 +218,46 @@ fn uninstall_opencode_plugin() -> anyhow::Result<()> {
         println!("  OpenCode plugin removed from {}", path.display());
     } else {
         println!("  OpenCode plugin not found (already removed)");
+    }
+    Ok(())
+}
+
+// --- Pi extension ---
+
+/// Pi loads extensions from `<PI_CODING_AGENT_DIR or ~/.pi/agent>/extensions/`.
+fn pi_extension_path() -> PathBuf {
+    let root = if let Ok(dir) = std::env::var("PI_CODING_AGENT_DIR") {
+        PathBuf::from(dir)
+    } else {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        PathBuf::from(home).join(".pi").join("agent")
+    };
+    root.join("extensions").join("bork-status.ts")
+}
+
+fn install_pi_extension() -> anyhow::Result<()> {
+    let path = pi_extension_path();
+
+    if file_has_content(&path, PI_EXTENSION) {
+        println!("  Pi extension already installed (skipped)");
+        return Ok(());
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, PI_EXTENSION)?;
+    println!("  Pi extension installed at {}", path.display());
+    Ok(())
+}
+
+fn uninstall_pi_extension() -> anyhow::Result<()> {
+    let path = pi_extension_path();
+    if path.exists() {
+        fs::remove_file(&path)?;
+        println!("  Pi extension removed from {}", path.display());
+    } else {
+        println!("  Pi extension not found (already removed)");
     }
     Ok(())
 }
@@ -486,6 +538,14 @@ fn is_bork_hook(entry: &serde_json::Value) -> bool {
         })
 }
 
+fn dirs_global_config() -> PathBuf {
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        return PathBuf::from(xdg);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".config")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,12 +647,58 @@ mod tests {
         assert!(!json_hooks_already_installed(&tmp, &claude_hook_entries()));
         let _ = std::fs::remove_file(&tmp);
     }
-}
 
-fn dirs_global_config() -> PathBuf {
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        return PathBuf::from(xdg);
+    // --- regression: hook commands must exit 0 when BORK env vars are unset ---
+
+    fn assert_all_hooks_exit_zero_without_env(events: &serde_json::Map<String, serde_json::Value>) {
+        let mut count = 0;
+        for (event_name, entries) in events {
+            for entry in entries.as_array().expect("event entries are array") {
+                let matcher = entry
+                    .get("matcher")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<none>");
+                let hooks = entry
+                    .get("hooks")
+                    .and_then(|v| v.as_array())
+                    .expect("entry has hooks array");
+                for hook in hooks {
+                    let cmd = hook
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .expect("hook has command string");
+                    let status = std::process::Command::new("sh")
+                        .arg("-c")
+                        .arg(cmd)
+                        .env_remove("BORK_STATUS_DIR")
+                        .env_remove("BORK_SESSION")
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .expect("sh -c runs");
+                    assert!(
+                        status.success(),
+                        "{}[{}] exited {:?} with BORK env unset\n  cmd: {}",
+                        event_name,
+                        matcher,
+                        status.code(),
+                        cmd
+                    );
+                    count += 1;
+                }
+            }
+        }
+        assert!(count > 0, "expected at least one hook command");
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".config")
+
+    #[test]
+    fn claude_hooks_exit_zero_when_bork_env_unset() {
+        assert_all_hooks_exit_zero_without_env(&parse_hook_entries(CLAUDE_HOOKS, None));
+    }
+
+    #[test]
+    fn codex_hooks_exit_zero_when_bork_env_unset() {
+        assert_all_hooks_exit_zero_without_env(&parse_hook_entries(CODEX_HOOKS, Some("hooks")));
+    }
 }

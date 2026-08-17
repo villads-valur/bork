@@ -30,12 +30,30 @@ pub fn column_header_style(selected: bool) -> Style {
     }
 }
 
-pub fn card_border_style(selected: bool) -> Style {
+pub fn card_border_style(selected: bool, marked: bool) -> Style {
     if selected {
         Style::default().fg(ACCENT)
+    } else if marked {
+        Style::default().fg(Color::Green)
     } else {
         Style::default().fg(BORDER)
     }
+}
+
+/// Orchestrator cards get a magenta border so they stand out on the board.
+/// Selection still wins, keeping the cursor visible.
+pub fn orchestrator_card_border_style(selected: bool, marked: bool) -> Style {
+    if selected {
+        Style::default().fg(ACCENT)
+    } else if marked {
+        Style::default().fg(Color::Green)
+    } else {
+        Style::default().fg(Color::Magenta)
+    }
+}
+
+pub fn orchestrator_badge_style() -> Style {
+    Style::default().fg(Color::Magenta)
 }
 
 pub fn card_title_style(selected: bool) -> Style {

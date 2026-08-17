@@ -1,23 +1,34 @@
+use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config;
+use crate::external::tmux;
 use crate::types::{AgentKind, AgentMode, Column, Issue, IssueKind};
+use crate::ui::styles::truncate;
+use crate::worktree;
 
 pub fn next_issue_id(issues: &[Issue], project_name: &str) -> String {
-    let prefix = project_name;
+    next_issue_id_after(issues, project_name, 0)
+}
+
+/// Next free `{project}-{n}` ID, skipping `offset` extra slots. The offset
+/// supports batch-creating issues before any of them is pushed to the list.
+pub fn next_issue_id_after(issues: &[Issue], project_name: &str, offset: u32) -> String {
+    let prefix = format!("{}-", project_name);
     let max_num = issues
         .iter()
         .filter_map(|issue| {
             issue
                 .id
-                .strip_prefix(&format!("{}-", prefix))
+                .strip_prefix(&prefix)
                 .and_then(|s| s.parse::<u32>().ok())
         })
         .max()
         .unwrap_or(0);
 
-    format!("{}-{}", prefix, max_num + 1)
+    format!("{}{}", prefix, max_num + 1 + offset)
 }
 
 fn find_issue_index(issues: &[Issue], id: &str) -> Option<usize> {
@@ -32,19 +43,66 @@ fn now_epoch() -> u64 {
         .as_secs()
 }
 
+fn move_issue_in_state(issue: &mut Issue, column: Column) {
+    let was_done = issue.column == Column::Done;
+    let now_done = column == Column::Done;
+    issue.column = column;
+
+    if now_done && !was_done {
+        issue.done_at = Some(now_epoch());
+    } else if !now_done && was_done {
+        issue.done_at = None;
+    }
+}
+
 pub struct ListOptions {
     pub column: Option<Column>,
     pub json: bool,
+    /// When set, restrict output to the connected component of links that
+    /// contains this issue id (the anchor plus everything reachable via links).
+    pub linked: Option<String>,
+}
+
+/// Connected component of the link graph containing `anchor` (BFS over
+/// `linked_issues`). Returns lowercased ids, including the anchor itself.
+pub fn linked_component(issues: &[Issue], anchor: &str) -> HashSet<String> {
+    let by_id: HashMap<String, &Issue> = issues.iter().map(|i| (i.id.to_lowercase(), i)).collect();
+    let mut seen = HashSet::new();
+    let mut queue = vec![anchor.to_lowercase()];
+    while let Some(id) = queue.pop() {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        if let Some(issue) = by_id.get(&id) {
+            for linked in &issue.linked_issues {
+                let next = linked.to_lowercase();
+                if !seen.contains(&next) {
+                    queue.push(next);
+                }
+            }
+        }
+    }
+    seen
 }
 
 pub fn list_issues(project_root: &Path, opts: &ListOptions) -> anyhow::Result<String> {
     let state = config::load_state(project_root);
     let config = config::load_config_from(project_root);
 
+    let component = opts
+        .linked
+        .as_deref()
+        .map(|anchor| linked_component(&state.issues, anchor));
+
     let issues: Vec<&Issue> = state
         .issues
         .iter()
         .filter(|i| opts.column.is_none() || Some(i.column) == opts.column)
+        .filter(|i| {
+            component
+                .as_ref()
+                .is_none_or(|c| c.contains(&i.id.to_lowercase()))
+        })
         .collect();
 
     if opts.json {
@@ -87,7 +145,7 @@ fn format_issue_table(issues: &[&Issue], _project_name: &str) -> anyhow::Result<
         if i > 0 {
             out.push_str("  ");
         }
-        out.push_str(&format!("{:<width$}", header, width = widths[i]));
+        let _ = write!(out, "{:<width$}", header, width = widths[i]);
     }
     out.push('\n');
 
@@ -96,20 +154,12 @@ fn format_issue_table(issues: &[&Issue], _project_name: &str) -> anyhow::Result<
             if i > 0 {
                 out.push_str("  ");
             }
-            out.push_str(&format!("{:<width$}", cell, width = widths[i]));
+            let _ = write!(out, "{:<width$}", cell, width = widths[i]);
         }
         out.push('\n');
     }
 
     Ok(out.trim_end().to_string())
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max - 3])
-    }
 }
 
 pub struct CreateOptions {
@@ -132,30 +182,15 @@ pub fn create_issue(project_root: &Path, opts: CreateOptions) -> anyhow::Result<
     let agent_mode = opts.agent_mode.unwrap_or(AgentMode::Plan);
 
     let issue = Issue {
-        id,
-        title: opts.title,
         kind,
-        column,
-        agent_kind,
         agent_mode,
         prompt: opts.prompt,
-        worktree: None,
         done_at: if column == Column::Done {
             Some(now_epoch())
         } else {
             None
         },
-        session_id: None,
-        pruned_at: None,
-        linear_links: Vec::new(),
-        github_pr_links: Vec::new(),
-        linear_id: None,
-        linear_identifier: None,
-        linear_url: None,
-        linear_imported: false,
-        pr_number: None,
-        pr_imported: false,
-        pr_import_source: None,
+        ..Issue::new(id, opts.title, column, agent_kind)
     };
 
     state.issues.push(issue.clone());
@@ -170,6 +205,7 @@ pub struct UpdateOptions {
     pub agent_kind: Option<AgentKind>,
     pub agent_mode: Option<AgentMode>,
     pub prompt: Option<String>,
+    pub kind: Option<IssueKind>,
 }
 
 pub fn update_issue(
@@ -188,15 +224,7 @@ pub fn update_issue(
         issue.title = title;
     }
     if let Some(column) = opts.column {
-        let was_done = issue.column == Column::Done;
-        let now_done = column == Column::Done;
-        issue.column = column;
-
-        if now_done && !was_done {
-            issue.done_at = Some(now_epoch());
-        } else if !now_done && was_done {
-            issue.done_at = None;
-        }
+        move_issue_in_state(issue, column);
     }
     if let Some(agent_kind) = opts.agent_kind {
         issue.agent_kind = agent_kind;
@@ -209,6 +237,14 @@ pub fn update_issue(
             issue.prompt = None;
         } else {
             issue.prompt = Some(prompt);
+        }
+    }
+    if let Some(kind) = opts.kind {
+        if issue.set_kind(kind) {
+            // Kill any live session so it isn't re-attached with the old
+            // kind's prompt and cwd. Best effort; the session may not exist.
+            let config = config::load_config_from(project_root);
+            let _ = tmux::kill_session(&issue.session_name(&config.project_name));
         }
     }
 
@@ -225,9 +261,71 @@ pub fn delete_issue(project_root: &Path, issue_id: &str) -> anyhow::Result<Issue
         .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", issue_id))?;
 
     let removed = state.issues.remove(idx);
+    remove_link_references(&mut state.issues, &removed.id);
     config::save_state(&state, project_root)?;
 
     Ok(removed)
+}
+
+/// Drop `removed_id` from every issue's `linked_issues`, keeping links symmetric
+/// after an issue is deleted or archived.
+pub fn remove_link_references(issues: &mut [Issue], removed_id: &str) {
+    for issue in issues.iter_mut() {
+        issue
+            .linked_issues
+            .retain(|l| !l.eq_ignore_ascii_case(removed_id));
+    }
+}
+
+/// Tie two issues together. Links are symmetric: each issue records the other's
+/// id. Both issues must exist in the same project; self-links are rejected.
+pub fn link_issues(project_root: &Path, a: &str, b: &str) -> anyhow::Result<(String, String)> {
+    let mut state = config::load_state(project_root);
+
+    let idx_a = find_issue_index(&state.issues, a)
+        .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", a))?;
+    let idx_b = find_issue_index(&state.issues, b)
+        .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", b))?;
+
+    if idx_a == idx_b {
+        anyhow::bail!("Cannot link an issue to itself");
+    }
+
+    let id_a = state.issues[idx_a].id.clone();
+    let id_b = state.issues[idx_b].id.clone();
+
+    if !state.issues[idx_a].is_linked_to(&id_b) {
+        state.issues[idx_a].linked_issues.push(id_b.clone());
+    }
+    if !state.issues[idx_b].is_linked_to(&id_a) {
+        state.issues[idx_b].linked_issues.push(id_a.clone());
+    }
+
+    config::save_state(&state, project_root)?;
+    Ok((id_a, id_b))
+}
+
+/// Remove a symmetric link between two issues.
+pub fn unlink_issues(project_root: &Path, a: &str, b: &str) -> anyhow::Result<(String, String)> {
+    let mut state = config::load_state(project_root);
+
+    let idx_a = find_issue_index(&state.issues, a)
+        .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", a))?;
+    let idx_b = find_issue_index(&state.issues, b)
+        .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", b))?;
+
+    let id_a = state.issues[idx_a].id.clone();
+    let id_b = state.issues[idx_b].id.clone();
+
+    state.issues[idx_a]
+        .linked_issues
+        .retain(|l| !l.eq_ignore_ascii_case(&id_b));
+    state.issues[idx_b]
+        .linked_issues
+        .retain(|l| !l.eq_ignore_ascii_case(&id_a));
+
+    config::save_state(&state, project_root)?;
+    Ok((id_a, id_b))
 }
 
 pub fn show_issue(project_root: &Path, issue_id: &str, json: bool) -> anyhow::Result<String> {
@@ -243,21 +341,21 @@ pub fn show_issue(project_root: &Path, issue_id: &str, json: bool) -> anyhow::Re
     }
 
     let mut out = String::new();
-    out.push_str(&format!("ID:       {}\n", issue.id));
-    out.push_str(&format!("Title:    {}\n", issue.title));
-    out.push_str(&format!("Kind:     {}\n", issue.kind));
-    out.push_str(&format!("Column:   {}\n", issue.column));
-    out.push_str(&format!("Agent:    {}\n", issue.agent_kind));
-    out.push_str(&format!("Mode:     {}\n", issue.agent_mode));
+    let _ = writeln!(out, "ID:       {}", issue.id);
+    let _ = writeln!(out, "Title:    {}", issue.title);
+    let _ = writeln!(out, "Kind:     {}", issue.kind);
+    let _ = writeln!(out, "Column:   {}", issue.column);
+    let _ = writeln!(out, "Agent:    {}", issue.agent_kind);
+    let _ = writeln!(out, "Mode:     {}", issue.agent_mode);
     if let Some(ref prompt) = issue.prompt {
-        out.push_str(&format!("Prompt:   {}\n", prompt));
+        let _ = writeln!(out, "Prompt:   {}", prompt);
     }
     if let Some(ref wt) = issue.worktree {
-        out.push_str(&format!("Worktree: {}\n", wt));
+        let _ = writeln!(out, "Worktree: {}", wt);
     }
     if !issue.linear_links.is_empty() {
         let ids: Vec<&str> = issue.linear_identifiers();
-        out.push_str(&format!("Linear:   {}\n", ids.join(", ")));
+        let _ = writeln!(out, "Linear:   {}", ids.join(", "));
     }
     if !issue.github_pr_links.is_empty() {
         let nums: Vec<String> = issue
@@ -265,7 +363,10 @@ pub fn show_issue(project_root: &Path, issue_id: &str, json: bool) -> anyhow::Re
             .iter()
             .map(|n| format!("#{}", n))
             .collect();
-        out.push_str(&format!("PR:       {}\n", nums.join(", ")));
+        let _ = writeln!(out, "PR:       {}", nums.join(", "));
+    }
+    if !issue.linked_issues.is_empty() {
+        let _ = writeln!(out, "Linked:   {}", issue.linked_issues.join(", "));
     }
 
     Ok(out.trim_end().to_string())
@@ -311,6 +412,13 @@ pub fn attach_pr(project_root: &Path, issue_id: &str, pr_number: u32) -> anyhow:
 
     let issue = &mut state.issues[idx];
 
+    if issue.kind == IssueKind::Orchestrator {
+        anyhow::bail!(
+            "Cannot attach a PR to '{}': orchestrator issues have no PR links",
+            issue.id
+        );
+    }
+
     if !issue.has_pr_number(pr_number) {
         issue.github_pr_links.push(crate::types::LinkedGithubPr {
             number: pr_number,
@@ -325,18 +433,187 @@ pub fn attach_pr(project_root: &Path, issue_id: &str, pr_number: u32) -> anyhow:
     Ok(updated)
 }
 
+pub fn detach_linear(
+    project_root: &Path,
+    issue_id: &str,
+    linear_identifier: &str,
+) -> anyhow::Result<Issue> {
+    let mut state = config::load_state(project_root);
+
+    let idx = find_issue_index(&state.issues, issue_id)
+        .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", issue_id))?;
+
+    let identifier = linear_identifier.to_uppercase();
+    let issue = &mut state.issues[idx];
+
+    let before = issue.linear_links.len();
+    issue.linear_links.retain(|l| l.identifier != identifier);
+    if issue.linear_links.len() == before {
+        anyhow::bail!("Issue '{}' has no Linear link '{}'", issue.id, identifier);
+    }
+
+    let updated = issue.clone();
+    config::save_state(&state, project_root)?;
+
+    Ok(updated)
+}
+
+pub fn detach_pr(project_root: &Path, issue_id: &str, pr_number: u32) -> anyhow::Result<Issue> {
+    let mut state = config::load_state(project_root);
+
+    let idx = find_issue_index(&state.issues, issue_id)
+        .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", issue_id))?;
+
+    let issue = &mut state.issues[idx];
+
+    let before = issue.github_pr_links.len();
+    issue.github_pr_links.retain(|l| l.number != pr_number);
+    if issue.github_pr_links.len() == before {
+        anyhow::bail!("Issue '{}' has no PR link #{}", issue.id, pr_number);
+    }
+
+    let updated = issue.clone();
+    config::save_state(&state, project_root)?;
+
+    Ok(updated)
+}
+
+pub fn clear_linear(project_root: &Path, issue_id: &str) -> anyhow::Result<Issue> {
+    let mut state = config::load_state(project_root);
+
+    let idx = find_issue_index(&state.issues, issue_id)
+        .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", issue_id))?;
+
+    state.issues[idx].linear_links.clear();
+
+    let updated = state.issues[idx].clone();
+    config::save_state(&state, project_root)?;
+
+    Ok(updated)
+}
+
+pub fn clear_pr(project_root: &Path, issue_id: &str) -> anyhow::Result<Issue> {
+    let mut state = config::load_state(project_root);
+
+    let idx = find_issue_index(&state.issues, issue_id)
+        .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", issue_id))?;
+
+    state.issues[idx].github_pr_links.clear();
+
+    let updated = state.issues[idx].clone();
+    config::save_state(&state, project_root)?;
+
+    Ok(updated)
+}
+
+pub struct MoveIssuesReport {
+    pub moved: Vec<Issue>,
+    pub skipped: Vec<String>,
+}
+
+#[cfg(test)]
 pub fn move_issue(project_root: &Path, issue_id: &str, column: Column) -> anyhow::Result<Issue> {
-    update_issue(
-        project_root,
-        issue_id,
-        UpdateOptions {
-            title: None,
-            column: Some(column),
-            agent_kind: None,
-            agent_mode: None,
-            prompt: None,
-        },
-    )
+    let report = move_issues(project_root, &[issue_id.to_string()], None, column)?;
+    report
+        .moved
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", issue_id))
+}
+
+pub fn move_issues(
+    project_root: &Path,
+    issue_ids: &[String],
+    linked: Option<&str>,
+    column: Column,
+) -> anyhow::Result<MoveIssuesReport> {
+    let mut state = config::load_state(project_root);
+    let mut targets: HashSet<String> = issue_ids.iter().map(|id| id.to_lowercase()).collect();
+    let mut skipped = Vec::new();
+
+    if let Some(anchor) = linked {
+        if find_issue_index(&state.issues, anchor).is_some() {
+            targets.extend(linked_component(&state.issues, anchor));
+        } else {
+            skipped.push(anchor.to_string());
+        }
+    }
+
+    let mut moved = Vec::new();
+    for id in targets {
+        let Some(idx) = find_issue_index(&state.issues, &id) else {
+            skipped.push(id);
+            continue;
+        };
+        move_issue_in_state(&mut state.issues[idx], column);
+        moved.push(state.issues[idx].clone());
+    }
+
+    if !moved.is_empty() {
+        config::save_state(&state, project_root)?;
+    }
+
+    Ok(MoveIssuesReport { moved, skipped })
+}
+
+pub struct ArchiveReport {
+    pub issue_id: String,
+    pub title: String,
+    pub session_name: String,
+    pub session_killed: bool,
+    pub worktree_removed: Option<String>,
+}
+
+/// Archive an issue: kill its agent session, run the teardown script, remove
+/// its worktree, and move it to Done.
+///
+/// `force` lets the archive proceed past a failing teardown script and
+/// discards uncommitted changes in the worktree.
+pub fn archive_issue(
+    project_root: &Path,
+    issue_id: &str,
+    force: bool,
+) -> anyhow::Result<ArchiveReport> {
+    let app_config = config::load_config_from(project_root);
+    let state = config::load_state(project_root);
+
+    let idx = find_issue_index(&state.issues, issue_id)
+        .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", issue_id))?;
+    let issue = state.issues[idx].clone();
+
+    let session_name = issue.session_name(&app_config.project_name);
+    let session_killed = tmux::session_exists(&session_name);
+    if session_killed {
+        let _ = tmux::kill_session(&session_name);
+    }
+
+    let worktree_removed = match issue.worktree.as_deref() {
+        Some(dir) => {
+            worktree::remove_worktree_in(&app_config, dir, force)?;
+            Some(dir.to_string())
+        }
+        None => None,
+    };
+
+    // Reload state so we don't clobber concurrent updates made while the
+    // teardown script and git removal were running.
+    let mut state = config::load_state(project_root);
+    if let Some(saved) = state.issues.iter_mut().find(|i| i.id == issue.id) {
+        saved.worktree = None;
+        if saved.column != Column::Done {
+            saved.column = Column::Done;
+            saved.done_at = Some(now_epoch());
+        }
+    }
+    config::save_state(&state, project_root)?;
+
+    Ok(ArchiveReport {
+        issue_id: issue.id,
+        title: issue.title,
+        session_name,
+        session_killed,
+        worktree_removed,
+    })
 }
 
 /// Load state and return a JSON snapshot of all issues (for machine consumption).
@@ -386,6 +663,44 @@ mod tests {
     }
 
     #[test]
+    fn next_id_after_skips_offset_slots() {
+        let issues = vec![test_issue("bork-2", Column::Todo)];
+        assert_eq!(next_issue_id_after(&issues, "bork", 0), "bork-3");
+        assert_eq!(next_issue_id_after(&issues, "bork", 2), "bork-5");
+    }
+
+    #[test]
+    fn list_table_handles_non_ascii_titles() {
+        // Regression: byte-slice truncation panicked on multi-byte UTF-8.
+        let dir = setup_project();
+        let root = dir.path();
+
+        create_issue(
+            root,
+            CreateOptions {
+                title: "Fix résumé parsing — naïve solution breaks on émojis 🎉🎉🎉🎉🎉🎉🎉".into(),
+                column: None,
+                agent_kind: None,
+                agent_mode: None,
+                prompt: None,
+                kind: None,
+            },
+        )
+        .unwrap();
+
+        let output = list_issues(
+            root,
+            &ListOptions {
+                column: None,
+                json: false,
+                linked: None,
+            },
+        )
+        .unwrap();
+        assert!(output.contains("test-1"));
+    }
+
+    #[test]
     fn create_and_list() {
         let dir = setup_project();
         let root = dir.path();
@@ -413,6 +728,7 @@ mod tests {
             &ListOptions {
                 column: None,
                 json: false,
+                linked: None,
             },
         )
         .unwrap();
@@ -467,6 +783,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                kind: None,
             },
         )
         .unwrap();
@@ -502,6 +819,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                kind: None,
             },
         )
         .unwrap();
@@ -536,11 +854,89 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                kind: None,
             },
         )
         .unwrap();
 
         assert!(updated.done_at.is_none());
+    }
+
+    #[test]
+    fn update_kind_to_orchestrator_clears_stale_state() {
+        let dir = setup_project();
+        let root = dir.path();
+
+        create_issue(
+            root,
+            CreateOptions {
+                title: "Convert me".into(),
+                column: None,
+                agent_kind: None,
+                agent_mode: None,
+                prompt: None,
+                kind: None,
+            },
+        )
+        .unwrap();
+
+        // Simulate an issue that already ran: worktree, session, and a PR link.
+        let mut state = config::load_state(root);
+        state.issues[0].worktree = Some("test-1-convert-me".into());
+        state.issues[0].session_id = Some("ses_abc".into());
+        state.issues[0]
+            .github_pr_links
+            .push(crate::types::LinkedGithubPr {
+                number: 42,
+                imported: false,
+                import_source: None,
+            });
+        config::save_state(&state, root).unwrap();
+
+        let updated = update_issue(
+            root,
+            "test-1",
+            UpdateOptions {
+                title: None,
+                column: None,
+                agent_kind: None,
+                agent_mode: None,
+                prompt: None,
+                kind: Some(IssueKind::Orchestrator),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(updated.kind, IssueKind::Orchestrator);
+        assert!(updated.worktree.is_none());
+        assert!(updated.session_id.is_none());
+        assert!(updated.github_pr_links.is_empty());
+    }
+
+    #[test]
+    fn attach_pr_rejects_orchestrator_issue() {
+        let dir = setup_project();
+        let root = dir.path();
+
+        create_issue(
+            root,
+            CreateOptions {
+                title: "Coordinate".into(),
+                column: None,
+                agent_kind: None,
+                agent_mode: None,
+                prompt: None,
+                kind: Some(IssueKind::Orchestrator),
+            },
+        )
+        .unwrap();
+
+        let result = attach_pr(root, "test-1", 42);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("orchestrator"));
+
+        let state = config::load_state(root);
+        assert!(state.issues[0].github_pr_links.is_empty());
     }
 
     #[test]
@@ -569,6 +965,7 @@ mod tests {
             &ListOptions {
                 column: None,
                 json: false,
+                linked: None,
             },
         )
         .unwrap();
@@ -664,6 +1061,7 @@ mod tests {
             &ListOptions {
                 column: Some(Column::Todo),
                 json: false,
+                linked: None,
             },
         )
         .unwrap();
@@ -694,6 +1092,7 @@ mod tests {
             &ListOptions {
                 column: None,
                 json: true,
+                linked: None,
             },
         )
         .unwrap();
@@ -760,6 +1159,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                kind: None,
             },
         );
         assert!(result.is_err());
@@ -787,6 +1187,90 @@ mod tests {
     }
 
     #[test]
+    fn archive_without_worktree_moves_to_done() {
+        let dir = setup_project();
+        let root = dir.path();
+
+        create_issue(
+            root,
+            CreateOptions {
+                title: "Archive me".into(),
+                column: Some(Column::InProgress),
+                agent_kind: None,
+                agent_mode: None,
+                prompt: None,
+                kind: None,
+            },
+        )
+        .unwrap();
+
+        let report = archive_issue(root, "test-1", false).unwrap();
+        assert_eq!(report.issue_id, "test-1");
+        assert_eq!(report.title, "Archive me");
+        assert!(report.worktree_removed.is_none());
+
+        let state = config::load_state(root);
+        let issue = state.issues.iter().find(|i| i.id == "test-1").unwrap();
+        assert_eq!(issue.column, Column::Done);
+        assert!(issue.done_at.is_some());
+        assert!(issue.worktree.is_none());
+    }
+
+    #[test]
+    fn archive_orchestrator_issue_moves_to_done() {
+        let dir = setup_project();
+        let root = dir.path();
+
+        create_issue(
+            root,
+            CreateOptions {
+                title: "Coordinate".into(),
+                column: Some(Column::InProgress),
+                agent_kind: None,
+                agent_mode: None,
+                prompt: None,
+                kind: Some(IssueKind::Orchestrator),
+            },
+        )
+        .unwrap();
+
+        let report = archive_issue(root, "test-1", false).unwrap();
+        assert!(report.worktree_removed.is_none());
+
+        let state = config::load_state(root);
+        let issue = state.issues.iter().find(|i| i.id == "test-1").unwrap();
+        assert_eq!(issue.column, Column::Done);
+        assert_eq!(issue.kind, IssueKind::Orchestrator);
+    }
+
+    #[test]
+    fn archive_nonexistent_fails() {
+        let dir = setup_project();
+        assert!(archive_issue(dir.path(), "nope-99", false).is_err());
+    }
+
+    #[test]
+    fn archive_is_case_insensitive() {
+        let dir = setup_project();
+        let root = dir.path();
+
+        create_issue(
+            root,
+            CreateOptions {
+                title: "Case test".into(),
+                column: None,
+                agent_kind: None,
+                agent_mode: None,
+                prompt: None,
+                kind: None,
+            },
+        )
+        .unwrap();
+
+        assert!(archive_issue(root, "TEST-1", false).is_ok());
+    }
+
+    #[test]
     fn move_issue_changes_column() {
         let dir = setup_project();
         let root = dir.path();
@@ -809,27 +1293,190 @@ mod tests {
     }
 
     fn test_issue(id: &str, column: Column) -> Issue {
-        Issue {
-            id: id.to_string(),
-            title: format!("Test {}", id),
-            kind: IssueKind::Agentic,
-            column,
-            agent_kind: AgentKind::OpenCode,
-            agent_mode: AgentMode::Plan,
-            prompt: None,
-            worktree: None,
-            done_at: None,
-            session_id: None,
-            pruned_at: None,
-            linear_links: Vec::new(),
-            github_pr_links: Vec::new(),
-            linear_id: None,
-            linear_identifier: None,
-            linear_url: None,
-            linear_imported: false,
-            pr_number: None,
-            pr_imported: false,
-            pr_import_source: None,
-        }
+        Issue::new(id, format!("Test {}", id), column, AgentKind::OpenCode)
+    }
+
+    fn seed_issues(root: &Path, ids: &[&str]) {
+        let issues = ids.iter().map(|id| test_issue(id, Column::Todo)).collect();
+        config::save_state(
+            &config::AppState {
+                issues,
+                ..Default::default()
+            },
+            root,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn link_is_symmetric() {
+        let dir = setup_project();
+        let root = dir.path();
+        seed_issues(root, &["test-1", "test-2"]);
+
+        link_issues(root, "test-1", "test-2").unwrap();
+
+        let state = config::load_state(root);
+        assert!(state.issues[0].is_linked_to("test-2"));
+        assert!(state.issues[1].is_linked_to("test-1"));
+    }
+
+    #[test]
+    fn link_is_idempotent_and_case_insensitive() {
+        let dir = setup_project();
+        let root = dir.path();
+        seed_issues(root, &["test-1", "test-2"]);
+
+        link_issues(root, "test-1", "test-2").unwrap();
+        link_issues(root, "TEST-1", "TEST-2").unwrap();
+
+        let state = config::load_state(root);
+        assert_eq!(state.issues[0].linked_issues.len(), 1);
+        assert_eq!(state.issues[1].linked_issues.len(), 1);
+    }
+
+    #[test]
+    fn link_rejects_self() {
+        let dir = setup_project();
+        let root = dir.path();
+        seed_issues(root, &["test-1"]);
+
+        assert!(link_issues(root, "test-1", "test-1").is_err());
+    }
+
+    #[test]
+    fn link_rejects_missing_issue() {
+        let dir = setup_project();
+        let root = dir.path();
+        seed_issues(root, &["test-1"]);
+
+        assert!(link_issues(root, "test-1", "test-99").is_err());
+    }
+
+    #[test]
+    fn unlink_removes_both_sides() {
+        let dir = setup_project();
+        let root = dir.path();
+        seed_issues(root, &["test-1", "test-2"]);
+        link_issues(root, "test-1", "test-2").unwrap();
+
+        unlink_issues(root, "test-1", "test-2").unwrap();
+
+        let state = config::load_state(root);
+        assert!(state.issues[0].linked_issues.is_empty());
+        assert!(state.issues[1].linked_issues.is_empty());
+    }
+
+    #[test]
+    fn delete_strips_link_references() {
+        let dir = setup_project();
+        let root = dir.path();
+        seed_issues(root, &["test-1", "test-2", "test-3"]);
+        link_issues(root, "test-1", "test-2").unwrap();
+        link_issues(root, "test-2", "test-3").unwrap();
+
+        delete_issue(root, "test-2").unwrap();
+
+        let state = config::load_state(root);
+        assert!(state.issues.iter().all(|i| !i.is_linked_to("test-2")));
+    }
+
+    #[test]
+    fn linked_component_spans_chain() {
+        let dir = setup_project();
+        let root = dir.path();
+        seed_issues(root, &["test-1", "test-2", "test-3", "test-4"]);
+        link_issues(root, "test-1", "test-2").unwrap();
+        link_issues(root, "test-2", "test-3").unwrap();
+
+        let state = config::load_state(root);
+        let component = linked_component(&state.issues, "test-1");
+
+        assert!(component.contains("test-1"));
+        assert!(component.contains("test-2"));
+        assert!(component.contains("test-3"));
+        assert!(!component.contains("test-4"));
+    }
+
+    #[test]
+    fn detach_linear_removes_matching_link() {
+        let dir = setup_project();
+        let root = dir.path();
+        seed_issues(root, &["test-1"]);
+        attach_linear(root, "test-1", "VIL-1").unwrap();
+        attach_linear(root, "test-1", "VIL-2").unwrap();
+
+        let updated = detach_linear(root, "test-1", "vil-1").unwrap();
+
+        assert_eq!(updated.linear_identifiers(), vec!["VIL-2"]);
+    }
+
+    #[test]
+    fn detach_linear_errors_when_not_linked() {
+        let dir = setup_project();
+        let root = dir.path();
+        seed_issues(root, &["test-1"]);
+
+        assert!(detach_linear(root, "test-1", "VIL-1").is_err());
+    }
+
+    #[test]
+    fn detach_pr_removes_matching_link() {
+        let dir = setup_project();
+        let root = dir.path();
+        seed_issues(root, &["test-1"]);
+        attach_pr(root, "test-1", 41).unwrap();
+        attach_pr(root, "test-1", 42).unwrap();
+
+        let updated = detach_pr(root, "test-1", 41).unwrap();
+
+        assert_eq!(updated.pr_numbers(), vec![42]);
+    }
+
+    #[test]
+    fn detach_pr_errors_when_not_linked() {
+        let dir = setup_project();
+        let root = dir.path();
+        seed_issues(root, &["test-1"]);
+
+        assert!(detach_pr(root, "test-1", 42).is_err());
+    }
+
+    #[test]
+    fn clear_linear_and_pr_remove_all_links() {
+        let dir = setup_project();
+        let root = dir.path();
+        seed_issues(root, &["test-1"]);
+        attach_linear(root, "test-1", "VIL-1").unwrap();
+        attach_linear(root, "test-1", "VIL-2").unwrap();
+        attach_pr(root, "test-1", 42).unwrap();
+
+        let updated = clear_linear(root, "test-1").unwrap();
+        assert!(updated.linear_links.is_empty());
+
+        let updated = clear_pr(root, "test-1").unwrap();
+        assert!(updated.github_pr_links.is_empty());
+    }
+
+    #[test]
+    fn list_linked_filters_to_component() {
+        let dir = setup_project();
+        let root = dir.path();
+        seed_issues(root, &["test-1", "test-2", "test-3"]);
+        link_issues(root, "test-1", "test-2").unwrap();
+
+        let output = list_issues(
+            root,
+            &ListOptions {
+                column: None,
+                json: false,
+                linked: Some("test-1".into()),
+            },
+        )
+        .unwrap();
+
+        assert!(output.contains("test-1"));
+        assert!(output.contains("test-2"));
+        assert!(!output.contains("test-3"));
     }
 }

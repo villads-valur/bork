@@ -16,6 +16,7 @@ pub const CARD_HEIGHT_MEDIUM: u16 = 5;
 pub struct CardContext<'a> {
     pub issue: &'a Issue,
     pub selected: bool,
+    pub marked: bool,
     pub session_alive: bool,
     pub agent_status: AgentStatus,
     pub activity: Option<&'a str>,
@@ -31,10 +32,18 @@ pub fn render_card(frame: &mut Frame, ctx: &CardContext, area: Rect, card_size: 
         return;
     }
 
-    let border_style = styles::card_border_style(ctx.selected);
+    let border_style = if ctx.issue.kind == IssueKind::Orchestrator {
+        styles::orchestrator_card_border_style(ctx.selected, ctx.marked)
+    } else {
+        styles::card_border_style(ctx.selected, ctx.marked)
+    };
     let title_style = styles::card_title_style(ctx.selected);
 
-    let id_text = format!(" {} ", ctx.issue.id);
+    let id_text = if ctx.marked {
+        format!(" [x] {} ", ctx.issue.id)
+    } else {
+        format!(" {} ", ctx.issue.id)
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
@@ -137,12 +146,24 @@ pub fn highlight_spans(text: &str, query: &str, base_style: Style) -> Vec<Span<'
     spans
 }
 
+fn link_badge(issue: &Issue) -> Option<Span<'static>> {
+    if !issue.has_links() {
+        return None;
+    }
+    Some(Span::styled(
+        format!("\u{221e}{}", issue.linked_issues.len()),
+        Style::default().fg(Color::Cyan),
+    ))
+}
+
 fn format_status_line(ctx: &CardContext) -> Line<'static> {
     if ctx.issue.kind == IssueKind::NonAgentic {
-        return Line::from(vec![
-            Span::raw("  "),
-            Span::styled("Todo", styles::dim_style()),
-        ]);
+        let mut spans = vec![Span::raw("  "), Span::styled("Todo", styles::dim_style())];
+        if let Some(badge) = link_badge(ctx.issue) {
+            spans.push(Span::raw(" "));
+            spans.push(badge);
+        }
+        return Line::from(spans);
     }
 
     let status_color = styles::agent_status_color(&ctx.agent_status);
@@ -170,6 +191,19 @@ fn format_status_line(ctx: &CardContext) -> Line<'static> {
     if is_review {
         spans.push(Span::raw(" "));
         spans.push(Span::styled("review", Style::default().fg(Color::Yellow)));
+    }
+
+    if ctx.issue.kind == IssueKind::Orchestrator {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            "\u{25c6} orch",
+            styles::orchestrator_badge_style(),
+        ));
+    }
+
+    if let Some(badge) = link_badge(ctx.issue) {
+        spans.push(Span::raw(" "));
+        spans.push(badge);
     }
 
     let git_spans = format_git_status(ctx.git_status);
@@ -512,26 +546,14 @@ mod tests {
 
     fn issue_for_prune_indicator(worktree: Option<&str>, pruned_at: Option<u64>) -> Issue {
         Issue {
-            id: "bork-1".into(),
-            title: "t".into(),
-            kind: crate::types::IssueKind::Agentic,
-            column: crate::types::Column::Done,
-            agent_kind: crate::types::AgentKind::OpenCode,
-            agent_mode: crate::types::AgentMode::Plan,
-            prompt: None,
             worktree: worktree.map(String::from),
-            done_at: None,
-            session_id: None,
             pruned_at,
-            linear_links: Vec::new(),
-            github_pr_links: Vec::new(),
-            linear_id: None,
-            linear_identifier: None,
-            linear_url: None,
-            linear_imported: false,
-            pr_number: None,
-            pr_imported: false,
-            pr_import_source: None,
+            ..Issue::new(
+                "bork-1",
+                "t",
+                crate::types::Column::Done,
+                crate::types::AgentKind::OpenCode,
+            )
         }
     }
 

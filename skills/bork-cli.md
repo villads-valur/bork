@@ -31,10 +31,31 @@ bork issue create "Add search" --prompt "Implement full-text search using the ex
 
 Options:
 - `--column`: todo (default), in-progress, code-review, done
-- `--agent`: opencode (default from project config), claude, codex
+- `--agent`: opencode (default from project config), claude, codex, pi
 - `--mode`: plan (default), build, yolo
 - `--kind`: agentic (default), todo (non-agentic)
 - `--prompt`: agent prompt text
+
+### Start an issue agent
+
+Use this when you want to spin off a new issue and have another agent work on it immediately.
+
+```bash
+bork issue start "Implement search" --prompt "Add search using the existing indexing code"
+bork issue start "Fix auth bug" --agent claude --mode build --slug fix-auth-bug
+bork issue start "Add API route" --project my-api --prompt "Implement this in my-api"
+bork issue start "Investigate flaky test" --no-worktree --prompt "Find the root cause"
+```
+
+This creates an agentic issue, creates a git worktree by default, moves the issue to In Progress, and starts the configured agent in a tmux session. If the project configures a `setup_script`, it runs inside the worktree before the agent starts.
+
+Options:
+- `--prompt`: agent prompt text
+- `--agent`: opencode (default from project config), claude, codex
+- `--mode`: plan, build (default), yolo
+- `--slug`: worktree/branch slug (generated from title by default)
+- `--no-worktree`: launch without creating a worktree
+- `--project`: registered project name or path (defaults to current project)
 
 ### Show issue details
 
@@ -65,6 +86,17 @@ bork issue move bork-1 todo
 
 Moving to `done` sets a completion timestamp. Moving away from `done` clears it.
 
+### Archive an issue
+
+Use this to clean up when an issue's work is merged. It kills the agent's tmux session, runs the project's `teardown_script` (if configured) inside the worktree, removes the worktree, and moves the issue to Done.
+
+```bash
+bork issue archive bork-1
+bork issue archive bork-1 --force    # proceed past a failing teardown, discard uncommitted changes
+```
+
+Without `--force`, the archive aborts if the teardown script fails or the worktree has uncommitted changes.
+
 ### Delete an issue
 
 ```bash
@@ -91,12 +123,11 @@ This sets the PR number on the issue so the TUI can display PR status (checks, r
 
 ## Typical workflow
 
-1. Create an issue: `bork issue create "Implement feature X" --prompt "Details..."`
-2. Create a worktree: `bork worktree bork-1 implement-feature-x`
-3. Work on the issue in the worktree
-4. Link a PR when ready: `bork integration attach-pr bork-1 123`
-5. Move to review: `bork issue move bork-1 code-review`
-6. Mark done: `bork issue move bork-1 done`
+1. Spin off work: `bork issue start "Implement feature X" --prompt "Details..."`
+2. The new agent works in the created worktree
+3. Link a PR when ready: `bork integration attach-pr bork-1 123`
+4. Move to review: `bork issue move bork-1 code-review`
+5. When merged, clean up: `bork issue archive bork-1` (kills session, runs teardown, removes worktree, marks Done)
 
 ## Column values
 

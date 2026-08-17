@@ -6,22 +6,32 @@ Terminal kanban board for orchestrating OpenCode/Claude coding sessions across g
 
 - **Language**: Rust (no async runtime, pure `std::thread` + `mpsc`)
 - **TUI**: ratatui + crossterm
-- **External tools**: tmux, git, gh, linear (optional), opencode/claude/codex (all via `std::process::Command`)
+- **External tools**: tmux, git, gh, linear (optional), opencode/claude/codex/pi (all via `std::process::Command`)
 
 ### Threading Model
 
 ```
 Main Thread (50ms tick event loop)
+├── Shared workers (one each, app-wide)
+│   ├── Tmux Session Worker (polls every 2s - one global `tmux list-sessions`)
+│   ├── Port Poll Worker (polls every 10s - listening TCP ports via lsof/ps)
+│   ├── Linear Worker (polls every 45s - assigned Linear issues, conditional on `linear` CLI)
+│   ├── Activity Poller (polls every 5s - agent status dirs for all registered projects)
+│   └── Update Check Worker (every 6h - new-version banner, plus cache mtime poll every 2s)
 ├── Primary ProjectWorkers (for focused project)
-│   ├── Session Status Worker (polls every 2s - tmux sessions + agent status files)
-│   ├── Port Poll Worker (polls every 5s - listening TCP ports)
-│   ├── Git Status Worker (polls every 3s - worktree changes + branches)
-│   ├── PR Status Worker (polls every 60s - GitHub PRs via gh api graphql)
-│   └── Linear Worker (polls every 45s - assigned Linear issues, conditional on `linear` CLI)
+│   ├── Agent Status Worker (polls every 2s - agent status files)
+│   ├── Git Status Worker (polls every 5s - per-worktree `git status` + one batched
+│   │                       `git worktree list --porcelain` for branches)
+│   └── PR Status Worker (polls every 60s - GitHub PRs via gh api graphql)
 ├── Swimlane Workers (one ProjectWorkers set per visible swimlane, excluding focused)
-├── Activity Poller (polls every 5s - agent status dirs for all registered projects)
 └── Action Threads (fire-and-forget per user action)
 ```
+
+Workers send results over per-worker `mpsc` channels drained on the main loop tick.
+Results are diffed against the previous data before triggering a redraw. Wake
+channels (`sleep_with_wake`) let user actions trigger an immediate poll; queued
+wakes are coalesced. While a tmux popup or external editor owns the terminal,
+all pollers idle via a shared `poll_suspended` flag.
 
 ### Data Flow
 
@@ -56,11 +66,11 @@ src/
 ├── external/
 │   ├── mod.rs
 │   ├── tmux.rs       # Tmux session management
-│   ├── opencode.rs   # Agent session launcher (opencode/claude/codex)
+│   ├── opencode.rs   # Agent session launcher (opencode/claude/codex/pi)
 │   ├── git.rs        # Git worktree status polling
 │   ├── github.rs     # GitHub PR polling via gh api graphql (per-repo identity cache)
 │   ├── linear.rs     # Linear CLI integration (assigned issues via graphql)
-│   └── hooks.rs      # Agent status hooks (install/uninstall for opencode/claude/codex)
+│   └── hooks.rs      # Agent status hooks (install/uninstall for opencode/claude/codex/pi)
 └── ui/
     ├── mod.rs         # Root render, layout composition, swimlane splitting
     ├── board.rs       # 4-column kanban board with adaptive card sizes
@@ -114,7 +124,7 @@ State lives in `.bork/` at the container root. Config is detected by walking up 
 
 ## Global State
 
-- `~/.config/bork/config.toml` — global config layer (agents allowlist, default_agent, default_prompt, etc.). Same flat schema as `<project>/.bork/config.toml`; project values override global.
+- `~/.config/bork/config.toml` — global config layer (agents allowlist, default_agent, default_prompt, review_prompt, orchestrator_prompt, setup_script, teardown_script, auto_import_reviews, auto_import_authored_prs, etc.). Same flat schema as `<project>/.bork/config.toml`; project values override global. Scalar keys can be read/written with `bork config get|set|list`.
 - `~/.config/bork/projects.json` — registry of all bork projects (auto-registered, auto-pruned, managed artifact)
 - `~/.config/bork/bork.pid` — flock-based single instance lock
 
@@ -138,6 +148,12 @@ The binary is symlinked to `/opt/homebrew/bin/bork`.
 - Wrapper tmux session: always named "bork" (single global session)
 - Opencode launched at project root with --prompt for issue context
 
+## Issue Kinds
+
+- `Agentic` (default) — launches a coding agent in a tmux session, usually in its own worktree
+- `NonAgentic` ("Todo") — plain checklist card, never launches an agent; Enter opens the edit dialog
+- `Orchestrator` — launches a coordinating agent at the project root with no worktree and no GitHub PR field. Its prompt comes from `orchestrator_prompt` (project overrides global, falls back to `DEFAULT_ORCHESTRATOR_PROMPT` in config.rs) instead of `default_prompt`, and bork appends the planning file path `plans/{issue-id}/planning.md`. The agent breaks the goal into issues, spawns them via `bork issue start`, and monitors/nudges their agents via `bork issue list --json` and tmux. Cards render with a magenta border and an `◆ orch` badge. `IssueKind::is_agentic()` is true for both `Agentic` and `Orchestrator`. Kind changes go through `Issue::set_kind()`, which clears the session ID when crossing the orchestrator boundary and additionally drops the worktree and PR links when becoming an orchestrator (`bork integration attach-pr` also rejects orchestrators).
+
 ## Integration Data Model
 
 Each `Issue` can link to multiple Linear issues and GitHub PRs via Vec fields:
@@ -148,3 +164,13 @@ Each `Issue` can link to multiple Linear issues and GitHub PRs via Vec fields:
 Legacy singular fields (`linear_id`, `pr_number`, etc.) are kept for deserialization backward compat but marked `#[serde(skip_serializing)]`. Migration happens automatically in `load_state()`.
 
 The dialog picker uses multi-select in Attach mode (Enter toggles, Backspace removes last). Import mode stays single-select (creates a new bork issue per selection).
+
+## Issue Links
+
+Issues can be tied to other issues in the same project via a symmetric `linked_issues: Vec<String>` field (each side stores the other's id, case-insensitive). Links power a board filter that narrows the view to one connected component (BFS over `linked_issues`, see `Project::linked_component` and `ops::linked_component`).
+
+- **Auto-link on spawn**: agent sessions export `BORK_ISSUE_ID`; `bork issue start` links the new issue back to the spawning issue (or to `--link <id>`) when the target resolves in the same project. This ties an orchestrator to the sub-issues it spawns.
+- **Manual links**: `bork integration link <a> <b>` / `unlink <a> <b>`, or the TUI link picker (`c`, model after `linear_picker`).
+- **Filter**: `f` toggles the board to the selected issue's connected component; `Esc`/`f` clears. `bork issue list --linked <id>` does the same from the CLI.
+- Cards show a cyan `∞N` badge (link count). Deleting an issue strips its id from every other issue's `linked_issues` (`ops::remove_link_references`).
+- Any new `Issue` field (including `linked_issues`) must be added to `merge_issue_fields` in `app.rs` or concurrent TUI edits drop CLI-written values.

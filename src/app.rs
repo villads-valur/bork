@@ -7,17 +7,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// actions don't appear as a single-frame flash.
 const BUSY_MIN_VISIBLE: Duration = Duration::from_millis(250);
 
-use ratatui::style::{Modifier, Style};
-use ratatui_textarea::{CursorMove, TextArea, WrapMode};
-
-use crate::config::{AppConfig, AppState};
+use crate::config::{AppConfig, AppState, DEFAULT_REVIEW_PROMPT};
 use crate::external::linear::LinearIssue;
 use crate::prune::{PruneAction, PruneCandidate};
 use crate::types::{
-    AgentKind, AgentMode, AgentStatus, AgentStatusInfo, Column, Issue, IssueKind, LinkedGithubPr,
+    AgentKind, AgentStatus, AgentStatusInfo, Column, Issue, IssueKind, LinkedGithubPr,
     PrImportSource, PrState, PrStatus, WorktreeStatus,
 };
-use crate::ui::styles;
 
 pub type ProjectId = PathBuf;
 
@@ -35,6 +31,7 @@ pub enum InputMode {
     Dialog,
     Search,
     LinearPicker,
+    LinkPicker,
     Help,
     DebugInspector,
     Sidebar,
@@ -68,11 +65,19 @@ impl LiveState {
 }
 
 pub struct Project {
+    /// Canonicalized project root, computed once at construction. `id()` is
+    /// called in per-frame render paths, so it must not hit the filesystem.
+    id: ProjectId,
     pub issues: Vec<Issue>,
     pub config: AppConfig,
     pub available_agents: Vec<AgentKind>,
     pub selected_column: usize,
     pub selected_row: [usize; 4],
+    pub marked_issues: HashSet<String>,
+    /// When set, the board shows only the connected component of links that
+    /// contains this issue id (the anchor itself plus everything reachable
+    /// through `linked_issues`). Cleared with the same key or Esc.
+    pub link_filter: Option<String>,
     pub linear_available: bool,
     pub tuicr_available: bool,
     pub live: LiveState,
@@ -84,6 +89,7 @@ pub struct Project {
     /// Most recent time we ran the auto-prune threshold check for this
     /// project. Ephemeral; throttles both the check and its toast.
     pub last_auto_prune_check: Option<Instant>,
+    pub last_config_mtime: Option<SystemTime>,
 }
 
 impl Project {
@@ -97,12 +103,18 @@ impl Project {
         }
         let base_issues = issues.clone();
         let last_state_mtime = crate::config::state_mtime(&config.project_root);
+        let id = std::fs::canonicalize(&config.project_root)
+            .unwrap_or_else(|_| config.project_root.clone());
+        let last_config_mtime = crate::config::config_mtime(&config.project_root);
         Project {
+            id,
             issues,
             config,
             available_agents: AgentKind::ALL.to_vec(),
             selected_column: 0,
             selected_row: [0; 4],
+            marked_issues: HashSet::new(),
+            link_filter: None,
             linear_available: false,
             tuicr_available: false,
             live: LiveState::default(),
@@ -111,12 +123,20 @@ impl Project {
             last_state_mtime,
             last_prune_at: state.last_prune_at,
             last_auto_prune_check: None,
+            last_config_mtime,
         }
     }
 
+    /// Re-read the layered config from disk, replacing `self.config`. Used to
+    /// pick up `bork config set` edits without a TUI restart. Leaves
+    /// `available_agents` (resolved at startup) untouched.
+    pub fn reload_config(&mut self) {
+        self.config = crate::config::load_config_from(&self.config.project_root);
+        self.last_config_mtime = crate::config::config_mtime(&self.config.project_root);
+    }
+
     pub fn id(&self) -> ProjectId {
-        std::fs::canonicalize(&self.config.project_root)
-            .unwrap_or_else(|_| self.config.project_root.clone())
+        self.id.clone()
     }
 
     pub fn set_available_agents(
@@ -190,6 +210,8 @@ impl Project {
             // No local changes pending, safe to fully replace
             self.issues = file_issues.clone();
             self.base_issues = file_issues;
+            self.clear_stale_link_filter();
+            self.clear_stale_marks();
             self.clamp_all_rows("");
             return;
         }
@@ -208,12 +230,20 @@ impl Project {
             }
         }
 
-        // Field-level merge for issues present in both memory and file
+        // Field-level merge for issues present in both memory and file.
+        // Indexed by ID to avoid an O(issues^2) scan per merge.
+        let file_by_id: HashMap<&str, &Issue> =
+            file_issues.iter().map(|i| (i.id.as_str(), i)).collect();
+        let base_by_id: HashMap<&str, &Issue> = self
+            .base_issues
+            .iter()
+            .map(|i| (i.id.as_str(), i))
+            .collect();
         for issue in &mut self.issues {
-            let Some(file_issue) = file_issues.iter().find(|f| f.id == issue.id) else {
+            let Some(file_issue) = file_by_id.get(issue.id.as_str()).copied() else {
                 continue;
             };
-            let Some(base_issue) = self.base_issues.iter().find(|b| b.id == issue.id) else {
+            let Some(base_issue) = base_by_id.get(issue.id.as_str()).copied() else {
                 // No base means this issue was added after last snapshot; keep memory version
                 continue;
             };
@@ -221,18 +251,54 @@ impl Project {
         }
 
         self.base_issues = file_issues;
+        self.clear_stale_link_filter();
+        self.clear_stale_marks();
         self.clamp_all_rows("");
+    }
+
+    /// Drop the link filter when its anchor issue no longer exists (e.g. it was
+    /// deleted via the CLI while the filter was active), so the board doesn't
+    /// get stuck showing nothing.
+    fn clear_stale_link_filter(&mut self) {
+        let stale = self.link_filter.as_deref().is_some_and(|anchor| {
+            !self
+                .issues
+                .iter()
+                .any(|i| i.id.eq_ignore_ascii_case(anchor))
+        });
+        if stale {
+            self.link_filter = None;
+        }
+    }
+
+    fn clear_stale_marks(&mut self) {
+        let ids: HashSet<String> = self.issues.iter().map(|i| i.id.to_lowercase()).collect();
+        self.marked_issues.retain(|id| ids.contains(id));
     }
 
     pub fn issues_in_column(&self, column: Column, query: &str) -> Vec<(usize, &Issue)> {
         let query = query.to_lowercase();
+        let component = self
+            .link_filter
+            .as_deref()
+            .map(|anchor| self.linked_component(anchor));
         self.issues
             .iter()
             .enumerate()
             .filter(|(_, issue)| {
-                issue.column == column && (query.is_empty() || self.issue_matches(issue, &query))
+                issue.column == column
+                    && (query.is_empty() || self.issue_matches(issue, &query))
+                    && component
+                        .as_ref()
+                        .is_none_or(|c| c.contains(&issue.id.to_lowercase()))
             })
             .collect()
+    }
+
+    /// Connected component of the link graph containing `anchor` (BFS over
+    /// `linked_issues`). Returns lowercased ids, including the anchor itself.
+    pub fn linked_component(&self, anchor: &str) -> HashSet<String> {
+        crate::ops::linked_component(&self.issues, anchor)
     }
 
     fn issue_matches(&self, issue: &Issue, query: &str) -> bool {
@@ -272,9 +338,8 @@ impl Project {
     }
 
     pub fn move_selection_down(&mut self, query: &str) {
-        let column = match Column::from_index(self.selected_column) {
-            Some(c) => c,
-            None => return,
+        let Some(column) = Column::from_index(self.selected_column) else {
+            return;
         };
         let count = self.issues_in_column(column, query).len();
         let row = &mut self.selected_row[self.selected_column];
@@ -316,9 +381,8 @@ impl Project {
     }
 
     pub fn focus_right(&mut self, query: &str) {
-        let column = match Column::from_index(self.selected_column) {
-            Some(c) => c,
-            None => return,
+        let Some(column) = Column::from_index(self.selected_column) else {
+            return;
         };
         let count = self.issues_in_column(column, query).len();
         let row = self.selected_row[self.selected_column];
@@ -351,9 +415,8 @@ impl Project {
     }
 
     pub fn scroll_to_bottom(&mut self, query: &str) {
-        let column = match Column::from_index(self.selected_column) {
-            Some(c) => c,
-            None => return,
+        let Some(column) = Column::from_index(self.selected_column) else {
+            return;
         };
         let count = self.issues_in_column(column, query).len();
         if count > 0 {
@@ -361,38 +424,92 @@ impl Project {
         }
     }
 
-    pub fn move_issue_right(&mut self, query: &str) {
-        let Some(idx) = self.selected_issue_index(query) else {
-            return;
-        };
-        let Some(next) = self.issues[idx].column.next() else {
-            return;
-        };
-        self.move_issue_to_column(idx, next);
+    pub fn toggle_mark(&mut self, query: &str) -> Option<usize> {
+        let issue_id = self.selected_issue(query)?.id.to_lowercase();
+        if !self.marked_issues.insert(issue_id.clone()) {
+            self.marked_issues.remove(&issue_id);
+        }
+        Some(self.marked_issues.len())
     }
 
-    pub fn move_issue_left(&mut self, query: &str) {
-        let Some(idx) = self.selected_issue_index(query) else {
-            return;
-        };
-        let Some(prev) = self.issues[idx].column.prev() else {
-            return;
-        };
-        self.move_issue_to_column(idx, prev);
+    pub fn mark_linked_component(&mut self, query: &str) -> Option<usize> {
+        let issue_id = self.selected_issue(query)?.id.clone();
+        for linked_id in self.linked_component(&issue_id) {
+            self.marked_issues.insert(linked_id);
+        }
+        Some(self.marked_issues.len())
     }
 
-    pub fn move_to_done(&mut self, query: &str) {
-        let Some(idx) = self.selected_issue_index(query) else {
-            return;
-        };
-        self.move_issue_to_column(idx, Column::Done);
+    pub fn clear_marks(&mut self) {
+        self.marked_issues.clear();
     }
 
-    pub fn move_to_todo(&mut self, query: &str) {
+    fn marked_issue_indices(&self) -> Vec<usize> {
+        self.issues
+            .iter()
+            .enumerate()
+            .filter(|(_, issue)| self.marked_issues.contains(&issue.id.to_lowercase()))
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    pub fn move_issue_right(&mut self, query: &str) -> usize {
+        if !self.marked_issues.is_empty() {
+            return self.move_marked(query, |column| column.next());
+        }
+        self.move_selected(query, |column| column.next())
+    }
+
+    pub fn move_issue_left(&mut self, query: &str) -> usize {
+        if !self.marked_issues.is_empty() {
+            return self.move_marked(query, |column| column.prev());
+        }
+        self.move_selected(query, |column| column.prev())
+    }
+
+    pub fn move_to_done(&mut self, query: &str) -> usize {
+        if !self.marked_issues.is_empty() {
+            return self.move_marked(query, |_| Some(Column::Done));
+        }
+        self.move_selected(query, |_| Some(Column::Done))
+    }
+
+    pub fn move_to_todo(&mut self, query: &str) -> usize {
+        if !self.marked_issues.is_empty() {
+            return self.move_marked(query, |_| Some(Column::Todo));
+        }
+        self.move_selected(query, |_| Some(Column::Todo))
+    }
+
+    /// Move the selected issue to the column produced by `target`. Returns the
+    /// number of issues moved (0 or 1).
+    fn move_selected(&mut self, query: &str, target: impl Fn(Column) -> Option<Column>) -> usize {
         let Some(idx) = self.selected_issue_index(query) else {
-            return;
+            return 0;
         };
-        self.move_issue_to_column(idx, Column::Todo);
+        let Some(target) = target(self.issues[idx].column) else {
+            return 0;
+        };
+        self.move_issue_to_column(idx, target);
+        1
+    }
+
+    /// Move every marked issue to the column produced by `target`, skipping any
+    /// that have no valid target. Clears the marks afterward and returns the
+    /// number of issues actually moved.
+    fn move_marked(&mut self, query: &str, target: impl Fn(Column) -> Option<Column>) -> usize {
+        let mut moved = 0;
+        for idx in self.marked_issue_indices() {
+            let column = self.issues[idx].column;
+            let Some(target) = target(column).filter(|t| *t != column) else {
+                continue;
+            };
+            self.move_issue_to_column(idx, target);
+            moved += 1;
+        }
+        self.clear_marks();
+        self.clamp_all_rows(query);
+        moved
     }
 
     pub fn move_issue_up(&mut self, query: &str) {
@@ -409,12 +526,16 @@ impl Project {
         };
         let items = self.issues_in_column(column, query);
         let row = self.selected_row[self.selected_column];
-        let target_row = row.wrapping_add(direction as usize);
+        if row >= items.len() {
+            return;
+        }
+        let Some(target_row) = row.checked_add_signed(direction) else {
+            return;
+        };
         if target_row >= items.len() {
             return;
         }
         let (a, b) = (items[row].0, items[target_row].0);
-        drop(items);
         self.issues.swap(a, b);
         self.selected_row[self.selected_column] = target_row;
     }
@@ -476,6 +597,15 @@ impl Project {
         self.live.listening_ports.get(&session_name)
     }
 
+    /// True when any issue in this project has a tmux session listening on a port
+    /// (i.e. a dev env is running). Mirrors the per-card 🔌 condition.
+    pub fn has_listening_ports(&self) -> bool {
+        self.issues.iter().any(|issue| {
+            self.listening_ports_for(issue)
+                .is_some_and(|ports| !ports.is_empty())
+        })
+    }
+
     pub fn worktree_for<'a>(&self, issue: &'a Issue) -> Option<&'a str> {
         issue.worktree.as_deref()
     }
@@ -500,7 +630,7 @@ impl Project {
             let before_ok = pos == 0 || dir_lower.as_bytes()[pos - 1] == b'-';
             let end = pos + issue_id_lower.len();
             let after_ok = end == dir_lower.len() || dir_lower.as_bytes()[end] == b'-';
-            if before_ok && after_ok && (best.is_none() || dir_name.len() < best.unwrap().len()) {
+            if before_ok && after_ok && best.is_none_or(|b| dir_name.len() < b.len()) {
                 best = Some(dir_name.as_str());
             }
         }
@@ -509,7 +639,9 @@ impl Project {
 
     pub fn auto_assign_worktrees(&mut self) -> bool {
         let assignments: Vec<(usize, String)> = (0..self.issues.len())
-            .filter(|&i| self.issues[i].worktree.is_none())
+            .filter(|&i| {
+                self.issues[i].worktree.is_none() && self.issues[i].kind != IssueKind::Orchestrator
+            })
             .filter_map(|i| self.detect_worktree(&self.issues[i]).map(|wt| (i, wt)))
             .collect();
 
@@ -721,7 +853,12 @@ impl Project {
         let mut new_pr_numbers: HashSet<u32> = HashSet::new();
 
         // Import authored PRs
-        for pr in &self.live.user_prs {
+        let authored_prs: &[PrStatus] = if self.config.auto_import_authored_prs {
+            &self.live.user_prs
+        } else {
+            &[]
+        };
+        for pr in authored_prs {
             if !should_import(
                 pr,
                 &claimed_branches,
@@ -733,36 +870,16 @@ impl Project {
             }
             new_pr_numbers.insert(pr.number);
             let id = self.next_issue_id_after(new_issues.len() as u32);
-            new_issues.push(Issue {
-                id,
-                title: pr.title.clone(),
-                kind: IssueKind::Agentic,
-                column: Column::CodeReview,
-                agent_kind: self.config.agent_kind,
-                agent_mode: AgentMode::Plan,
-                prompt: None,
-                worktree: None,
-                done_at: None,
-                session_id: None,
-                pruned_at: None,
-                linear_links: Vec::new(),
-                github_pr_links: vec![LinkedGithubPr {
-                    number: pr.number,
-                    imported: true,
-                    import_source: Some(PrImportSource::Authored),
-                }],
-                linear_id: None,
-                linear_identifier: None,
-                linear_url: None,
-                linear_imported: false,
-                pr_number: None,
-                pr_imported: false,
-                pr_import_source: None,
-            });
+            new_issues.push(self.imported_pr_issue(id, pr, PrImportSource::Authored));
         }
 
         // Import review-requested PRs
-        for pr in &self.live.review_requested_prs {
+        let review_prs: &[PrStatus] = if self.config.auto_import_reviews {
+            &self.live.review_requested_prs
+        } else {
+            &[]
+        };
+        for pr in review_prs {
             if !should_import(
                 pr,
                 &claimed_branches,
@@ -774,34 +891,7 @@ impl Project {
             }
             new_pr_numbers.insert(pr.number);
             let id = self.next_issue_id_after(new_issues.len() as u32);
-            new_issues.push(Issue {
-                id,
-                title: pr.title.clone(),
-                kind: IssueKind::Agentic,
-                column: Column::CodeReview,
-                agent_kind: self.config.agent_kind,
-                agent_mode: AgentMode::Plan,
-                prompt: Some(
-                    "Review this PR. Read the diff, check for correctness, regressions, missing tests, and edge cases. Summarize your findings.".to_string(),
-                ),
-                worktree: None,
-                done_at: None,
-                session_id: None,
-                pruned_at: None,
-                linear_links: Vec::new(),
-                github_pr_links: vec![LinkedGithubPr {
-                    number: pr.number,
-                    imported: true,
-                    import_source: Some(PrImportSource::ReviewRequested),
-                }],
-                linear_id: None,
-                linear_identifier: None,
-                linear_url: None,
-                linear_imported: false,
-                pr_number: None,
-                pr_imported: false,
-                pr_import_source: None,
-            });
+            new_issues.push(self.imported_pr_issue(id, pr, PrImportSource::ReviewRequested));
         }
 
         let added = new_issues.len();
@@ -836,6 +926,39 @@ impl Project {
         (true, Some(parts.join(", ")))
     }
 
+    /// Issue skeleton for a PR auto-imported into Code Review. Review-requested
+    /// PRs get a review prompt; authored PRs get none.
+    fn imported_pr_issue(&self, id: String, pr: &PrStatus, source: PrImportSource) -> Issue {
+        let prompt = match source {
+            PrImportSource::Authored => None,
+            PrImportSource::ReviewRequested => {
+                let body = self
+                    .config
+                    .review_prompt
+                    .as_deref()
+                    .unwrap_or(DEFAULT_REVIEW_PROMPT);
+                Some(format!(
+                    "Review this PR: #{} ({}). {}",
+                    pr.number, pr.url, body
+                ))
+            }
+        };
+        Issue {
+            prompt,
+            github_pr_links: vec![LinkedGithubPr {
+                number: pr.number,
+                imported: true,
+                import_source: Some(source),
+            }],
+            ..Issue::new(
+                id,
+                pr.title.clone(),
+                Column::CodeReview,
+                self.config.agent_kind,
+            )
+        }
+    }
+
     pub fn done_worktree_names(&self) -> HashSet<String> {
         self.issues
             .iter()
@@ -845,10 +968,10 @@ impl Project {
     }
 
     pub fn freeze_worktree_status(&mut self, worktree: &str) {
-        if let Some(status) = self.live.worktree_statuses.get(worktree) {
+        if let Some(status) = self.live.worktree_statuses.get(worktree).copied() {
             self.live
                 .frozen_worktree_statuses
-                .insert(worktree.to_string(), status.clone());
+                .insert(worktree.to_string(), status);
         }
         if let Some(branch) = self.live.worktree_branches.get(worktree).cloned() {
             self.live
@@ -948,20 +1071,7 @@ impl Project {
     }
 
     fn next_issue_id_after(&self, offset: u32) -> String {
-        let prefix = &self.config.project_name;
-        let max_num = self
-            .issues
-            .iter()
-            .filter_map(|issue| {
-                issue
-                    .id
-                    .strip_prefix(&format!("{}-", prefix))
-                    .and_then(|s| s.parse::<u32>().ok())
-            })
-            .max()
-            .unwrap_or(0);
-
-        format!("{}-{}", prefix, max_num + 1 + offset)
+        crate::ops::next_issue_id_after(&self.issues, &self.config.project_name, offset)
     }
 
     pub fn clamp_all_rows(&mut self, query: &str) {
@@ -976,9 +1086,8 @@ impl Project {
     }
 
     fn clamp_row(&mut self, query: &str) {
-        let column = match Column::from_index(self.selected_column) {
-            Some(c) => c,
-            None => return,
+        let Some(column) = Column::from_index(self.selected_column) else {
+            return;
         };
         let count = self.issues_in_column(column, query).len();
         let row = &mut self.selected_row[self.selected_column];
@@ -1021,6 +1130,15 @@ pub struct ActionContext {
 
 #[derive(Debug)]
 pub struct LinearPickerState {
+    pub search: String,
+    pub selected: usize,
+}
+
+#[derive(Debug)]
+pub struct LinkPickerState {
+    /// The issue being linked from. Candidates are other issues in the same
+    /// project; Enter toggles a link with the highlighted candidate.
+    pub anchor_id: String,
     pub search: String,
     pub selected: usize,
 }
@@ -1103,7 +1221,9 @@ pub enum ConfirmAction {
         project_id: ProjectId,
     },
     DeleteIssue {
-        issue_index: usize,
+        /// Stored by ID, not index: background workers can reorder/remove
+        /// issues while the confirm prompt is open.
+        issue_id: String,
         project_id: ProjectId,
     },
 }
@@ -1120,462 +1240,7 @@ pub enum ImportSource {
     GitHub,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DialogField {
-    Kind,
-    Agent,
-    Mode,
-    Linear,
-    GithubPr,
-    Title,
-    Prompt,
-}
-
-pub struct DialogState {
-    pub kind: IssueKind,
-    pub title: String,
-    pub title_cursor: usize,
-    pub prompt: TextArea<'static>,
-    pub available_agents: Vec<AgentKind>,
-    pub agent_mode: AgentMode,
-    pub agent_kind: AgentKind,
-    pub focused_field: usize,
-    pub editing_index: Option<usize>,
-    pub target_column: Option<Column>,
-    pub linear_issues: Vec<LinearIssue>,
-    pub linear_detached: bool,
-    pub linear_available: bool,
-    pub github_prs: Vec<PrStatus>,
-    pub github_pr_cleared: bool,
-    pub github_available: bool,
-}
-
-fn make_prompt_textarea(text: &str) -> TextArea<'static> {
-    let mut ta = TextArea::from(text.lines());
-    ta.set_cursor_line_style(Style::default());
-    ta.set_cursor_style(
-        Style::default()
-            .fg(styles::ACCENT)
-            .add_modifier(Modifier::REVERSED),
-    );
-    ta.set_block(ratatui::widgets::Block::default());
-    ta.set_wrap_mode(WrapMode::Word);
-    ta
-}
-
-impl DialogState {
-    pub fn new(
-        agent_kind: AgentKind,
-        available_agents: Vec<AgentKind>,
-        linear_available: bool,
-        github_available: bool,
-    ) -> Self {
-        let kind = IssueKind::Agentic;
-        let resolved_agent = Self::resolve_agent_kind(agent_kind, &available_agents);
-        let title_idx =
-            Self::compute_title_index(kind, &available_agents, linear_available, github_available);
-        DialogState {
-            kind,
-            title: String::new(),
-            title_cursor: 0,
-            prompt: make_prompt_textarea(""),
-            available_agents,
-            agent_mode: AgentMode::Plan,
-            agent_kind: resolved_agent,
-            focused_field: title_idx,
-            editing_index: None,
-            target_column: None,
-            linear_issues: Vec::new(),
-            linear_detached: false,
-            linear_available,
-            github_prs: Vec::new(),
-            github_pr_cleared: false,
-            github_available,
-        }
-    }
-
-    pub fn from_issue(
-        issue: &Issue,
-        index: usize,
-        available_agents: Vec<AgentKind>,
-        linear_available: bool,
-        github_available: bool,
-        all_prs: &HashMap<String, PrStatus>,
-        user_prs: &[PrStatus],
-    ) -> Self {
-        let prompt_text = issue.prompt.as_deref().unwrap_or("");
-
-        let linear_issues: Vec<LinearIssue> = issue
-            .linear_links
-            .iter()
-            .map(|link| LinearIssue {
-                id: link.id.clone(),
-                identifier: link.identifier.clone(),
-                title: issue.title.clone(),
-                url: link.url.clone(),
-                branch_name: String::new(),
-                priority: 0,
-                state_name: String::new(),
-                team_key: String::new(),
-            })
-            .collect();
-
-        let github_prs: Vec<PrStatus> = issue
-            .github_pr_links
-            .iter()
-            .filter_map(|link| {
-                all_prs
-                    .values()
-                    .chain(user_prs.iter())
-                    .find(|pr| pr.number == link.number)
-                    .cloned()
-            })
-            .collect();
-
-        let mut prompt = make_prompt_textarea(prompt_text);
-        prompt.move_cursor(CursorMove::Bottom);
-        prompt.move_cursor(CursorMove::End);
-
-        let resolved_agent = Self::resolve_agent_kind(issue.agent_kind, &available_agents);
-        let title_idx = Self::compute_title_index(
-            issue.kind,
-            &available_agents,
-            linear_available,
-            github_available,
-        );
-        DialogState {
-            kind: issue.kind,
-            title: issue.title.clone(),
-            title_cursor: issue.title.chars().count(),
-            prompt,
-            available_agents,
-            agent_mode: Self::normalize_mode_for_agent(issue.agent_mode, resolved_agent),
-            agent_kind: resolved_agent,
-            focused_field: title_idx,
-            editing_index: Some(index),
-            target_column: None,
-            linear_issues,
-            linear_detached: false,
-            linear_available,
-            github_prs,
-            github_pr_cleared: false,
-            github_available,
-        }
-    }
-
-    fn resolve_agent_kind(preferred: AgentKind, available_agents: &[AgentKind]) -> AgentKind {
-        if available_agents.contains(&preferred) {
-            return preferred;
-        }
-        available_agents.first().copied().unwrap_or(preferred)
-    }
-
-    fn normalize_mode_for_agent(mode: AgentMode, agent_kind: AgentKind) -> AgentMode {
-        if agent_kind == AgentKind::OpenCode && mode == AgentMode::Yolo {
-            AgentMode::Build
-        } else {
-            mode
-        }
-    }
-
-    fn set_agent_at(&mut self, index: usize) {
-        self.agent_kind = self.available_agents[index];
-        self.agent_mode = Self::normalize_mode_for_agent(self.agent_mode, self.agent_kind);
-    }
-
-    fn cycle_agent_next(&mut self) {
-        let len = self.available_agents.len();
-        if len == 0 {
-            return;
-        }
-        let idx = self.agent_index();
-        self.set_agent_at((idx + 1) % len);
-    }
-
-    fn cycle_agent_prev(&mut self) {
-        let len = self.available_agents.len();
-        if len == 0 {
-            return;
-        }
-        let idx = self.agent_index();
-        self.set_agent_at(if idx == 0 { len - 1 } else { idx - 1 });
-    }
-
-    fn agent_index(&self) -> usize {
-        self.available_agents
-            .iter()
-            .position(|kind| *kind == self.agent_kind)
-            .unwrap_or(0)
-    }
-
-    pub fn prompt_text(&self) -> String {
-        self.prompt.lines().join("\n")
-    }
-
-    pub fn set_prompt_text(&mut self, text: &str) {
-        self.prompt = make_prompt_textarea(text);
-        self.prompt.move_cursor(CursorMove::Bottom);
-        self.prompt.move_cursor(CursorMove::End);
-    }
-
-    pub fn current_field(&self) -> DialogField {
-        let fields = self.ordered_fields();
-        fields[self.focused_field.min(fields.len() - 1)]
-    }
-
-    fn ordered_fields(&self) -> Vec<DialogField> {
-        let mut fields = vec![DialogField::Kind];
-        if self.linear_available {
-            fields.push(DialogField::Linear);
-        }
-        if self.github_available {
-            fields.push(DialogField::GithubPr);
-        }
-        if self.kind == IssueKind::Agentic {
-            fields.push(DialogField::Agent);
-            if !self.available_agents.is_empty() {
-                fields.push(DialogField::Mode);
-            }
-        }
-        fields.push(DialogField::Title);
-        fields.push(DialogField::Prompt);
-        fields
-    }
-
-    pub fn active_field_count(&self) -> usize {
-        self.ordered_fields().len()
-    }
-
-    fn compute_title_index(
-        kind: IssueKind,
-        available_agents: &[AgentKind],
-        linear_available: bool,
-        github_available: bool,
-    ) -> usize {
-        let mut idx = 1;
-        if linear_available {
-            idx += 1;
-        }
-        if github_available {
-            idx += 1;
-        }
-        if kind == IssueKind::Agentic {
-            idx += 1;
-            if !available_agents.is_empty() {
-                idx += 1;
-            }
-        }
-        idx
-    }
-
-    pub fn is_on_linear_field(&self) -> bool {
-        self.current_field() == DialogField::Linear
-    }
-
-    pub fn is_on_github_field(&self) -> bool {
-        self.current_field() == DialogField::GithubPr
-    }
-
-    pub fn next_field(&mut self) {
-        self.focused_field = (self.focused_field + 1) % self.active_field_count();
-    }
-
-    pub fn prev_field(&mut self) {
-        if self.focused_field > 0 {
-            self.focused_field -= 1;
-        } else {
-            self.focused_field = self.active_field_count() - 1;
-        }
-    }
-
-    fn clamp_focused_field(&mut self) {
-        let max = self.active_field_count() - 1;
-        if self.focused_field > max {
-            self.focused_field = max;
-        }
-    }
-
-    pub fn push_char(&mut self, c: char) {
-        match self.current_field() {
-            DialogField::Kind => {
-                match c {
-                    ' ' => {
-                        self.kind = match self.kind {
-                            IssueKind::Agentic => IssueKind::NonAgentic,
-                            IssueKind::NonAgentic => IssueKind::Agentic,
-                        };
-                    }
-                    'h' => self.kind = IssueKind::Agentic,
-                    'l' => self.kind = IssueKind::NonAgentic,
-                    _ => {}
-                }
-                if self.kind == IssueKind::Agentic {
-                    self.agent_kind =
-                        Self::resolve_agent_kind(self.agent_kind, &self.available_agents);
-                    self.agent_mode =
-                        Self::normalize_mode_for_agent(self.agent_mode, self.agent_kind);
-                }
-                self.clamp_focused_field();
-            }
-            DialogField::Agent => match c {
-                ' ' | 'l' => self.cycle_agent_next(),
-                'h' => self.cycle_agent_prev(),
-                _ => {}
-            },
-            DialogField::Mode => {
-                if self.available_agents.is_empty() {
-                    return;
-                }
-                if c == ' ' || c == 'h' || c == 'l' {
-                    self.agent_mode = match self.agent_kind {
-                        AgentKind::Claude | AgentKind::Codex => {
-                            self.agent_mode.next_for_yolo_agents()
-                        }
-                        AgentKind::OpenCode => self.agent_mode.toggle(),
-                    };
-                }
-            }
-            DialogField::Linear | DialogField::GithubPr => {}
-            DialogField::Title => insert_char(&mut self.title, &mut self.title_cursor, c),
-            DialogField::Prompt => self.prompt.insert_char(c),
-        }
-    }
-
-    pub fn delete_char(&mut self) {
-        match self.current_field() {
-            DialogField::Title => {
-                delete_char_before_cursor(&mut self.title, &mut self.title_cursor)
-            }
-            DialogField::Prompt => {
-                self.prompt.delete_char();
-            }
-            _ => {}
-        }
-    }
-
-    pub fn delete_char_forward(&mut self) {
-        match self.current_field() {
-            DialogField::Title => delete_char_at_cursor(&mut self.title, self.title_cursor),
-            DialogField::Prompt => {
-                self.prompt.delete_next_char();
-            }
-            _ => {}
-        }
-    }
-
-    pub fn move_cursor_left(&mut self) {
-        match self.current_field() {
-            DialogField::Title => self.title_cursor = self.title_cursor.saturating_sub(1),
-            DialogField::Prompt => self.prompt.move_cursor(CursorMove::Back),
-            _ => {}
-        }
-    }
-
-    pub fn move_cursor_right(&mut self) {
-        match self.current_field() {
-            DialogField::Title => {
-                self.title_cursor = (self.title_cursor + 1).min(self.title.chars().count())
-            }
-            DialogField::Prompt => self.prompt.move_cursor(CursorMove::Forward),
-            _ => {}
-        }
-    }
-
-    pub fn move_cursor_start(&mut self) {
-        match self.current_field() {
-            DialogField::Title => self.title_cursor = 0,
-            DialogField::Prompt => self.prompt.move_cursor(CursorMove::Head),
-            _ => {}
-        }
-    }
-
-    pub fn move_cursor_end(&mut self) {
-        match self.current_field() {
-            DialogField::Title => self.title_cursor = self.title.chars().count(),
-            DialogField::Prompt => self.prompt.move_cursor(CursorMove::End),
-            _ => {}
-        }
-    }
-
-    pub fn delete_word_backward(&mut self) {
-        match self.current_field() {
-            DialogField::Title => delete_word_backward(&mut self.title, &mut self.title_cursor),
-            DialogField::Prompt => {
-                self.prompt.delete_word();
-            }
-            _ => {}
-        }
-    }
-
-    pub fn clear_to_start(&mut self) {
-        match self.current_field() {
-            DialogField::Title => clear_to_start(&mut self.title, &mut self.title_cursor),
-            DialogField::Prompt => {
-                self.prompt.delete_line_by_head();
-            }
-            _ => {}
-        }
-    }
-}
-
-fn char_to_byte_index(s: &str, char_index: usize) -> usize {
-    s.char_indices()
-        .nth(char_index)
-        .map(|(idx, _)| idx)
-        .unwrap_or_else(|| s.len())
-}
-
-fn insert_char(text: &mut String, cursor: &mut usize, c: char) {
-    let byte_index = char_to_byte_index(text, *cursor);
-    text.insert(byte_index, c);
-    *cursor += 1;
-}
-
-fn delete_char_before_cursor(text: &mut String, cursor: &mut usize) {
-    if *cursor == 0 {
-        return;
-    }
-    let end = char_to_byte_index(text, *cursor);
-    let start = char_to_byte_index(text, *cursor - 1);
-    text.drain(start..end);
-    *cursor -= 1;
-}
-
-fn delete_char_at_cursor(text: &mut String, cursor: usize) {
-    if cursor >= text.chars().count() {
-        return;
-    }
-    let start = char_to_byte_index(text, cursor);
-    let end = char_to_byte_index(text, cursor + 1);
-    text.drain(start..end);
-}
-
-fn delete_word_backward(text: &mut String, cursor: &mut usize) {
-    if *cursor == 0 {
-        return;
-    }
-    let chars: Vec<char> = text.chars().collect();
-    let mut start = *cursor;
-    while start > 0 && chars[start - 1].is_whitespace() {
-        start -= 1;
-    }
-    while start > 0 && !chars[start - 1].is_whitespace() {
-        start -= 1;
-    }
-    let start_byte = char_to_byte_index(text, start);
-    let end_byte = char_to_byte_index(text, *cursor);
-    text.drain(start_byte..end_byte);
-    *cursor = start;
-}
-
-fn clear_to_start(text: &mut String, cursor: &mut usize) {
-    if *cursor == 0 {
-        return;
-    }
-    let end_byte = char_to_byte_index(text, *cursor);
-    text.drain(0..end_byte);
-    *cursor = 0;
-}
+pub use crate::dialog_state::{DialogField, DialogState};
 
 /// 3-way field merge: for each field, if file diverged from base but memory didn't,
 /// take the file value. If both diverged, memory wins.
@@ -1598,6 +1263,7 @@ fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
     merge_field!(session_id);
     merge_field!(linear_links);
     merge_field!(github_pr_links);
+    merge_field!(linked_issues);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1627,9 +1293,13 @@ pub struct App {
     /// quick actions don't blink in and out.
     pub busy_visible_since: Option<Instant>,
     pub spinner_tick: usize,
+    /// Issue IDs with a session launch currently in flight. Guards against
+    /// double-launch races from repeated keypresses.
+    pub launches_in_flight: HashSet<String>,
     pub linear_picker: Option<LinearPickerState>,
     pub linear_picker_context: LinearPickerContext,
     pub picker_tab: ImportSource,
+    pub link_picker: Option<LinkPickerState>,
     pub debug_inspector_json: Option<String>,
     pub debug_inspector_scroll: usize,
     pub update_available: bool,
@@ -1656,9 +1326,11 @@ impl App {
             busy_count: 0,
             busy_visible_since: None,
             spinner_tick: 0,
+            launches_in_flight: HashSet::new(),
             linear_picker: None,
             linear_picker_context: LinearPickerContext::Import,
             picker_tab: ImportSource::Linear,
+            link_picker: None,
             debug_inspector_json: None,
             debug_inspector_scroll: 0,
             update_available: false,
@@ -2011,17 +1683,15 @@ impl App {
     }
 
     pub fn filtered_linear_issues(&self) -> Vec<&LinearIssue> {
-        let picker = match &self.linear_picker {
-            Some(p) => p,
-            None => return Vec::new(),
+        let Some(picker) = &self.linear_picker else {
+            return Vec::new();
         };
         self.active_project().filtered_linear_issues(picker)
     }
 
     pub fn filtered_github_prs(&self) -> Vec<&PrStatus> {
-        let picker = match &self.linear_picker {
-            Some(p) => p,
-            None => return Vec::new(),
+        let Some(picker) = &self.linear_picker else {
+            return Vec::new();
         };
         self.active_project().filtered_github_prs(picker)
     }
@@ -2107,7 +1777,16 @@ impl App {
         self.input_mode = InputMode::Normal;
     }
 
-    pub fn clear_search(&mut self, _ctx: &ActionContext) {
+    pub fn clear_search(&mut self, ctx: &ActionContext) {
+        if !self.active_project().marked_issues.is_empty() {
+            self.context_project_mut(ctx).clear_marks();
+            return;
+        }
+        // Esc peels off one active board filter at a time.
+        if self.active_project().link_filter.is_some() {
+            self.clear_link_filter(ctx);
+            return;
+        }
         if !self.search_query.is_empty() {
             self.search_query.clear();
             for project in &mut self.projects {
@@ -2119,6 +1798,110 @@ impl App {
     pub fn has_active_search(&self) -> bool {
         !self.search_query.is_empty()
     }
+
+    /// Toggle the board filter to the selected issue's connected link component.
+    /// Pressing it again on a filtered board clears the filter.
+    pub fn toggle_link_filter(&mut self, ctx: &ActionContext) {
+        let query = self.search_query.clone();
+        if self.context_project(ctx).link_filter.is_some() {
+            self.clear_link_filter(ctx);
+            return;
+        }
+        let anchor = match self.context_project(ctx).selected_issue(&query) {
+            Some(issue) if issue.has_links() => issue.id.clone(),
+            Some(_) => {
+                self.set_warning("Issue has no links to filter by");
+                return;
+            }
+            None => return,
+        };
+        let project = self.context_project_mut(ctx);
+        project.link_filter = Some(anchor);
+        project.clamp_all_rows(&query);
+    }
+
+    pub fn clear_link_filter(&mut self, ctx: &ActionContext) {
+        let query = self.search_query.clone();
+        let project = self.context_project_mut(ctx);
+        project.link_filter = None;
+        project.clamp_all_rows(&query);
+    }
+
+    pub fn open_link_picker(&mut self, ctx: &ActionContext) {
+        let query = self.search_query.clone();
+        let Some(issue) = self.context_project(ctx).selected_issue(&query) else {
+            return;
+        };
+        let anchor_id = issue.id.clone();
+        self.link_picker = Some(LinkPickerState {
+            anchor_id,
+            search: String::new(),
+            selected: 0,
+        });
+        self.input_mode = InputMode::LinkPicker;
+    }
+
+    pub fn close_link_picker(&mut self) {
+        self.link_picker = None;
+        self.input_mode = InputMode::Normal;
+    }
+
+    /// Candidate issues for the link picker: every other issue in the anchor's
+    /// project, filtered by the picker search (matches id or title).
+    pub fn link_picker_candidates(&self) -> Vec<(String, String, bool)> {
+        let Some(picker) = &self.link_picker else {
+            return Vec::new();
+        };
+        let project = self.active_project();
+        let anchor = project
+            .issues
+            .iter()
+            .find(|i| i.id.eq_ignore_ascii_case(&picker.anchor_id));
+        let query = picker.search.to_lowercase();
+        project
+            .issues
+            .iter()
+            .filter(|i| !i.id.eq_ignore_ascii_case(&picker.anchor_id))
+            .filter(|i| {
+                query.is_empty()
+                    || i.id.to_lowercase().contains(&query)
+                    || i.title.to_lowercase().contains(&query)
+            })
+            .map(|i| {
+                let linked = anchor.is_some_and(|a| a.is_linked_to(&i.id));
+                (i.id.clone(), i.title.clone(), linked)
+            })
+            .collect()
+    }
+
+    pub fn link_picker_move_down(&mut self) {
+        let count = self.link_picker_candidates().len();
+        if let Some(picker) = &mut self.link_picker {
+            if picker.selected + 1 < count {
+                picker.selected += 1;
+            }
+        }
+    }
+
+    pub fn link_picker_move_up(&mut self) {
+        if let Some(picker) = &mut self.link_picker {
+            picker.selected = picker.selected.saturating_sub(1);
+        }
+    }
+
+    pub fn link_picker_push_char(&mut self, c: char) {
+        if let Some(picker) = &mut self.link_picker {
+            picker.search.push(c);
+            picker.selected = 0;
+        }
+    }
+
+    pub fn link_picker_delete_char(&mut self) {
+        if let Some(picker) = &mut self.link_picker {
+            picker.search.pop();
+            picker.selected = 0;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2127,7 +1910,7 @@ mod tests {
 
     use super::*;
     use crate::config::DEFAULT_DONE_SESSION_TTL;
-    use crate::types::{AgentKind, AgentMode, IssueKind, PrState, PrStatus};
+    use crate::types::{AgentKind, IssueKind, PrState, PrStatus};
 
     fn test_config() -> AppConfig {
         AppConfig {
@@ -2135,48 +1918,33 @@ mod tests {
             project_root: PathBuf::from("/tmp/test-bork"),
             agent_kind: AgentKind::OpenCode,
             default_prompt: None,
+            review_prompt: None,
+            orchestrator_prompt: None,
+            setup_script: None,
+            teardown_script: None,
             done_session_ttl: DEFAULT_DONE_SESSION_TTL,
             debug: false,
+            auto_import_reviews: true,
+            auto_import_authored_prs: true,
             agents_allowlist: None,
             prune_threshold: crate::config::DEFAULT_PRUNE_THRESHOLD,
             auto_prune_check_interval: crate::config::DEFAULT_AUTO_PRUNE_CHECK_INTERVAL,
+            agent_launch: std::collections::HashMap::new(),
         }
     }
 
     fn test_issue(id: &str, column: Column) -> Issue {
-        Issue {
-            id: id.to_string(),
-            title: format!("Test issue {}", id),
-            kind: IssueKind::Agentic,
+        Issue::new(
+            id,
+            format!("Test issue {}", id),
             column,
-            agent_kind: AgentKind::OpenCode,
-            agent_mode: AgentMode::Plan,
-            prompt: None,
-            worktree: None,
-            done_at: None,
-            session_id: None,
-            pruned_at: None,
-            linear_links: Vec::new(),
-            github_pr_links: Vec::new(),
-            linear_id: None,
-            linear_identifier: None,
-            linear_url: None,
-            linear_imported: false,
-            pr_number: None,
-            pr_imported: false,
-            pr_import_source: None,
-        }
+            AgentKind::OpenCode,
+        )
     }
 
     fn test_issue_titled(id: &str, title: &str, column: Column) -> Issue {
         let mut issue = test_issue(id, column);
         issue.title = title.to_string();
-        issue
-    }
-
-    fn test_issue_with_worktree(id: &str, column: Column, worktree: &str) -> Issue {
-        let mut issue = test_issue(id, column);
-        issue.worktree = Some(worktree.to_string());
         issue
     }
 
@@ -2248,6 +2016,34 @@ mod tests {
                 .detect_worktree(&app.project().issues[0].clone()),
             None
         );
+    }
+
+    #[test]
+    fn has_listening_ports_true_when_issue_session_has_ports() {
+        let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
+        let session = app.project().issues[0].session_name(&app.project().config.project_name);
+        app.project_mut()
+            .live
+            .listening_ports
+            .insert(session, vec![3000]);
+        assert!(app.project().has_listening_ports());
+    }
+
+    #[test]
+    fn has_listening_ports_false_when_no_ports() {
+        let app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
+        assert!(!app.project().has_listening_ports());
+    }
+
+    #[test]
+    fn has_listening_ports_false_for_empty_port_list() {
+        let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
+        let session = app.project().issues[0].session_name(&app.project().config.project_name);
+        app.project_mut()
+            .live
+            .listening_ports
+            .insert(session, vec![]);
+        assert!(!app.project().has_listening_ports());
     }
 
     #[test]
@@ -2465,6 +2261,20 @@ mod tests {
     }
 
     #[test]
+    fn test_auto_assign_skips_orchestrator_issues() {
+        let mut issue = test_issue("bork-8", Column::InProgress);
+        issue.kind = IssueKind::Orchestrator;
+        let mut app = test_app(vec![issue]);
+        app.project_mut()
+            .live
+            .worktree_branches
+            .insert("bork-8".into(), "bork-8/init-cli".into());
+        let changed = app.project_mut().auto_assign_worktrees();
+        assert!(!changed);
+        assert!(app.project().issues[0].worktree.is_none());
+    }
+
+    #[test]
     fn test_auto_assign_returns_false_when_no_match() {
         let mut app = test_app(vec![test_issue("bork-99", Column::InProgress)]);
         app.project_mut()
@@ -2626,7 +2436,7 @@ mod tests {
     fn test_clear_stale_does_not_touch_none() {
         let app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
         // worktree is already None, should not count as changed
-        assert!(!app.project().issues[0].worktree.is_some());
+        assert!(app.project().issues[0].worktree.is_none());
     }
 
     #[test]
@@ -2740,6 +2550,63 @@ mod tests {
         assert_eq!(app.project().issues[0].title, "PR #1");
         assert_eq!(app.project().issues[0].column, Column::CodeReview);
         assert!(app.project().issues[0].has_pr_number(1));
+    }
+
+    #[test]
+    fn sync_prs_skips_authored_when_disabled() {
+        let mut app = test_app(vec![]);
+        app.project_mut().config.auto_import_authored_prs = false;
+        app.project_mut().live.user_prs = vec![test_pr(1, "feature/new")];
+        app.project_mut().live.pr_poll_done = true;
+
+        assert!(!app.project_mut().sync_prs_as_issues().0);
+        assert!(app.project().issues.is_empty());
+    }
+
+    #[test]
+    fn sync_prs_skips_reviews_when_disabled() {
+        let mut app = test_app(vec![]);
+        app.project_mut().config.auto_import_reviews = false;
+        app.project_mut().live.review_requested_prs = vec![test_pr(7, "someones/branch")];
+        app.project_mut().live.pr_poll_done = true;
+
+        assert!(!app.project_mut().sync_prs_as_issues().0);
+        assert!(app.project().issues.is_empty());
+    }
+
+    #[test]
+    fn sync_prs_imports_reviews_when_enabled() {
+        let mut app = test_app(vec![]);
+        app.project_mut().live.review_requested_prs = vec![test_pr(7, "someones/branch")];
+        app.project_mut().live.pr_poll_done = true;
+
+        assert!(app.project_mut().sync_prs_as_issues().0);
+        assert_eq!(app.project().issues.len(), 1);
+        assert_eq!(
+            app.project().issues[0].primary_pr_import_source(),
+            Some(PrImportSource::ReviewRequested)
+        );
+    }
+
+    #[test]
+    fn sync_prs_disabled_reviews_still_complete_existing() {
+        // Throwaway-repo case: auto-import off, but a previously imported
+        // review issue should still move to Done once the review clears.
+        let mut existing = test_issue("bork-1", Column::CodeReview);
+        existing.github_pr_links = vec![LinkedGithubPr {
+            number: 7,
+            imported: true,
+            import_source: Some(PrImportSource::ReviewRequested),
+        }];
+        let mut app = test_app(vec![existing]);
+        app.project_mut().config.auto_import_reviews = false;
+        // PR #7 no longer in the live review set.
+        app.project_mut().live.review_requested_prs = vec![];
+        app.project_mut().live.pr_poll_done = true;
+
+        let (changed, _) = app.project_mut().sync_prs_as_issues();
+        assert!(changed);
+        assert_eq!(app.project().issues[0].column, Column::Done);
     }
 
     #[test]
@@ -3004,6 +2871,36 @@ mod tests {
     }
 
     #[test]
+    fn dialog_pi_hides_mode_field() {
+        let d = DialogState::new(
+            crate::types::AgentKind::Pi,
+            crate::types::AgentKind::ALL.to_vec(),
+            false,
+            false,
+        );
+        assert!(!d.ordered_fields().contains(&DialogField::Mode));
+        // Pi pins its single mode to Build.
+        assert_eq!(d.agent_mode, crate::types::AgentMode::Build);
+    }
+
+    #[test]
+    fn dialog_cycling_to_pi_resets_mode_to_build() {
+        // Start on Claude in Yolo, then cycle agents until we land on Pi.
+        let mut d = claude_dialog();
+        d.agent_mode = crate::types::AgentMode::Yolo;
+        d.focused_field = 1; // Agent field
+
+        for _ in 0..crate::types::AgentKind::ALL.len() {
+            if d.agent_kind == crate::types::AgentKind::Pi {
+                break;
+            }
+            d.push_char('l');
+        }
+        assert_eq!(d.agent_kind, crate::types::AgentKind::Pi);
+        assert_eq!(d.agent_mode, crate::types::AgentMode::Build);
+    }
+
+    #[test]
     fn dialog_new_uses_config_agent_kind() {
         let config = test_config();
         let d = DialogState::new(
@@ -3044,6 +2941,74 @@ mod tests {
         assert_eq!(d.kind, IssueKind::Agentic);
         // Agentic, no linear: Kind(0), Agent(1), Mode(2), Title(3)
         assert_eq!(d.focused_field, 3);
+    }
+
+    #[test]
+    fn dialog_kind_space_cycles_three_kinds() {
+        let mut d = opencode_dialog();
+        d.focused_field = 0; // Kind field
+        d.push_char(' ');
+        assert_eq!(d.kind, IssueKind::Orchestrator);
+        d.push_char(' ');
+        assert_eq!(d.kind, IssueKind::NonAgentic);
+        d.push_char(' ');
+        assert_eq!(d.kind, IssueKind::Agentic);
+    }
+
+    #[test]
+    fn dialog_kind_h_l_move_and_clamp() {
+        let mut d = opencode_dialog();
+        d.focused_field = 0; // Kind field
+        d.push_char('l');
+        assert_eq!(d.kind, IssueKind::Orchestrator);
+        d.push_char('l');
+        assert_eq!(d.kind, IssueKind::NonAgentic);
+        d.push_char('l');
+        assert_eq!(d.kind, IssueKind::NonAgentic);
+        d.push_char('h');
+        assert_eq!(d.kind, IssueKind::Orchestrator);
+        d.push_char('h');
+        assert_eq!(d.kind, IssueKind::Agentic);
+        d.push_char('h');
+        assert_eq!(d.kind, IssueKind::Agentic);
+    }
+
+    #[test]
+    fn dialog_orchestrator_hides_github_pr_field_keeps_agent() {
+        let mut d = DialogState::new(
+            crate::types::AgentKind::OpenCode,
+            crate::types::AgentKind::ALL.to_vec(),
+            true,
+            true,
+        );
+        d.kind = IssueKind::Orchestrator;
+        assert_eq!(
+            d.ordered_fields(),
+            vec![
+                DialogField::Kind,
+                DialogField::Linear,
+                DialogField::Agent,
+                DialogField::Mode,
+                DialogField::Title,
+                DialogField::Prompt,
+            ]
+        );
+    }
+
+    #[test]
+    fn dialog_from_orchestrator_issue_focuses_title() {
+        let mut issue = test_issue("bork-1", Column::Todo);
+        issue.kind = IssueKind::Orchestrator;
+        let d = DialogState::from_issue(
+            &issue,
+            0,
+            crate::types::AgentKind::ALL.to_vec(),
+            true,
+            true,
+            &std::collections::HashMap::new(),
+            &[],
+        );
+        assert_eq!(d.ordered_fields()[d.focused_field], DialogField::Title);
     }
 
     #[test]
@@ -4404,7 +4369,7 @@ mod tests {
 
         // test_multi_app creates issues with titles like "Test issue alpha-1"
         // so "test" should match them
-        assert!(alpha_results.len() > 0 || beta_results.len() > 0);
+        assert!(!alpha_results.is_empty() || !beta_results.is_empty());
     }
 
     #[test]
@@ -4717,11 +4682,18 @@ mod tests {
             project_root: PathBuf::from(format!("/tmp/test-{}", name)),
             agent_kind: AgentKind::OpenCode,
             default_prompt: None,
+            review_prompt: None,
+            orchestrator_prompt: None,
+            setup_script: None,
+            teardown_script: None,
             done_session_ttl: DEFAULT_DONE_SESSION_TTL,
             debug: false,
+            auto_import_reviews: true,
+            auto_import_authored_prs: true,
             agents_allowlist: None,
             prune_threshold: crate::config::DEFAULT_PRUNE_THRESHOLD,
             auto_prune_check_interval: crate::config::DEFAULT_AUTO_PRUNE_CHECK_INTERVAL,
+            agent_launch: std::collections::HashMap::new(),
         }
     }
 
@@ -5624,7 +5596,8 @@ mod tests {
 
     #[test]
     fn scan_candidates_links_to_matching_issue() {
-        let issue = test_issue_with_worktree("bork-1", Column::Done, "wt-1");
+        let mut issue = test_issue("bork-1", Column::Done);
+        issue.worktree = Some("wt-1".into());
         let mut app = test_app(vec![issue]);
         app.project_mut()
             .live
@@ -5656,5 +5629,108 @@ mod tests {
         let candidates = crate::prune::scan_candidates(app.project());
         let names: Vec<&str> = candidates.iter().map(|c| c.worktree.as_str()).collect();
         assert_eq!(names, vec!["alpha", "mango", "zebra"]);
+    }
+
+    fn linked_issue(id: &str, links: &[&str]) -> Issue {
+        let mut issue = test_issue(id, Column::Todo);
+        issue.linked_issues = links.iter().map(|s| s.to_string()).collect();
+        issue
+    }
+
+    #[test]
+    fn toggle_link_filter_sets_and_clears_anchor() {
+        let mut app = test_app(vec![
+            linked_issue("bork-1", &["bork-2"]),
+            linked_issue("bork-2", &["bork-1"]),
+        ]);
+        let ctx = app.action_context();
+
+        app.toggle_link_filter(&ctx);
+        assert_eq!(app.active_project().link_filter.as_deref(), Some("bork-1"));
+
+        app.toggle_link_filter(&ctx);
+        assert!(app.active_project().link_filter.is_none());
+    }
+
+    #[test]
+    fn toggle_link_filter_warns_without_links() {
+        let mut app = test_app(vec![test_issue("bork-1", Column::Todo)]);
+        let ctx = app.action_context();
+
+        app.toggle_link_filter(&ctx);
+        assert!(app.active_project().link_filter.is_none());
+        assert!(app.message.is_some());
+    }
+
+    #[test]
+    fn link_filter_hides_unconnected_issues() {
+        let mut app = test_app(vec![
+            linked_issue("bork-1", &["bork-2"]),
+            linked_issue("bork-2", &["bork-1"]),
+            test_issue("bork-3", Column::Todo),
+        ]);
+        let ctx = app.action_context();
+        app.toggle_link_filter(&ctx);
+
+        let visible = app.active_project().issues_in_column(Column::Todo, "");
+        let ids: Vec<&str> = visible.iter().map(|(_, i)| i.id.as_str()).collect();
+        assert!(ids.contains(&"bork-1"));
+        assert!(ids.contains(&"bork-2"));
+        assert!(!ids.contains(&"bork-3"));
+    }
+
+    #[test]
+    fn external_merge_clears_stale_link_filter() {
+        let mut app = test_app(vec![
+            linked_issue("bork-1", &["bork-2"]),
+            linked_issue("bork-2", &["bork-1"]),
+        ]);
+        let ctx = app.action_context();
+        app.toggle_link_filter(&ctx);
+        assert!(app.active_project().link_filter.is_some());
+
+        // Simulate the anchor being deleted externally (e.g. `bork issue delete`).
+        let remaining = vec![linked_issue("bork-2", &[])];
+        app.active_project_mut().merge_external_state(AppState {
+            issues: remaining,
+            ..Default::default()
+        });
+
+        assert!(app.active_project().link_filter.is_none());
+    }
+
+    #[test]
+    fn external_merge_keeps_link_filter_when_anchor_survives() {
+        let mut app = test_app(vec![
+            linked_issue("bork-1", &["bork-2"]),
+            linked_issue("bork-2", &["bork-1"]),
+        ]);
+        let ctx = app.action_context();
+        app.toggle_link_filter(&ctx);
+
+        let same = vec![
+            linked_issue("bork-1", &["bork-2"]),
+            linked_issue("bork-2", &["bork-1"]),
+        ];
+        app.active_project_mut().merge_external_state(AppState {
+            issues: same,
+            ..Default::default()
+        });
+
+        assert_eq!(app.active_project().link_filter.as_deref(), Some("bork-1"));
+    }
+
+    #[test]
+    fn link_picker_candidates_exclude_anchor() {
+        let mut app = test_app(vec![
+            test_issue("bork-1", Column::Todo),
+            test_issue("bork-2", Column::Todo),
+        ]);
+        let ctx = app.action_context();
+        app.open_link_picker(&ctx);
+
+        let candidates = app.link_picker_candidates();
+        let ids: Vec<&str> = candidates.iter().map(|(id, _, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["bork-2"]);
     }
 }

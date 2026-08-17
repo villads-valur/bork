@@ -55,8 +55,15 @@ pub fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::DarkGray)
             };
 
+            let has_ports = project.has_listening_ports();
+
             let name = &project.config.project_name;
-            let max_name = area.width.saturating_sub(SIDEBAR_NAME_PADDING) as usize;
+            // The 🔌 is 2 cells wide plus a leading space; reserve room so the
+            // name truncation never pushes the icon past the sidebar edge.
+            let port_reserve = if has_ports { 3 } else { 0 };
+            let max_name =
+                area.width
+                    .saturating_sub(SIDEBAR_NAME_PADDING + port_reserve) as usize;
             let display_name = styles::truncate(name, max_name);
 
             let name_style = if is_focused {
@@ -74,11 +81,15 @@ pub fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
                 style = style.add_modifier(Modifier::REVERSED);
             }
 
-            ListItem::new(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(format!(" {} ", marker), marker_style),
                 Span::styled(display_name, name_style),
-            ]))
-            .style(style)
+            ];
+            if has_ports {
+                spans.push(Span::styled(" \u{1f50c}", Style::default()));
+            }
+
+            ListItem::new(Line::from(spans)).style(style)
         })
         .collect();
 

@@ -7,11 +7,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::config::{self, AppConfig};
 use crate::error::AppError;
 use crate::external::{github, tmux};
-use crate::types::{AgentKind, AgentMode, Issue, LinkedGithubPr, LinkedLinear};
+use crate::types::{AgentKind, AgentMode, Issue, IssueKind, LinkedGithubPr, LinkedLinear};
 
 /// Launch an agent session for an issue.
 /// Creates a tmux session with two windows:
-///   1. The agent (opencode/claude/codex) launched at the project root with issue context
+///   1. The agent (opencode/claude/codex/pi) launched at the project root with issue context
 ///   2. A bare terminal
 ///
 /// Exports BORK_SESSION and BORK_STATUS_DIR so hooks/plugins can write status files.
@@ -36,8 +36,31 @@ pub fn launch_session(
     let status_dir = config::agent_status_dir(&config.project_root);
     let status_dir_str = status_dir.to_str().unwrap_or("");
 
-    let (agent_cmd, pre_assigned_session_id) =
-        build_agent_cmd(issue, config, &session_name, status_dir_str);
+    let prompt_path = prompt_file_path(&status_dir, &session_name);
+    let prompt_path_str = prompt_path.to_str().unwrap_or("");
+
+    let (agent_cmd, pre_assigned_session_id, prompt_contents) = build_agent_cmd(
+        issue,
+        config,
+        &session_name,
+        status_dir_str,
+        prompt_path_str,
+    );
+
+    // Multiline prompts can't be typed directly: tmux send-keys collapses
+    // embedded newlines. Instead we write the prompt to a file and the launch
+    // command reads it back via `"$(cat ...)"`, which preserves it verbatim.
+    if let Some(contents) = &prompt_contents {
+        write_prompt_file(&prompt_path, contents)?;
+    }
+
+    // Fresh sessions with a worktree run the configured setup script inside
+    // the worktree first; `&&` ensures the agent only starts if it succeeds
+    // and its output stays visible in the agent window.
+    let agent_cmd = match setup_prefix(issue, config) {
+        Some(prefix) => format!("{} && {}", prefix, agent_cmd),
+        None => agent_cmd,
+    };
 
     tmux::send_keys(&session_name, &agent_cmd)?;
 
@@ -51,36 +74,82 @@ pub fn launch_session(
             AgentKind::OpenCode => detect_opencode_session_id(),
             AgentKind::Claude => None,
             AgentKind::Codex => detect_codex_session_id(),
+            AgentKind::Pi => detect_pi_session_id(&config.project_root),
         },
     };
 
     Ok((session_name, agent_session_id))
 }
 
-/// Build the agent launch command and return (command, pre_assigned_session_id).
+/// Build the setup-script prefix for a launch command, if applicable.
+/// Only fresh sessions (no session_id to resume) for issues with an assigned
+/// worktree run the setup script. The script itself is user-authored shell
+/// and is inserted verbatim; the worktree dir is escaped. The tmux session's
+/// cwd is the project root, so the relative worktree dir resolves correctly.
+fn setup_prefix(issue: &Issue, config: &AppConfig) -> Option<String> {
+    if issue.session_id.is_some() {
+        return None;
+    }
+    let worktree = issue.worktree.as_deref()?;
+    let script = config.setup_script.as_deref()?;
+    Some(format!(
+        "(cd '{}' && {})",
+        shell_escape_single_quotes(worktree),
+        script
+    ))
+}
+
+/// Path for an issue's staged prompt file, scoped to its session name so
+/// concurrent launches don't collide.
+fn prompt_file_path(status_dir: &Path, session_name: &str) -> PathBuf {
+    status_dir.join(format!("prompt-{session_name}.txt"))
+}
+
+/// Write the prompt to disk (creating the parent dir if needed) so the launch
+/// command can read it back verbatim.
+fn write_prompt_file(path: &Path, contents: &str) -> Result<(), AppError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(AppError::Io)?;
+    }
+    fs::write(path, contents).map_err(AppError::Io)
+}
+
+/// Build the agent launch command and return
+/// (command, pre_assigned_session_id, prompt_contents).
 /// For Claude, pre-assigns a UUID and returns it. For OpenCode, returns None (ID detected post-launch).
-/// If the issue already has a session_id, builds a resume command instead.
+/// `prompt_contents` is `Some` for fresh sessions (staged to a file by the
+/// caller) and `None` for resume sessions, which carry no prompt.
 fn build_agent_cmd(
     issue: &Issue,
     config: &AppConfig,
     session_name: &str,
     status_dir_str: &str,
-) -> (String, Option<String>) {
+    prompt_path_str: &str,
+) -> (String, Option<String>, Option<String>) {
     let env_prefix = format!(
-        "export BORK_SESSION='{}' BORK_STATUS_DIR='{}'",
+        "export BORK_SESSION='{}' BORK_STATUS_DIR='{}' BORK_ISSUE_ID='{}'",
         shell_escape_single_quotes(session_name),
         shell_escape_single_quotes(status_dir_str),
+        shell_escape_single_quotes(&issue.id),
     );
 
-    // Builds and shell-escapes the issue prompt. Lazy: only invoked for fresh
-    // sessions, since resume paths skip the prompt entirely.
-    let build_escaped_prompt = || {
-        let default_prompt = config
-            .default_prompt
-            .as_deref()
-            .unwrap_or(config::DEFAULT_PROMPT_FALLBACK);
+    // Builds the full issue prompt text. Lazy: only invoked for fresh sessions,
+    // since resume paths skip the prompt entirely. Returned verbatim (no shell
+    // escaping) because it's staged to a file and read back via `"$(cat ...)"`.
+    let build_prompt_contents = || {
+        let default_prompt = if issue.kind == IssueKind::Orchestrator {
+            config
+                .orchestrator_prompt
+                .as_deref()
+                .unwrap_or(config::DEFAULT_ORCHESTRATOR_PROMPT)
+        } else {
+            config
+                .default_prompt
+                .as_deref()
+                .unwrap_or(config::DEFAULT_PROMPT_FALLBACK)
+        };
         let main_worktree = config.project_root.join("main");
-        let prompt = build_prompt(
+        let mut prompt = build_prompt(
             &issue.id,
             &issue.title,
             default_prompt,
@@ -89,95 +158,196 @@ fn build_agent_cmd(
             &issue.github_pr_links,
             |number| github::pr_url(&main_worktree, number),
         );
-        shell_escape_single_quotes(&prompt)
+        prompt.push_str("\n\nBork project: ");
+        prompt.push_str(&config.project_name);
+        if let Some(worktree) = issue.worktree.as_deref() {
+            prompt.push_str("\n\nAssigned worktree: ");
+            prompt.push_str(worktree);
+            prompt.push_str(". Do all work for this issue inside that directory.");
+        }
+        if issue.kind == IssueKind::Orchestrator {
+            prompt.push_str(&format!(
+                "\n\nMaintain your plan in plans/{}/planning.md, relative to the project root (the directory containing main/).",
+                issue.id
+            ));
+        }
+        prompt
     };
+
+    // Shell snippet that expands to the prompt at runtime by reading the staged
+    // file, plus a cleanup suffix that removes the file afterwards. Using a file
+    // sidesteps tmux send-keys mangling newlines in the typed command line.
+    let escaped_prompt_path = shell_escape_single_quotes(prompt_path_str);
+    let prompt_subst = format!("\"$(cat '{}')\"", escaped_prompt_path);
+    let prompt_cleanup = format!("; rm -f '{}'", escaped_prompt_path);
+
+    // Built-in mode flags. These are replaced when the user configured
+    // per-mode args under `[agent.<name>.mode.<mode>]`.
+    let builtin_mode_flag = match issue.agent_kind {
+        AgentKind::OpenCode => match issue.agent_mode {
+            // OpenCode has no yolo mode; treat it as Build.
+            AgentMode::Plan => "--agent plan",
+            AgentMode::Build | AgentMode::Yolo => "",
+        },
+        AgentKind::Claude => match issue.agent_mode {
+            AgentMode::Plan => "--permission-mode plan",
+            AgentMode::Yolo => "--dangerously-skip-permissions",
+            AgentMode::Build => "",
+        },
+        AgentKind::Codex => match issue.agent_mode {
+            // `--full-auto` is deprecated upstream; use explicit sandbox + approval flags.
+            AgentMode::Plan => "--sandbox workspace-write --ask-for-approval on-request",
+            AgentMode::Build => "--sandbox workspace-write --ask-for-approval never",
+            AgentMode::Yolo => "--dangerously-bypass-approvals-and-sandbox",
+        },
+        // Pi has a single mode and no built-in plan/yolo flags. Users can still
+        // add per-mode args via `[agent.pi.mode.<mode>]` if desired.
+        AgentKind::Pi => "",
+    };
+
+    let trailing = trailing_args(
+        config,
+        issue.agent_kind,
+        issue.agent_mode,
+        builtin_mode_flag,
+    );
 
     match issue.agent_kind {
         AgentKind::OpenCode => {
-            // Yolo is Claude-only; treat as Build for OpenCode
-            let mode_flag = match issue.agent_mode {
-                AgentMode::Plan => " --agent plan",
-                AgentMode::Build | AgentMode::Yolo => "",
-            };
             if let Some(ref sid) = issue.session_id {
                 // Resume existing session — skip --prompt, history is preserved
                 let escaped_sid = shell_escape_single_quotes(sid);
                 let cmd = format!(
                     "{} && opencode --session '{}'{}",
-                    env_prefix, escaped_sid, mode_flag,
+                    env_prefix, escaped_sid, trailing,
                 );
-                (cmd, None)
+                (cmd, None, None)
             } else {
                 let cmd = format!(
-                    "{} && opencode --prompt '{}'{}",
-                    env_prefix,
-                    build_escaped_prompt(),
-                    mode_flag,
+                    "{} && opencode --prompt {}{}{}",
+                    env_prefix, prompt_subst, trailing, prompt_cleanup,
                 );
-                (cmd, None)
+                (cmd, None, Some(build_prompt_contents()))
             }
         }
         AgentKind::Claude => {
             let session_display_name = format!("{}: {}", issue.id, issue.title);
             let escaped_name = shell_escape_single_quotes(&session_display_name);
-            let mode_flag = match issue.agent_mode {
-                AgentMode::Plan => " --permission-mode plan",
-                AgentMode::Yolo => " --dangerously-skip-permissions",
-                AgentMode::Build => "",
-            };
 
             if let Some(ref sid) = issue.session_id {
                 // Resume existing session — skip the prompt, history is preserved
                 let escaped_sid = shell_escape_single_quotes(sid);
                 let cmd = format!(
                     "{} && claude --name '{}'{} --resume '{}'",
-                    env_prefix, escaped_name, mode_flag, escaped_sid,
+                    env_prefix, escaped_name, trailing, escaped_sid,
                 );
-                (cmd, Some(sid.clone()))
+                (cmd, Some(sid.clone()), None)
             } else {
-                // Fresh session: build prompt and optionally pre-assign a UUID
-                let escaped_prompt = build_escaped_prompt();
+                // Fresh session: stage prompt and optionally pre-assign a UUID
+                let prompt = build_prompt_contents();
                 let uuid = generate_uuid().unwrap_or_default();
                 if uuid.is_empty() {
                     let cmd = format!(
-                        "{} && claude --name '{}'{} '{}'",
-                        env_prefix, escaped_name, mode_flag, escaped_prompt,
+                        "{} && claude --name '{}'{} {}{}",
+                        env_prefix, escaped_name, trailing, prompt_subst, prompt_cleanup,
                     );
-                    (cmd, None)
+                    (cmd, None, Some(prompt))
                 } else {
                     let escaped_uuid = shell_escape_single_quotes(&uuid);
                     let cmd = format!(
-                        "{} && claude --name '{}'{} --session-id '{}' '{}'",
-                        env_prefix, escaped_name, mode_flag, escaped_uuid, escaped_prompt,
+                        "{} && claude --name '{}'{} --session-id '{}' {}{}",
+                        env_prefix,
+                        escaped_name,
+                        trailing,
+                        escaped_uuid,
+                        prompt_subst,
+                        prompt_cleanup,
                     );
-                    (cmd, Some(uuid))
+                    (cmd, Some(uuid), Some(prompt))
                 }
             }
         }
         AgentKind::Codex => {
-            let mode_flag = match issue.agent_mode {
-                AgentMode::Plan => " --sandbox read-only --ask-for-approval untrusted",
-                AgentMode::Build => " --full-auto",
-                AgentMode::Yolo => " --dangerously-bypass-approvals-and-sandbox",
-            };
-
             if let Some(ref sid) = issue.session_id {
                 let escaped_sid = shell_escape_single_quotes(sid);
                 let cmd = format!(
                     "{} && codex resume '{}'{}",
-                    env_prefix, escaped_sid, mode_flag
+                    env_prefix, escaped_sid, trailing
                 );
-                (cmd, Some(sid.clone()))
+                (cmd, Some(sid.clone()), None)
             } else {
                 let cmd = format!(
-                    "{} && codex{} '{}'",
-                    env_prefix,
-                    mode_flag,
-                    build_escaped_prompt()
+                    "{} && codex{} {}{}",
+                    env_prefix, trailing, prompt_subst, prompt_cleanup,
                 );
-                (cmd, None)
+                (cmd, None, Some(build_prompt_contents()))
             }
         }
+        AgentKind::Pi => {
+            let session_display_name = format!("{}: {}", issue.id, issue.title);
+            let escaped_name = shell_escape_single_quotes(&session_display_name);
+
+            if let Some(ref sid) = issue.session_id {
+                // Resume existing session — skip the prompt, history is preserved.
+                let escaped_sid = shell_escape_single_quotes(sid);
+                let cmd = format!(
+                    "{} && pi --session '{}'{}",
+                    env_prefix, escaped_sid, trailing,
+                );
+                (cmd, Some(sid.clone()), None)
+            } else {
+                let cmd = format!(
+                    "{} && pi --name '{}'{} {}{}",
+                    env_prefix, escaped_name, trailing, prompt_subst, prompt_cleanup,
+                );
+                (cmd, None, Some(build_prompt_contents()))
+            }
+        }
+    }
+}
+
+/// Build the trailing args string (always starts with a leading space when
+/// non-empty) that gets appended to each agent invocation.
+///
+/// Resolution:
+/// - Base args from `[agent.<name>].args` are always appended.
+/// - Per-mode args from `[agent.<name>.mode.<mode>].args` replace the
+///   built-in mode flags. Set to `[]` to suppress mode flags entirely.
+/// - When no per-mode override is configured, bork's built-in mode flags
+///   are used.
+///
+/// All configured args are individually shell-escaped so values containing
+/// spaces or quotes are passed through safely.
+fn trailing_args(
+    config: &AppConfig,
+    kind: AgentKind,
+    mode: AgentMode,
+    builtin_mode_flag: &str,
+) -> String {
+    let (base_args, mode_args_override) = config.launch_args_for(kind, mode);
+
+    let mut parts: Vec<String> = Vec::new();
+    match mode_args_override {
+        Some(args) => {
+            for arg in args {
+                parts.push(format!("'{}'", shell_escape_single_quotes(arg)));
+            }
+        }
+        None => {
+            let trimmed = builtin_mode_flag.trim();
+            if !trimmed.is_empty() {
+                parts.push(trimmed.to_string());
+            }
+        }
+    }
+    for arg in base_args {
+        parts.push(format!("'{}'", shell_escape_single_quotes(arg)));
+    }
+
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", parts.join(" "))
     }
 }
 
@@ -218,7 +388,7 @@ fn detect_codex_session_id() -> Option<String> {
 
     for _ in 0..9 {
         let after = collect_codex_session_ids(&sessions_root);
-        for (id, _) in &after {
+        for id in after.keys() {
             if !before.contains_key(id) {
                 return Some(id.clone());
             }
@@ -292,6 +462,92 @@ fn is_uuid_like(value: &str) -> bool {
             ch.is_ascii_hexdigit()
         }
     })
+}
+
+/// Detect a newly created Pi session UUID by scanning Pi's per-cwd session
+/// directory. Snapshots existing sessions before waiting, then polls for a new
+/// one. Pi stores sessions under `<sessions_root>/--<cwd>--/` as
+/// `<timestamp>_<uuid>.jsonl`, where `<cwd>` has `/` replaced by `-`.
+fn detect_pi_session_id(project_root: &Path) -> Option<String> {
+    let sessions_dir = pi_sessions_dir(project_root)?;
+
+    let before = collect_pi_session_ids(&sessions_dir);
+
+    std::thread::sleep(Duration::from_millis(800));
+
+    for _ in 0..9 {
+        let after = collect_pi_session_ids(&sessions_dir);
+        for id in after.keys() {
+            if !before.contains_key(id) {
+                return Some(id.clone());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    // Fallback: return the newest session if no new one appeared.
+    collect_pi_session_ids(&sessions_dir)
+        .into_iter()
+        .max_by_key(|(_, modified)| *modified)
+        .map(|(id, _)| id)
+}
+
+/// Resolve Pi's session directory for a given working directory.
+/// Honors `PI_CODING_AGENT_SESSION_DIR` (flat dir) and `PI_CODING_AGENT_DIR`
+/// overrides, falling back to `~/.pi/agent/sessions/--<cwd>--/`.
+fn pi_sessions_dir(project_root: &Path) -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("PI_CODING_AGENT_SESSION_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+
+    let root = if let Ok(dir) = std::env::var("PI_CODING_AGENT_DIR") {
+        PathBuf::from(dir)
+    } else {
+        let home = std::env::var("HOME").ok()?;
+        PathBuf::from(home).join(".pi").join("agent")
+    };
+
+    let cwd = project_root.to_str()?;
+    Some(
+        root.join("sessions")
+            .join(format!("--{}--", cwd.replace('/', "-"))),
+    )
+}
+
+/// Collect Pi session UUIDs and their modification times from a session dir.
+fn collect_pi_session_ids(sessions_dir: &Path) -> HashMap<String, SystemTime> {
+    let mut sessions = HashMap::new();
+    let Ok(entries) = fs::read_dir(sessions_dir) else {
+        return sessions;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(session_id) = parse_pi_session_id_from_filename(file_name) else {
+            continue;
+        };
+        let modified = fs::metadata(&path)
+            .and_then(|meta| meta.modified())
+            .unwrap_or(UNIX_EPOCH);
+        sessions.insert(session_id, modified);
+    }
+    sessions
+}
+
+/// Extract the session UUID from a Pi session filename (`<timestamp>_<uuid>.jsonl`).
+fn parse_pi_session_id_from_filename(file_name: &str) -> Option<String> {
+    let stem = file_name.strip_suffix(".jsonl")?;
+    let candidate = stem.rsplit('_').next()?;
+    if is_uuid_like(candidate) {
+        Some(candidate.to_string())
+    } else {
+        None
+    }
 }
 
 /// Run `opencode session list` and return the first (newest) session ID found.
@@ -609,7 +865,7 @@ mod tests {
         );
         assert!(result.starts_with("You are working on bork-6: New feature."));
         assert!(result.contains("source code is in main/"));
-        assert!(result.contains("bork worktree"));
+        assert!(result.contains("bork issue start"));
     }
 
     #[test]
@@ -826,26 +1082,13 @@ mod tests {
 
     fn test_issue(agent_kind: AgentKind, agent_mode: AgentMode) -> Issue {
         Issue {
-            id: "bork-1".to_string(),
-            title: "Fix bug".to_string(),
-            kind: crate::types::IssueKind::Agentic,
-            column: crate::types::Column::InProgress,
-            agent_kind,
             agent_mode,
-            prompt: None,
-            worktree: None,
-            done_at: None,
-            session_id: None,
-            pruned_at: None,
-            linear_links: Vec::new(),
-            github_pr_links: Vec::new(),
-            linear_id: None,
-            linear_identifier: None,
-            linear_url: None,
-            linear_imported: false,
-            pr_number: None,
-            pr_imported: false,
-            pr_import_source: None,
+            ..Issue::new(
+                "bork-1",
+                "Fix bug",
+                crate::types::Column::InProgress,
+                agent_kind,
+            )
         }
     }
 
@@ -855,12 +1098,33 @@ mod tests {
             project_root: std::path::PathBuf::from("/tmp/test"),
             agent_kind: AgentKind::OpenCode,
             default_prompt: Some("The source code is in main/.".to_string()),
+            review_prompt: None,
+            orchestrator_prompt: None,
+            setup_script: None,
+            teardown_script: None,
             done_session_ttl: 300,
             debug: false,
+            auto_import_reviews: true,
+            auto_import_authored_prs: true,
             agents_allowlist: None,
             prune_threshold: crate::config::DEFAULT_PRUNE_THRESHOLD,
             auto_prune_check_interval: crate::config::DEFAULT_AUTO_PRUNE_CHECK_INTERVAL,
+            agent_launch: std::collections::HashMap::new(),
         }
+    }
+
+    /// Test wrapper: invoke build_agent_cmd with a fixed prompt-file path and
+    /// return (cmd, pre_assigned_sid, prompt_contents). The prompt-file path is
+    /// fixed so tests can also assert on the `"$(cat ...)"` substitution.
+    const TEST_PROMPT_PATH: &str = "/tmp/status/prompt-bork-bork-1.txt";
+
+    fn agent_cmd(
+        issue: &Issue,
+        config: &AppConfig,
+        session: &str,
+        status_dir: &str,
+    ) -> (String, Option<String>, Option<String>) {
+        build_agent_cmd(issue, config, session, status_dir, TEST_PROMPT_PATH)
     }
 
     // --- build_agent_cmd ---
@@ -869,8 +1133,9 @@ mod tests {
     fn opencode_fresh_plan() {
         let issue = test_issue(AgentKind::OpenCode, AgentMode::Plan);
         let config = test_config();
-        let (cmd, sid) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
-        assert!(cmd.contains("opencode --prompt"));
+        let (cmd, sid, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(cmd.contains("opencode --prompt \"$(cat '/tmp/status/prompt-bork-bork-1.txt')\""));
+        assert!(cmd.contains("rm -f '/tmp/status/prompt-bork-bork-1.txt'"));
         assert!(cmd.contains("--agent plan"));
         assert!(cmd.contains("BORK_SESSION='bork-bork-1'"));
         assert!(cmd.contains("BORK_STATUS_DIR='/tmp/status'"));
@@ -881,16 +1146,72 @@ mod tests {
     fn opencode_fresh_build() {
         let issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
         let config = test_config();
-        let (cmd, _) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         assert!(cmd.contains("opencode --prompt"));
         assert!(!cmd.contains("--agent plan"));
+    }
+
+    #[test]
+    fn fresh_prompt_includes_project_name() {
+        let issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        let config = test_config();
+        let (_, _, prompt) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(prompt.unwrap().contains("Bork project: bork"));
+    }
+
+    #[test]
+    fn fresh_prompt_includes_assigned_worktree() {
+        let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        issue.worktree = Some("bork-1-fix-bug".to_string());
+        let config = test_config();
+        let (_, _, prompt) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let prompt = prompt.unwrap();
+        assert!(prompt.contains("Assigned worktree: bork-1-fix-bug"));
+        assert!(prompt.contains("inside that directory"));
+    }
+
+    #[test]
+    fn orchestrator_prompt_uses_orchestrator_template() {
+        let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        issue.kind = crate::types::IssueKind::Orchestrator;
+        let config = test_config();
+        let (_, _, prompt) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let prompt = prompt.unwrap();
+        assert!(prompt.contains("orchestrator agent"));
+        assert!(prompt.contains("bork issue start"));
+        assert!(prompt.contains("plans/bork-1/planning.md"));
+        assert!(!prompt.contains("Assigned worktree"));
+        // The regular default prompt is not used for orchestrators.
+        assert!(!prompt.contains("The source code is in main/."));
+    }
+
+    #[test]
+    fn orchestrator_prompt_respects_config_override() {
+        let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        issue.kind = crate::types::IssueKind::Orchestrator;
+        let mut config = test_config();
+        config.orchestrator_prompt = Some("Custom orchestration rules".to_string());
+        let (_, _, prompt) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let prompt = prompt.unwrap();
+        assert!(prompt.contains("Custom orchestration rules"));
+        assert!(prompt.contains("plans/bork-1/planning.md"));
+    }
+
+    #[test]
+    fn agentic_prompt_does_not_use_orchestrator_template() {
+        let issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        let config = test_config();
+        let (_, _, prompt) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let prompt = prompt.unwrap();
+        assert!(prompt.contains("The source code is in main/."));
+        assert!(!prompt.contains("planning.md"));
     }
 
     #[test]
     fn opencode_fresh_yolo_treated_as_build() {
         let issue = test_issue(AgentKind::OpenCode, AgentMode::Yolo);
         let config = test_config();
-        let (cmd, _) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         assert!(cmd.contains("opencode --prompt"));
         assert!(!cmd.contains("--agent plan"));
         assert!(!cmd.contains("yolo"));
@@ -901,7 +1222,7 @@ mod tests {
         let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Plan);
         issue.session_id = Some("ses_abc123".to_string());
         let config = test_config();
-        let (cmd, sid) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let (cmd, sid, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         assert!(cmd.contains("opencode --session 'ses_abc123'"));
         assert!(cmd.contains("--agent plan"));
         assert!(!cmd.contains("--prompt"));
@@ -913,7 +1234,7 @@ mod tests {
         let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
         issue.session_id = Some("ses_abc123".to_string());
         let config = test_config();
-        let (cmd, _) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         assert!(cmd.contains("opencode --session 'ses_abc123'"));
         assert!(!cmd.contains("--agent plan"));
     }
@@ -922,7 +1243,7 @@ mod tests {
     fn claude_fresh_plan() {
         let issue = test_issue(AgentKind::Claude, AgentMode::Plan);
         let config = test_config();
-        let (cmd, sid) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let (cmd, sid, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         assert!(cmd.contains("claude --name"));
         assert!(cmd.contains("--permission-mode plan"));
         assert!(!cmd.contains("--resume"));
@@ -938,7 +1259,7 @@ mod tests {
     fn claude_fresh_build() {
         let issue = test_issue(AgentKind::Claude, AgentMode::Build);
         let config = test_config();
-        let (cmd, _) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         assert!(cmd.contains("claude --name"));
         assert!(!cmd.contains("--permission-mode plan"));
         assert!(!cmd.contains("--dangerously-skip-permissions"));
@@ -948,7 +1269,7 @@ mod tests {
     fn claude_fresh_yolo() {
         let issue = test_issue(AgentKind::Claude, AgentMode::Yolo);
         let config = test_config();
-        let (cmd, _) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         assert!(cmd.contains("--dangerously-skip-permissions"));
         assert!(!cmd.contains("--permission-mode plan"));
     }
@@ -958,7 +1279,7 @@ mod tests {
         let mut issue = test_issue(AgentKind::Claude, AgentMode::Plan);
         issue.session_id = Some("uuid-123-456".to_string());
         let config = test_config();
-        let (cmd, sid) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let (cmd, sid, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         assert!(cmd.contains("claude --name"));
         assert!(cmd.contains("--resume 'uuid-123-456'"));
         assert!(cmd.contains("--permission-mode plan"));
@@ -971,7 +1292,7 @@ mod tests {
         let mut issue = test_issue(AgentKind::Claude, AgentMode::Yolo);
         issue.session_id = Some("uuid-789".to_string());
         let config = test_config();
-        let (cmd, _) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         assert!(cmd.contains("--resume 'uuid-789'"));
         assert!(cmd.contains("--dangerously-skip-permissions"));
     }
@@ -980,18 +1301,21 @@ mod tests {
     fn codex_fresh_plan() {
         let issue = test_issue(AgentKind::Codex, AgentMode::Plan);
         let config = test_config();
-        let (cmd, sid) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
-        assert!(cmd.contains("codex --sandbox read-only --ask-for-approval untrusted"));
-        assert!(cmd.contains("You are working on bork-1: Fix bug"));
+        let (cmd, sid, prompt) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(cmd.contains("codex --sandbox workspace-write --ask-for-approval on-request"));
+        assert!(prompt
+            .unwrap()
+            .contains("You are working on bork-1: Fix bug"));
         assert!(sid.is_none());
     }
 
     #[test]
-    fn codex_fresh_build_uses_full_auto() {
+    fn codex_fresh_build_uses_workspace_write_never() {
         let issue = test_issue(AgentKind::Codex, AgentMode::Build);
         let config = test_config();
-        let (cmd, _) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
-        assert!(cmd.contains("codex --full-auto"));
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(cmd.contains("codex --sandbox workspace-write --ask-for-approval never"));
+        assert!(!cmd.contains("--full-auto"));
         assert!(!cmd.contains("--dangerously-bypass-approvals-and-sandbox"));
     }
 
@@ -999,9 +1323,10 @@ mod tests {
     fn codex_fresh_yolo() {
         let issue = test_issue(AgentKind::Codex, AgentMode::Yolo);
         let config = test_config();
-        let (cmd, _) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         assert!(cmd.contains("codex --dangerously-bypass-approvals-and-sandbox"));
         assert!(!cmd.contains("--full-auto"));
+        assert!(!cmd.contains("workspace-write"));
     }
 
     #[test]
@@ -1009,8 +1334,10 @@ mod tests {
         let mut issue = test_issue(AgentKind::Codex, AgentMode::Build);
         issue.session_id = Some("019d76ad-9734-77c0-8169-a727a5524013".to_string());
         let config = test_config();
-        let (cmd, sid) = build_agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
-        assert!(cmd.contains("codex resume '019d76ad-9734-77c0-8169-a727a5524013' --full-auto"));
+        let (cmd, sid, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(cmd.contains(
+            "codex resume '019d76ad-9734-77c0-8169-a727a5524013' --sandbox workspace-write --ask-for-approval never"
+        ));
         assert!(!cmd.contains("--prompt"));
         assert_eq!(
             sid,
@@ -1019,21 +1346,265 @@ mod tests {
     }
 
     #[test]
+    fn fresh_prompt_staged_to_file_not_inlined() {
+        // A multiline prompt with characters that break naive shell quoting must
+        // be staged verbatim to the file, while the command references it via
+        // `"$(cat ...)"` and never inlines the prompt text.
+        let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        issue.prompt = Some("line one\nline `two`\n$VAR and \"quotes\"".to_string());
+        let config = test_config();
+        let (cmd, _, prompt) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+
+        let prompt = prompt.expect("fresh session should stage a prompt file");
+        assert!(prompt.contains("line one\nline `two`\n$VAR and \"quotes\""));
+
+        // Command must read the file, not embed the multiline text.
+        assert!(cmd.contains("\"$(cat '/tmp/status/prompt-bork-bork-1.txt')\""));
+        assert!(!cmd.contains("line `two`"));
+        // No literal newlines in the typed command line (send-keys would mangle them).
+        assert!(!cmd.contains('\n'));
+    }
+
+    #[test]
+    fn prompt_file_path_is_scoped_to_session() {
+        let path = prompt_file_path(Path::new("/tmp/status"), "bork-bork-7");
+        assert_eq!(path, PathBuf::from("/tmp/status/prompt-bork-bork-7.txt"));
+    }
+
+    #[test]
+    fn pi_fresh_uses_name_and_prompt() {
+        let issue = test_issue(AgentKind::Pi, AgentMode::Build);
+        let config = test_config();
+        let (cmd, sid, prompt) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(cmd.contains("pi --name 'bork-1: Fix bug'"));
+        assert!(prompt
+            .unwrap()
+            .contains("You are working on bork-1: Fix bug"));
+        // Pi has no built-in mode flags.
+        assert!(!cmd.contains("--agent plan"));
+        assert!(!cmd.contains("--permission-mode"));
+        assert!(!cmd.contains("--sandbox"));
+        assert!(sid.is_none());
+    }
+
+    #[test]
+    fn pi_single_mode_ignores_agent_mode() {
+        // Pi behaves identically regardless of the stored agent_mode.
+        let config = test_config();
+        let plan = agent_cmd(
+            &test_issue(AgentKind::Pi, AgentMode::Plan),
+            &config,
+            "bork-bork-1",
+            "/tmp/status",
+        )
+        .0;
+        let build = agent_cmd(
+            &test_issue(AgentKind::Pi, AgentMode::Build),
+            &config,
+            "bork-bork-1",
+            "/tmp/status",
+        )
+        .0;
+        assert_eq!(plan, build);
+    }
+
+    #[test]
+    fn pi_resume_uses_session_id() {
+        let mut issue = test_issue(AgentKind::Pi, AgentMode::Build);
+        issue.session_id = Some("019d76ad-9734-77c0-8169-a727a5524013".to_string());
+        let config = test_config();
+        let (cmd, sid, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(cmd.contains("pi --session '019d76ad-9734-77c0-8169-a727a5524013'"));
+        assert!(!cmd.contains("--prompt"));
+        assert!(!cmd.contains("--name"));
+        assert_eq!(
+            sid,
+            Some("019d76ad-9734-77c0-8169-a727a5524013".to_string())
+        );
+    }
+
+    #[test]
+    fn pi_session_id_parsed_from_filename() {
+        assert_eq!(
+            parse_pi_session_id_from_filename(
+                "2024-12-03T14-00-00_019d76ad-9734-77c0-8169-a727a5524013.jsonl"
+            ),
+            Some("019d76ad-9734-77c0-8169-a727a5524013".to_string())
+        );
+        assert_eq!(parse_pi_session_id_from_filename("not-a-session.txt"), None);
+        assert_eq!(parse_pi_session_id_from_filename("123_short.jsonl"), None);
+    }
+
+    // --- setup_prefix ---
+
+    #[test]
+    fn setup_prefix_for_fresh_session_with_worktree() {
+        let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        issue.worktree = Some("bork-1-fix-bug".to_string());
+        let mut config = test_config();
+        config.setup_script = Some("npm install".to_string());
+        assert_eq!(
+            setup_prefix(&issue, &config),
+            Some("(cd 'bork-1-fix-bug' && npm install)".to_string())
+        );
+    }
+
+    #[test]
+    fn setup_prefix_skipped_on_resume() {
+        let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        issue.worktree = Some("bork-1-fix-bug".to_string());
+        issue.session_id = Some("ses_abc123".to_string());
+        let mut config = test_config();
+        config.setup_script = Some("npm install".to_string());
+        assert_eq!(setup_prefix(&issue, &config), None);
+    }
+
+    #[test]
+    fn setup_prefix_skipped_without_worktree() {
+        let issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        let mut config = test_config();
+        config.setup_script = Some("npm install".to_string());
+        assert_eq!(setup_prefix(&issue, &config), None);
+    }
+
+    #[test]
+    fn setup_prefix_skipped_for_orchestrator() {
+        // Orchestrators never have a worktree (set_kind clears it,
+        // auto_assign and `bork worktree` skip them), so setup_script
+        // must not run for their launches.
+        let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        issue.kind = crate::types::IssueKind::Orchestrator;
+        issue.worktree = None;
+        let mut config = test_config();
+        config.setup_script = Some("npm install".to_string());
+        assert_eq!(setup_prefix(&issue, &config), None);
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(!cmd.contains("npm install"));
+    }
+
+    #[test]
+    fn setup_prefix_skipped_without_config() {
+        let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        issue.worktree = Some("bork-1-fix-bug".to_string());
+        let config = test_config();
+        assert_eq!(setup_prefix(&issue, &config), None);
+    }
+
+    #[test]
+    fn setup_prefix_escapes_worktree_dir() {
+        let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        issue.worktree = Some("it's-a-dir".to_string());
+        let mut config = test_config();
+        config.setup_script = Some("bin/setup".to_string());
+        assert_eq!(
+            setup_prefix(&issue, &config),
+            Some("(cd 'it'\\''s-a-dir' && bin/setup)".to_string())
+        );
+    }
+
+    #[test]
     fn cmd_env_prefix() {
         let issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
         let config = test_config();
-        let (cmd, _) = build_agent_cmd(&issue, &config, "my-session", "/path/to/status");
+        let (cmd, _, _) = agent_cmd(&issue, &config, "my-session", "/path/to/status");
         assert!(
             cmd.starts_with("export BORK_SESSION='my-session' BORK_STATUS_DIR='/path/to/status'")
         );
+    }
+
+    fn config_with_launch(
+        kind: AgentKind,
+        base: &[&str],
+        mode_overrides: &[(AgentMode, &[&str])],
+    ) -> AppConfig {
+        let mut config = test_config();
+        let launch = crate::config::AgentLaunchConfig {
+            args: base.iter().map(|s| s.to_string()).collect(),
+            mode_args: mode_overrides
+                .iter()
+                .map(|(m, args)| (*m, args.iter().map(|s| s.to_string()).collect()))
+                .collect(),
+        };
+        config.agent_launch.insert(kind, launch);
+        config
     }
 
     #[test]
     fn cmd_escapes_single_quotes_in_session_name() {
         let issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
         let config = test_config();
-        let (cmd, _) = build_agent_cmd(&issue, &config, "it's-a-test", "/tmp/status");
+        let (cmd, _, _) = agent_cmd(&issue, &config, "it's-a-test", "/tmp/status");
         assert!(cmd.contains("BORK_SESSION='it'\\''s-a-test'"));
+    }
+
+    // --- agent_launch / trailing_args integration ---
+
+    #[test]
+    fn claude_base_args_are_appended() {
+        let issue = test_issue(AgentKind::Claude, AgentMode::Build);
+        let config = config_with_launch(AgentKind::Claude, &["--verbose"], &[]);
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(cmd.contains(" '--verbose' "));
+    }
+
+    #[test]
+    fn claude_mode_override_replaces_builtin_flag() {
+        let issue = test_issue(AgentKind::Claude, AgentMode::Plan);
+        let config = config_with_launch(
+            AgentKind::Claude,
+            &[],
+            &[(AgentMode::Plan, &["--dangerously-skip-permissions"])],
+        );
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(cmd.contains("'--dangerously-skip-permissions'"));
+        assert!(!cmd.contains("--permission-mode plan"));
+    }
+
+    #[test]
+    fn claude_empty_mode_override_clears_builtin_flag() {
+        let issue = test_issue(AgentKind::Claude, AgentMode::Plan);
+        let config = config_with_launch(AgentKind::Claude, &[], &[(AgentMode::Plan, &[])]);
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(!cmd.contains("--permission-mode plan"));
+    }
+
+    #[test]
+    fn opencode_extra_args_appended_on_resume() {
+        let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        issue.session_id = Some("ses_abc123".to_string());
+        let config = config_with_launch(AgentKind::OpenCode, &["--quiet"], &[]);
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(cmd.contains("opencode --session 'ses_abc123' '--quiet'"));
+    }
+
+    #[test]
+    fn codex_mode_override_replaces_sandbox_flags() {
+        let issue = test_issue(AgentKind::Codex, AgentMode::Build);
+        let config = config_with_launch(
+            AgentKind::Codex,
+            &[],
+            &[(AgentMode::Build, &["--sandbox", "read-only"])],
+        );
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(cmd.contains("'--sandbox' 'read-only'"));
+        assert!(!cmd.contains("workspace-write"));
+        assert!(!cmd.contains("--ask-for-approval never"));
+    }
+
+    #[test]
+    fn launcher_does_not_affect_other_agents() {
+        let issue = test_issue(AgentKind::Claude, AgentMode::Build);
+        let config = config_with_launch(AgentKind::OpenCode, &["--quiet"], &[]);
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(!cmd.contains("--quiet"));
+    }
+
+    #[test]
+    fn configured_args_are_individually_shell_escaped() {
+        let issue = test_issue(AgentKind::Claude, AgentMode::Build);
+        let config = config_with_launch(AgentKind::Claude, &["it's a flag"], &[]);
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(cmd.contains("'it'\\''s a flag'"));
     }
 
     #[test]

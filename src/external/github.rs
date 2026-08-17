@@ -325,9 +325,13 @@ fn parse_search_response(json_str: &str) -> Vec<PrStatus> {
 }
 
 pub fn fetch_current_user(main_worktree: &Path) -> Option<String> {
-    let mut cached = GITHUB_USER.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(ref user) = *cached {
-        return Some(user.clone());
+    // Check cache (short lock). Never hold the lock across the `gh` call:
+    // a hung network request would block every PR worker in every project.
+    {
+        let cached = GITHUB_USER.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref user) = *cached {
+            return Some(user.clone());
+        }
     }
 
     let output = Command::new("gh")
@@ -345,6 +349,7 @@ pub fn fetch_current_user(main_worktree: &Path) -> Option<String> {
         return None;
     }
 
+    let mut cached = GITHUB_USER.lock().unwrap_or_else(|e| e.into_inner());
     *cached = Some(login.clone());
     Some(login)
 }

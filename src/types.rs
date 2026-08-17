@@ -62,22 +62,35 @@ impl fmt::Display for Column {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AgentKind {
     OpenCode,
     Claude,
     Codex,
+    Pi,
 }
 
 impl AgentKind {
-    pub const ALL: [AgentKind; 3] = [AgentKind::OpenCode, AgentKind::Claude, AgentKind::Codex];
+    pub const ALL: [AgentKind; 4] = [
+        AgentKind::OpenCode,
+        AgentKind::Claude,
+        AgentKind::Codex,
+        AgentKind::Pi,
+    ];
 
     pub fn command(self) -> &'static str {
         match self {
             AgentKind::OpenCode => "opencode",
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
+            AgentKind::Pi => "pi",
         }
+    }
+
+    /// Whether this agent has bork-managed plan/build/yolo modes. Pi has a
+    /// single mode, so the dialog hides the mode picker for it.
+    pub fn has_modes(self) -> bool {
+        !matches!(self, AgentKind::Pi)
     }
 
     pub fn parse(value: &str) -> Option<Self> {
@@ -85,6 +98,7 @@ impl AgentKind {
             "opencode" | "open_code" | "open-code" => Some(AgentKind::OpenCode),
             "claude" => Some(AgentKind::Claude),
             "codex" => Some(AgentKind::Codex),
+            "pi" => Some(AgentKind::Pi),
             _ => None,
         }
     }
@@ -92,15 +106,11 @@ impl AgentKind {
 
 impl fmt::Display for AgentKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            AgentKind::OpenCode => write!(f, "opencode"),
-            AgentKind::Claude => write!(f, "claude"),
-            AgentKind::Codex => write!(f, "codex"),
-        }
+        write!(f, "{}", self.command())
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AgentMode {
     Plan,
     Build,
@@ -109,6 +119,16 @@ pub enum AgentMode {
 }
 
 impl AgentMode {
+    /// Parse a mode name from config (case-insensitive).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "plan" => Some(AgentMode::Plan),
+            "build" => Some(AgentMode::Build),
+            "yolo" => Some(AgentMode::Yolo),
+            _ => None,
+        }
+    }
+
     /// Cycles Plan → Build → Plan (for OpenCode, which has no yolo mode).
     pub fn toggle(self) -> Self {
         match self {
@@ -157,6 +177,16 @@ pub enum IssueKind {
     #[default]
     Agentic,
     NonAgentic,
+    /// Coordinates work across multiple bork issues: maintains a plan file,
+    /// spawns issues via `bork issue start`, and monitors their agents.
+    Orchestrator,
+}
+
+impl IssueKind {
+    /// Whether this kind launches an agent session.
+    pub fn is_agentic(self) -> bool {
+        matches!(self, Self::Agentic | Self::Orchestrator)
+    }
 }
 
 impl fmt::Display for IssueKind {
@@ -164,6 +194,7 @@ impl fmt::Display for IssueKind {
         match self {
             Self::Agentic => write!(f, "Agentic"),
             Self::NonAgentic => write!(f, "Todo"),
+            Self::Orchestrator => write!(f, "Orchestrator"),
         }
     }
 }
@@ -205,7 +236,7 @@ impl fmt::Display for AgentStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentStatusInfo {
     pub status: AgentStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -213,7 +244,7 @@ pub struct AgentStatusInfo {
     pub updated_at: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WorktreeStatus {
     pub staged: usize,
     pub unstaged: usize,
@@ -270,6 +301,11 @@ pub struct Issue {
     #[serde(default)]
     pub github_pr_links: Vec<LinkedGithubPr>,
 
+    /// IDs of other issues in the same project this one is tied to.
+    /// Links are symmetric: each side stores the other's id.
+    #[serde(default)]
+    pub linked_issues: Vec<String>,
+
     // --- Legacy singular fields (read-only, for migration from old state.json) ---
     #[serde(default, skip_serializing)]
     pub linear_id: Option<String>,
@@ -288,6 +324,40 @@ pub struct Issue {
 }
 
 impl Issue {
+    /// Baseline issue with all optional/legacy fields empty. Combine with
+    /// struct update syntax for variations:
+    /// `Issue { prompt: Some(p), ..Issue::new(id, title, column, agent) }`.
+    pub fn new(
+        id: impl Into<String>,
+        title: impl Into<String>,
+        column: Column,
+        agent_kind: AgentKind,
+    ) -> Self {
+        Issue {
+            id: id.into(),
+            title: title.into(),
+            kind: IssueKind::Agentic,
+            column,
+            agent_kind,
+            agent_mode: AgentMode::Plan,
+            prompt: None,
+            worktree: None,
+            done_at: None,
+            session_id: None,
+            pruned_at: None,
+            linear_links: Vec::new(),
+            github_pr_links: Vec::new(),
+            linked_issues: Vec::new(),
+            linear_id: None,
+            linear_identifier: None,
+            linear_url: None,
+            linear_imported: false,
+            pr_number: None,
+            pr_imported: false,
+            pr_import_source: None,
+        }
+    }
+
     pub fn session_name(&self, project_name: &str) -> String {
         format!("{}-{}", project_name, self.id.to_lowercase())
     }
@@ -329,6 +399,32 @@ impl Issue {
             }
         }
         self.pr_imported = false;
+    }
+
+    /// Change the issue kind, clearing state the new kind invalidates.
+    /// Crossing the orchestrator boundary drops the agent session (resuming it
+    /// would skip the new kind's prompt); becoming an orchestrator also drops
+    /// the worktree and PR links since orchestrators run at the project root
+    /// and have no PR of their own.
+    ///
+    /// Returns `true` when the orchestrator boundary was crossed. Callers
+    /// should then kill any live tmux session, since re-attaching it would
+    /// silently resume the old agent with the previous kind's prompt.
+    pub fn set_kind(&mut self, kind: IssueKind) -> bool {
+        let previous = self.kind;
+        self.kind = kind;
+        if kind == previous {
+            return false;
+        }
+        if kind != IssueKind::Orchestrator && previous != IssueKind::Orchestrator {
+            return false;
+        }
+        self.session_id = None;
+        if kind == IssueKind::Orchestrator {
+            self.worktree = None;
+            self.github_pr_links.clear();
+        }
+        true
     }
 
     pub fn has_linear(&self) -> bool {
@@ -375,6 +471,16 @@ impl Issue {
     pub fn has_linear_id(&self, id: &str) -> bool {
         self.linear_links.iter().any(|l| l.id == id)
     }
+
+    pub fn has_links(&self) -> bool {
+        !self.linked_issues.is_empty()
+    }
+
+    pub fn is_linked_to(&self, id: &str) -> bool {
+        self.linked_issues
+            .iter()
+            .any(|l| l.eq_ignore_ascii_case(id))
+    }
 }
 
 // --- PR types (ephemeral, not persisted) ---
@@ -411,11 +517,10 @@ pub enum ReviewDecision {
     ReviewRequired,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrStatus {
     pub number: u32,
     pub title: String,
-    #[allow(dead_code)] // Fetched from GitHub; natural to display/open in a future PR detail view
     pub url: String,
     pub author: String,
     pub state: PrState,
@@ -432,28 +537,12 @@ mod tests {
     use super::*;
 
     fn test_issue(id: &str, column: Column) -> Issue {
-        Issue {
-            id: id.to_string(),
-            title: format!("Test issue {}", id),
-            kind: IssueKind::Agentic,
+        Issue::new(
+            id,
+            format!("Test issue {}", id),
             column,
-            agent_kind: AgentKind::OpenCode,
-            agent_mode: AgentMode::Plan,
-            prompt: None,
-            worktree: None,
-            done_at: None,
-            session_id: None,
-            pruned_at: None,
-            linear_links: Vec::new(),
-            github_pr_links: Vec::new(),
-            linear_id: None,
-            linear_identifier: None,
-            linear_url: None,
-            linear_imported: false,
-            pr_number: None,
-            pr_imported: false,
-            pr_import_source: None,
-        }
+            AgentKind::OpenCode,
+        )
     }
 
     // --- PR types ---
@@ -562,6 +651,94 @@ mod tests {
     fn column_from_index_out_of_range() {
         assert_eq!(Column::from_index(4), None);
         assert_eq!(Column::from_index(99), None);
+    }
+
+    // --- IssueKind ---
+
+    #[test]
+    fn issue_kind_is_agentic() {
+        assert!(IssueKind::Agentic.is_agentic());
+        assert!(IssueKind::Orchestrator.is_agentic());
+        assert!(!IssueKind::NonAgentic.is_agentic());
+    }
+
+    #[test]
+    fn issue_kind_display() {
+        assert_eq!(IssueKind::Agentic.to_string(), "Agentic");
+        assert_eq!(IssueKind::NonAgentic.to_string(), "Todo");
+        assert_eq!(IssueKind::Orchestrator.to_string(), "Orchestrator");
+    }
+
+    #[test]
+    fn issue_kind_orchestrator_serde_roundtrip() {
+        let mut issue = test_issue("bork-1", Column::Todo);
+        issue.kind = IssueKind::Orchestrator;
+        let json = serde_json::to_string(&issue).unwrap();
+        let back: Issue = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.kind, IssueKind::Orchestrator);
+    }
+
+    #[test]
+    fn issue_without_kind_defaults_to_agentic() {
+        let json = r#"{
+            "id": "bork-1",
+            "title": "Test",
+            "column": "Todo",
+            "agent_kind": "OpenCode",
+            "agent_mode": "Plan",
+            "prompt": null
+        }"#;
+        let issue: Issue = serde_json::from_str(json).unwrap();
+        assert_eq!(issue.kind, IssueKind::Agentic);
+    }
+
+    fn issue_with_session_state(kind: IssueKind) -> Issue {
+        let mut issue = test_issue("bork-1", Column::InProgress);
+        issue.kind = kind;
+        issue.worktree = Some("bork-1-fix-bug".into());
+        issue.session_id = Some("ses_abc".into());
+        issue.github_pr_links.push(LinkedGithubPr {
+            number: 42,
+            imported: false,
+            import_source: None,
+        });
+        issue
+    }
+
+    #[test]
+    fn set_kind_to_orchestrator_clears_worktree_session_and_prs() {
+        let mut issue = issue_with_session_state(IssueKind::Agentic);
+        assert!(issue.set_kind(IssueKind::Orchestrator));
+        assert_eq!(issue.kind, IssueKind::Orchestrator);
+        assert!(issue.worktree.is_none());
+        assert!(issue.session_id.is_none());
+        assert!(issue.github_pr_links.is_empty());
+    }
+
+    #[test]
+    fn set_kind_from_orchestrator_clears_session_only() {
+        let mut issue = issue_with_session_state(IssueKind::Orchestrator);
+        assert!(issue.set_kind(IssueKind::Agentic));
+        assert!(issue.session_id.is_none());
+        assert_eq!(issue.worktree, Some("bork-1-fix-bug".into()));
+        assert_eq!(issue.github_pr_links.len(), 1);
+    }
+
+    #[test]
+    fn set_kind_between_agentic_and_todo_keeps_state() {
+        let mut issue = issue_with_session_state(IssueKind::Agentic);
+        assert!(!issue.set_kind(IssueKind::NonAgentic));
+        assert_eq!(issue.worktree, Some("bork-1-fix-bug".into()));
+        assert_eq!(issue.session_id, Some("ses_abc".into()));
+        assert_eq!(issue.github_pr_links.len(), 1);
+    }
+
+    #[test]
+    fn set_kind_same_kind_is_noop() {
+        let mut issue = issue_with_session_state(IssueKind::Orchestrator);
+        assert!(!issue.set_kind(IssueKind::Orchestrator));
+        assert_eq!(issue.worktree, Some("bork-1-fix-bug".into()));
+        assert_eq!(issue.session_id, Some("ses_abc".into()));
     }
 
     // --- Issue session_name ---
@@ -699,6 +876,30 @@ mod tests {
         assert_eq!(AgentMode::Plan.to_string(), "plan");
         assert_eq!(AgentMode::Build.to_string(), "build");
         assert_eq!(AgentMode::Yolo.to_string(), "yolo");
+    }
+
+    // --- AgentKind ---
+
+    #[test]
+    fn agent_kind_parse_and_display_pi() {
+        assert_eq!(AgentKind::parse("pi"), Some(AgentKind::Pi));
+        assert_eq!(AgentKind::parse("PI"), Some(AgentKind::Pi));
+        assert_eq!(AgentKind::Pi.to_string(), "pi");
+        assert_eq!(AgentKind::Pi.command(), "pi");
+    }
+
+    #[test]
+    fn agent_kind_pi_has_no_modes() {
+        assert!(!AgentKind::Pi.has_modes());
+        assert!(AgentKind::OpenCode.has_modes());
+        assert!(AgentKind::Claude.has_modes());
+        assert!(AgentKind::Codex.has_modes());
+    }
+
+    #[test]
+    fn agent_kind_all_includes_pi() {
+        assert!(AgentKind::ALL.contains(&AgentKind::Pi));
+        assert_eq!(AgentKind::ALL.len(), 4);
     }
 
     // --- Issue session_id ---

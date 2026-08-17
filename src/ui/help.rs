@@ -64,11 +64,17 @@ const SECTIONS: &[Section] = &[
     Section {
         title: "Move Issues",
         bindings: &[
+            ("Space", "Mark / unmark issue"),
+            ("m", "Mark linked group"),
             ("H / L", "Move left / right"),
             ("K / J", "Move up / down"),
             ("D", "Move to Done"),
             ("T", "Move to To Do"),
         ],
+    },
+    Section {
+        title: "Links",
+        bindings: &[("c", "Link issues"), ("f", "Filter to linked")],
     },
     Section {
         title: "Other",

@@ -291,26 +291,8 @@ mod tests {
 
     fn make_issue(id: &str, worktree: Option<&str>) -> Issue {
         Issue {
-            id: id.into(),
-            title: "t".into(),
-            kind: crate::types::IssueKind::Agentic,
-            column: Column::Done,
-            agent_kind: crate::types::AgentKind::OpenCode,
-            agent_mode: crate::types::AgentMode::Plan,
-            prompt: None,
             worktree: worktree.map(String::from),
-            done_at: None,
-            session_id: None,
-            pruned_at: None,
-            linear_links: Vec::new(),
-            github_pr_links: Vec::new(),
-            linear_id: None,
-            linear_identifier: None,
-            linear_url: None,
-            linear_imported: false,
-            pr_number: None,
-            pr_imported: false,
-            pr_import_source: None,
+            ..Issue::new(id, "t", Column::Done, crate::types::AgentKind::OpenCode)
         }
     }
 
