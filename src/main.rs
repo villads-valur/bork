@@ -1921,6 +1921,10 @@ fn run_tui() -> anyhow::Result<()> {
                 }
             }
 
+            if let Some((project_id, issue_id)) = result.issue_to_delete {
+                handler::delete_issue_from_app(&mut app, &project_id, &issue_id);
+            }
+
             if let Some(launch_id) = result.launched_issue_id {
                 app.launches_in_flight.remove(&launch_id);
                 let pending = pending_popup_for_launch.remove(&launch_id);
@@ -2042,15 +2046,17 @@ fn run_tui() -> anyhow::Result<()> {
             needs_redraw = true;
             let session_name =
                 app.project().issues[idx].session_name(&app.project().config.project_name);
-            let status_file = config::agent_status_dir(&app.project().config.project_root)
-                .join(format!("{}.json", session_name));
-            let sn = session_name.clone();
+            let project_root = app.project().config.project_root.clone();
+            let tx = action_tx.clone();
             app.project_mut().live.active_sessions.remove(&session_name);
             thread::spawn(move || {
-                let _ = external::tmux::kill_session(&sn);
-                let _ = std::fs::remove_file(&status_file);
+                let _ = tx.send(handler::terminate_to_result(
+                    &project_root,
+                    &session_name,
+                    format!("Auto-killed session '{}' (done TTL)", session_name),
+                    format!("Session '{}' was already stopped", session_name),
+                ));
             });
-            app.set_message(format!("Auto-killed session '{}' (done TTL)", session_name));
         }
 
         let mut git_data_changed = false;

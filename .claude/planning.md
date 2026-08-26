@@ -1,66 +1,44 @@
-# Current Work
+# bork-146: clean up zsh and other processes when killing an issue
 
-> Last updated: 2026-08-17
+> Last updated: 2026-08-26
 
-## Active Task
+## Findings
 
-**Task:** bork-105 — Auto-prune mechanism for stale worktrees
-**Status:** Implementation complete, verified (check + clippy + fmt + 629 tests), uncommitted
+- zsh itself is not leaking: the apparent PID 1 children belong to active
+  pane TTYs and exit when tmux closes the pane.
+- Codex, OpenCode, and self-daemonizing commands can outlive the tmux session.
+- `bork issue delete` did not terminate its issue session.
+- `tmux::kill_session` discarded failures and always reported success.
 
-## Design
+## Implementation
 
-- **Scheduled check:** main event loop checks every 60s per project; when the
-  on-disk worktree count (excluding `main/`) reaches `prune_threshold`
-  (default 10) and `auto_prune_check_interval` (default 24h) has passed since
-  `last_prune_at`, a toast suggests pruning. A 5-min in-session cooldown
-  (`last_auto_prune_prompt`) stops the toast re-flashing.
-- **Manual trigger:** `p` in normal mode opens the prune dialog; `bork prune`
-  CLI with `--dry-run`, `--yes`, `--include`, `--exclude`.
-- **Dialog:** lists all worktrees with issue id, dirty/session/column state.
-  Space toggles keep/remove, `a` all, `n` none, Enter confirms, Esc cancels.
-  Defaults: remove clean Done/orphan worktrees; keep dirty, live-session, or
-  non-Done ones. Submitting with a dirty worktree selected is refused.
-- **Execution:** `git worktree remove` (never `--force`) per selection, run in
-  a background thread; results flow back via `ActionResult.prune_outcome`.
-- **Persistence:** `last_prune_at` lives in `.bork/state.json` (AppState), not
-  config — it's machine-written state; keeping it out of config.toml avoids the
-  global-layer merge footgun and write churn in a user-edited file. External
-  writes merge via "later timestamp wins" in `merge_external_state`. Issues
-  keep their card; `issue.worktree` cleared, `issue.pruned_at` set, card shows
-  "pruned 3d ago". `pruned_at` clears when a new worktree is attached.
+- Snapshot the POSIX session ID for every tmux pane before teardown, then kill
+  survivors that retain those IDs after the pane closes.
+- On Linux, also identify survivors through the inherited `BORK_SESSION`
+  environment marker so descendants that call `setsid` remain discoverable.
+- Escalate survivor cleanup from SIGTERM to SIGKILL after a grace period.
+- Route issue kill, delete, archive, kind-change, and TTL cleanup through one
+  cleanup function.
+- Validate tmux exit status and clean transient status/prompt files.
+- Preserve issues when teardown fails: CLI delete/archive now return the
+  failure, and TUI delete waits for successful asynchronous cleanup before
+  removing the card.
 
-## Files
+## Status
 
-- `src/prune.rs` (new) — scan, classify, execute, apply-to-issues + tests
-- `src/ui/prune_dialog.rs` (new) — dialog renderer
-- `src/config.rs` — `prune_threshold` + `auto_prune_check_interval` config
-  keys; `last_prune_at` on `AppState` (state.json)
-- `src/types.rs` — `Issue.pruned_at`
-- `src/app.rs` — `PruneDialogState`, `InputMode::PruneDialog`, open/close
-- `src/handler.rs` — dialog action handling, submit, background removal
-- `src/main.rs` — `bork prune` subcommand, scheduled toast, outcome apply
-- `src/ui/card.rs` — "pruned Xd ago" indicator + `humanize_age`
-- `src/input/{action,keybindings}.rs`, `src/ui/{help,mod}.rs`, `src/ops.rs`,
-  `src/worktree.rs`, `src/external/opencode.rs`, `README.md` — wiring
+- [x] Investigation and isolated reproduction
+- [x] Initial implementation and unit tests
+- [x] Sync worktree with current `origin/main`
+- [x] Review cleanup safety and portability
+- [x] Code-review and simplification pass
+- [x] Formatting, clippy, and all 787 tests pass
+- [x] End-to-end test: detached `nohup` processes from two tmux windows are
+      both terminated by `bork issue delete`
 
-## Progress
+## Limitation
 
-- [x] prune module with conservative defaults + tests
-- [x] Interactive dialog (toggle/all/none, dirty refusal)
-- [x] `bork prune` CLI (dry-run/yes/include/exclude)
-- [x] Scheduled per-project prompt with threshold + interval + cooldown
-- [x] `last_prune_at` persisted to state.json (moved out of config per review)
-- [x] Card shows pruned date; clears on worktree reattach
-- [x] Simplify pass applied (4-angle review): shared candidate builder for
-  TUI+CLI, `partition_selection` as the single dirty-refusal policy, git as
-  the sole remove-time authority (dropped `was_dirty`/`SkippedDirty`),
-  `action` lives on the candidate (no parallel vectors), `ActionResult`
-  Default, `Issue::attach_worktree`, shared `unix_now()`,
-  `Project::prunable_worktree_names()`, check-throttled toast
-- [x] cargo check + fmt clean, 627/627 tests pass
-- [ ] Commit + PR
-
-## Notes
-
-- 6 clippy warnings exist on this branch, all on unchanged lines inherited
-  from main — not introduced here.
+On macOS, a process that deliberately calls `setsid` before tmux teardown can
+escape the pane's POSIX session, and the OS does not expose detached-process
+environments to recover the `BORK_SESSION` marker. Such fully daemonized
+services still require the project's `teardown_script`. Normal background and
+`nohup` jobs, agent subprocesses, zsh helpers, and every tmux window are covered.

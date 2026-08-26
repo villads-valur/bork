@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
@@ -7,7 +7,7 @@ use crate::app::{
     ActionContext, App, ConfirmAction, ImportSource, InputMode, LinearPickerContext, MessageKind,
     Project, ProjectId,
 };
-use crate::config::{self, AppConfig};
+use crate::config::AppConfig;
 use crate::external::{github, opencode, tmux, tuicr};
 use crate::global_config::ReloadResult;
 use crate::input::Action;
@@ -32,6 +32,8 @@ pub struct ActionResult {
     pub launched_issue_id: Option<String>,
     /// If set, apply this prune outcome to the issues of `project_id`.
     pub prune_outcome: Option<(crate::app::ProjectId, crate::prune::PruneOutcome)>,
+    /// Remove this issue only after its asynchronous session teardown succeeds.
+    pub issue_to_delete: Option<(ProjectId, String)>,
 }
 
 impl Default for ActionResult {
@@ -44,6 +46,7 @@ impl Default for ActionResult {
             session_id: None,
             launched_issue_id: None,
             prune_outcome: None,
+            issue_to_delete: None,
         }
     }
 }
@@ -361,10 +364,8 @@ fn handle_normal(
                 let result = match tmux::create_session(&session_name, &project_root) {
                     Ok(()) => ActionResult {
                         message: format!("Terminal session '{}' ready", session_name),
-                        message_kind: MessageKind::Info,
                         session_to_open: Some(session_name),
                         popup_title: Some(popup_title),
-                        session_id: None,
                         ..Default::default()
                     },
                     Err(e) => ActionResult {
@@ -486,10 +487,8 @@ fn handle_normal(
                 let result = match outcome {
                     Ok(()) => ActionResult {
                         message: "tuicr ready".to_string(),
-                        message_kind: MessageKind::Info,
                         session_to_open: Some(session_name),
                         popup_title: Some(popup_title),
-                        session_id: None,
                         ..Default::default()
                     },
                     Err(e) => ActionResult {
@@ -785,12 +784,21 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
         if idx < p.issues.len() {
             let session_name = p.issues[idx].session_name(&p.config.project_name);
             let detached_worktree = p.issues[idx].worktree.clone();
+            let crossed_orchestrator_boundary =
+                p.issues[idx].kind_change_resets_session(dialog.kind);
+
+            if crossed_orchestrator_boundary {
+                if let Err(e) = opencode::terminate_session(&p.config.project_root, &session_name) {
+                    app.set_error(format!("Failed to reset session: {e}"));
+                    return;
+                }
+            }
 
             p.issues[idx].title = title;
             p.issues[idx].prompt = prompt;
             p.issues[idx].agent_kind = dialog.agent_kind;
             p.issues[idx].agent_mode = dialog.agent_mode;
-            let crossed_orchestrator_boundary = p.issues[idx].set_kind(dialog.kind);
+            p.issues[idx].set_kind(dialog.kind);
 
             apply_linear_fields(&mut p.issues[idx], &dialog);
             apply_pr_fields(&mut p.issues[idx], &dialog);
@@ -799,9 +807,6 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
             p.mark_dirty();
 
             if crossed_orchestrator_boundary {
-                // A live session would otherwise be re-attached with the old
-                // kind's prompt and cwd.
-                let _ = tmux::kill_session(&session_name);
                 match detached_worktree.filter(|_| dialog.kind == IssueKind::Orchestrator) {
                     Some(wt) => app.set_message(format!(
                         "Updated {} (session reset; worktree {} detached, remove it manually)",
@@ -1354,29 +1359,17 @@ fn handle_confirm(
                             app.set_warning("Project no longer available");
                             return;
                         };
-                        let status_file =
-                            agent_status_file(&project.config.project_root, &session_name);
+                        let project_root = project.config.project_root.clone();
                         app.begin_busy();
                         let tx = action_tx.clone();
 
                         thread::spawn(move || {
-                            let (message, message_kind) = match tmux::kill_session(&session_name) {
-                                Ok(()) => {
-                                    let _ = std::fs::remove_file(&status_file);
-                                    (
-                                        format!("Session '{}' killed", session_name),
-                                        MessageKind::Info,
-                                    )
-                                }
-                                Err(e) => {
-                                    (format!("Failed to kill session: {e}"), MessageKind::Error)
-                                }
-                            };
-                            let _ = tx.send(ActionResult {
-                                message,
-                                message_kind,
-                                ..Default::default()
-                            });
+                            let _ = tx.send(terminate_to_result(
+                                &project_root,
+                                &session_name,
+                                format!("Session '{}' killed", session_name),
+                                format!("Session '{}' was already stopped", session_name),
+                            ));
                         });
                     }
                     ConfirmAction::DeleteIssue {
@@ -1397,40 +1390,22 @@ fn handle_confirm(
                         let issue = &p.issues[issue_index];
                         let session_name = issue.session_name(&p.config.project_name);
                         let id = issue.id.clone();
-                        let status_file = agent_status_file(&p.config.project_root, &session_name);
+                        let project_root = p.config.project_root.clone();
 
-                        if p.is_session_alive(&session_name) {
-                            let tx = action_tx.clone();
-                            let sn = session_name.clone();
-                            thread::spawn(move || {
-                                let _ = tmux::kill_session(&sn);
-                                let _ = std::fs::remove_file(&status_file);
-                                let _ = tx.send(ActionResult {
-                                    message: format!("Deleted {} and killed session", id),
-                                    message_kind: MessageKind::Info,
-                                    ..Default::default()
-                                });
-                            });
-                            app.begin_busy();
-                        } else {
-                            let _ = std::fs::remove_file(&status_file);
-                            app.set_message(format!("Deleted {}", id));
-                        }
-
-                        let q = app.search_query.clone();
-                        if let Some(p) = app.find_project_mut(&project_id) {
-                            let removed = p.issues.remove(issue_index);
-                            crate::ops::remove_link_references(&mut p.issues, &removed.id);
-                            if p.link_filter
-                                .as_deref()
-                                .is_some_and(|a| a.eq_ignore_ascii_case(&removed.id))
-                            {
-                                p.link_filter = None;
+                        app.begin_busy();
+                        let tx = action_tx.clone();
+                        thread::spawn(move || {
+                            let mut result = terminate_to_result(
+                                &project_root,
+                                &session_name,
+                                format!("Deleted {} and killed session", id),
+                                format!("Deleted {}", id),
+                            );
+                            if result.message_kind != MessageKind::Error {
+                                result.issue_to_delete = Some((project_id, id));
                             }
-                            p.marked_issues.remove(&removed.id.to_lowercase());
-                            p.clamp_all_rows(&q);
-                            p.mark_dirty();
-                        }
+                            let _ = tx.send(result);
+                        });
                     }
                 }
             }
@@ -1442,13 +1417,39 @@ fn handle_confirm(
     }
 }
 
+pub fn delete_issue_from_app(app: &mut App, project_id: &ProjectId, issue_id: &str) -> bool {
+    let query = app.search_query.clone();
+    let Some(project) = app.find_project_mut(project_id) else {
+        return false;
+    };
+    let Some(index) = project
+        .issues
+        .iter()
+        .position(|issue| issue.id.eq_ignore_ascii_case(issue_id))
+    else {
+        return false;
+    };
+
+    let removed = project.issues.remove(index);
+    crate::ops::remove_link_references(&mut project.issues, &removed.id);
+    if project
+        .link_filter
+        .as_deref()
+        .is_some_and(|anchor| anchor.eq_ignore_ascii_case(&removed.id))
+    {
+        project.link_filter = None;
+    }
+    project.marked_issues.remove(&removed.id.to_lowercase());
+    project.clamp_all_rows(&query);
+    project.mark_dirty();
+    true
+}
+
 fn launch_and_report(issue: Issue, config: AppConfig) -> ActionResult {
     match opencode::launch_session(&issue, &config) {
         Ok((session_name, agent_sid)) => ActionResult {
             message: format!("Session '{}' started", session_name),
-            message_kind: MessageKind::Info,
             session_to_open: Some(session_name),
-            popup_title: None,
             session_id: agent_sid.map(|sid| (issue.id.clone(), sid)),
             launched_issue_id: Some(issue.id.clone()),
             ..Default::default()
@@ -1462,8 +1463,28 @@ fn launch_and_report(issue: Issue, config: AppConfig) -> ActionResult {
     }
 }
 
-fn agent_status_file(project_root: &Path, session_name: &str) -> PathBuf {
-    config::agent_status_dir(project_root).join(format!("{}.json", session_name))
+/// Terminate a session and map the outcome to a user-facing `ActionResult`.
+/// `killed_msg` is shown when a live session was killed, `absent_msg` when
+/// there was none; the failure message is uniform across call sites.
+pub fn terminate_to_result(
+    project_root: &Path,
+    session_name: &str,
+    killed_msg: String,
+    absent_msg: String,
+) -> ActionResult {
+    let (message, message_kind) = match opencode::terminate_session(project_root, session_name) {
+        Ok(true) => (killed_msg, MessageKind::Info),
+        Ok(false) => (absent_msg, MessageKind::Info),
+        Err(e) => (
+            format!("Failed to kill session '{session_name}': {e}"),
+            MessageKind::Error,
+        ),
+    };
+    ActionResult {
+        message,
+        message_kind,
+        ..Default::default()
+    }
 }
 
 #[cfg(test)]
@@ -2137,13 +2158,16 @@ mod tests {
     }
 
     #[test]
-    fn delete_confirm_removes_issue() {
+    fn delete_confirm_waits_for_teardown_before_removing_issue() {
         let mut app = app_with_issues();
+        let project_id = app.project().id();
         act(&mut app, Action::DeleteIssue);
         assert_eq!(app.input_mode, InputMode::Confirm);
         act(&mut app, Action::ConfirmYes);
         assert_eq!(app.input_mode, InputMode::Normal);
-        // bork-1 was deleted (no active session so synchronous)
+        assert_eq!(app.project().issues.len(), 3);
+
+        assert!(delete_issue_from_app(&mut app, &project_id, "bork-1"));
         assert_eq!(app.project().issues.len(), 2);
         assert_eq!(app.project().issues[0].id, "bork-2");
         assert!(app.project().state_dirty);

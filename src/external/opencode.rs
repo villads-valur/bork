@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::config::{self, AppConfig};
 use crate::error::AppError;
+use crate::external::process::{self, BORK_SESSION_VAR};
 use crate::external::{github, tmux};
 use crate::types::{AgentKind, AgentMode, Issue, IssueKind, LinkedGithubPr, LinkedLinear};
 
@@ -81,6 +82,47 @@ pub fn launch_session(
     Ok((session_name, agent_session_id))
 }
 
+/// Kill an issue's tmux session and remove its transient hook/prompt files.
+///
+/// Returns whether a live tmux session was killed. An already-absent session
+/// is a successful no-op.
+pub fn terminate_session(project_root: &Path, session_name: &str) -> Result<bool, AppError> {
+    let process_sessions = capture_process_sessions(session_name)?;
+    let killed = kill_tmux_session(session_name)?;
+
+    let status_dir = config::agent_status_dir(project_root);
+    let _ = fs::remove_file(status_dir.join(format!("{session_name}.json")));
+    let _ = fs::remove_file(prompt_file_path(&status_dir, session_name));
+
+    // Killing tmux does not guarantee that detached descendants exited.
+    process::kill_session_survivors(session_name, &process_sessions);
+
+    Ok(killed)
+}
+
+#[cfg(not(test))]
+fn capture_process_sessions(session_name: &str) -> Result<Vec<i32>, AppError> {
+    let pane_pids = tmux::pane_pids(session_name)?;
+    Ok(process::process_session_ids(&pane_pids))
+}
+
+#[cfg(test)]
+fn capture_process_sessions(_session_name: &str) -> Result<Vec<i32>, AppError> {
+    Ok(Vec::new())
+}
+
+/// `tmux::kill_session`, stubbed under test so the suite never talks to a
+/// live tmux server.
+#[cfg(not(test))]
+fn kill_tmux_session(session_name: &str) -> Result<bool, AppError> {
+    tmux::kill_session(session_name)
+}
+
+#[cfg(test)]
+fn kill_tmux_session(_session_name: &str) -> Result<bool, AppError> {
+    Ok(false)
+}
+
 /// Build the setup-script prefix for a launch command, if applicable.
 /// Only fresh sessions (no session_id to resume) for issues with an assigned
 /// worktree run the setup script. The script itself is user-authored shell
@@ -127,7 +169,7 @@ fn build_agent_cmd(
     prompt_path_str: &str,
 ) -> (String, Option<String>, Option<String>) {
     let env_prefix = format!(
-        "export BORK_SESSION='{}' BORK_STATUS_DIR='{}' BORK_ISSUE_ID='{}'",
+        "export {BORK_SESSION_VAR}='{}' BORK_STATUS_DIR='{}' BORK_ISSUE_ID='{}'",
         shell_escape_single_quotes(session_name),
         shell_escape_single_quotes(status_dir_str),
         shell_escape_single_quotes(&issue.id),
