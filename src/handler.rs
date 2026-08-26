@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
 
@@ -8,7 +7,7 @@ use crate::app::{
     Project, ProjectId,
 };
 use crate::config::{self, AppConfig};
-use crate::external::{github, opencode, tmux, tuicr};
+use crate::external::{browser, github, opencode, tmux, tuicr};
 use crate::global_config::ReloadResult;
 use crate::input::Action;
 use crate::types::{Column, Issue, IssueKind, LinkedGithubPr, LinkedLinear, PrImportSource};
@@ -105,6 +104,43 @@ pub fn handle_action(
             handle_prune_dialog(app, action, ctx, ch.action_tx);
             PostAction::None
         }
+    }
+}
+
+/// Summarize a batch of browser-open attempts for the status bar. `noun` names
+/// what was opened ("PR", "Linear issue"); `failures` holds one "label: error"
+/// line per failed link. Partial failures report how many opened plus the
+/// first failure, so the user knows not to retry the ones that worked.
+fn summarize_open_links(
+    noun: &str,
+    total: usize,
+    first_label: &str,
+    failures: Vec<String>,
+) -> ActionResult {
+    let (message, message_kind) = if failures.is_empty() {
+        let message = if total == 1 {
+            format!("Opened {noun} {first_label}")
+        } else {
+            format!("Opened {total} {noun}s")
+        };
+        (message, MessageKind::Info)
+    } else {
+        let mut detail = failures[0].clone();
+        if failures.len() > 1 {
+            detail.push_str(&format!(" (+{} more failed)", failures.len() - 1));
+        }
+        let opened = total - failures.len();
+        let message = if opened == 0 {
+            format!("Failed to open {noun} {detail}")
+        } else {
+            format!("Opened {opened} of {total} {noun}s; {detail}")
+        };
+        (message, MessageKind::Error)
+    };
+    ActionResult {
+        message,
+        message_kind,
+        ..Default::default()
     }
 }
 
@@ -514,25 +550,44 @@ fn handle_normal(
             let Some(issue) = app.context_project(ctx).selected_issue(&q) else {
                 return PostAction::None;
             };
-            if issue.github_pr_links.is_empty() {
+            let pr_numbers: Vec<u32> = if issue.github_pr_links.is_empty() {
                 let Some(pr) = app.context_project(ctx).pr_for(issue) else {
                     app.set_warning("No PR found for this issue");
                     return PostAction::None;
                 };
-                let pr_number = pr.number;
-                let main_worktree = app.context_project(ctx).config.project_root.join("main");
-                thread::spawn(move || {
-                    github::open_pr_in_browser(pr_number, &main_worktree);
-                });
+                vec![pr.number]
             } else {
-                let pr_numbers: Vec<u32> = issue.pr_numbers();
-                let main_worktree = app.context_project(ctx).config.project_root.join("main");
-                thread::spawn(move || {
-                    for num in &pr_numbers {
-                        github::open_pr_in_browser(*num, &main_worktree);
+                issue.pr_numbers()
+            };
+            let main_worktree = app.context_project(ctx).config.project_root.join("main");
+
+            app.begin_busy();
+            app.set_message("Opening PR...");
+            let tx = ch.action_tx.clone();
+
+            thread::spawn(move || {
+                // pr_url resolves the repo identity via gh (cached after the
+                // first call), so it must run off the main thread.
+                let mut failures = Vec::new();
+                for num in &pr_numbers {
+                    let outcome = github::pr_url(&main_worktree, *num)
+                        .ok_or_else(|| {
+                            "could not determine GitHub repo (is gh installed and authenticated?)"
+                                .to_string()
+                        })
+                        .and_then(|url| browser::open_url(&url));
+                    if let Err(e) = outcome {
+                        failures.push(format!("#{num}: {e}"));
                     }
-                });
-            }
+                }
+                let first_label = format!("#{}", pr_numbers[0]);
+                let _ = tx.send(summarize_open_links(
+                    "PR",
+                    pr_numbers.len(),
+                    &first_label,
+                    failures,
+                ));
+            });
             PostAction::None
         }
 
@@ -544,11 +599,29 @@ fn handle_normal(
                 app.set_warning("No Linear issue linked");
                 return PostAction::None;
             }
-            let urls: Vec<String> = issue.linear_links.iter().map(|l| l.url.clone()).collect();
+            let links: Vec<(String, String)> = issue
+                .linear_links
+                .iter()
+                .map(|link| (link.identifier.clone(), link.url.clone()))
+                .collect();
+
+            app.begin_busy();
+            app.set_message("Opening Linear...");
+            let tx = ch.action_tx.clone();
+
             thread::spawn(move || {
-                for url in &urls {
-                    let _ = Command::new("open").arg(url).output();
+                let mut failures = Vec::new();
+                for (identifier, url) in &links {
+                    if let Err(e) = browser::open_url(url) {
+                        failures.push(format!("{identifier}: {e}"));
+                    }
                 }
+                let _ = tx.send(summarize_open_links(
+                    "Linear issue",
+                    links.len(),
+                    &links[0].0,
+                    failures,
+                ));
             });
             PostAction::None
         }
@@ -2306,6 +2379,49 @@ mod tests {
         let (msg, kind) = app.message.as_ref().unwrap();
         assert!(msg.contains("No Linear issue linked"));
         assert_eq!(*kind, MessageKind::Warning);
+    }
+
+    // ================================================================
+    // summarize_open_links: batch-open outcome summaries
+    // ================================================================
+
+    #[test]
+    fn open_links_single_success_names_the_link() {
+        let result = summarize_open_links("PR", 1, "#42", vec![]);
+        assert_eq!(result.message, "Opened PR #42");
+        assert_eq!(result.message_kind, MessageKind::Info);
+    }
+
+    #[test]
+    fn open_links_multi_success_reports_count() {
+        let result = summarize_open_links("PR", 3, "#1", vec![]);
+        assert_eq!(result.message, "Opened 3 PRs");
+        assert_eq!(result.message_kind, MessageKind::Info);
+    }
+
+    #[test]
+    fn open_links_single_failure_includes_label_and_error() {
+        let result = summarize_open_links("PR", 1, "#42", vec!["#42: no handler".to_string()]);
+        assert_eq!(result.message, "Failed to open PR #42: no handler");
+        assert_eq!(result.message_kind, MessageKind::Error);
+    }
+
+    #[test]
+    fn open_links_partial_failure_reports_opened_count() {
+        let result = summarize_open_links("PR", 3, "#1", vec!["#2: gone".to_string()]);
+        assert_eq!(result.message, "Opened 2 of 3 PRs; #2: gone");
+        assert_eq!(result.message_kind, MessageKind::Error);
+    }
+
+    #[test]
+    fn open_links_extra_failures_are_counted() {
+        let failures = vec!["BORK-1: no handler".to_string(), "BORK-2: gone".to_string()];
+        let result = summarize_open_links("Linear issue", 2, "BORK-1", failures);
+        assert_eq!(
+            result.message,
+            "Failed to open Linear issue BORK-1: no handler (+1 more failed)"
+        );
+        assert_eq!(result.message_kind, MessageKind::Error);
     }
 
     #[test]

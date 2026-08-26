@@ -1,66 +1,59 @@
 # Current Work
 
-> Last updated: 2026-08-17
+> Last updated: 2026-08-26
 
 ## Active Task
 
-**Task:** bork-105 — Auto-prune mechanism for stale worktrees
-**Status:** Implementation complete, verified (check + clippy + fmt + 629 tests), uncommitted
+**Task:** bork-148 — Error handling for integrations missing
+**Status:** Implementation complete, reviewed, verified (787 tests + clippy), uncommitted
+
+## Problem
+
+Pressing `o` (open PR) / `O` (open Linear) gave no feedback when the underlying
+command failed (gh missing, unauthenticated, PR gone, no URL handler). The old
+code discarded the `Command` output entirely.
 
 ## Design
 
-- **Scheduled check:** main event loop checks every 60s per project; when the
-  on-disk worktree count (excluding `main/`) reaches `prune_threshold`
-  (default 10) and `auto_prune_check_interval` (default 24h) has passed since
-  `last_prune_at`, a toast suggests pruning. A 5-min in-session cooldown
-  (`last_auto_prune_prompt`) stops the toast re-flashing.
-- **Manual trigger:** `p` in normal mode opens the prune dialog; `bork prune`
-  CLI with `--dry-run`, `--yes`, `--include`, `--exclude`.
-- **Dialog:** lists all worktrees with issue id, dirty/session/column state.
-  Space toggles keep/remove, `a` all, `n` none, Enter confirms, Esc cancels.
-  Defaults: remove clean Done/orphan worktrees; keep dirty, live-session, or
-  non-Done ones. Submitting with a dirty worktree selected is refused.
-- **Execution:** `git worktree remove` (never `--force`) per selection, run in
-  a background thread; results flow back via `ActionResult.prune_outcome`.
-- **Persistence:** `last_prune_at` lives in `.bork/state.json` (AppState), not
-  config — it's machine-written state; keeping it out of config.toml avoids the
-  global-layer merge footgun and write churn in a user-edited file. External
-  writes merge via "later timestamp wins" in `merge_external_state`. Issues
-  keep their card; `issue.worktree` cleared, `issue.pruned_at` set, card shows
-  "pruned 3d ago". `pruned_at` clears when a new worktree is attached.
+- New `src/external/browser.rs` with `open_url(url) -> Result<(), String>` —
+  `open` on macOS, `xdg-open` elsewhere; the error is the first non-empty
+  stderr line so it fits the one-row status bar.
+- `Action::OpenPR` / `Action::OpenLinear` in `src/handler.rs` now use the
+  established async-report pattern (`begin_busy()` + `set_message` + spawned
+  thread sends `ActionResult` over `action_tx`), same shape as
+  `OpenTerminal`/`OpenReview`.
+- PRs open via `github::pr_url` (cached repo identity) instead of
+  `gh pr view --web`: no gh network round trip per PR, no `$GH_BROWSER`
+  blocking risk. `github::open_pr_in_browser` deleted.
+- Shared pure `summarize_open_links(noun, total, first_label, failures)` builds
+  the status message: "Opened PR #42" / "Opened 3 PRs" /
+  "Opened 2 of 3 PRs; #2: <err> (+1 more failed)" /
+  "Failed to open PR #42: <err>". Partial failures name what failed so the
+  user knows not to retry the links that worked.
 
 ## Files
 
-- `src/prune.rs` (new) — scan, classify, execute, apply-to-issues + tests
-- `src/ui/prune_dialog.rs` (new) — dialog renderer
-- `src/config.rs` — `prune_threshold` + `auto_prune_check_interval` config
-  keys; `last_prune_at` on `AppState` (state.json)
-- `src/types.rs` — `Issue.pruned_at`
-- `src/app.rs` — `PruneDialogState`, `InputMode::PruneDialog`, open/close
-- `src/handler.rs` — dialog action handling, submit, background removal
-- `src/main.rs` — `bork prune` subcommand, scheduled toast, outcome apply
-- `src/ui/card.rs` — "pruned Xd ago" indicator + `humanize_age`
-- `src/input/{action,keybindings}.rs`, `src/ui/{help,mod}.rs`, `src/ops.rs`,
-  `src/worktree.rs`, `src/external/opencode.rs`, `README.md` — wiring
+- `src/external/browser.rs` (new) — `open_url`
+- `src/external/mod.rs` — register module
+- `src/external/github.rs` — remove `open_pr_in_browser`
+- `src/handler.rs` — rewritten OpenPR/OpenLinear arms, `summarize_open_links`
+  + 5 tests on the summarizer
 
 ## Progress
 
-- [x] prune module with conservative defaults + tests
-- [x] Interactive dialog (toggle/all/none, dirty refusal)
-- [x] `bork prune` CLI (dry-run/yes/include/exclude)
-- [x] Scheduled per-project prompt with threshold + interval + cooldown
-- [x] `last_prune_at` persisted to state.json (moved out of config per review)
-- [x] Card shows pruned date; clears on worktree reattach
-- [x] Simplify pass applied (4-angle review): shared candidate builder for
-  TUI+CLI, `partition_selection` as the single dirty-refusal policy, git as
-  the sole remove-time authority (dropped `was_dirty`/`SkippedDirty`),
-  `action` lives on the candidate (no parallel vectors), `ActionResult`
-  Default, `Issue::attach_worktree`, shared `unix_now()`,
-  `Project::prunable_worktree_names()`, check-throttled toast
-- [x] cargo check + fmt clean, 627/627 tests pass
+- [x] Implementation
+- [x] /code-review: 6 findings, all addressed (partial-failure reporting,
+      stderr first-line only, no real subprocesses in tests, pr_url instead of
+      gh pr view, dedup via shared summarizer)
+- [x] /simplify (4-angle): browser.rs module split, xdg-open fallback, pure
+      summarizer instead of fn-pointer test seam, single ActionResult build
+- [x] cargo build + 787 tests + clippy clean (verified before worktree move)
 - [ ] Commit + PR
 
-## Notes
+## Out of scope (candidate follow-up issues)
 
-- 6 clippy warnings exist on this branch, all on unchanged lines inherited
-  from main — not introduced here.
+- Background polls swallow errors: gh graphql polls return an empty Vec on
+  failure (indistinguishable from "no PRs") and `main.rs` discards Linear poll
+  errors with `unwrap_or_default()`. Needs debouncing to avoid nagging every
+  poll cycle.
+- Unifying stderr-first-line extraction with the inline copy in `prune.rs`.
