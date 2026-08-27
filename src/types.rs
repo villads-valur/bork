@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -62,7 +63,7 @@ impl fmt::Display for Column {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum AgentKind {
     OpenCode,
     Claude,
@@ -288,12 +289,20 @@ pub struct Issue {
     pub worktree: Option<String>,
     #[serde(default)]
     pub done_at: Option<u64>,
+    /// Agent session IDs keyed by the agent that created them. Switching
+    /// agents keeps every agent's session resumable; only the entry for the
+    /// current `agent_kind` is ever used to resume.
     #[serde(default)]
-    pub session_id: Option<String>,
+    pub sessions: BTreeMap<AgentKind, String>,
     /// Timestamp of the last time this issue's worktree was pruned.
     /// Cleared when a new worktree is assigned.
     #[serde(default)]
     pub pruned_at: Option<u64>,
+    /// Whether the worktree setup script has run for this issue. Set when a
+    /// launch command that included the setup prefix was sent — independent
+    /// of session-id capture, which is best effort and can miss.
+    #[serde(default)]
+    pub setup_ran: bool,
 
     // --- New multi-link fields ---
     #[serde(default)]
@@ -307,6 +316,8 @@ pub struct Issue {
     pub linked_issues: Vec<String>,
 
     // --- Legacy singular fields (read-only, for migration from old state.json) ---
+    #[serde(default, skip_serializing)]
+    pub session_id: Option<String>,
     #[serde(default, skip_serializing)]
     pub linear_id: Option<String>,
     #[serde(default, skip_serializing)]
@@ -343,11 +354,13 @@ impl Issue {
             prompt: None,
             worktree: None,
             done_at: None,
-            session_id: None,
+            sessions: BTreeMap::new(),
             pruned_at: None,
+            setup_ran: false,
             linear_links: Vec::new(),
             github_pr_links: Vec::new(),
             linked_issues: Vec::new(),
+            session_id: None,
             linear_id: None,
             linear_identifier: None,
             linear_url: None,
@@ -362,17 +375,53 @@ impl Issue {
         format!("{}-{}", project_name, self.id.to_lowercase())
     }
 
-    /// Attach a worktree to this issue. Also clears the `pruned_at` marker so
-    /// the "pruned" card indicator disappears; every attach path must keep
-    /// these two fields in sync, so the invariant lives here.
+    /// Session ID for the currently selected agent, if that agent has run
+    /// before. Sessions created by other agents stay in `sessions` untouched.
+    pub fn current_session_id(&self) -> Option<&str> {
+        self.sessions.get(&self.agent_kind).map(String::as_str)
+    }
+
+    /// Whether a landed launch result's detected session id still applies to
+    /// this issue. A kind change while detection was polling means `set_kind`
+    /// invalidated everything the launch produced; an agent change means the
+    /// switch's kill may have landed mid-detection, making the id suspect.
+    pub fn accepts_launch_result(
+        &self,
+        launched_kind: IssueKind,
+        launched_agent: AgentKind,
+    ) -> bool {
+        self.kind == launched_kind && self.agent_kind == launched_agent
+    }
+
+    /// Attach a worktree to this issue. Clears the `pruned_at` marker so the
+    /// "pruned" card indicator disappears, and `setup_ran` because the setup
+    /// script is scoped to a worktree — a fresh checkout (re-attach after a
+    /// prune or an orchestrator round-trip) needs it to run again. Every
+    /// attach path must keep these fields in sync, so the invariant lives
+    /// here.
     pub fn attach_worktree(&mut self, worktree: String) {
         self.worktree = Some(worktree);
         self.pruned_at = None;
+        self.setup_ran = false;
     }
 
     /// Migrate legacy singular fields into the new Vec fields.
     /// Called once after deserialization from old state.json format.
-    pub fn migrate_legacy_fields(&mut self) {
+    ///
+    /// Returns the legacy session id, if any, for the caller to attribute
+    /// and file into `sessions` — the legacy field could hold another
+    /// agent's id (the pre-map mismatch this map fixes, bork-147), and
+    /// telling the owners apart needs the agents' on-disk transcript stores
+    /// (`opencode::LegacySessionStores`), which this module can't touch.
+    #[must_use]
+    pub fn migrate_legacy_fields(&mut self) -> Option<String> {
+        let legacy_session = self.session_id.take();
+        if legacy_session.is_some() || !self.sessions.is_empty() {
+            // A recorded or legacy id proves a launch happened, so the
+            // one-time worktree setup must not run again.
+            self.setup_ran = true;
+        }
+
         if self.linear_links.is_empty() {
             if let (Some(id), Some(identifier), Some(url)) = (
                 self.linear_id.take(),
@@ -399,32 +448,51 @@ impl Issue {
             }
         }
         self.pr_imported = false;
+
+        legacy_session
     }
 
     /// Change the issue kind, clearing state the new kind invalidates.
-    /// Crossing the orchestrator boundary drops the agent session (resuming it
-    /// would skip the new kind's prompt); becoming an orchestrator also drops
-    /// the worktree and PR links since orchestrators run at the project root
-    /// and have no PR of their own.
+    /// Crossing the orchestrator boundary drops all agent sessions (resuming
+    /// any of them would skip the new kind's prompt); becoming an orchestrator
+    /// also drops the worktree and PR links since orchestrators run at the
+    /// project root and have no PR of their own.
     ///
     /// Returns `true` when the orchestrator boundary was crossed. Callers
     /// should then kill any live tmux session, since re-attaching it would
     /// silently resume the old agent with the previous kind's prompt.
+    #[must_use]
     pub fn set_kind(&mut self, kind: IssueKind) -> bool {
-        let previous = self.kind;
+        let resets_session = self.kind_change_resets_session(kind);
         self.kind = kind;
-        if kind == previous {
+        if !resets_session {
             return false;
         }
-        if kind != IssueKind::Orchestrator && previous != IssueKind::Orchestrator {
-            return false;
-        }
-        self.session_id = None;
+        self.sessions.clear();
         if kind == IssueKind::Orchestrator {
             self.worktree = None;
             self.github_pr_links.clear();
         }
         true
+    }
+
+    /// Change the selected agent, keeping every agent's stored session
+    /// resumable. Returns `true` when it changed; callers must then kill any
+    /// live tmux session, which is still running the old agent's process.
+    #[must_use]
+    pub fn set_agent_kind(&mut self, kind: AgentKind) -> bool {
+        let changed = kind != self.agent_kind;
+        self.agent_kind = kind;
+        changed
+    }
+
+    /// Whether changing to `kind` crosses the orchestrator boundary, i.e. the
+    /// issue's live session must be killed before committing the change (a
+    /// re-attached session would resume the old agent with the previous
+    /// kind's prompt and cwd). Single owner of the rule `set_kind` and its
+    /// callers act on.
+    pub fn kind_change_resets_session(&self, kind: IssueKind) -> bool {
+        (self.kind == IssueKind::Orchestrator) != (kind == IssueKind::Orchestrator)
     }
 
     pub fn has_linear(&self) -> bool {
@@ -696,7 +764,7 @@ mod tests {
         let mut issue = test_issue("bork-1", Column::InProgress);
         issue.kind = kind;
         issue.worktree = Some("bork-1-fix-bug".into());
-        issue.session_id = Some("ses_abc".into());
+        issue.sessions.insert(issue.agent_kind, "ses_abc".into());
         issue.github_pr_links.push(LinkedGithubPr {
             number: 42,
             imported: false,
@@ -711,7 +779,7 @@ mod tests {
         assert!(issue.set_kind(IssueKind::Orchestrator));
         assert_eq!(issue.kind, IssueKind::Orchestrator);
         assert!(issue.worktree.is_none());
-        assert!(issue.session_id.is_none());
+        assert!(issue.sessions.is_empty());
         assert!(issue.github_pr_links.is_empty());
     }
 
@@ -719,7 +787,7 @@ mod tests {
     fn set_kind_from_orchestrator_clears_session_only() {
         let mut issue = issue_with_session_state(IssueKind::Orchestrator);
         assert!(issue.set_kind(IssueKind::Agentic));
-        assert!(issue.session_id.is_none());
+        assert!(issue.sessions.is_empty());
         assert_eq!(issue.worktree, Some("bork-1-fix-bug".into()));
         assert_eq!(issue.github_pr_links.len(), 1);
     }
@@ -729,8 +797,34 @@ mod tests {
         let mut issue = issue_with_session_state(IssueKind::Agentic);
         assert!(!issue.set_kind(IssueKind::NonAgentic));
         assert_eq!(issue.worktree, Some("bork-1-fix-bug".into()));
-        assert_eq!(issue.session_id, Some("ses_abc".into()));
+        assert_eq!(issue.current_session_id(), Some("ses_abc"));
         assert_eq!(issue.github_pr_links.len(), 1);
+    }
+
+    #[test]
+    fn set_agent_kind_reports_change_and_keeps_sessions() {
+        let mut issue = issue_with_session_state(IssueKind::Agentic);
+        let original_agent = issue.agent_kind;
+        assert!(!issue.set_agent_kind(original_agent));
+        assert!(issue.set_agent_kind(AgentKind::Codex));
+        assert_eq!(issue.agent_kind, AgentKind::Codex);
+        assert_eq!(
+            issue.sessions.get(&original_agent).map(String::as_str),
+            Some("ses_abc")
+        );
+    }
+
+    #[test]
+    fn attach_worktree_resets_setup_for_fresh_checkout() {
+        // A re-attached worktree is a fresh checkout: the setup script must
+        // run again even though a session was recorded in the old one.
+        let mut issue = issue_with_session_state(IssueKind::Agentic);
+        issue.setup_ran = true;
+        issue.pruned_at = Some(123);
+        issue.attach_worktree("bork-1-redo".into());
+        assert!(!issue.setup_ran);
+        assert!(issue.pruned_at.is_none());
+        assert_eq!(issue.worktree.as_deref(), Some("bork-1-redo"));
     }
 
     #[test]
@@ -738,7 +832,7 @@ mod tests {
         let mut issue = issue_with_session_state(IssueKind::Orchestrator);
         assert!(!issue.set_kind(IssueKind::Orchestrator));
         assert_eq!(issue.worktree, Some("bork-1-fix-bug".into()));
-        assert_eq!(issue.session_id, Some("ses_abc".into()));
+        assert_eq!(issue.current_session_id(), Some("ses_abc"));
     }
 
     // --- Issue session_name ---
@@ -902,10 +996,10 @@ mod tests {
         assert_eq!(AgentKind::ALL.len(), 4);
     }
 
-    // --- Issue session_id ---
+    // --- Issue sessions ---
 
     #[test]
-    fn issue_deserializes_without_session_id_defaults_to_none() {
+    fn issue_deserializes_without_sessions_defaults_to_empty() {
         let json = r#"{
             "id": "bork-1",
             "title": "Test",
@@ -916,17 +1010,45 @@ mod tests {
             "prompt": null
         }"#;
         let issue: Issue = serde_json::from_str(json).unwrap();
-        assert_eq!(issue.session_id, None);
+        assert!(issue.sessions.is_empty());
+        assert_eq!(issue.current_session_id(), None);
     }
 
     #[test]
-    fn issue_serializes_and_deserializes_session_id() {
+    fn issue_serializes_and_deserializes_sessions() {
         let mut issue = test_issue("bork-1", Column::InProgress);
-        issue.session_id = Some("ses_abc123xyz".to_string());
+        issue
+            .sessions
+            .insert(AgentKind::OpenCode, "ses_abc123xyz".to_string());
         let json = serde_json::to_string(&issue).unwrap();
-        assert!(json.contains("\"session_id\":\"ses_abc123xyz\""));
+        // On-disk shape: a map keyed by agent variant name.
+        assert!(json.contains(r#""sessions":{"OpenCode":"ses_abc123xyz"}"#));
         let roundtrip: Issue = serde_json::from_str(&json).unwrap();
-        assert_eq!(roundtrip.session_id, Some("ses_abc123xyz".to_string()));
+        assert_eq!(roundtrip.sessions, issue.sessions);
+    }
+
+    #[test]
+    fn migration_yields_legacy_session_id_for_attribution() {
+        // Keying is the caller's job (opencode::LegacySessionStores); types
+        // only surrenders the id, marks the launch, and clears the field.
+        let json = r#"{
+            "id": "bork-1",
+            "title": "Test",
+            "column": "Todo",
+            "agent_kind": "OpenCode",
+            "agent_mode": "Plan",
+            "prompt": null,
+            "session_id": "ses_legacy"
+        }"#;
+        let mut issue: Issue = serde_json::from_str(json).unwrap();
+        let legacy = issue.migrate_legacy_fields();
+        assert_eq!(legacy.as_deref(), Some("ses_legacy"));
+        assert_eq!(issue.session_id, None);
+        // A legacy id proves a launch happened, so setup must not re-run.
+        assert!(issue.setup_ran);
+        // Legacy field never serializes back out.
+        let out = serde_json::to_string(&issue).unwrap();
+        assert!(!out.contains("\"session_id\""));
     }
 
     // --- AgentStatus ---
@@ -976,7 +1098,7 @@ mod tests {
             "linear_imported": true
         }"#;
         let mut issue: Issue = serde_json::from_str(json).unwrap();
-        issue.migrate_legacy_fields();
+        let _ = issue.migrate_legacy_fields();
         assert_eq!(issue.linear_links.len(), 1);
         assert_eq!(issue.linear_links[0].id, "uuid-abc");
         assert_eq!(issue.linear_links[0].identifier, "VIL-123");
@@ -997,7 +1119,7 @@ mod tests {
             "pr_import_source": "Authored"
         }"#;
         let mut issue: Issue = serde_json::from_str(json).unwrap();
-        issue.migrate_legacy_fields();
+        let _ = issue.migrate_legacy_fields();
         assert_eq!(issue.github_pr_links.len(), 1);
         assert_eq!(issue.github_pr_links[0].number, 42);
         assert!(issue.github_pr_links[0].imported);
@@ -1022,7 +1144,7 @@ mod tests {
             "linear_url": "https://b"
         }"#;
         let mut issue: Issue = serde_json::from_str(json).unwrap();
-        issue.migrate_legacy_fields();
+        let _ = issue.migrate_legacy_fields();
         assert_eq!(issue.linear_links.len(), 1);
         assert_eq!(issue.linear_links[0].identifier, "VIL-1");
     }

@@ -193,12 +193,80 @@ fn configure_extended_keys(session_name: &str) {
     set_option(session_name, "extended-keys-format", "csi-u");
 }
 
-pub fn kill_session(name: &str) -> Result<(), AppError> {
-    let _ = Command::new("tmux")
+/// Kill a tmux session. Returns whether a live session was killed; a missing
+/// session (or missing tmux entirely) is `Ok(false)`.
+///
+/// Issue sessions should go through `opencode::terminate_session` instead,
+/// which also sweeps processes the agent leaked — calling this directly for
+/// an issue session reintroduces orphan leaks.
+pub fn kill_session(name: &str) -> Result<bool, AppError> {
+    let output = match Command::new("tmux")
         .args(["kill-session", "-t", name])
-        .stderr(Stdio::null())
-        .status();
-    Ok(())
+        .output()
+    {
+        Ok(output) => output,
+        // No tmux binary means no session to kill; same outcome as a missing
+        // session, and CLI subcommands must keep working without tmux.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => {
+            return Err(AppError::Tmux(format!(
+                "failed to kill session '{name}': {e}"
+            )))
+        }
+    };
+
+    if output.status.success() {
+        return Ok(true);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if is_missing_session_error(&stderr) {
+        return Ok(false);
+    }
+
+    Err(AppError::Tmux(format!(
+        "tmux kill-session failed for '{name}': {}",
+        stderr.trim()
+    )))
+}
+
+/// Return the shell PID for every pane in a session. Missing sessions are an
+/// empty set so termination remains idempotent.
+#[cfg_attr(test, allow(dead_code))]
+pub fn pane_pids(name: &str) -> Result<Vec<i32>, AppError> {
+    let output = match Command::new("tmux")
+        .args(["list-panes", "-s", "-t", name, "-F", "#{pane_pid}"])
+        .output()
+    {
+        Ok(output) => output,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(AppError::Tmux(format!(
+                "failed to list panes for session '{name}': {e}"
+            )))
+        }
+    };
+
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse().ok())
+            .collect());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if is_missing_session_error(&stderr) {
+        return Ok(Vec::new());
+    }
+
+    Err(AppError::Tmux(format!(
+        "tmux list-panes failed for '{name}': {}",
+        stderr.trim()
+    )))
+}
+
+fn is_missing_session_error(stderr: &str) -> bool {
+    stderr.contains("can't find session") || stderr.contains("no server running")
 }
 
 pub fn send_keys(session: &str, keys: &str) -> Result<(), AppError> {
@@ -288,4 +356,22 @@ pub fn open_popup(session: &str, title: &str) -> Result<(), AppError> {
 fn shell_escape(s: &str) -> String {
     // Simple escaping: wrap in single quotes, escape any internal single quotes
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_session_errors_are_harmless() {
+        assert!(is_missing_session_error("can't find session: bork-1"));
+        assert!(is_missing_session_error("no server running on /tmp/tmux"));
+    }
+
+    #[test]
+    fn connection_errors_are_not_treated_as_missing_sessions() {
+        assert!(!is_missing_session_error(
+            "error connecting to /tmp/tmux/default (Operation not permitted)"
+        ));
+    }
 }

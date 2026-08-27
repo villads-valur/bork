@@ -1209,6 +1209,7 @@ impl PruneDialogState {
 pub enum ConfirmAction {
     KillSession {
         session_name: String,
+        issue_id: String,
         project_id: ProjectId,
     },
     DeleteIssue {
@@ -1235,7 +1236,14 @@ pub use crate::dialog_state::{DialogField, DialogState};
 
 /// 3-way field merge: for each field, if file diverged from base but memory didn't,
 /// take the file value. If both diverged, memory wins.
+fn crossed_orchestrator_boundary(issue: &Issue, base: &Issue) -> bool {
+    (issue.kind == IssueKind::Orchestrator) != (base.kind == IssueKind::Orchestrator)
+}
+
 fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
+    // Must be captured before merge_field!(kind) overwrites memory.kind.
+    let memory_crossed_boundary = crossed_orchestrator_boundary(memory, base);
+
     macro_rules! merge_field {
         ($field:ident) => {
             if memory.$field == base.$field && file.$field != base.$field {
@@ -1251,14 +1259,49 @@ fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
     merge_field!(prompt);
     merge_field!(worktree);
     merge_field!(done_at);
-    merge_field!(session_id);
+    merge_field!(pruned_at);
+    merge_field!(setup_ran);
     merge_field!(linear_links);
     merge_field!(github_pr_links);
     merge_field!(linked_issues);
+
+    // `sessions` merges entry-wise: per-agent entries are independent, so a
+    // concurrent write to one agent's session (e.g. `bork issue start` from a
+    // spawned agent) must not clobber another agent's entry held in memory.
+    // Exception: a memory-side crossing of the orchestrator boundary cleared
+    // the whole map, and that clear must win over concurrent file-side
+    // inserts — resuming any pre-conversion session would skip the new
+    // kind's prompt.
+    if !memory_crossed_boundary {
+        for agent in AgentKind::ALL {
+            if memory.sessions.get(&agent) == base.sessions.get(&agent)
+                && file.sessions.get(&agent) != base.sessions.get(&agent)
+            {
+                match file.sessions.get(&agent) {
+                    Some(sid) => memory.sessions.insert(agent, sid.clone()),
+                    None => memory.sessions.remove(&agent),
+                };
+            }
+        }
+    }
+
+    // A file-side crossing of the orchestrator boundary clears sessions
+    // atomically with the kind (`set_kind`). When that kind change won the
+    // merge, its session clear must win too — otherwise a concurrent
+    // memory-side session write survives and resumes the pre-conversion
+    // conversation on the next launch.
+    let file_crossed_boundary = crossed_orchestrator_boundary(file, base);
+    // Skip when memory crossed too: its own set_kind already cleared the
+    // pre-conversion sessions, and anything it recorded since (e.g. the new
+    // orchestrator's session) is newer than the file's empty map.
+    if file_crossed_boundary && !memory_crossed_boundary && memory.kind == file.kind {
+        memory.sessions = file.sessions.clone();
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MessageKind {
+    #[default]
     Info,
     Warning,
     Error,
@@ -1287,6 +1330,10 @@ pub struct App {
     /// Issue IDs with a session launch currently in flight. Guards against
     /// double-launch races from repeated keypresses.
     pub launches_in_flight: HashSet<String>,
+    /// Issue IDs whose in-flight launch was invalidated (session killed
+    /// mid-detection). The landing result's session id and setup flag are
+    /// discarded — the pane the detectors were watching is gone.
+    pub launches_invalidated: HashSet<String>,
     pub linear_picker: Option<LinearPickerState>,
     pub linear_picker_context: LinearPickerContext,
     pub picker_tab: ImportSource,
@@ -1318,6 +1365,7 @@ impl App {
             busy_visible_since: None,
             spinner_tick: 0,
             launches_in_flight: HashSet::new(),
+            launches_invalidated: HashSet::new(),
             linear_picker: None,
             linear_picker_context: LinearPickerContext::Import,
             picker_tab: ImportSource::Linear,
@@ -1510,6 +1558,17 @@ impl App {
             self.busy_visible_since = Some(Instant::now());
         }
         self.busy_count += 1;
+    }
+
+    /// Mark an issue's in-flight launch as invalidated (its session was
+    /// killed mid-detection), so the landing handler drops the result's
+    /// session id and setup flag. Guarded on the launch actually being in
+    /// flight — an unconditional insert would leave a stale entry that
+    /// poisons the issue's next launch.
+    pub fn invalidate_inflight_launch(&mut self, issue_id: &str) {
+        if self.launches_in_flight.contains(issue_id) {
+            self.launches_invalidated.insert(issue_id.to_string());
+        }
     }
 
     /// Whether the spinner should currently be drawn. True while any
@@ -5091,6 +5150,112 @@ mod tests {
 
         merge_issue_fields(&mut memory, &base, &file);
         assert_eq!(memory.title, "Same");
+    }
+
+    #[test]
+    fn merge_sessions_entrywise_keeps_both_sides() {
+        let base = test_issue_titled("a", "Original", Column::Todo);
+        let mut memory = base.clone();
+        memory
+            .sessions
+            .insert(AgentKind::Claude, "uuid-local".to_string());
+        let mut file = base.clone();
+        file.sessions
+            .insert(AgentKind::OpenCode, "ses_external".to_string());
+
+        merge_issue_fields(&mut memory, &base, &file);
+        assert_eq!(
+            memory.sessions.get(&AgentKind::Claude).map(String::as_str),
+            Some("uuid-local"),
+            "memory-side entry survives"
+        );
+        assert_eq!(
+            memory
+                .sessions
+                .get(&AgentKind::OpenCode)
+                .map(String::as_str),
+            Some("ses_external"),
+            "file-side entry merges in"
+        );
+    }
+
+    #[test]
+    fn merge_memory_side_conversion_rejects_file_session_insert() {
+        // TUI converts to orchestrator (clears sessions) while an external
+        // `bork issue start` writes a brand-new session entry to disk. The
+        // in-memory clear is part of the conversion and must win.
+        let base = test_issue_titled("a", "Original", Column::Todo);
+        let mut memory = base.clone();
+        let _ = memory.set_kind(IssueKind::Orchestrator);
+        let mut file = base.clone();
+        file.sessions
+            .insert(AgentKind::OpenCode, "ses_external".to_string());
+
+        merge_issue_fields(&mut memory, &base, &file);
+        assert_eq!(memory.kind, IssueKind::Orchestrator);
+        assert!(
+            memory.sessions.is_empty(),
+            "conversion's clear must not adopt concurrent file-side sessions"
+        );
+    }
+
+    #[test]
+    fn merge_pruned_at_and_setup_ran_adopt_file_changes() {
+        let base = test_issue_titled("a", "Original", Column::Todo);
+        let mut memory = base.clone();
+        let mut file = base.clone();
+        file.pruned_at = Some(1_700_000_000);
+        file.setup_ran = true;
+
+        merge_issue_fields(&mut memory, &base, &file);
+        assert_eq!(memory.pruned_at, Some(1_700_000_000));
+        assert!(memory.setup_ran);
+    }
+
+    #[test]
+    fn merge_orchestrator_conversion_clears_memory_sessions() {
+        // File side converted to orchestrator (set_kind cleared sessions);
+        // a concurrent memory-side session write must not survive the merge.
+        let base = test_issue_titled("a", "Original", Column::Todo);
+        let mut memory = base.clone();
+        memory
+            .sessions
+            .insert(AgentKind::OpenCode, "ses_stale".to_string());
+        let mut file = base.clone();
+        file.kind = IssueKind::Orchestrator;
+
+        merge_issue_fields(&mut memory, &base, &file);
+        assert_eq!(memory.kind, IssueKind::Orchestrator);
+        assert!(
+            memory.sessions.is_empty(),
+            "conversion's session clear wins over the concurrent write"
+        );
+    }
+
+    #[test]
+    fn merge_double_crossing_keeps_memory_post_conversion_session() {
+        // Both sides converted to orchestrator; memory then launched it and
+        // recorded the new orchestrator's session. The file's empty map is
+        // older than that write and must not wipe it.
+        let base = test_issue_titled("a", "Original", Column::Todo);
+        let mut memory = base.clone();
+        let _ = memory.set_kind(IssueKind::Orchestrator);
+        memory
+            .sessions
+            .insert(AgentKind::OpenCode, "ses_orch".to_string());
+        let mut file = base.clone();
+        let _ = file.set_kind(IssueKind::Orchestrator);
+
+        merge_issue_fields(&mut memory, &base, &file);
+        assert_eq!(memory.kind, IssueKind::Orchestrator);
+        assert_eq!(
+            memory
+                .sessions
+                .get(&AgentKind::OpenCode)
+                .map(String::as_str),
+            Some("ses_orch"),
+            "memory's post-conversion session survives a concurrent file-side conversion"
+        );
     }
 
     #[test]

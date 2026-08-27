@@ -193,13 +193,11 @@ pub fn discover_new_projects(known_roots: HashSet<ProjectId>) -> ReloadResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    // Serialize tests that modify XDG_CONFIG_HOME
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn with_temp_config(name: &str, test: impl FnOnce()) {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::XDG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let dir =
             std::env::temp_dir().join(format!("bork-test-global-{}-{}", name, std::process::id()));

@@ -29,8 +29,17 @@ pub struct DialogState {
     pub available_agents: Vec<AgentKind>,
     pub agent_mode: AgentMode,
     pub agent_kind: AgentKind,
+    /// The agent shown when the dialog opened (post-normalization). Submit
+    /// compares against this to tell a user-made switch from the silent
+    /// fallback `resolve_agent_kind` applies when the stored agent isn't
+    /// available — only the former should kill a live session.
+    pub initial_agent_kind: AgentKind,
     pub focused_field: usize,
     pub editing_index: Option<usize>,
+    /// ID of the issue being edited. Submit resolves by this, not by
+    /// `editing_index`, since background merges can reorder issues while
+    /// the dialog is open.
+    pub editing_issue_id: Option<String>,
     pub target_column: Option<Column>,
     pub linear_issues: Vec<LinearIssue>,
     pub linear_detached: bool,
@@ -77,8 +86,10 @@ impl DialogState {
             available_agents,
             agent_mode: Self::normalize_mode_for_agent(AgentMode::Plan, resolved_agent),
             agent_kind: resolved_agent,
+            initial_agent_kind: resolved_agent,
             focused_field: title_idx,
             editing_index: None,
+            editing_issue_id: None,
             target_column: None,
             linear_issues: Vec::new(),
             linear_detached: false,
@@ -147,8 +158,10 @@ impl DialogState {
             available_agents,
             agent_mode: Self::normalize_mode_for_agent(issue.agent_mode, resolved_agent),
             agent_kind: resolved_agent,
+            initial_agent_kind: resolved_agent,
             focused_field: title_idx,
             editing_index: Some(index),
+            editing_issue_id: Some(issue.id.clone()),
             target_column: None,
             linear_issues,
             linear_detached: false,

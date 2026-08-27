@@ -4,7 +4,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config;
-use crate::external::tmux;
+use crate::external::opencode;
 use crate::types::{AgentKind, AgentMode, Column, Issue, IssueKind};
 use crate::ui::styles::truncate;
 use crate::worktree;
@@ -162,6 +162,7 @@ fn format_issue_table(issues: &[&Issue], _project_name: &str) -> anyhow::Result<
     Ok(out.trim_end().to_string())
 }
 
+#[derive(Default)]
 pub struct CreateOptions {
     pub title: String,
     pub column: Option<Column>,
@@ -199,6 +200,7 @@ pub fn create_issue(project_root: &Path, opts: CreateOptions) -> anyhow::Result<
     Ok(issue)
 }
 
+#[derive(Default)]
 pub struct UpdateOptions {
     pub title: Option<String>,
     pub column: Option<Column>,
@@ -226,8 +228,9 @@ pub fn update_issue(
     if let Some(column) = opts.column {
         move_issue_in_state(issue, column);
     }
+    let mut session_stale = false;
     if let Some(agent_kind) = opts.agent_kind {
-        issue.agent_kind = agent_kind;
+        session_stale |= issue.set_agent_kind(agent_kind);
     }
     if let Some(agent_mode) = opts.agent_mode {
         issue.agent_mode = agent_mode;
@@ -240,12 +243,16 @@ pub fn update_issue(
         }
     }
     if let Some(kind) = opts.kind {
-        if issue.set_kind(kind) {
-            // Kill any live session so it isn't re-attached with the old
-            // kind's prompt and cwd. Best effort; the session may not exist.
-            let config = config::load_config_from(project_root);
-            let _ = tmux::kill_session(&issue.session_name(&config.project_name));
-        }
+        session_stale |= issue.set_kind(kind);
+    }
+
+    if session_stale {
+        // Kill any live session so it isn't re-attached with the old kind's
+        // prompt and cwd, or the old agent's process. A failed cleanup
+        // aborts here, before the state is persisted below, so it cannot
+        // leave an untracked old agent running against saved changes.
+        let config = config::load_config_from(project_root);
+        opencode::terminate_session(project_root, &issue.session_name(&config.project_name))?;
     }
 
     let updated = issue.clone();
@@ -259,6 +266,10 @@ pub fn delete_issue(project_root: &Path, issue_id: &str) -> anyhow::Result<Issue
 
     let idx = find_issue_index(&state.issues, issue_id)
         .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", issue_id))?;
+
+    let config = config::load_config_from(project_root);
+    let session_name = state.issues[idx].session_name(&config.project_name);
+    opencode::terminate_session(project_root, &session_name)?;
 
     let removed = state.issues.remove(idx);
     remove_link_references(&mut state.issues, &removed.id);
@@ -582,10 +593,7 @@ pub fn archive_issue(
     let issue = state.issues[idx].clone();
 
     let session_name = issue.session_name(&app_config.project_name);
-    let session_killed = tmux::session_exists(&session_name);
-    if session_killed {
-        let _ = tmux::kill_session(&session_name);
-    }
+    let session_killed = opencode::terminate_session(project_root, &session_name)?;
 
     let worktree_removed = match issue.worktree.as_deref() {
         Some(dir) => {
@@ -883,7 +891,8 @@ mod tests {
         // Simulate an issue that already ran: worktree, session, and a PR link.
         let mut state = config::load_state(root);
         state.issues[0].worktree = Some("test-1-convert-me".into());
-        state.issues[0].session_id = Some("ses_abc".into());
+        let agent = state.issues[0].agent_kind;
+        state.issues[0].sessions.insert(agent, "ses_abc".into());
         state.issues[0]
             .github_pr_links
             .push(crate::types::LinkedGithubPr {
@@ -909,8 +918,51 @@ mod tests {
 
         assert_eq!(updated.kind, IssueKind::Orchestrator);
         assert!(updated.worktree.is_none());
-        assert!(updated.session_id.is_none());
+        assert!(updated.sessions.is_empty());
         assert!(updated.github_pr_links.is_empty());
+    }
+
+    #[test]
+    fn update_agent_keeps_stored_sessions() {
+        let dir = setup_project();
+        let root = dir.path();
+        create_issue(
+            root,
+            CreateOptions {
+                title: "Switch me".into(),
+                agent_kind: Some(AgentKind::OpenCode),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mut state = config::load_state(root);
+        state.issues[0]
+            .sessions
+            .insert(AgentKind::OpenCode, "ses_abc".into());
+        config::save_state(&state, root).unwrap();
+
+        let updated = update_issue(
+            root,
+            "test-1",
+            UpdateOptions {
+                agent_kind: Some(AgentKind::Claude),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(updated.agent_kind, AgentKind::Claude);
+        // The old agent's session survives the switch and resumes on switch-back.
+        assert_eq!(
+            updated
+                .sessions
+                .get(&AgentKind::OpenCode)
+                .map(String::as_str),
+            Some("ses_abc")
+        );
+        // The new agent has no session yet, so the next launch starts fresh.
+        assert_eq!(updated.current_session_id(), None);
     }
 
     #[test]
@@ -957,8 +1009,17 @@ mod tests {
         )
         .unwrap();
 
+        let status_dir = config::agent_status_dir(root);
+        fs::create_dir_all(&status_dir).unwrap();
+        let status_file = status_dir.join("test-test-1.json");
+        let prompt_file = status_dir.join("prompt-test-test-1.txt");
+        fs::write(&status_file, "{}").unwrap();
+        fs::write(&prompt_file, "prompt").unwrap();
+
         let deleted = delete_issue(root, "test-1").unwrap();
         assert_eq!(deleted.title, "Delete me");
+        assert!(!status_file.exists());
+        assert!(!prompt_file.exists());
 
         let output = list_issues(
             root,

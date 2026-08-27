@@ -1,5 +1,4 @@
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
 
@@ -7,11 +6,13 @@ use crate::app::{
     ActionContext, App, ConfirmAction, ImportSource, InputMode, LinearPickerContext, MessageKind,
     Project, ProjectId,
 };
-use crate::config::{self, AppConfig};
-use crate::external::{github, opencode, tmux, tuicr};
+use crate::config::AppConfig;
+use crate::external::{browser, github, opencode, tmux, tuicr};
 use crate::global_config::ReloadResult;
 use crate::input::Action;
-use crate::types::{Column, Issue, IssueKind, LinkedGithubPr, LinkedLinear, PrImportSource};
+use crate::types::{
+    AgentKind, Column, Issue, IssueKind, LinkedGithubPr, LinkedLinear, PrImportSource,
+};
 
 pub struct ActionChannels<'a> {
     pub action_tx: &'a mpsc::Sender<ActionResult>,
@@ -21,31 +22,34 @@ pub struct ActionChannels<'a> {
     pub reload_tx: &'a mpsc::Sender<ReloadResult>,
 }
 
+/// A detected agent session id for the issue named by `launched_issue_id`.
+/// Agent and kind are captured at launch time: the id is stored under the
+/// agent that minted it, and a kind change while detection was still polling
+/// means the session was invalidated and must not be recorded.
+pub struct LaunchedSession {
+    pub agent: AgentKind,
+    pub kind: IssueKind,
+    pub session_id: String,
+}
+
+#[derive(Default)]
 pub struct ActionResult {
     pub message: String,
     pub message_kind: MessageKind,
     pub session_to_open: Option<String>,
     pub popup_title: Option<String>,
-    pub session_id: Option<(String, String)>,
+    pub launched_session: Option<LaunchedSession>,
+    /// True when this launch's command included the one-time worktree setup
+    /// prefix, so the issue's `setup_ran` flag must be persisted even if
+    /// session-id detection failed.
+    pub launched_setup_ran: bool,
     /// Set (on success *and* failure) when this result completes a session
     /// launch, so the main loop can clear the in-flight guard for the issue.
     pub launched_issue_id: Option<String>,
     /// If set, apply this prune outcome to the issues of `project_id`.
     pub prune_outcome: Option<(crate::app::ProjectId, crate::prune::PruneOutcome)>,
-}
-
-impl Default for ActionResult {
-    fn default() -> Self {
-        Self {
-            message: String::new(),
-            message_kind: MessageKind::Info,
-            session_to_open: None,
-            popup_title: None,
-            session_id: None,
-            launched_issue_id: None,
-            prune_outcome: None,
-        }
-    }
+    /// Remove this issue only after its asynchronous session teardown succeeds.
+    pub issue_to_delete: Option<(ProjectId, String)>,
 }
 
 pub enum PostAction {
@@ -105,6 +109,43 @@ pub fn handle_action(
             handle_prune_dialog(app, action, ctx, ch.action_tx);
             PostAction::None
         }
+    }
+}
+
+/// Summarize a batch of browser-open attempts for the status bar. `noun` names
+/// what was opened ("PR", "Linear issue"); `failures` holds one "label: error"
+/// line per failed link. Partial failures report how many opened plus the
+/// first failure, so the user knows not to retry the ones that worked.
+fn summarize_open_links(
+    noun: &str,
+    total: usize,
+    first_label: &str,
+    failures: Vec<String>,
+) -> ActionResult {
+    let (message, message_kind) = if failures.is_empty() {
+        let message = if total == 1 {
+            format!("Opened {noun} {first_label}")
+        } else {
+            format!("Opened {total} {noun}s")
+        };
+        (message, MessageKind::Info)
+    } else {
+        let mut detail = failures[0].clone();
+        if failures.len() > 1 {
+            detail.push_str(&format!(" (+{} more failed)", failures.len() - 1));
+        }
+        let opened = total - failures.len();
+        let message = if opened == 0 {
+            format!("Failed to open {noun} {detail}")
+        } else {
+            format!("Opened {opened} of {total} {noun}s; {detail}")
+        };
+        (message, MessageKind::Error)
+    };
+    ActionResult {
+        message,
+        message_kind,
+        ..Default::default()
     }
 }
 
@@ -237,6 +278,7 @@ fn handle_normal(
                 format!("Kill session '{}'? (y/n)", session_name),
                 ConfirmAction::KillSession {
                     session_name,
+                    issue_id: issue.id.clone(),
                     project_id: ctx.project_id.clone(),
                 },
             );
@@ -361,10 +403,8 @@ fn handle_normal(
                 let result = match tmux::create_session(&session_name, &project_root) {
                     Ok(()) => ActionResult {
                         message: format!("Terminal session '{}' ready", session_name),
-                        message_kind: MessageKind::Info,
                         session_to_open: Some(session_name),
                         popup_title: Some(popup_title),
-                        session_id: None,
                         ..Default::default()
                     },
                     Err(e) => ActionResult {
@@ -486,10 +526,8 @@ fn handle_normal(
                 let result = match outcome {
                     Ok(()) => ActionResult {
                         message: "tuicr ready".to_string(),
-                        message_kind: MessageKind::Info,
                         session_to_open: Some(session_name),
                         popup_title: Some(popup_title),
-                        session_id: None,
                         ..Default::default()
                     },
                     Err(e) => ActionResult {
@@ -514,25 +552,44 @@ fn handle_normal(
             let Some(issue) = app.context_project(ctx).selected_issue(&q) else {
                 return PostAction::None;
             };
-            if issue.github_pr_links.is_empty() {
+            let pr_numbers: Vec<u32> = if issue.github_pr_links.is_empty() {
                 let Some(pr) = app.context_project(ctx).pr_for(issue) else {
                     app.set_warning("No PR found for this issue");
                     return PostAction::None;
                 };
-                let pr_number = pr.number;
-                let main_worktree = app.context_project(ctx).config.project_root.join("main");
-                thread::spawn(move || {
-                    github::open_pr_in_browser(pr_number, &main_worktree);
-                });
+                vec![pr.number]
             } else {
-                let pr_numbers: Vec<u32> = issue.pr_numbers();
-                let main_worktree = app.context_project(ctx).config.project_root.join("main");
-                thread::spawn(move || {
-                    for num in &pr_numbers {
-                        github::open_pr_in_browser(*num, &main_worktree);
+                issue.pr_numbers()
+            };
+            let main_worktree = app.context_project(ctx).config.project_root.join("main");
+
+            app.begin_busy();
+            app.set_message("Opening PR...");
+            let tx = ch.action_tx.clone();
+
+            thread::spawn(move || {
+                // pr_url resolves the repo identity via gh (cached after the
+                // first call), so it must run off the main thread.
+                let mut failures = Vec::new();
+                for num in &pr_numbers {
+                    let outcome = github::pr_url(&main_worktree, *num)
+                        .ok_or_else(|| {
+                            "could not determine GitHub repo (is gh installed and authenticated?)"
+                                .to_string()
+                        })
+                        .and_then(|url| browser::open_url(&url));
+                    if let Err(e) = outcome {
+                        failures.push(format!("#{num}: {e}"));
                     }
-                });
-            }
+                }
+                let first_label = format!("#{}", pr_numbers[0]);
+                let _ = tx.send(summarize_open_links(
+                    "PR",
+                    pr_numbers.len(),
+                    &first_label,
+                    failures,
+                ));
+            });
             PostAction::None
         }
 
@@ -544,11 +601,29 @@ fn handle_normal(
                 app.set_warning("No Linear issue linked");
                 return PostAction::None;
             }
-            let urls: Vec<String> = issue.linear_links.iter().map(|l| l.url.clone()).collect();
+            let links: Vec<(String, String)> = issue
+                .linear_links
+                .iter()
+                .map(|link| (link.identifier.clone(), link.url.clone()))
+                .collect();
+
+            app.begin_busy();
+            app.set_message("Opening Linear...");
+            let tx = ch.action_tx.clone();
+
             thread::spawn(move || {
-                for url in &urls {
-                    let _ = Command::new("open").arg(url).output();
+                let mut failures = Vec::new();
+                for (identifier, url) in &links {
+                    if let Err(e) = browser::open_url(url) {
+                        failures.push(format!("{identifier}: {e}"));
+                    }
                 }
+                let _ = tx.send(summarize_open_links(
+                    "Linear issue",
+                    links.len(),
+                    &links[0].0,
+                    failures,
+                ));
             });
             PostAction::None
         }
@@ -777,20 +852,73 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
 
     let proj_id = ctx.project_id.clone();
 
-    if let Some(idx) = dialog.editing_index {
+    if dialog.editing_index.is_some() {
+        // Only apply the dialog's agent when the user actually moved the
+        // picker. An untouched picker's value can be wrong two ways: a
+        // normalized fallback for an unavailable stored agent, or stale
+        // against a concurrent CLI agent change — silently writing it back
+        // would flip the issue while the live session keeps running the real
+        // agent's process.
+        let picker_moved = dialog.agent_kind != dialog.initial_agent_kind;
+
+        let Some(p) = app.find_project(&proj_id) else {
+            app.set_warning("Project no longer available");
+            return;
+        };
+        // Resolve by ID, not the index captured at dialog-open: background
+        // merges can reorder or remove issues while the dialog is up, and a
+        // stale index would edit (and kill the session of) the wrong issue.
+        let idx = dialog.editing_issue_id.as_deref().and_then(|id| {
+            let lower = id.to_lowercase();
+            p.issues.iter().position(|i| i.id.to_lowercase() == lower)
+        });
+
+        // An in-flight launch is still detecting its session id; killing the
+        // session out from under it wastes the launch and leaves its result
+        // describing a dead pane. Block the destructive edits until the
+        // launch settles.
+        if let Some(idx) = idx {
+            let issue = &p.issues[idx];
+            let switches_agent = picker_moved && dialog.agent_kind != issue.agent_kind;
+            let crosses_boundary =
+                (issue.kind == IssueKind::Orchestrator) != (dialog.kind == IssueKind::Orchestrator);
+            if (switches_agent || crosses_boundary) && app.launches_in_flight.contains(&issue.id) {
+                app.set_warning("Launch in progress; wait for it before switching agent or kind");
+                return;
+            }
+        }
+
         let Some(p) = app.find_project_mut(&proj_id) else {
             app.set_warning("Project no longer available");
             return;
         };
-        if idx < p.issues.len() {
+        if let Some(idx) = idx {
             let session_name = p.issues[idx].session_name(&p.config.project_name);
             let detached_worktree = p.issues[idx].worktree.clone();
+            let crossed_orchestrator_boundary =
+                p.issues[idx].kind_change_resets_session(dialog.kind);
+            let agent_changed = picker_moved && dialog.agent_kind != p.issues[idx].agent_kind;
+
+            if crossed_orchestrator_boundary || agent_changed {
+                // A live session would otherwise be re-attached with the old
+                // kind's prompt and cwd, or the old agent's process. Kill it
+                // before committing the edit so a failed cleanup can't leave
+                // an untracked old agent running, and drop the cached
+                // liveness so relaunch works before the next 2s tmux poll.
+                if let Err(e) = opencode::terminate_session(&p.config.project_root, &session_name) {
+                    app.set_error(format!("Failed to reset session: {e}"));
+                    return;
+                }
+                p.live.active_sessions.remove(&session_name);
+            }
 
             p.issues[idx].title = title;
             p.issues[idx].prompt = prompt;
-            p.issues[idx].agent_kind = dialog.agent_kind;
+            if picker_moved {
+                let _ = p.issues[idx].set_agent_kind(dialog.agent_kind);
+            }
             p.issues[idx].agent_mode = dialog.agent_mode;
-            let crossed_orchestrator_boundary = p.issues[idx].set_kind(dialog.kind);
+            let _ = p.issues[idx].set_kind(dialog.kind);
 
             apply_linear_fields(&mut p.issues[idx], &dialog);
             apply_pr_fields(&mut p.issues[idx], &dialog);
@@ -799,9 +927,6 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
             p.mark_dirty();
 
             if crossed_orchestrator_boundary {
-                // A live session would otherwise be re-attached with the old
-                // kind's prompt and cwd.
-                let _ = tmux::kill_session(&session_name);
                 match detached_worktree.filter(|_| dialog.kind == IssueKind::Orchestrator) {
                     Some(wt) => app.set_message(format!(
                         "Updated {} (session reset; worktree {} detached, remove it manually)",
@@ -809,9 +934,16 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
                     )),
                     None => app.set_message(format!("Updated {} (session reset)", updated_id)),
                 }
+            } else if agent_changed {
+                app.set_message(format!(
+                    "Updated {} (switched to {}, other sessions kept)",
+                    updated_id, dialog.agent_kind
+                ));
             } else {
                 app.set_message(format!("Updated {}", updated_id));
             }
+        } else {
+            app.set_warning("Issue no longer exists");
         }
         return;
     }
@@ -1348,35 +1480,25 @@ fn handle_confirm(
                 match confirm_action {
                     ConfirmAction::KillSession {
                         session_name,
+                        issue_id,
                         project_id,
                     } => {
                         let Some(project) = app.find_project(&project_id) else {
                             app.set_warning("Project no longer available");
                             return;
                         };
-                        let status_file =
-                            agent_status_file(&project.config.project_root, &session_name);
+                        let project_root = project.config.project_root.clone();
+                        app.invalidate_inflight_launch(&issue_id);
                         app.begin_busy();
                         let tx = action_tx.clone();
 
                         thread::spawn(move || {
-                            let (message, message_kind) = match tmux::kill_session(&session_name) {
-                                Ok(()) => {
-                                    let _ = std::fs::remove_file(&status_file);
-                                    (
-                                        format!("Session '{}' killed", session_name),
-                                        MessageKind::Info,
-                                    )
-                                }
-                                Err(e) => {
-                                    (format!("Failed to kill session: {e}"), MessageKind::Error)
-                                }
-                            };
-                            let _ = tx.send(ActionResult {
-                                message,
-                                message_kind,
-                                ..Default::default()
-                            });
+                            let _ = tx.send(terminate_to_result(
+                                &project_root,
+                                &session_name,
+                                format!("Session '{}' killed", session_name),
+                                format!("Session '{}' was already stopped", session_name),
+                            ));
                         });
                     }
                     ConfirmAction::DeleteIssue {
@@ -1397,40 +1519,23 @@ fn handle_confirm(
                         let issue = &p.issues[issue_index];
                         let session_name = issue.session_name(&p.config.project_name);
                         let id = issue.id.clone();
-                        let status_file = agent_status_file(&p.config.project_root, &session_name);
+                        let project_root = p.config.project_root.clone();
 
-                        if p.is_session_alive(&session_name) {
-                            let tx = action_tx.clone();
-                            let sn = session_name.clone();
-                            thread::spawn(move || {
-                                let _ = tmux::kill_session(&sn);
-                                let _ = std::fs::remove_file(&status_file);
-                                let _ = tx.send(ActionResult {
-                                    message: format!("Deleted {} and killed session", id),
-                                    message_kind: MessageKind::Info,
-                                    ..Default::default()
-                                });
-                            });
-                            app.begin_busy();
-                        } else {
-                            let _ = std::fs::remove_file(&status_file);
-                            app.set_message(format!("Deleted {}", id));
-                        }
-
-                        let q = app.search_query.clone();
-                        if let Some(p) = app.find_project_mut(&project_id) {
-                            let removed = p.issues.remove(issue_index);
-                            crate::ops::remove_link_references(&mut p.issues, &removed.id);
-                            if p.link_filter
-                                .as_deref()
-                                .is_some_and(|a| a.eq_ignore_ascii_case(&removed.id))
-                            {
-                                p.link_filter = None;
+                        app.invalidate_inflight_launch(&issue_id);
+                        app.begin_busy();
+                        let tx = action_tx.clone();
+                        thread::spawn(move || {
+                            let mut result = terminate_to_result(
+                                &project_root,
+                                &session_name,
+                                format!("Deleted {} and killed session", id),
+                                format!("Deleted {}", id),
+                            );
+                            if result.message_kind != MessageKind::Error {
+                                result.issue_to_delete = Some((project_id, id));
                             }
-                            p.marked_issues.remove(&removed.id.to_lowercase());
-                            p.clamp_all_rows(&q);
-                            p.mark_dirty();
-                        }
+                            let _ = tx.send(result);
+                        });
                     }
                 }
             }
@@ -1442,15 +1547,46 @@ fn handle_confirm(
     }
 }
 
+pub fn delete_issue_from_app(app: &mut App, project_id: &ProjectId, issue_id: &str) -> bool {
+    let query = app.search_query.clone();
+    let Some(project) = app.find_project_mut(project_id) else {
+        return false;
+    };
+    let Some(index) = project
+        .issues
+        .iter()
+        .position(|issue| issue.id.eq_ignore_ascii_case(issue_id))
+    else {
+        return false;
+    };
+
+    let removed = project.issues.remove(index);
+    crate::ops::remove_link_references(&mut project.issues, &removed.id);
+    if project
+        .link_filter
+        .as_deref()
+        .is_some_and(|anchor| anchor.eq_ignore_ascii_case(&removed.id))
+    {
+        project.link_filter = None;
+    }
+    project.marked_issues.remove(&removed.id.to_lowercase());
+    project.clamp_all_rows(&query);
+    project.mark_dirty();
+    true
+}
+
 fn launch_and_report(issue: Issue, config: AppConfig) -> ActionResult {
     match opencode::launch_session(&issue, &config) {
-        Ok((session_name, agent_sid)) => ActionResult {
+        Ok((session_name, agent_sid, setup_ran)) => ActionResult {
+            launched_setup_ran: setup_ran,
             message: format!("Session '{}' started", session_name),
-            message_kind: MessageKind::Info,
             session_to_open: Some(session_name),
-            popup_title: None,
-            session_id: agent_sid.map(|sid| (issue.id.clone(), sid)),
-            launched_issue_id: Some(issue.id.clone()),
+            launched_session: agent_sid.map(|sid| LaunchedSession {
+                agent: issue.agent_kind,
+                kind: issue.kind,
+                session_id: sid,
+            }),
+            launched_issue_id: Some(issue.id),
             ..Default::default()
         },
         Err(e) => ActionResult {
@@ -1462,8 +1598,28 @@ fn launch_and_report(issue: Issue, config: AppConfig) -> ActionResult {
     }
 }
 
-fn agent_status_file(project_root: &Path, session_name: &str) -> PathBuf {
-    config::agent_status_dir(project_root).join(format!("{}.json", session_name))
+/// Terminate a session and map the outcome to a user-facing `ActionResult`.
+/// `killed_msg` is shown when a live session was killed, `absent_msg` when
+/// there was none; the failure message is uniform across call sites.
+pub fn terminate_to_result(
+    project_root: &Path,
+    session_name: &str,
+    killed_msg: String,
+    absent_msg: String,
+) -> ActionResult {
+    let (message, message_kind) = match opencode::terminate_session(project_root, session_name) {
+        Ok(true) => (killed_msg, MessageKind::Info),
+        Ok(false) => (absent_msg, MessageKind::Info),
+        Err(e) => (
+            format!("Failed to kill session '{session_name}': {e}"),
+            MessageKind::Error,
+        ),
+    };
+    ActionResult {
+        message,
+        message_kind,
+        ..Default::default()
+    }
 }
 
 #[cfg(test)]
@@ -1966,6 +2122,39 @@ mod tests {
         assert!(app.dialog.is_none());
     }
 
+    #[test]
+    fn untouched_dialog_keeps_concurrent_agent_change() {
+        let mut app = test_app();
+        app.project_mut()
+            .issues
+            .push(test_issue_titled("bork-1", "Test issue", Column::Todo));
+
+        let ctx = app.action_context();
+        let issue = app.project().issues[0].clone();
+        app.open_edit_dialog(&issue, 0, &ctx);
+
+        // While the dialog is open, a CLI edit lands via the state merge and
+        // switches the issue's agent to something else.
+        let concurrent_agent = if issue.agent_kind == AgentKind::Claude {
+            AgentKind::OpenCode
+        } else {
+            AgentKind::Claude
+        };
+        let _ = app.project_mut().issues[0].set_agent_kind(concurrent_agent);
+        app.project_mut().issues[0]
+            .sessions
+            .insert(concurrent_agent, "ses_live".to_string());
+
+        // Submitting the untouched dialog must not write its stale agent
+        // back over the concurrent change (or kill the live session).
+        handle_action(&mut app, Action::DialogSubmit, &ctx, &test_channels());
+        assert_eq!(app.project().issues[0].agent_kind, concurrent_agent);
+        assert_eq!(
+            app.project().issues[0].current_session_id(),
+            Some("ses_live")
+        );
+    }
+
     // ================================================================
     // Normal mode: navigation
     // ================================================================
@@ -2137,13 +2326,16 @@ mod tests {
     }
 
     #[test]
-    fn delete_confirm_removes_issue() {
+    fn delete_confirm_waits_for_teardown_before_removing_issue() {
         let mut app = app_with_issues();
+        let project_id = app.project().id();
         act(&mut app, Action::DeleteIssue);
         assert_eq!(app.input_mode, InputMode::Confirm);
         act(&mut app, Action::ConfirmYes);
         assert_eq!(app.input_mode, InputMode::Normal);
-        // bork-1 was deleted (no active session so synchronous)
+        assert_eq!(app.project().issues.len(), 3);
+
+        assert!(delete_issue_from_app(&mut app, &project_id, "bork-1"));
         assert_eq!(app.project().issues.len(), 2);
         assert_eq!(app.project().issues[0].id, "bork-2");
         assert!(app.project().state_dirty);
@@ -2306,6 +2498,49 @@ mod tests {
         let (msg, kind) = app.message.as_ref().unwrap();
         assert!(msg.contains("No Linear issue linked"));
         assert_eq!(*kind, MessageKind::Warning);
+    }
+
+    // ================================================================
+    // summarize_open_links: batch-open outcome summaries
+    // ================================================================
+
+    #[test]
+    fn open_links_single_success_names_the_link() {
+        let result = summarize_open_links("PR", 1, "#42", vec![]);
+        assert_eq!(result.message, "Opened PR #42");
+        assert_eq!(result.message_kind, MessageKind::Info);
+    }
+
+    #[test]
+    fn open_links_multi_success_reports_count() {
+        let result = summarize_open_links("PR", 3, "#1", vec![]);
+        assert_eq!(result.message, "Opened 3 PRs");
+        assert_eq!(result.message_kind, MessageKind::Info);
+    }
+
+    #[test]
+    fn open_links_single_failure_includes_label_and_error() {
+        let result = summarize_open_links("PR", 1, "#42", vec!["#42: no handler".to_string()]);
+        assert_eq!(result.message, "Failed to open PR #42: no handler");
+        assert_eq!(result.message_kind, MessageKind::Error);
+    }
+
+    #[test]
+    fn open_links_partial_failure_reports_opened_count() {
+        let result = summarize_open_links("PR", 3, "#1", vec!["#2: gone".to_string()]);
+        assert_eq!(result.message, "Opened 2 of 3 PRs; #2: gone");
+        assert_eq!(result.message_kind, MessageKind::Error);
+    }
+
+    #[test]
+    fn open_links_extra_failures_are_counted() {
+        let failures = vec!["BORK-1: no handler".to_string(), "BORK-2: gone".to_string()];
+        let result = summarize_open_links("Linear issue", 2, "BORK-1", failures);
+        assert_eq!(
+            result.message,
+            "Failed to open Linear issue BORK-1: no handler (+1 more failed)"
+        );
+        assert_eq!(result.message_kind, MessageKind::Error);
     }
 
     #[test]
