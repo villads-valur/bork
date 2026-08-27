@@ -354,13 +354,6 @@ pub fn fetch_current_user(main_worktree: &Path) -> Option<String> {
     Some(login)
 }
 
-pub fn open_pr_in_browser(pr_number: u32, main_worktree: &Path) {
-    let _ = Command::new("gh")
-        .args(["pr", "view", &pr_number.to_string(), "--web"])
-        .current_dir(main_worktree)
-        .output();
-}
-
 /// Build the canonical github.com URL for a PR, given the project's main worktree.
 /// Returns None if we can't determine the repo identity (e.g. no `gh` available, or
 /// the worktree isn't a GitHub remote). Uses the cached repo identity, so this is
