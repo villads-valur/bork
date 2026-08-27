@@ -295,6 +295,10 @@ impl Project {
                 .linear_links
                 .iter()
                 .any(|l| l.identifier.to_lowercase().contains(query))
+            || issue
+                .github_pr_links
+                .iter()
+                .any(|link| format!("#{}", link.number).contains(query))
             || self
                 .branch_for(issue)
                 .is_some_and(|b| b.to_lowercase().contains(query))
