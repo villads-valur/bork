@@ -1624,7 +1624,6 @@ fn spawn_project_workers(project: &app::Project, suspended: &Arc<AtomicBool>) ->
 }
 
 /// Outcome of draining one project's worker channels for a single tick.
-#[derive(Default)]
 struct DrainOutcome {
     needs_redraw: bool,
     /// Status message produced by `sync_prs_as_issues`, surfaced by the caller
@@ -1650,7 +1649,6 @@ fn drain_project_workers(
     action_tx: &mpsc::Sender<ActionResult>,
     now: u64,
 ) -> DrainOutcome {
-    let mut outcome = DrainOutcome::default();
     let mut needs_redraw = false;
     let mut message = None;
 
@@ -1658,11 +1656,7 @@ fn drain_project_workers(
     // Runs for every worker-owning project (focused + swimlanes). Attempts are
     // capped in ephemeral LiveState so an undying session can't retry forever.
     let cleanup = project.drive_session_cleanup(now);
-    if cleanup.needs_redraw {
-        needs_redraw = true;
-    }
-    outcome.give_up_messages = cleanup.give_up_messages;
-    outcome.invalidate_issue_ids = cleanup.invalidate_issue_ids;
+    needs_redraw |= cleanup.needs_redraw;
     let project_root = project.config.project_root.clone();
     for session_name in cleanup.kill_sessions {
         let tx = action_tx.clone();
@@ -1785,18 +1779,18 @@ fn drain_project_workers(
         *skip = project.done_worktree_names();
     }
 
-    outcome.needs_redraw = needs_redraw;
-    outcome.message = message;
-    outcome
+    DrainOutcome {
+        needs_redraw,
+        message,
+        give_up_messages: cleanup.give_up_messages,
+        invalidate_issue_ids: cleanup.invalidate_issue_ids,
+    }
 }
 
 /// Apply a `DrainOutcome` to the `App`: invalidate any auto-killed in-flight
-/// launches, surface messages, and set the redraw flag. Kept at the App level
-/// because the drain helper owns only a single `Project`.
-fn apply_drain_outcome(app: &mut app::App, outcome: DrainOutcome, needs_redraw: &mut bool) {
-    if outcome.needs_redraw {
-        *needs_redraw = true;
-    }
+/// launches and surface messages. Returns whether the UI needs a redraw. Kept
+/// at the App level because the drain helper owns only a single `Project`.
+fn apply_drain_outcome(app: &mut app::App, outcome: DrainOutcome) -> bool {
     for issue_id in &outcome.invalidate_issue_ids {
         app.invalidate_inflight_launch(issue_id);
     }
@@ -1806,6 +1800,7 @@ fn apply_drain_outcome(app: &mut app::App, outcome: DrainOutcome, needs_redraw: 
     } else if let Some(msg) = outcome.message {
         app.set_message(msg);
     }
+    outcome.needs_redraw
 }
 
 const ACTIVITY_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -2324,7 +2319,7 @@ fn run_tui() -> anyhow::Result<()> {
             .unwrap_or_default()
             .as_secs();
         let outcome = drain_project_workers(app.project_mut(), &workers, &action_tx, now);
-        apply_drain_outcome(&mut app, outcome, &mut needs_redraw);
+        needs_redraw |= apply_drain_outcome(&mut app, outcome);
 
         // --- Update check (periodic worker results) ---
         // The `bork update --check` cache-mtime poll lives in the 2s state
@@ -2394,7 +2389,7 @@ fn run_tui() -> anyhow::Result<()> {
                 continue;
             };
             let outcome = drain_project_workers(&mut app.projects[proj_pos], sw, &action_tx, now);
-            apply_drain_outcome(&mut app, outcome, &mut needs_redraw);
+            needs_redraw |= apply_drain_outcome(&mut app, outcome);
         }
 
         // Rebuild shared port sessions, but only when session data actually

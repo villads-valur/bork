@@ -1081,8 +1081,8 @@ impl Project {
     /// the per-session attempt counter, optimistically drops the session from
     /// `active_sessions` (the poller re-adds it if the kill fails), and returns
     /// the work the caller must perform: sessions to kill in background threads,
-    /// issue ids whose in-flight launch should be invalidated, and a one-shot
-    /// message when a session hits the attempt cap.
+    /// issue ids whose in-flight launch should be invalidated, and a message per
+    /// session that hit the attempt cap.
     ///
     /// Shared by the focused project and every swimlane so all worker-owning
     /// projects get TTL cleanup, not just the focused one.
