@@ -74,6 +74,7 @@ const KITTY_KEYBOARD_FLAGS: KeyboardEnhancementFlags =
 
 const TICK_RATE: Duration = Duration::from_millis(50);
 const TMUX_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const AGENT_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const GIT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 // `lsof -iTCP` scans every process and routinely takes 100ms+ on macOS, so the
 // port poll runs at a slower cadence than the other pollers.
@@ -137,14 +138,17 @@ fn spawn_agent_status_worker(
 ) -> mpsc::Receiver<HashMap<String, AgentStatusInfo>> {
     let (tx, rx) = mpsc::channel();
 
-    thread::spawn(move || loop {
-        wait_while_suspended(&suspended);
-        let agent_statuses = read_agent_statuses(&status_dir);
-        if tx.send(agent_statuses).is_err() {
-            break;
-        }
-        if !sleep_with_wake(&wake_rx, TMUX_POLL_INTERVAL) {
-            break;
+    thread::spawn(move || {
+        let mut cache = AgentStatusCache::default();
+        loop {
+            wait_while_suspended(&suspended);
+            let agent_statuses = cache.read(&status_dir);
+            if tx.send(agent_statuses).is_err() {
+                break;
+            }
+            if !sleep_with_wake(&wake_rx, AGENT_STATUS_POLL_INTERVAL) {
+                break;
+            }
         }
     });
 
@@ -174,28 +178,79 @@ fn spawn_port_poll_worker(
     rx
 }
 
-fn read_agent_statuses(status_dir: &Path) -> HashMap<String, AgentStatusInfo> {
-    let mut statuses = HashMap::new();
-    let entries = match std::fs::read_dir(status_dir) {
-        Ok(e) => e,
-        Err(_) => return statuses,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_none_or(|e| e != "json") {
-            continue;
-        }
-        let Some(session_name) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
+/// A cached agent status file: its last-seen (mtime, size) and parsed contents.
+/// Directory mtime is deliberately not used as a key because rewriting an
+/// existing status file in place leaves the directory mtime unchanged.
+#[derive(Clone)]
+struct CachedStatus {
+    mtime: Option<SystemTime>,
+    size: u64,
+    info: AgentStatusInfo,
+}
+
+/// Per-file cache for `read_agent_statuses`. Each poller thread owns one so the
+/// unchanged JSON files it sees every tick are not reread or reparsed. Keyed on
+/// the full file path, so a single cache can serve many project directories.
+#[derive(Default)]
+struct AgentStatusCache {
+    files: HashMap<PathBuf, CachedStatus>,
+}
+
+impl AgentStatusCache {
+    fn read(&mut self, status_dir: &Path) -> HashMap<String, AgentStatusInfo> {
+        let mut statuses = HashMap::new();
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        let entries = match std::fs::read_dir(status_dir) {
+            Ok(e) => e,
+            Err(_) => {
+                // Directory gone/unreadable: drop any cached entries under it so
+                // stale statuses do not linger.
+                self.files
+                    .retain(|path, _| path.parent() != Some(status_dir));
+                return statuses;
+            }
         };
-        let Ok(contents) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        if let Ok(info) = serde_json::from_str::<AgentStatusInfo>(&contents) {
-            statuses.insert(session_name.to_string(), info);
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|e| e != "json") {
+                continue;
+            }
+            let Some(session_name) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            seen.insert(path.clone());
+
+            let meta = entry.metadata().ok();
+            let mtime = meta.as_ref().and_then(|m| m.modified().ok());
+            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+
+            if let Some(cached) = self.files.get(&path) {
+                if cached.mtime == mtime && cached.size == size {
+                    statuses.insert(session_name.to_string(), cached.info.clone());
+                    continue;
+                }
+            }
+
+            let Ok(contents) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if let Ok(info) = serde_json::from_str::<AgentStatusInfo>(&contents) {
+                self.files.insert(
+                    path.clone(),
+                    CachedStatus {
+                        mtime,
+                        size,
+                        info: info.clone(),
+                    },
+                );
+                statuses.insert(session_name.to_string(), info);
+            }
         }
+        // Drop cache entries for files that were removed from this directory.
+        self.files
+            .retain(|path, _| path.parent() != Some(status_dir) || seen.contains(path));
+        statuses
     }
-    statuses
 }
 
 fn spawn_git_status_worker(
@@ -1570,31 +1625,34 @@ fn spawn_activity_poller(
 ) -> mpsc::Receiver<HashMap<ProjectId, bool>> {
     let (tx, rx) = mpsc::channel();
 
-    thread::spawn(move || loop {
-        if shutdown.load(Ordering::Relaxed) {
-            break;
+    thread::spawn(move || {
+        let mut cache = AgentStatusCache::default();
+        loop {
+            if shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            wait_while_suspended(&suspended);
+            let mut activity: HashMap<ProjectId, bool> = HashMap::new();
+            for (id, root) in &projects {
+                let status_dir = root.join(".bork").join("agent-status");
+                let statuses = cache.read(&status_dir);
+                let has_activity = statuses.values().any(|info| {
+                    matches!(
+                        info.status,
+                        types::AgentStatus::Busy
+                            | types::AgentStatus::WaitingInput
+                            | types::AgentStatus::WaitingPermission
+                            | types::AgentStatus::WaitingApproval
+                            | types::AgentStatus::Error
+                    )
+                });
+                activity.insert(id.clone(), has_activity);
+            }
+            if tx.send(activity).is_err() {
+                break;
+            }
+            thread::sleep(ACTIVITY_POLL_INTERVAL);
         }
-        wait_while_suspended(&suspended);
-        let mut activity: HashMap<ProjectId, bool> = HashMap::new();
-        for (id, root) in &projects {
-            let status_dir = root.join(".bork").join("agent-status");
-            let statuses = read_agent_statuses(&status_dir);
-            let has_activity = statuses.values().any(|info| {
-                matches!(
-                    info.status,
-                    types::AgentStatus::Busy
-                        | types::AgentStatus::WaitingInput
-                        | types::AgentStatus::WaitingPermission
-                        | types::AgentStatus::WaitingApproval
-                        | types::AgentStatus::Error
-                )
-            });
-            activity.insert(id.clone(), has_activity);
-        }
-        if tx.send(activity).is_err() {
-            break;
-        }
-        thread::sleep(ACTIVITY_POLL_INTERVAL);
     });
 
     rx
