@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 
 use crate::types::{
     ChecksStatus, GithubStack, GithubStackPullRequest, PrState, PrStatus, ReviewDecision,
@@ -13,7 +13,18 @@ struct RepoIdentity {
     name: String,
 }
 
-static REPO_CACHE: Mutex<Option<HashMap<PathBuf, RepoIdentity>>> = Mutex::new(None);
+/// Single-flight state for one cache key: either a fetch is in progress, or a
+/// value is cached. A missing entry means "cold, nobody is fetching yet".
+enum FetchState<T> {
+    InFlight,
+    Ready(T),
+}
+
+/// Process-global repo-identity cache with per-path single-flight. Concurrent
+/// cold-cache callers for the same path wait on `REPO_WAIT` for the one
+/// in-flight `gh repo view` instead of each spawning their own.
+static REPO_CACHE: Mutex<Option<HashMap<PathBuf, FetchState<RepoIdentity>>>> = Mutex::new(None);
+static REPO_WAIT: Condvar = Condvar::new();
 
 const PR_FIELDS: &str = r#"
     number url title state isDraft headRefName
@@ -30,7 +41,10 @@ const PR_FIELDS: &str = r#"
     }
 "#;
 
-static GITHUB_USER: Mutex<Option<String>> = Mutex::new(None);
+/// Process-global viewer-login cache with single-flight. Concurrent cold-cache
+/// callers wait on `GITHUB_USER_WAIT` for the one in-flight `gh api user`.
+static GITHUB_USER: Mutex<Option<FetchState<String>>> = Mutex::new(None);
+static GITHUB_USER_WAIT: Condvar = Condvar::new();
 
 fn parse_repo_identity(json_str: &str) -> Option<RepoIdentity> {
     let parsed: serde_json::Value = serde_json::from_str(json_str.trim()).ok()?;
@@ -43,17 +57,51 @@ fn get_repo_identity(main_worktree: &Path) -> Option<RepoIdentity> {
     let canonical =
         std::fs::canonicalize(main_worktree).unwrap_or_else(|_| main_worktree.to_path_buf());
 
-    // Check cache (short lock)
+    // Claim the fetch or wait for an in-flight one. We never hold the lock
+    // across the `gh` call: a hung network request would otherwise block every
+    // PR worker in every project.
     {
-        let cache = REPO_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(map) = cache.as_ref() {
-            if let Some(identity) = map.get(&canonical) {
-                return Some(identity.clone());
+        let mut cache = REPO_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            match cache.get_or_insert_with(HashMap::new).get(&canonical) {
+                Some(FetchState::Ready(identity)) => return Some(identity.clone()),
+                Some(FetchState::InFlight) => {
+                    // Another thread is fetching this path; wait for it, then
+                    // re-check (it may have produced a value or given up).
+                    cache = REPO_WAIT.wait(cache).unwrap_or_else(|e| e.into_inner());
+                }
+                None => {
+                    // We are the fetcher.
+                    cache
+                        .get_or_insert_with(HashMap::new)
+                        .insert(canonical.clone(), FetchState::InFlight);
+                    break;
+                }
             }
         }
     }
 
-    // Cache miss: fetch without holding the lock
+    // We hold the (logical) fetch claim. Run `gh` without the lock, and make
+    // sure to clear the in-flight marker and wake waiters on every exit path.
+    let identity = fetch_repo_identity(main_worktree);
+
+    let mut cache = REPO_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let map = cache.get_or_insert_with(HashMap::new);
+    match &identity {
+        Some(id) => {
+            map.insert(canonical, FetchState::Ready(id.clone()));
+        }
+        None => {
+            // Failed: drop the marker so a later poll retries (matches the
+            // previous behaviour of not caching failures).
+            map.remove(&canonical);
+        }
+    }
+    REPO_WAIT.notify_all();
+    identity
+}
+
+fn fetch_repo_identity(main_worktree: &Path) -> Option<RepoIdentity> {
     let output = Command::new("gh")
         .args(["repo", "view", "--json", "owner,name"])
         .current_dir(main_worktree)
@@ -65,13 +113,7 @@ fn get_repo_identity(main_worktree: &Path) -> Option<RepoIdentity> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let identity = parse_repo_identity(&stdout)?;
-
-    // Re-acquire lock to insert
-    let mut cache = REPO_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    let map = cache.get_or_insert_with(HashMap::new);
-    map.insert(canonical, identity.clone());
-    Some(identity)
+    parse_repo_identity(&stdout)
 }
 
 pub fn fetch_prs(main_worktree: &Path) -> Vec<PrStatus> {
@@ -412,15 +454,40 @@ fn parse_search_response(json_str: &str) -> Vec<PrStatus> {
 }
 
 pub fn fetch_current_user(main_worktree: &Path) -> Option<String> {
-    // Check cache (short lock). Never hold the lock across the `gh` call:
-    // a hung network request would block every PR worker in every project.
+    // Claim the fetch or wait for an in-flight one. Never hold the lock across
+    // the `gh` call: a hung network request would block every PR worker in
+    // every project.
     {
-        let cached = GITHUB_USER.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(ref user) = *cached {
-            return Some(user.clone());
+        let mut cached = GITHUB_USER.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            match cached.as_ref() {
+                Some(FetchState::Ready(user)) => return Some(user.clone()),
+                Some(FetchState::InFlight) => {
+                    cached = GITHUB_USER_WAIT
+                        .wait(cached)
+                        .unwrap_or_else(|e| e.into_inner());
+                }
+                None => {
+                    *cached = Some(FetchState::InFlight);
+                    break;
+                }
+            }
         }
     }
 
+    let login = fetch_current_user_uncached(main_worktree);
+
+    let mut cached = GITHUB_USER.lock().unwrap_or_else(|e| e.into_inner());
+    match &login {
+        Some(user) => *cached = Some(FetchState::Ready(user.clone())),
+        // Failed: clear the marker so a later poll retries.
+        None => *cached = None,
+    }
+    GITHUB_USER_WAIT.notify_all();
+    login
+}
+
+fn fetch_current_user_uncached(main_worktree: &Path) -> Option<String> {
     let output = Command::new("gh")
         .args(["api", "user", "-q", ".login"])
         .current_dir(main_worktree)
@@ -436,8 +503,6 @@ pub fn fetch_current_user(main_worktree: &Path) -> Option<String> {
         return None;
     }
 
-    let mut cached = GITHUB_USER.lock().unwrap_or_else(|e| e.into_inner());
-    *cached = Some(login.clone());
     Some(login)
 }
 
