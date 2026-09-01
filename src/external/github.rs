@@ -117,10 +117,8 @@ pub fn fetch_prs(main_worktree: &Path) -> Vec<PrStatus> {
     parse_graphql_response(&stdout)
 }
 
-pub fn fetch_stacks(main_worktree: &Path) -> Vec<GithubStack> {
-    let Some(repo) = get_repo_identity(main_worktree) else {
-        return Vec::new();
-    };
+pub fn fetch_stacks(main_worktree: &Path) -> Option<Vec<GithubStack>> {
+    let repo = get_repo_identity(main_worktree)?;
     let endpoint = format!("repos/{}/{}/stacks?per_page=100", repo.owner, repo.name);
     let output = Command::new("gh")
         .args(["api", &endpoint])
@@ -128,23 +126,21 @@ pub fn fetch_stacks(main_worktree: &Path) -> Vec<GithubStack> {
         .output();
 
     let Ok(output) = output else {
-        return Vec::new();
+        return None;
     };
     if !output.status.success() {
-        return Vec::new();
+        return None;
     }
 
     parse_stacks_response(&String::from_utf8_lossy(&output.stdout))
 }
 
-fn parse_stacks_response(json_str: &str) -> Vec<GithubStack> {
+fn parse_stacks_response(json_str: &str) -> Option<Vec<GithubStack>> {
     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) else {
-        return Vec::new();
+        return None;
     };
-    let Some(stacks) = parsed.as_array() else {
-        return Vec::new();
-    };
-    stacks.iter().filter_map(parse_stack).collect()
+    let stacks = parsed.as_array()?;
+    Some(stacks.iter().filter_map(parse_stack).collect())
 }
 
 fn parse_stack(value: &serde_json::Value) -> Option<GithubStack> {
@@ -765,6 +761,7 @@ mod tests {
         }]);
 
         let stacks = parse_stacks_response(&response.to_string());
+        let stacks = stacks.unwrap();
         assert_eq!(stacks.len(), 1);
         assert_eq!(stacks[0].number, 7);
         assert_eq!(stacks[0].base_ref, "main");
@@ -787,6 +784,7 @@ mod tests {
         }]);
 
         let stacks = parse_stacks_response(&response.to_string());
+        let stacks = stacks.unwrap();
         assert_eq!(stacks.len(), 1);
         assert_eq!(stacks[0].number, 8);
     }

@@ -60,7 +60,7 @@ use types::{GithubStack, PrStatus};
 struct PrPollResult {
     prs: HashMap<String, PrStatus>,
     prs_by_number: HashMap<u32, PrStatus>,
-    stacks: Vec<GithubStack>,
+    stacks: Option<Vec<GithubStack>>,
     user_prs: Vec<PrStatus>,
     review_requested_prs: Vec<PrStatus>,
     github_user: Option<String>,
@@ -280,7 +280,7 @@ fn spawn_pr_poll_worker(
             PrPollResult {
                 prs: external::github::index_by_branch(prs),
                 prs_by_number,
-                stacks: stacks_handle.join().unwrap_or_default(),
+                stacks: stacks_handle.join().unwrap_or(None),
                 user_prs: user_prs_handle.join().unwrap_or_default(),
                 review_requested_prs: review_handle.join().unwrap_or_default(),
                 github_user: user_handle.join().ok().flatten(),
@@ -2123,7 +2123,10 @@ fn run_tui() -> anyhow::Result<()> {
             let changed = !live.pr_poll_done
                 || live.pr_statuses != pr_result.prs
                 || live.pr_statuses_by_number != pr_result.prs_by_number
-                || live.github_stacks != pr_result.stacks
+                || pr_result
+                    .stacks
+                    .as_ref()
+                    .is_some_and(|stacks| live.github_stacks != *stacks)
                 || live.user_prs != pr_result.user_prs
                 || live.review_requested_prs != pr_result.review_requested_prs;
             if pr_result.github_user.is_some() && live.github_user != pr_result.github_user {
@@ -2137,7 +2140,9 @@ fn run_tui() -> anyhow::Result<()> {
             pr_data_changed = true;
             live.pr_statuses = pr_result.prs;
             live.pr_statuses_by_number = pr_result.prs_by_number;
-            live.github_stacks = pr_result.stacks;
+            if let Some(stacks) = pr_result.stacks {
+                live.github_stacks = stacks;
+            }
             live.user_prs = pr_result.user_prs;
             live.review_requested_prs = pr_result.review_requested_prs;
             live.pr_poll_done = true;
@@ -2304,13 +2309,18 @@ fn run_tui() -> anyhow::Result<()> {
                 if !live.pr_poll_done
                     || live.pr_statuses != pr_result.prs
                     || live.pr_statuses_by_number != pr_result.prs_by_number
-                    || live.github_stacks != pr_result.stacks
+                    || pr_result
+                        .stacks
+                        .as_ref()
+                        .is_some_and(|stacks| live.github_stacks != *stacks)
                     || live.user_prs != pr_result.user_prs
                     || live.review_requested_prs != pr_result.review_requested_prs
                 {
                     live.pr_statuses = pr_result.prs;
                     live.pr_statuses_by_number = pr_result.prs_by_number;
-                    live.github_stacks = pr_result.stacks;
+                    if let Some(stacks) = pr_result.stacks {
+                        live.github_stacks = stacks;
+                    }
                     live.user_prs = pr_result.user_prs;
                     live.review_requested_prs = pr_result.review_requested_prs;
                     live.pr_poll_done = true;
