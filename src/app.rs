@@ -1679,8 +1679,7 @@ impl App {
             p.available_agents.clone(),
             p.linear_available,
             github_available,
-            &live.pr_statuses,
-            &live.user_prs,
+            live,
         ));
         self.input_mode = InputMode::Dialog;
     }
@@ -3066,8 +3065,7 @@ mod tests {
             crate::types::AgentKind::ALL.to_vec(),
             false,
             false,
-            &std::collections::HashMap::new(),
-            &[],
+            &LiveState::default(),
         );
         assert_eq!(d.agent_kind, crate::types::AgentKind::Claude);
         assert_eq!(d.agent_mode, crate::types::AgentMode::Yolo);
@@ -3141,6 +3139,30 @@ mod tests {
     }
 
     #[test]
+    fn dialog_from_issue_resolves_fork_review_pr() {
+        let mut issue = test_issue("bork-1", Column::CodeReview);
+        issue.github_pr_links = vec![LinkedGithubPr {
+            number: 106,
+            imported: true,
+            import_source: Some(PrImportSource::ReviewRequested),
+        }];
+        let mut pr = test_pr(106, "linear-api-fallback");
+        pr.is_cross_repository = true;
+        let mut live = LiveState::default();
+        live.review_requested_prs = vec![pr];
+        let d = DialogState::from_issue(
+            &issue,
+            0,
+            crate::types::AgentKind::ALL.to_vec(),
+            false,
+            true,
+            &live,
+        );
+        assert_eq!(d.github_prs.len(), 1);
+        assert_eq!(d.github_prs[0].number, 106);
+    }
+
+    #[test]
     fn dialog_from_orchestrator_issue_focuses_title() {
         let mut issue = test_issue("bork-1", Column::Todo);
         issue.kind = IssueKind::Orchestrator;
@@ -3150,8 +3172,7 @@ mod tests {
             crate::types::AgentKind::ALL.to_vec(),
             true,
             true,
-            &std::collections::HashMap::new(),
-            &[],
+            &LiveState::default(),
         );
         assert_eq!(d.ordered_fields()[d.focused_field], DialogField::Title);
     }
