@@ -600,6 +600,23 @@ pub struct PrStatus {
     pub head_branch: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GithubStack {
+    pub number: u32,
+    pub url: String,
+    pub base_ref: String,
+    pub open: bool,
+    pub pull_requests: Vec<GithubStackPullRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GithubStackPullRequest {
+    pub number: u32,
+    pub state: PrState,
+    pub is_draft: bool,
+    pub head_branch: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

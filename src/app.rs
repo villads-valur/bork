@@ -11,7 +11,7 @@ use crate::config::{AppConfig, AppState, DEFAULT_REVIEW_PROMPT};
 use crate::external::linear::LinearIssue;
 use crate::prune::{PruneAction, PruneCandidate};
 use crate::types::{
-    AgentKind, AgentStatus, AgentStatusInfo, Column, Issue, IssueKind, LinkedGithubPr,
+    AgentKind, AgentStatus, AgentStatusInfo, Column, GithubStack, Issue, IssueKind, LinkedGithubPr,
     PrImportSource, PrState, PrStatus, WorktreeStatus,
 };
 
@@ -46,6 +46,8 @@ pub struct LiveState {
     pub worktree_statuses: HashMap<String, WorktreeStatus>,
     pub worktree_branches: HashMap<String, String>,
     pub pr_statuses: HashMap<String, PrStatus>,
+    pub pr_statuses_by_number: HashMap<u32, PrStatus>,
+    pub github_stacks: Vec<GithubStack>,
     pub frozen_worktree_statuses: HashMap<String, WorktreeStatus>,
     pub frozen_worktree_branches: HashMap<String, String>,
     pub linear_issues: Vec<LinearIssue>,
@@ -724,6 +726,9 @@ impl Project {
             }
         }
         for link in &issue.github_pr_links {
+            if let Some(pr) = live.pr_statuses_by_number.get(&link.number) {
+                return Some(pr);
+            }
             let found = live
                 .pr_statuses
                 .values()
@@ -735,6 +740,13 @@ impl Project {
             }
         }
         None
+    }
+
+    pub fn stack_for_pr(&self, number: u32) -> Option<&GithubStack> {
+        self.live
+            .github_stacks
+            .iter()
+            .find(|stack| stack.pull_requests.iter().any(|pr| pr.number == number))
     }
 
     pub fn sync_prs_as_issues(&mut self) -> (bool, Option<String>) {

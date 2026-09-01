@@ -55,10 +55,12 @@ use types::{AgentKind, AgentMode, AgentStatusInfo, Column, IssueKind};
 use external::git::GitPollResult;
 use external::linear::LinearPollResult;
 use external::ports::PortPollResult;
-use types::PrStatus;
+use types::{GithubStack, PrStatus};
 
 struct PrPollResult {
     prs: HashMap<String, PrStatus>,
+    prs_by_number: HashMap<u32, PrStatus>,
+    stacks: Vec<GithubStack>,
     user_prs: Vec<PrStatus>,
     review_requested_prs: Vec<PrStatus>,
     github_user: Option<String>,
@@ -263,19 +265,22 @@ fn spawn_pr_poll_worker(
 
     thread::spawn(move || loop {
         wait_while_suspended(&suspended);
-        // Run the 4 independent gh api calls in parallel
+        // Run the independent GitHub calls in parallel.
         let result = thread::scope(|s| {
-            let prs_handle = s.spawn(|| {
-                let prs = external::github::fetch_prs(&main_worktree);
-                external::github::index_by_branch(prs)
-            });
+            let prs_handle = s.spawn(|| external::github::fetch_prs(&main_worktree));
             let user_prs_handle = s.spawn(|| external::github::fetch_user_prs(&main_worktree));
             let review_handle =
                 s.spawn(|| external::github::fetch_review_requested_prs(&main_worktree));
             let user_handle = s.spawn(|| external::github::fetch_current_user(&main_worktree));
+            let stacks_handle = s.spawn(|| external::github::fetch_stacks(&main_worktree));
+
+            let prs = prs_handle.join().unwrap_or_default();
+            let prs_by_number = prs.iter().map(|pr| (pr.number, pr.clone())).collect();
 
             PrPollResult {
-                prs: prs_handle.join().unwrap_or_default(),
+                prs: external::github::index_by_branch(prs),
+                prs_by_number,
+                stacks: stacks_handle.join().unwrap_or_default(),
                 user_prs: user_prs_handle.join().unwrap_or_default(),
                 review_requested_prs: review_handle.join().unwrap_or_default(),
                 github_user: user_handle.join().ok().flatten(),
@@ -2117,6 +2122,8 @@ fn run_tui() -> anyhow::Result<()> {
             let live = &mut app.project_mut().live;
             let changed = !live.pr_poll_done
                 || live.pr_statuses != pr_result.prs
+                || live.pr_statuses_by_number != pr_result.prs_by_number
+                || live.github_stacks != pr_result.stacks
                 || live.user_prs != pr_result.user_prs
                 || live.review_requested_prs != pr_result.review_requested_prs;
             if pr_result.github_user.is_some() && live.github_user != pr_result.github_user {
@@ -2129,6 +2136,8 @@ fn run_tui() -> anyhow::Result<()> {
             needs_redraw = true;
             pr_data_changed = true;
             live.pr_statuses = pr_result.prs;
+            live.pr_statuses_by_number = pr_result.prs_by_number;
+            live.github_stacks = pr_result.stacks;
             live.user_prs = pr_result.user_prs;
             live.review_requested_prs = pr_result.review_requested_prs;
             live.pr_poll_done = true;
@@ -2294,10 +2303,14 @@ fn run_tui() -> anyhow::Result<()> {
                 }
                 if !live.pr_poll_done
                     || live.pr_statuses != pr_result.prs
+                    || live.pr_statuses_by_number != pr_result.prs_by_number
+                    || live.github_stacks != pr_result.stacks
                     || live.user_prs != pr_result.user_prs
                     || live.review_requested_prs != pr_result.review_requested_prs
                 {
                     live.pr_statuses = pr_result.prs;
+                    live.pr_statuses_by_number = pr_result.prs_by_number;
+                    live.github_stacks = pr_result.stacks;
                     live.user_prs = pr_result.user_prs;
                     live.review_requested_prs = pr_result.review_requested_prs;
                     live.pr_poll_done = true;

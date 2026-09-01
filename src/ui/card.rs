@@ -6,7 +6,7 @@ use ratatui::Frame;
 
 use crate::app::CardSize;
 use crate::types::{
-    AgentStatus, Issue, IssueKind, PrImportSource, PrState, PrStatus, WorktreeStatus,
+    AgentStatus, GithubStack, Issue, IssueKind, PrImportSource, PrState, PrStatus, WorktreeStatus,
 };
 use crate::ui::styles;
 
@@ -23,6 +23,7 @@ pub struct CardContext<'a> {
     pub branch: Option<&'a str>,
     pub git_status: Option<&'a WorktreeStatus>,
     pub pr: Option<&'a PrStatus>,
+    pub stack: Option<&'a GithubStack>,
     pub ports: Option<&'a Vec<u16>>,
     pub search_query: &'a str,
 }
@@ -78,7 +79,7 @@ fn render_full(
     let title_text = styles::truncate(&ctx.issue.title, max_width);
     let title_line = Line::from(highlight_spans(&title_text, ctx.search_query, title_style));
     let status_line = format_status_line(ctx);
-    let pr_line = format_pr_line(ctx.pr, ctx.issue);
+    let pr_line = format_pr_line(ctx.pr, ctx.issue, ctx.stack);
     let bottom_line = format_bottom_line(ctx.issue, ctx.branch, ctx.ports, max_width);
 
     let mut lines = vec![title_line];
@@ -108,7 +109,7 @@ fn render_medium(
     let title_text = styles::truncate(&ctx.issue.title, max_width);
     let title_line = Line::from(highlight_spans(&title_text, ctx.search_query, title_style));
     let status_line = format_status_line(ctx);
-    let pr_line = format_pr_compact(ctx.pr, ctx.issue);
+    let pr_line = format_pr_compact(ctx.pr, ctx.issue, ctx.stack);
 
     let mut lines = vec![title_line, status_line];
     if inner.height > 2 {
@@ -376,7 +377,11 @@ fn format_git_status(status: Option<&WorktreeStatus>) -> Vec<Span<'static>> {
     spans
 }
 
-fn format_pr_line(pr: Option<&PrStatus>, issue: &Issue) -> Line<'static> {
+fn format_pr_line(
+    pr: Option<&PrStatus>,
+    issue: &Issue,
+    stack: Option<&GithubStack>,
+) -> Line<'static> {
     let Some(pr) = pr else {
         if issue.github_pr_links.len() > 1 {
             let mut spans = vec![Span::raw("  ")];
@@ -389,13 +394,16 @@ fn format_pr_line(pr: Option<&PrStatus>, issue: &Issue) -> Line<'static> {
                     styles::dim_style(),
                 ));
             }
+            append_stack_badge(&mut spans, stack, issue.github_pr_links[0].number);
             return Line::from(spans);
         }
         if let Some(num) = issue.primary_pr_number() {
-            return Line::from(vec![
+            let mut spans = vec![
                 Span::raw("  "),
                 Span::styled(format!("#{}", num), styles::dim_style()),
-            ]);
+            ];
+            append_stack_badge(&mut spans, stack, num);
+            return Line::from(spans);
         }
         return Line::from("");
     };
@@ -452,12 +460,18 @@ fn format_pr_line(pr: Option<&PrStatus>, issue: &Issue) -> Line<'static> {
                 spans.push(Span::styled("draft", styles::dim_style()));
             }
 
+            append_stack_badge(&mut spans, stack, pr.number);
+
             Line::from(spans)
         }
     }
 }
 
-fn format_pr_compact(pr: Option<&PrStatus>, issue: &Issue) -> Line<'static> {
+fn format_pr_compact(
+    pr: Option<&PrStatus>,
+    issue: &Issue,
+    stack: Option<&GithubStack>,
+) -> Line<'static> {
     let Some(pr) = pr else {
         if let Some(num) = issue.primary_pr_number() {
             let mut spans = vec![Span::styled(format!("  #{}", num), styles::dim_style())];
@@ -467,6 +481,7 @@ fn format_pr_compact(pr: Option<&PrStatus>, issue: &Issue) -> Line<'static> {
                     styles::dim_style(),
                 ));
             }
+            append_stack_badge(&mut spans, stack, num);
             return Line::from(spans);
         }
         return Line::from("");
@@ -504,9 +519,33 @@ fn format_pr_compact(pr: Option<&PrStatus>, issue: &Issue) -> Line<'static> {
             spans.push(Span::styled(checks_sym, Style::default().fg(checks_color)));
             spans.push(Span::raw(" "));
             spans.push(Span::styled(review_sym, Style::default().fg(review_color)));
+            append_stack_badge(&mut spans, stack, pr.number);
             Line::from(spans)
         }
     }
+}
+
+fn append_stack_badge(spans: &mut Vec<Span<'static>>, stack: Option<&GithubStack>, pr_number: u32) {
+    let Some(stack) = stack else {
+        return;
+    };
+    let Some(position) = stack
+        .pull_requests
+        .iter()
+        .position(|pr| pr.number == pr_number)
+    else {
+        return;
+    };
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(
+        format!(
+            "S{} {}/{}",
+            stack.number,
+            position + 1,
+            stack.pull_requests.len()
+        ),
+        Style::default().fg(Color::Cyan),
+    ));
 }
 
 #[cfg(test)]

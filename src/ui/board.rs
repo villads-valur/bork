@@ -198,6 +198,9 @@ fn render_column(
             branch: project.branch_for(issue),
             git_status: project.worktree_status_for(issue),
             pr: project.pr_for(issue),
+            stack: project
+                .pr_for(issue)
+                .and_then(|pr| project.stack_for_pr(pr.number)),
             ports: project.listening_ports_for(issue),
             search_query,
         };
