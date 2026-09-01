@@ -543,6 +543,10 @@ Each issue gets its own git worktree. Tmux sessions are named `bork-{issue-id}` 
 - [serde](https://serde.rs/) &mdash; Serialization
 - [anyhow](https://github.com/dtolnay/anyhow) + [thiserror](https://github.com/dtolnay/thiserror) &mdash; Error handling
 
+## Contributors
+
+See [CONTRIBUTORS.md](CONTRIBUTORS.md) for everyone who has helped improve bork. Contributions welcome!
+
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
