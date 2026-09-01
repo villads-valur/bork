@@ -15,6 +15,7 @@ const BUSY_MIN_VISIBLE: Duration = Duration::from_millis(250);
 const MAX_CLEANUP_ATTEMPTS: u32 = 5;
 
 use crate::config::{AppConfig, AppState, DEFAULT_REVIEW_PROMPT};
+use crate::external::git::PollClass;
 use crate::external::linear::LinearIssue;
 use crate::prune::{PruneAction, PruneCandidate};
 use crate::types::{
@@ -1115,12 +1116,29 @@ impl Project {
         }
     }
 
-    pub fn done_worktree_names(&self) -> HashSet<String> {
-        self.issues
-            .iter()
-            .filter(|i| i.column == Column::Done)
-            .filter_map(|i| i.worktree.clone())
-            .collect()
+    /// Poll class per issue-backed worktree, driving the git worker's adaptive
+    /// cadence: In-Progress worktrees are `Hot` (refreshed every cycle), Done
+    /// worktrees are `Skip` (status frozen), everything else is `Cold`. The
+    /// worker treats any worktree not in this map (e.g. an independent clone in
+    /// the container) as `Cold`.
+    pub fn worktree_poll_classes(&self) -> HashMap<String, PollClass> {
+        let mut classes: HashMap<String, PollClass> = HashMap::new();
+        for issue in &self.issues {
+            let Some(worktree) = &issue.worktree else {
+                continue;
+            };
+            let class = match issue.column {
+                Column::InProgress => PollClass::Hot,
+                Column::Done => PollClass::Skip,
+                _ => PollClass::Cold,
+            };
+            // A worktree shared by multiple issues takes the highest-priority
+            // class (Hot > Cold > Skip) so an in-progress issue is never
+            // starved by a Done sibling.
+            let current = classes.entry(worktree.clone()).or_insert(class);
+            *current = (*current).max(class);
+        }
+        classes
     }
 
     pub fn freeze_worktree_status(&mut self, worktree: &str) {
@@ -3893,39 +3911,40 @@ mod tests {
     }
 
     // ================================================================
-    // Feature 3: Git polling - done_worktree_names
+    // Feature 3: Git polling - worktree_poll_classes (adaptive cadence)
     // ================================================================
 
     #[test]
-    fn done_worktree_names_returns_done_issue_worktrees() {
-        let mut issue1 = test_issue("bork-1", Column::Done);
-        issue1.worktree = Some("bork-1".into());
-        let mut issue2 = test_issue("bork-2", Column::InProgress);
-        issue2.worktree = Some("bork-2".into());
-        let mut issue3 = test_issue("bork-3", Column::Done);
-        issue3.worktree = Some("bork-3".into());
-        let app = test_app(vec![issue1, issue2, issue3]);
-        let names = app.project().done_worktree_names();
-        assert!(names.contains("bork-1"));
-        assert!(!names.contains("bork-2"));
-        assert!(names.contains("bork-3"));
-        assert_eq!(names.len(), 2);
+    fn worktree_poll_classes_maps_columns_to_classes() {
+        let mut in_prog = test_issue("bork-1", Column::InProgress);
+        in_prog.worktree = Some("bork-1".into());
+        let mut review = test_issue("bork-2", Column::CodeReview);
+        review.worktree = Some("bork-2".into());
+        let mut done = test_issue("bork-3", Column::Done);
+        done.worktree = Some("bork-3".into());
+        let app = test_app(vec![in_prog, review, done]);
+        let classes = app.project().worktree_poll_classes();
+        assert_eq!(classes.get("bork-1"), Some(&PollClass::Hot));
+        assert_eq!(classes.get("bork-2"), Some(&PollClass::Cold));
+        assert_eq!(classes.get("bork-3"), Some(&PollClass::Skip));
     }
 
     #[test]
-    fn done_worktree_names_empty_when_no_done_issues() {
-        let mut issue1 = test_issue("bork-1", Column::Todo);
-        issue1.worktree = Some("bork-1".into());
-        let app = test_app(vec![issue1]);
-        let names = app.project().done_worktree_names();
-        assert!(names.is_empty());
-    }
-
-    #[test]
-    fn done_worktree_names_skips_issues_without_worktree() {
+    fn worktree_poll_classes_skips_issues_without_worktree() {
         let app = test_app(vec![test_issue("bork-99", Column::Done)]);
-        let names = app.project().done_worktree_names();
-        assert!(names.is_empty());
+        assert!(app.project().worktree_poll_classes().is_empty());
+    }
+
+    #[test]
+    fn worktree_poll_classes_takes_highest_priority_on_shared_worktree() {
+        // A worktree shared by a Done and an In-Progress issue stays Hot.
+        let mut done = test_issue("bork-1", Column::Done);
+        done.worktree = Some("shared".into());
+        let mut in_prog = test_issue("bork-2", Column::InProgress);
+        in_prog.worktree = Some("shared".into());
+        let app = test_app(vec![done, in_prog]);
+        let classes = app.project().worktree_poll_classes();
+        assert_eq!(classes.get("shared"), Some(&PollClass::Hot));
     }
 
     // ================================================================

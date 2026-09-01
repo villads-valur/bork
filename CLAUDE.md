@@ -20,8 +20,10 @@ Main Thread (50ms tick event loop)
 │   └── Update Check Worker (every 6h - new-version banner, plus cache mtime poll every 2s)
 ├── Primary ProjectWorkers (for focused project)
 │   ├── Agent Status Worker (polls every 2s - agent status files)
-│   ├── Git Status Worker (polls every 5s - per-worktree `git status` + one batched
-│   │                       `git worktree list --porcelain` for branches)
+│   ├── Git Status Worker (adaptive: in-progress worktrees ~5s, others 15-30s, done
+│   │                       skipped; per-worktree `git status` under a global
+│   │                       concurrency bound + one batched `git worktree list
+│   │                       --porcelain` for branches)
 │   └── PR Status Worker (polls every 60s - GitHub PRs via gh api graphql)
 ├── Swimlane Workers (one ProjectWorkers set per visible swimlane, excluding focused)
 └── Action Threads (fire-and-forget per user action)
