@@ -1561,6 +1561,139 @@ fn spawn_project_workers(project: &app::Project, suspended: &Arc<AtomicBool>) ->
     }
 }
 
+/// Outcome of draining one project's worker channels for a single tick.
+struct DrainOutcome {
+    needs_redraw: bool,
+    /// Status message produced by `sync_prs_as_issues`, surfaced by the caller
+    /// (the helper owns only the `Project`, not the `App`).
+    message: Option<String>,
+}
+
+/// Drains the per-project agent-status, git, and PR worker channels for one
+/// tick and applies the resulting state to `project`.
+///
+/// Shared by the focused project and each swimlane so both paths stay in sync:
+/// imported issue titles are rewritten from fresh PR titles, and a git wake is
+/// sent after any worktree reassignment. Diff-before-assign gating is preserved
+/// so an idle project never rebuilds its widget tree.
+fn drain_project_workers(project: &mut app::Project, workers: &ProjectWorkers) -> DrainOutcome {
+    let mut needs_redraw = false;
+    let mut message = None;
+
+    // --- Agent status ---
+    while let Ok(statuses) = workers.session_rx.try_recv() {
+        if project.live.agent_statuses != statuses {
+            project.live.agent_statuses = statuses;
+            needs_redraw = true;
+        }
+    }
+
+    // --- Git status ---
+    let mut git_data_changed = false;
+    while let Ok(git_result) = workers.git_rx.try_recv() {
+        let live = &mut project.live;
+        // The first poll must always register (sets git_poll_done) even
+        // when the data matches the empty default.
+        if !live.git_poll_done
+            || live.worktree_statuses != git_result.statuses
+            || live.worktree_branches != git_result.branches
+        {
+            live.worktree_statuses = git_result.statuses;
+            live.worktree_branches = git_result.branches;
+            live.git_poll_done = true;
+            git_data_changed = true;
+            needs_redraw = true;
+        }
+    }
+
+    // --- PR status ---
+    let mut pr_data_changed = false;
+    while let Ok(pr_result) = workers.pr_rx.try_recv() {
+        let live = &mut project.live;
+        let changed = !live.pr_poll_done
+            || live.pr_statuses != pr_result.prs
+            || live.pr_statuses_by_number != pr_result.prs_by_number
+            || pr_result
+                .stacks
+                .as_ref()
+                .is_some_and(|stacks| live.github_stacks != *stacks)
+            || live.user_prs != pr_result.user_prs
+            || live.review_requested_prs != pr_result.review_requested_prs;
+        if pr_result.github_user.is_some() && live.github_user != pr_result.github_user {
+            live.github_user = pr_result.github_user;
+            needs_redraw = true;
+        }
+        if !changed {
+            continue;
+        }
+        needs_redraw = true;
+        pr_data_changed = true;
+        live.pr_statuses = pr_result.prs;
+        live.pr_statuses_by_number = pr_result.prs_by_number;
+        if let Some(stacks) = pr_result.stacks {
+            live.github_stacks = stacks;
+        }
+        live.user_prs = pr_result.user_prs;
+        live.review_requested_prs = pr_result.review_requested_prs;
+        live.pr_poll_done = true;
+
+        // Rewrite imported issue titles from the fresh PR titles.
+        let pr_titles: Vec<(u32, String)> = project
+            .live
+            .pr_statuses
+            .values()
+            .chain(project.live.review_requested_prs.iter())
+            .map(|pr| (pr.number, pr.title.clone()))
+            .collect();
+        for issue in &mut project.issues {
+            if let Some(pr_num) = issue.pr_number {
+                if issue.pr_imported {
+                    if let Some((_, title)) = pr_titles.iter().find(|(n, _)| *n == pr_num) {
+                        issue.title = title.clone();
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Auto-import open PRs as issues (only when new PR data arrived) ---
+    if pr_data_changed {
+        let (changed, msg) = project.sync_prs_as_issues();
+        message = msg;
+        if changed {
+            project.mark_dirty();
+        }
+    }
+
+    // --- Auto-assign worktrees ---
+    // Runs when git data changed OR when issues changed (state_dirty):
+    // a freshly created issue whose worktree already exists must be
+    // assigned even if the git poll data is identical. Gated on
+    // git_poll_done so an empty pre-poll branch map can't wipe worktrees.
+    if git_data_changed || (project.state_dirty && project.live.git_poll_done) {
+        let mut worktree_changed = project.auto_assign_worktrees();
+        worktree_changed = project.clear_stale_worktrees() || worktree_changed;
+        if worktree_changed {
+            let _ = workers.git_wake_tx.send(());
+            project.mark_dirty();
+        }
+    }
+
+    // --- Update git skip set when issues changed columns or git data arrived ---
+    if git_data_changed || project.state_dirty {
+        let mut skip = workers
+            .git_skip_set
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *skip = project.done_worktree_names();
+    }
+
+    DrainOutcome {
+        needs_redraw,
+        message,
+    }
+}
+
 const ACTIVITY_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 fn spawn_activity_poller(
@@ -2057,14 +2190,6 @@ fn run_tui() -> anyhow::Result<()> {
             }
         }
 
-        while let Ok(statuses) = workers.session_rx.try_recv() {
-            let live = &mut app.project_mut().live;
-            if live.agent_statuses != statuses {
-                live.agent_statuses = statuses;
-                needs_redraw = true;
-            }
-        }
-
         // --- Shared: port data (distributed to all projects) ---
         while let Ok(port_result) = shared.port_rx.try_recv() {
             for project in &mut app.projects {
@@ -2100,104 +2225,13 @@ fn run_tui() -> anyhow::Result<()> {
             });
         }
 
-        let mut git_data_changed = false;
-        while let Ok(git_result) = workers.git_rx.try_recv() {
-            let live = &mut app.project_mut().live;
-            // The first poll must always register (sets git_poll_done) even
-            // when the data matches the empty default.
-            if !live.git_poll_done
-                || live.worktree_statuses != git_result.statuses
-                || live.worktree_branches != git_result.branches
-            {
-                live.worktree_statuses = git_result.statuses;
-                live.worktree_branches = git_result.branches;
-                live.git_poll_done = true;
-                git_data_changed = true;
-                needs_redraw = true;
-            }
-        }
-
-        let mut pr_data_changed = false;
-        while let Ok(pr_result) = workers.pr_rx.try_recv() {
-            let live = &mut app.project_mut().live;
-            let changed = !live.pr_poll_done
-                || live.pr_statuses != pr_result.prs
-                || live.pr_statuses_by_number != pr_result.prs_by_number
-                || pr_result
-                    .stacks
-                    .as_ref()
-                    .is_some_and(|stacks| live.github_stacks != *stacks)
-                || live.user_prs != pr_result.user_prs
-                || live.review_requested_prs != pr_result.review_requested_prs;
-            if pr_result.github_user.is_some() && live.github_user != pr_result.github_user {
-                live.github_user = pr_result.github_user;
-                needs_redraw = true;
-            }
-            if !changed {
-                continue;
-            }
+        // --- Drain focused-project workers (session, git, pr) ---
+        let outcome = drain_project_workers(app.project_mut(), &workers);
+        if outcome.needs_redraw {
             needs_redraw = true;
-            pr_data_changed = true;
-            live.pr_statuses = pr_result.prs;
-            live.pr_statuses_by_number = pr_result.prs_by_number;
-            if let Some(stacks) = pr_result.stacks {
-                live.github_stacks = stacks;
-            }
-            live.user_prs = pr_result.user_prs;
-            live.review_requested_prs = pr_result.review_requested_prs;
-            live.pr_poll_done = true;
-
-            let p = app.project_mut();
-            let pr_titles: Vec<(u32, String)> = p
-                .live
-                .pr_statuses
-                .values()
-                .chain(p.live.review_requested_prs.iter())
-                .map(|pr| (pr.number, pr.title.clone()))
-                .collect();
-            for issue in &mut p.issues {
-                if let Some(pr_num) = issue.pr_number {
-                    if issue.pr_imported {
-                        if let Some((_, title)) = pr_titles.iter().find(|(n, _)| *n == pr_num) {
-                            issue.title = title.clone();
-                        }
-                    }
-                }
-            }
         }
-
-        // --- Auto-import open PRs as issues (only when new PR data arrived) ---
-        if pr_data_changed {
-            let (changed, msg) = app.project_mut().sync_prs_as_issues();
-            if let Some(m) = msg {
-                app.set_message(m);
-            }
-            if changed {
-                app.project_mut().mark_dirty();
-            }
-        }
-
-        // --- Auto-assign worktrees ---
-        // Runs when git data changed OR when issues changed (state_dirty):
-        // a freshly created issue whose worktree already exists must be
-        // assigned even if the git poll data is identical. Gated on
-        // git_poll_done so an empty pre-poll branch map can't wipe worktrees.
-        if git_data_changed || (app.project().state_dirty && app.project().live.git_poll_done) {
-            let mut worktree_changed = app.project_mut().auto_assign_worktrees();
-            worktree_changed = app.project_mut().clear_stale_worktrees() || worktree_changed;
-            if worktree_changed {
-                let _ = workers.git_wake_tx.send(());
-                app.project_mut().mark_dirty();
-            }
-        }
-
-        // --- Update git skip set when issues changed columns or git data arrived ---
-        if git_data_changed || app.project().state_dirty {
-            let mut skip = workers
-                .git_skip_set
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            *skip = app.project().done_worktree_names();
+        if let Some(msg) = outcome.message {
+            app.set_message(msg);
         }
 
         // --- Update check (periodic worker results) ---
@@ -2267,75 +2301,12 @@ fn run_tui() -> anyhow::Result<()> {
             let Some(proj_pos) = app.projects.iter().position(|p| p.id() == *proj_id) else {
                 continue;
             };
-            while let Ok(statuses) = sw.session_rx.try_recv() {
-                let live = &mut app.projects[proj_pos].live;
-                if live.agent_statuses != statuses {
-                    live.agent_statuses = statuses;
-                    needs_redraw = true;
-                }
+            let outcome = drain_project_workers(&mut app.projects[proj_pos], sw);
+            if outcome.needs_redraw {
+                needs_redraw = true;
             }
-            let mut sw_git_changed = false;
-            while let Ok(git_result) = sw.git_rx.try_recv() {
-                let live = &mut app.projects[proj_pos].live;
-                if !live.git_poll_done
-                    || live.worktree_statuses != git_result.statuses
-                    || live.worktree_branches != git_result.branches
-                {
-                    live.worktree_statuses = git_result.statuses;
-                    live.worktree_branches = git_result.branches;
-                    live.git_poll_done = true;
-                    sw_git_changed = true;
-                    needs_redraw = true;
-                }
-            }
-            let sw_state_dirty =
-                app.projects[proj_pos].state_dirty && app.projects[proj_pos].live.git_poll_done;
-            if sw_git_changed || sw_state_dirty {
-                let changed = app.projects[proj_pos].auto_assign_worktrees();
-                let stale = app.projects[proj_pos].clear_stale_worktrees();
-                if changed || stale {
-                    app.projects[proj_pos].mark_dirty();
-                }
-                let mut skip = sw.git_skip_set.lock().unwrap_or_else(|e| e.into_inner());
-                *skip = app.projects[proj_pos].done_worktree_names();
-            }
-            let mut sw_pr_changed = false;
-            while let Ok(pr_result) = sw.pr_rx.try_recv() {
-                let live = &mut app.projects[proj_pos].live;
-                if pr_result.github_user.is_some() && live.github_user != pr_result.github_user {
-                    live.github_user = pr_result.github_user;
-                    needs_redraw = true;
-                }
-                if !live.pr_poll_done
-                    || live.pr_statuses != pr_result.prs
-                    || live.pr_statuses_by_number != pr_result.prs_by_number
-                    || pr_result
-                        .stacks
-                        .as_ref()
-                        .is_some_and(|stacks| live.github_stacks != *stacks)
-                    || live.user_prs != pr_result.user_prs
-                    || live.review_requested_prs != pr_result.review_requested_prs
-                {
-                    live.pr_statuses = pr_result.prs;
-                    live.pr_statuses_by_number = pr_result.prs_by_number;
-                    if let Some(stacks) = pr_result.stacks {
-                        live.github_stacks = stacks;
-                    }
-                    live.user_prs = pr_result.user_prs;
-                    live.review_requested_prs = pr_result.review_requested_prs;
-                    live.pr_poll_done = true;
-                    sw_pr_changed = true;
-                    needs_redraw = true;
-                }
-            }
-            if sw_pr_changed {
-                let (changed, msg) = app.projects[proj_pos].sync_prs_as_issues();
-                if let Some(m) = msg {
-                    app.set_message(m);
-                }
-                if changed {
-                    app.projects[proj_pos].mark_dirty();
-                }
+            if let Some(msg) = outcome.message {
+                app.set_message(msg);
             }
         }
 
