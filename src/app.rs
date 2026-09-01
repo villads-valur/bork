@@ -711,8 +711,7 @@ impl Project {
                 .chain(live.review_requested_prs.iter())
                 .find(|p| p.number == link.number)
             {
-                // Fork PR branches don't exist locally, so they can't resolve
-                // to a local branch (and must not claim one during dedup).
+                // Fork PR branches don't exist locally, so skip them.
                 if pr.is_cross_repository {
                     continue;
                 }
@@ -847,8 +846,8 @@ impl Project {
             if pr.state != PrState::Open || pr.is_draft {
                 return false;
             }
-            // Fork PR branch names live in another repo's namespace, so the
-            // branch-based checks below don't apply; dedup by PR number only.
+            // Fork branches live in another repo's namespace, so skip the
+            // branch checks and dedup fork PRs by number only.
             if !pr.is_cross_repository {
                 let branch = &pr.head_branch;
                 if branch == "main" || branch == "master" {
@@ -2690,8 +2689,8 @@ mod tests {
 
     #[test]
     fn sync_prs_fork_pr_skips_branch_checks() {
-        // A fork branch named like an existing issue id (or even "main") is in
-        // another repo's namespace, so branch-based dedup must not apply.
+        // Fork branches named like an issue id (or "main") live in another
+        // repo's namespace, so branch-based dedup must not apply.
         let existing = test_issue("bork-1", Column::InProgress);
         let mut app = test_app(vec![existing]);
         let mut prefix_pr = test_pr(50, "bork-1/some-fork-branch");
@@ -3148,8 +3147,10 @@ mod tests {
         }];
         let mut pr = test_pr(106, "linear-api-fallback");
         pr.is_cross_repository = true;
-        let mut live = LiveState::default();
-        live.review_requested_prs = vec![pr];
+        let live = LiveState {
+            review_requested_prs: vec![pr],
+            ..Default::default()
+        };
         let d = DialogState::from_issue(
             &issue,
             0,

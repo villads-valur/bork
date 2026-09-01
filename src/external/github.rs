@@ -233,11 +233,8 @@ fn parse_pr_node(node: &serde_json::Value) -> Option<PrStatus> {
         .unwrap_or(false);
     let head_branch = node.get("headRefName")?.as_str()?.to_string();
 
-    // Fork PRs are kept (they matter for review requests) but flagged so
-    // branch-keyed indexing can skip them: their head branch can collide with
-    // upstream branch names and pollute the by-branch index. The field is
-    // optional so we treat missing as same-repo (e.g. for older fixtures or
-    // partial responses).
+    // Kept but flagged so branch-keyed indexing can skip fork PRs, whose head
+    // branch can collide with upstream names. Missing means same-repo.
     let is_cross_repository = node
         .get("isCrossRepository")
         .and_then(|v| v.as_bool())

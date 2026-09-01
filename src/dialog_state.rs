@@ -128,9 +128,8 @@ impl DialogState {
             .github_pr_links
             .iter()
             .filter_map(|link| {
-                // Chain review_requested_prs too: fork PRs are absent from the
-                // by-branch map, so review-requested fork links would otherwise
-                // resolve to nothing and vanish on the next dialog save.
+                // Include review_requested_prs: fork PRs are absent from the
+                // by-branch map and would otherwise vanish on the next save.
                 live.pr_statuses
                     .values()
                     .chain(live.user_prs.iter())
