@@ -1,3 +1,16 @@
+//! CLI-side issue operations. Each function loads state, applies a mutation,
+//! and saves inline — the CLI is a short-lived process with no in-memory
+//! board, so it must persist before it exits.
+//!
+//! The shared, testable mutation *logic* lives on the domain types (e.g.
+//! [`Issue::move_to_column`] owns the `done_at` invariant, [`Issue::build`]
+//! owns the create invariants). The TUI (`handler`/`app`) calls those same
+//! methods but defers persistence: it mutates the in-memory board and
+//! `mark_dirty()`s, and the main loop flushes (via `flush_project_state`,
+//! which merges any external CLI write first). Persistence timing therefore
+//! stays deliberately per-caller — inline here, dirty-flush in the TUI —
+//! while the mutation invariants are single-sourced on the domain types.
+
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::Path;
@@ -5,7 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config;
 use crate::external::opencode;
-use crate::types::{AgentKind, AgentMode, Column, Issue, IssueKind};
+use crate::types::{AgentKind, AgentMode, Column, Issue, IssueDraft, IssueKind};
 use crate::ui::styles::truncate;
 use crate::worktree;
 
@@ -41,18 +54,6 @@ fn now_epoch() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-fn move_issue_in_state(issue: &mut Issue, column: Column) {
-    let was_done = issue.column == Column::Done;
-    let now_done = column == Column::Done;
-    issue.column = column;
-
-    if now_done && !was_done {
-        issue.done_at = Some(now_epoch());
-    } else if !now_done && was_done {
-        issue.done_at = None;
-    }
 }
 
 pub struct ListOptions {
@@ -182,17 +183,18 @@ pub fn create_issue(project_root: &Path, opts: CreateOptions) -> anyhow::Result<
     let agent_kind = opts.agent_kind.unwrap_or(config.agent_kind);
     let agent_mode = opts.agent_mode.unwrap_or(config.agent_mode);
 
-    let issue = Issue {
-        kind,
-        agent_mode,
-        prompt: opts.prompt,
-        done_at: if column == Column::Done {
-            Some(now_epoch())
-        } else {
-            None
+    let issue = Issue::build(
+        IssueDraft {
+            id,
+            title: opts.title,
+            column,
+            agent_kind,
+            kind,
+            agent_mode,
+            prompt: opts.prompt,
         },
-        ..Issue::new(id, opts.title, column, agent_kind)
-    };
+        now_epoch(),
+    );
 
     state.issues.push(issue.clone());
     config::save_state(&state, project_root)?;
@@ -226,7 +228,7 @@ pub fn update_issue(
         issue.title = title;
     }
     if let Some(column) = opts.column {
-        move_issue_in_state(issue, column);
+        issue.move_to_column(column, now_epoch());
     }
     let mut session_stale = false;
     if let Some(agent_kind) = opts.agent_kind {
@@ -556,7 +558,7 @@ pub fn move_issues(
             skipped.push(id);
             continue;
         };
-        move_issue_in_state(&mut state.issues[idx], column);
+        state.issues[idx].move_to_column(column, now_epoch());
         moved.push(state.issues[idx].clone());
     }
 
@@ -608,10 +610,7 @@ pub fn archive_issue(
     let mut state = config::load_state(project_root);
     if let Some(saved) = state.issues.iter_mut().find(|i| i.id == issue.id) {
         saved.worktree = None;
-        if saved.column != Column::Done {
-            saved.column = Column::Done;
-            saved.done_at = Some(now_epoch());
-        }
+        saved.move_to_column(Column::Done, now_epoch());
     }
     config::save_state(&state, project_root)?;
 

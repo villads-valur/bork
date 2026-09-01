@@ -334,6 +334,20 @@ pub struct Issue {
     pub pr_import_source: Option<PrImportSource>,
 }
 
+/// The user-supplied fields for a brand-new issue, shared by the CLI
+/// (`ops::create_issue`) and the TUI dialog create path. Feed it to
+/// [`Issue::build`] so both paths apply the same creation invariants (notably
+/// stamping `done_at` for a Done-column creation).
+pub struct IssueDraft {
+    pub id: String,
+    pub title: String,
+    pub column: Column,
+    pub agent_kind: AgentKind,
+    pub kind: IssueKind,
+    pub agent_mode: AgentMode,
+    pub prompt: Option<String>,
+}
+
 impl Issue {
     /// Baseline issue with all optional/legacy fields empty. Combine with
     /// struct update syntax for variations:
@@ -371,8 +385,48 @@ impl Issue {
         }
     }
 
+    /// Build a fresh issue from a `draft`, stamping `done_at` with `now` when
+    /// it is created directly in the Done column. Both the CLI
+    /// (`ops::create_issue`) and the TUI dialog create path go through this so
+    /// a Done-column creation can't drift on the timestamp (previously the
+    /// TUI relied on the `Project::new` backfill to self-heal).
+    pub fn build(draft: IssueDraft, now: u64) -> Self {
+        let IssueDraft {
+            id,
+            title,
+            column,
+            agent_kind,
+            kind,
+            agent_mode,
+            prompt,
+        } = draft;
+        Issue {
+            kind,
+            agent_mode,
+            prompt,
+            done_at: (column == Column::Done).then_some(now),
+            ..Issue::new(id, title, column, agent_kind)
+        }
+    }
+
     pub fn session_name(&self, project_name: &str) -> String {
         format!("{}-{}", project_name, self.id.to_lowercase())
+    }
+
+    /// Move the issue to `column`, keeping `done_at` in sync with the Done
+    /// column: it is stamped with `now` on the first entry into Done and
+    /// cleared on the way out. This is the single owner of the `done_at`
+    /// invariant so the CLI (`ops`) and TUI (`app`) can't drift on it. `now`
+    /// is injected (unix epoch seconds) to keep the method pure and testable.
+    pub fn move_to_column(&mut self, column: Column, now: u64) {
+        let was_done = self.column == Column::Done;
+        let now_done = column == Column::Done;
+        self.column = column;
+        if now_done && !was_done {
+            self.done_at = Some(now);
+        } else if !now_done && was_done {
+            self.done_at = None;
+        }
     }
 
     /// Session ID for the currently selected agent, if that agent has run
@@ -863,6 +917,67 @@ mod tests {
         let issue = test_issue("BORK-3", Column::Todo);
         assert_eq!(issue.session_name("bork"), "bork-bork-3");
         assert_eq!(issue.session_name("myapp"), "myapp-bork-3");
+    }
+
+    // --- Shared done_at invariant (move_to_column / build) ---
+
+    #[test]
+    fn move_to_column_stamps_done_at_on_first_done_entry() {
+        let mut issue = test_issue("bork-1", Column::InProgress);
+        issue.move_to_column(Column::Done, 1700000000);
+        assert_eq!(issue.column, Column::Done);
+        assert_eq!(issue.done_at, Some(1700000000));
+    }
+
+    #[test]
+    fn move_to_column_clears_done_at_on_leaving_done() {
+        let mut issue = test_issue("bork-1", Column::Done);
+        issue.done_at = Some(1700000000);
+        issue.move_to_column(Column::Todo, 1700009999);
+        assert_eq!(issue.column, Column::Todo);
+        assert_eq!(issue.done_at, None);
+    }
+
+    #[test]
+    fn move_to_column_keeps_done_at_when_staying_in_done() {
+        let mut issue = test_issue("bork-1", Column::Done);
+        issue.done_at = Some(1700000000);
+        // Re-entering Done must not re-stamp the original completion time.
+        issue.move_to_column(Column::Done, 1700009999);
+        assert_eq!(issue.done_at, Some(1700000000));
+    }
+
+    #[test]
+    fn move_to_column_non_done_leaves_done_at_none() {
+        let mut issue = test_issue("bork-1", Column::Todo);
+        issue.move_to_column(Column::InProgress, 1700000000);
+        assert_eq!(issue.done_at, None);
+    }
+
+    fn draft(column: Column, prompt: Option<&str>) -> IssueDraft {
+        IssueDraft {
+            id: "bork-1".to_string(),
+            title: "Draft".to_string(),
+            column,
+            agent_kind: AgentKind::OpenCode,
+            kind: IssueKind::Agentic,
+            agent_mode: AgentMode::Plan,
+            prompt: prompt.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn build_stamps_done_at_for_done_column_creation() {
+        let issue = Issue::build(draft(Column::Done, None), 1700000000);
+        assert_eq!(issue.done_at, Some(1700000000));
+    }
+
+    #[test]
+    fn build_leaves_done_at_none_for_non_done_creation() {
+        let issue = Issue::build(draft(Column::Todo, Some("prompt")), 1700000000);
+        assert_eq!(issue.done_at, None);
+        assert_eq!(issue.prompt, Some("prompt".to_string()));
+        assert_eq!(issue.kind, IssueKind::Agentic);
     }
 
     // --- Issue serialization with done_at ---

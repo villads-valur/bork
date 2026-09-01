@@ -2181,6 +2181,10 @@ fn run_tui() -> anyhow::Result<()> {
                 handler::delete_issue_from_app(&mut app, &project_id, &issue_id);
             }
 
+            if let Some((project_id, issue_id)) = result.issue_to_archive {
+                handler::archive_issue_in_app(&mut app, &project_id, &issue_id);
+            }
+
             if let Some(launch_id) = result.launched_issue_id {
                 // A kill during the detection window (x kill, done-TTL)
                 // invalidated whatever this launch produced: the setup may
