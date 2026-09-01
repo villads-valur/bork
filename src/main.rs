@@ -1630,8 +1630,8 @@ struct DrainOutcome {
     /// Status message produced by `sync_prs_as_issues`, surfaced by the caller
     /// (the helper owns only the `Project`, not the `App`).
     message: Option<String>,
-    /// Error message when a Done-TTL session hit the kill-attempt cap.
-    error_message: Option<String>,
+    /// Error messages for Done-TTL sessions that hit the kill-attempt cap.
+    give_up_messages: Vec<String>,
     /// Issue ids whose in-flight launch must be invalidated (their session was
     /// auto-killed mid-detection). The caller owns the `App` launch state.
     invalidate_issue_ids: Vec<String>,
@@ -1661,7 +1661,7 @@ fn drain_project_workers(
     if cleanup.needs_redraw {
         needs_redraw = true;
     }
-    outcome.error_message = cleanup.give_up_message;
+    outcome.give_up_messages = cleanup.give_up_messages;
     outcome.invalidate_issue_ids = cleanup.invalidate_issue_ids;
     let project_root = project.config.project_root.clone();
     for session_name in cleanup.kill_sessions {
@@ -1801,7 +1801,7 @@ fn apply_drain_outcome(app: &mut app::App, outcome: DrainOutcome, needs_redraw: 
         app.invalidate_inflight_launch(issue_id);
     }
     // A give-up error takes precedence over the routine sync message.
-    if let Some(err) = outcome.error_message {
+    if let Some(err) = outcome.give_up_messages.into_iter().next() {
         app.set_error(err);
     } else if let Some(msg) = outcome.message {
         app.set_message(msg);
@@ -2297,10 +2297,11 @@ fn run_tui() -> anyhow::Result<()> {
         let mut sessions_changed = false;
 
         // Shared: tmux sessions are server-global, distribute to all projects.
+        // A fresh poll also clears the done-TTL attempt counter for any session
+        // it confirms is gone (see `apply_session_poll`).
         while let Ok(sessions) = shared.tmux_rx.try_recv() {
             for project in &mut app.projects {
-                if project.live.active_sessions != sessions {
-                    project.live.active_sessions = sessions.clone();
+                if project.apply_session_poll(&sessions) {
                     sessions_changed = true;
                     needs_redraw = true;
                 }
