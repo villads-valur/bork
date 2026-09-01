@@ -11,8 +11,8 @@ use crate::config::{AppConfig, AppState, DEFAULT_REVIEW_PROMPT};
 use crate::external::linear::LinearIssue;
 use crate::prune::{PruneAction, PruneCandidate};
 use crate::types::{
-    AgentKind, AgentMode, AgentStatus, AgentStatusInfo, Column, GithubStack, Issue, IssueKind,
-    LinkedGithubPr, PrImportSource, PrState, PrStatus, WorktreeStatus,
+    AgentKind, AgentStatus, AgentStatusInfo, Column, GithubStack, Issue, IssueKind, LinkedGithubPr,
+    PrImportSource, PrState, PrStatus, WorktreeStatus,
 };
 
 pub type ProjectId = PathBuf;
@@ -171,10 +171,6 @@ impl Project {
             .first()
             .copied()
             .unwrap_or(self.config.agent_kind)
-    }
-
-    pub fn dialog_default_mode(&self) -> AgentMode {
-        self.config.agent_mode
     }
 
     pub fn mark_dirty(&mut self) {
@@ -1654,7 +1650,7 @@ impl App {
         let github_available = p.has_github_prs();
         let mut state = DialogState::new(
             p.dialog_default_agent(),
-            p.dialog_default_mode(),
+            p.config.agent_mode,
             p.available_agents.clone(),
             p.linear_available,
             github_available,

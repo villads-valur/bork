@@ -1041,7 +1041,7 @@ fn toml_literal_for(kind: ConfigKeyKind, value: &str) -> anyhow::Result<String> 
             None => anyhow::bail!("unknown agent '{}'", value),
         },
         ConfigKeyKind::Mode => match AgentMode::parse(value) {
-            Some(_) => Ok(format!("\"{}\"", value)),
+            Some(mode) => Ok(format!("\"{}\"", mode)),
             None => anyhow::bail!("unknown mode '{}' (expected plan, build, or yolo)", value),
         },
         ConfigKeyKind::Str => {
@@ -1326,7 +1326,7 @@ fn start_issue(project_root: &Path, opts: StartIssueOptions) -> anyhow::Result<S
             title: opts.title.clone(),
             column: None,
             agent_kind: opts.agent_kind,
-            agent_mode: Some(opts.agent_mode.unwrap_or(config.agent_mode)),
+            agent_mode: opts.agent_mode,
             prompt: opts.prompt,
             kind: Some(IssueKind::Agentic),
         },
