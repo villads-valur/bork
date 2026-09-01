@@ -81,6 +81,7 @@ fn map_normal_key(key: KeyEvent, swimlane_count: usize) -> Action {
         KeyCode::Char('a') => Action::AddIssue,
         KeyCode::Char('e') => Action::EditIssue,
         KeyCode::Char('d') => Action::DeleteIssue,
+        KeyCode::Char('A') => Action::ArchiveIssue,
 
         KeyCode::Char('H') => Action::MoveIssueLeft,
         KeyCode::Char('L') => Action::MoveIssueRight,

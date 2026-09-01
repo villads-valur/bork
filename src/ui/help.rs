@@ -50,6 +50,7 @@ const SECTIONS: &[Section] = &[
             ("a", "Add in column"),
             ("e", "Edit issue"),
             ("d", "Delete issue"),
+            ("A", "Archive issue"),
         ],
     },
     Section {

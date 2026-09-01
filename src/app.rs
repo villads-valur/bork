@@ -555,15 +555,18 @@ impl Project {
         }
         let was_done = issue.column == Column::Done;
         let wt = issue.worktree.clone();
-        issue.column = target;
+
+        // `done_at` upkeep is the shared domain invariant (also used by the
+        // CLI `ops` path). The worktree git-status freeze/unfreeze below is a
+        // TUI-only display concern (the CLI has no live git cache), so it
+        // stays here rather than in the shared method.
+        issue.move_to_column(target, unix_now());
 
         if target == Column::Done {
-            issue.done_at = Some(unix_now());
             if let Some(w) = wt {
                 self.freeze_worktree_status(&w);
             }
         } else if was_done {
-            issue.done_at = None;
             if let Some(w) = wt {
                 self.unfreeze_worktree_status(&w);
             }
@@ -1260,6 +1263,12 @@ pub enum ConfirmAction {
     DeleteIssue {
         /// Stored by ID, not index: background workers can reorder/remove
         /// issues while the confirm prompt is open.
+        issue_id: String,
+        project_id: ProjectId,
+    },
+    /// Kill the session, run teardown, remove the worktree, then move the
+    /// issue to Done. Stored by ID for the same reason as `DeleteIssue`.
+    ArchiveIssue {
         issue_id: String,
         project_id: ProjectId,
     },

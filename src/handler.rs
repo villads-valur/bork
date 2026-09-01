@@ -11,7 +11,7 @@ use crate::external::{browser, github, opencode, tmux, tuicr};
 use crate::global_config::ReloadResult;
 use crate::input::Action;
 use crate::types::{
-    AgentKind, Column, Issue, IssueKind, LinkedGithubPr, LinkedLinear, PrImportSource,
+    AgentKind, Column, Issue, IssueDraft, IssueKind, LinkedGithubPr, LinkedLinear, PrImportSource,
 };
 
 pub struct ActionChannels<'a> {
@@ -50,6 +50,10 @@ pub struct ActionResult {
     pub prune_outcome: Option<(crate::app::ProjectId, crate::prune::PruneOutcome)>,
     /// Remove this issue only after its asynchronous session teardown succeeds.
     pub issue_to_delete: Option<(ProjectId, String)>,
+    /// Move this issue to Done and drop its worktree only after its
+    /// asynchronous teardown (session kill + teardown script + worktree
+    /// removal) succeeds.
+    pub issue_to_archive: Option<(ProjectId, String)>,
 }
 
 pub enum PostAction {
@@ -314,6 +318,27 @@ fn handle_normal(
             app.start_confirm(
                 format!("Delete {}: {}? (y/n)", issue.id, issue.title),
                 ConfirmAction::DeleteIssue {
+                    issue_id: issue.id.clone(),
+                    project_id: ctx.project_id.clone(),
+                },
+            );
+            PostAction::None
+        }
+
+        Action::ArchiveIssue => {
+            let Some(issue) = app.context_project(ctx).selected_issue(&q) else {
+                return PostAction::None;
+            };
+
+            let has_worktree = issue.worktree.is_some();
+            let detail = if has_worktree {
+                "kill session, run teardown, remove worktree"
+            } else {
+                "kill session, move to Done"
+            };
+            app.start_confirm(
+                format!("Archive {}: {}? ({}) (y/n)", issue.id, issue.title, detail),
+                ConfirmAction::ArchiveIssue {
                     issue_id: issue.id.clone(),
                     project_id: ctx.project_id.clone(),
                 },
@@ -955,12 +980,20 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
     let id = p.next_issue_id();
     let column = dialog.target_column.unwrap_or(Column::Todo);
     let column_index = column.index();
-    let mut issue = Issue {
-        kind: dialog.kind,
-        agent_mode: dialog.agent_mode,
-        prompt,
-        ..Issue::new(id.clone(), title, column, dialog.agent_kind)
-    };
+    // Share the CLI's create invariant so a Done-column creation stamps
+    // `done_at` here too, instead of relying on the `Project::new` backfill.
+    let mut issue = Issue::build(
+        IssueDraft {
+            id: id.clone(),
+            title,
+            column,
+            agent_kind: dialog.agent_kind,
+            kind: dialog.kind,
+            agent_mode: dialog.agent_mode,
+            prompt,
+        },
+        crate::app::unix_now(),
+    );
 
     apply_linear_fields(&mut issue, &dialog);
     apply_pr_fields(&mut issue, &dialog);
@@ -1537,6 +1570,39 @@ fn handle_confirm(
                             let _ = tx.send(result);
                         });
                     }
+                    ConfirmAction::ArchiveIssue {
+                        issue_id,
+                        project_id,
+                    } => {
+                        let Some(p) = app.find_project(&project_id) else {
+                            app.set_warning("Project no longer available");
+                            return;
+                        };
+                        // Resolve by ID at confirm time: indices can shift while
+                        // the prompt is open (PR sync, external state merges).
+                        let Some(idx) = p.issues.iter().position(|i| i.id == issue_id) else {
+                            app.set_warning(format!("{} is no longer on the board", issue_id));
+                            return;
+                        };
+                        let issue = &p.issues[idx];
+                        let id = issue.id.clone();
+                        let session_name = issue.session_name(&p.config.project_name);
+                        let worktree = issue.worktree.clone();
+                        let config = p.config.clone();
+
+                        app.invalidate_inflight_launch(&issue_id);
+                        app.begin_busy();
+                        let tx = action_tx.clone();
+                        thread::spawn(move || {
+                            let _ = tx.send(archive_to_result(
+                                &config,
+                                project_id,
+                                id,
+                                &session_name,
+                                worktree.as_deref(),
+                            ));
+                        });
+                    }
                 }
             }
         }
@@ -1545,6 +1611,75 @@ fn handle_confirm(
         }
         _ => {}
     }
+}
+
+/// Run the off-thread half of a TUI archive: kill the agent session, run the
+/// teardown script, and remove the worktree (never forced, matching the CLI's
+/// default — a failing teardown or dirty worktree aborts and reports an
+/// error). On success it sets `issue_to_archive` so the main thread applies
+/// the move-to-Done and worktree drop against the live in-memory board,
+/// instead of writing state.json directly and racing concurrent merges.
+fn archive_to_result(
+    config: &AppConfig,
+    project_id: ProjectId,
+    issue_id: String,
+    session_name: &str,
+    worktree: Option<&str>,
+) -> ActionResult {
+    let session_killed = match opencode::terminate_session(&config.project_root, session_name) {
+        Ok(killed) => killed,
+        Err(e) => {
+            return ActionResult {
+                message: format!("Failed to archive {issue_id}: {e}"),
+                message_kind: MessageKind::Error,
+                ..Default::default()
+            };
+        }
+    };
+
+    if let Some(dir) = worktree {
+        if let Err(e) = crate::worktree::remove_worktree_in(config, dir, false) {
+            return ActionResult {
+                message: format!("Failed to archive {issue_id}: {e}"),
+                message_kind: MessageKind::Error,
+                ..Default::default()
+            };
+        }
+    }
+
+    let message = match (worktree.is_some(), session_killed) {
+        (true, true) => format!("Archived {issue_id} (session killed, worktree removed)"),
+        (true, false) => format!("Archived {issue_id} (worktree removed)"),
+        (false, true) => format!("Archived {issue_id} (session killed)"),
+        (false, false) => format!("Archived {issue_id}"),
+    };
+    ActionResult {
+        message,
+        issue_to_archive: Some((project_id, issue_id)),
+        ..Default::default()
+    }
+}
+
+/// Apply a completed archive to the in-memory board: drop the worktree and
+/// move the issue to Done (stamping `done_at`). Mirrors `delete_issue_from_app`
+/// so state mutation happens on the main thread after the async teardown.
+pub fn archive_issue_in_app(app: &mut App, project_id: &ProjectId, issue_id: &str) -> bool {
+    let query = app.search_query.clone();
+    let Some(project) = app.find_project_mut(project_id) else {
+        return false;
+    };
+    let Some(issue) = project
+        .issues
+        .iter_mut()
+        .find(|i| i.id.eq_ignore_ascii_case(issue_id))
+    else {
+        return false;
+    };
+    issue.worktree = None;
+    issue.move_to_column(Column::Done, crate::app::unix_now());
+    project.clamp_all_rows(&query);
+    project.mark_dirty();
+    true
 }
 
 pub fn delete_issue_from_app(app: &mut App, project_id: &ProjectId, issue_id: &str) -> bool {
@@ -2349,6 +2484,57 @@ mod tests {
         act(&mut app, Action::ConfirmNo);
         assert_eq!(app.input_mode, InputMode::Normal);
         assert_eq!(app.project().issues.len(), 3);
+    }
+
+    #[test]
+    fn archive_issue_opens_confirm_with_archive_action() {
+        let mut app = app_with_issues();
+        act(&mut app, Action::ArchiveIssue);
+        assert_eq!(app.input_mode, InputMode::Confirm);
+        match app.pending_confirm.as_ref().unwrap() {
+            ConfirmAction::ArchiveIssue { issue_id, .. } => assert_eq!(issue_id, "bork-1"),
+            _ => panic!("expected ArchiveIssue"),
+        }
+    }
+
+    #[test]
+    fn archive_issue_in_app_moves_to_done_and_drops_worktree() {
+        let mut app = app_with_issues();
+        let project_id = app.project().id();
+        app.project_mut().issues[0].worktree = Some("bork-1-slug".to_string());
+
+        assert!(archive_issue_in_app(&mut app, &project_id, "bork-1"));
+
+        let issue = &app.project().issues[0];
+        assert_eq!(issue.column, Column::Done);
+        assert!(issue.done_at.is_some());
+        assert!(issue.worktree.is_none());
+        assert!(app.project().state_dirty);
+    }
+
+    #[test]
+    fn archive_issue_in_app_unknown_id_is_noop() {
+        let mut app = app_with_issues();
+        let project_id = app.project().id();
+        assert!(!archive_issue_in_app(&mut app, &project_id, "bork-99"));
+    }
+
+    #[test]
+    fn dialog_create_in_done_column_stamps_done_at() {
+        let mut app = test_app();
+        let ctx = app.action_context();
+        app.open_dialog_in_column(Column::Done, &ctx);
+        if let Some(ref mut dialog) = app.dialog {
+            dialog.title = "Born done".to_string();
+        }
+        submit_dialog(&mut app, &ctx);
+
+        let issue = app.project().issues.last().unwrap();
+        assert_eq!(issue.column, Column::Done);
+        assert!(
+            issue.done_at.is_some(),
+            "TUI create in Done must stamp done_at like the CLI"
+        );
     }
 
     // ================================================================
