@@ -1,4 +1,6 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -22,6 +24,19 @@ pub(crate) fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Order-independent fingerprint of a collection: hash each item on its own and
+/// XOR the results, so iteration order (e.g. `HashMap` traversal) doesn't affect
+/// the output. Used as a cheap cache key for render-path memoization. XOR is
+/// safe against cancellation here because callers fingerprint over unique keys
+/// (issue ids, session names), so no two per-item hashes collide.
+fn xor_fingerprint<T: Hash>(items: impl Iterator<Item = T>) -> u64 {
+    items.fold(0u64, |acc, item| {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        item.hash(&mut hasher);
+        acc ^ hasher.finish()
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +107,23 @@ pub struct Project {
     /// project. Ephemeral; throttles both the check and its toast.
     pub last_auto_prune_check: Option<Instant>,
     pub last_config_mtime: Option<SystemTime>,
+    /// Per-frame render caches keyed on cheap fingerprints of their inputs.
+    /// Populated lazily by read-only query methods and invalidated implicitly
+    /// when the fingerprint changes, so they never need explicit invalidation
+    /// from mutation paths. See `RenderCache`.
+    render_cache: RefCell<RenderCache>,
+}
+
+/// Memoized results for hot read-only queries used by the render path. Each
+/// entry stores the fingerprint of the inputs it was computed from; a lookup is
+/// a hit only when the current fingerprint matches. Interior mutability keeps
+/// the owning query methods `&self`.
+#[derive(Default)]
+struct RenderCache {
+    /// `has_listening_ports`: (fingerprint of the `listening_ports` map, result).
+    listening_ports: Option<(u64, bool)>,
+    /// `linked_component`: (fingerprint of the link graph, anchor, component).
+    linked_component: Option<(u64, String, HashSet<String>)>,
 }
 
 impl Project {
@@ -133,6 +165,7 @@ impl Project {
             last_prune_at,
             last_auto_prune_check: None,
             last_config_mtime,
+            render_cache: RefCell::new(RenderCache::default()),
         }
     }
 
@@ -282,27 +315,60 @@ impl Project {
 
     pub fn issues_in_column(&self, column: Column, query: &str) -> Vec<(usize, &Issue)> {
         let query = query.to_lowercase();
-        let component = self
-            .link_filter
-            .as_deref()
-            .map(|anchor| self.linked_component(anchor));
-        self.issues
+        let matches: Vec<(usize, &Issue)> = self
+            .issues
             .iter()
             .enumerate()
             .filter(|(_, issue)| {
-                issue.column == column
-                    && (query.is_empty() || self.issue_matches(issue, &query))
-                    && component
-                        .as_ref()
-                        .is_none_or(|c| c.contains(&issue.id.to_lowercase()))
+                issue.column == column && (query.is_empty() || self.issue_matches(issue, &query))
             })
-            .collect()
+            .collect();
+        let Some(anchor) = self.link_filter.as_deref() else {
+            return matches;
+        };
+        // Resolve the component once (cached) instead of per-issue, then filter.
+        self.with_linked_component(anchor, |component| {
+            matches
+                .into_iter()
+                .filter(|(_, issue)| component.contains(&issue.id.to_lowercase()))
+                .collect()
+        })
     }
 
     /// Connected component of the link graph containing `anchor` (BFS over
     /// `linked_issues`). Returns lowercased ids, including the anchor itself.
     pub fn linked_component(&self, anchor: &str) -> HashSet<String> {
-        crate::ops::linked_component(&self.issues, anchor)
+        self.with_linked_component(anchor, |component| component.clone())
+    }
+
+    /// Runs `f` with the (memoized) linked component for `anchor`, avoiding a
+    /// clone on the hot path. `issues_in_column` is called for every column of
+    /// every swimlane per frame (and from many action sites), and each call
+    /// otherwise rebuilds a `HashMap` with a lowercased `String` per issue. The
+    /// component is cached against a fingerprint of the link graph plus the
+    /// anchor, so it is computed at most once per underlying change.
+    fn with_linked_component<T>(&self, anchor: &str, f: impl FnOnce(&HashSet<String>) -> T) -> T {
+        let fingerprint = self.link_graph_fingerprint();
+        {
+            let cache = self.render_cache.borrow();
+            if let Some((cached_fp, cached_anchor, component)) = cache.linked_component.as_ref() {
+                if *cached_fp == fingerprint && cached_anchor == anchor {
+                    return f(component);
+                }
+            }
+        }
+        let component = crate::ops::linked_component(&self.issues, anchor);
+        let result = f(&component);
+        self.render_cache.borrow_mut().linked_component =
+            Some((fingerprint, anchor.to_string(), component));
+        result
+    }
+
+    /// Fingerprint of the link graph (`id` + `linked_issues` per issue). Cheap
+    /// enough to recompute per frame and only changes when links or the issue
+    /// set change, at which point the cached component is recomputed.
+    fn link_graph_fingerprint(&self) -> u64 {
+        xor_fingerprint(self.issues.iter().map(|i| (&i.id, &i.linked_issues)))
     }
 
     fn issue_matches(&self, issue: &Issue, query: &str) -> bool {
@@ -607,11 +673,31 @@ impl Project {
 
     /// True when any issue in this project has a tmux session listening on a port
     /// (i.e. a dev env is running). Mirrors the per-card 🔌 condition.
+    ///
+    /// Called once per project per redraw from the sidebar and is O(all issues)
+    /// with a `session_name` allocation per issue, so the result is memoized
+    /// against a fingerprint of the `listening_ports` map. The map only changes
+    /// on the port poll delta (every 10s), so between polls this is a cache hit.
     pub fn has_listening_ports(&self) -> bool {
-        self.issues.iter().any(|issue| {
+        let fingerprint = self.listening_ports_fingerprint();
+        if let Some((cached_fp, result)) = self.render_cache.borrow().listening_ports {
+            if cached_fp == fingerprint {
+                return result;
+            }
+        }
+        let result = self.issues.iter().any(|issue| {
             self.listening_ports_for(issue)
                 .is_some_and(|ports| !ports.is_empty())
-        })
+        });
+        self.render_cache.borrow_mut().listening_ports = Some((fingerprint, result));
+        result
+    }
+
+    /// Order-independent fingerprint of the `listening_ports` map. The map is
+    /// bounded by the number of live sessions (small), so hashing it per frame
+    /// is far cheaper than the full `has_listening_ports` scan it guards.
+    fn listening_ports_fingerprint(&self) -> u64 {
+        xor_fingerprint(self.live.listening_ports.iter())
     }
 
     pub fn worktree_for<'a>(&self, issue: &'a Issue) -> Option<&'a str> {
@@ -768,8 +854,15 @@ impl Project {
             .find(|stack| stack.pull_requests.iter().any(|pr| pr.number == number))
     }
 
-    pub fn stack_for_issue(&self, issue: &Issue) -> Option<&GithubStack> {
-        if let Some(pr) = self.pr_for(issue) {
+    /// Resolves the GitHub stack for an issue given an already-resolved
+    /// `pr_for` result, so the render path can resolve `pr_for` once per card
+    /// instead of twice (once directly for the badge, once via the stack).
+    pub fn stack_for_issue_with_pr(
+        &self,
+        issue: &Issue,
+        pr: Option<&PrStatus>,
+    ) -> Option<&GithubStack> {
+        if let Some(pr) = pr {
             return self.stack_for_pr(pr.number);
         }
         issue
@@ -2177,6 +2270,60 @@ mod tests {
             .listening_ports
             .insert(session, vec![]);
         assert!(!app.project().has_listening_ports());
+    }
+
+    #[test]
+    fn has_listening_ports_cache_invalidates_on_port_change() {
+        let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
+        let session = app.project().issues[0].session_name(&app.project().config.project_name);
+        // Prime the cache with a false result.
+        assert!(!app.project().has_listening_ports());
+        // A poll delta adds a port: the fingerprint changes, so the cache misses.
+        app.project_mut()
+            .live
+            .listening_ports
+            .insert(session.clone(), vec![3000]);
+        assert!(app.project().has_listening_ports());
+        // A poll delta clears the ports again: fingerprint changes back.
+        app.project_mut()
+            .live
+            .listening_ports
+            .insert(session, vec![]);
+        assert!(!app.project().has_listening_ports());
+    }
+
+    #[test]
+    fn linked_component_cache_invalidates_when_links_change() {
+        let mut a = test_issue("bork-1", Column::Todo);
+        let mut b = test_issue("bork-2", Column::Todo);
+        let mut app = test_app(vec![a.clone(), b.clone()]);
+        // No links yet: component is just the anchor.
+        let component = app.project().linked_component("bork-1");
+        assert_eq!(component.len(), 1);
+        assert!(component.contains("bork-1"));
+        // Link the two issues: the fingerprint changes, so the cache recomputes.
+        a.linked_issues = vec!["bork-2".into()];
+        b.linked_issues = vec!["bork-1".into()];
+        app.project_mut().issues = vec![a, b];
+        let component = app.project().linked_component("bork-1");
+        assert_eq!(component.len(), 2);
+        assert!(component.contains("bork-1"));
+        assert!(component.contains("bork-2"));
+    }
+
+    #[test]
+    fn linked_component_cache_distinguishes_anchors() {
+        let mut a = test_issue("bork-1", Column::Todo);
+        let mut b = test_issue("bork-2", Column::Todo);
+        let c = test_issue("bork-3", Column::Todo);
+        a.linked_issues = vec!["bork-2".into()];
+        b.linked_issues = vec!["bork-1".into()];
+        let app = test_app(vec![a, b, c]);
+        // bork-1 and bork-2 form one component; bork-3 is isolated. Querying
+        // different anchors back to back must not return a stale cached result.
+        assert_eq!(app.project().linked_component("bork-1").len(), 2);
+        assert_eq!(app.project().linked_component("bork-3").len(), 1);
+        assert_eq!(app.project().linked_component("bork-1").len(), 2);
     }
 
     #[test]

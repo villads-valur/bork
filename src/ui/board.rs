@@ -187,6 +187,7 @@ fn render_column(
         let is_selected = is_selected_col && (viewport_start + visible_idx) == selected_row;
         let marked = project.marked_issues.contains(&issue.id.to_lowercase());
 
+        let pr = project.pr_for(issue);
         let ctx = card::CardContext {
             issue,
             selected: is_selected,
@@ -197,8 +198,8 @@ fn render_column(
             activity: project.resolved_activity(issue),
             branch: project.branch_for(issue),
             git_status: project.worktree_status_for(issue),
-            pr: project.pr_for(issue),
-            stack: project.stack_for_issue(issue),
+            pr,
+            stack: project.stack_for_issue_with_pr(issue, pr),
             ports: project.listening_ports_for(issue),
             search_query,
         };
