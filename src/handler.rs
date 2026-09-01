@@ -1638,6 +1638,7 @@ mod tests {
             project_name: "bork".to_string(),
             project_root: PathBuf::from("/tmp/test-bork"),
             agent_kind: crate::types::AgentKind::OpenCode,
+            agent_mode: crate::types::AgentMode::Plan,
             default_prompt: Some("Check AGENTS.md for context.".to_string()),
             review_prompt: None,
             orchestrator_prompt: None,
@@ -2573,6 +2574,7 @@ mod tests {
             project_name: name.to_string(),
             project_root: PathBuf::from(format!("/tmp/test-{}", name)),
             agent_kind: crate::types::AgentKind::OpenCode,
+            agent_mode: crate::types::AgentMode::Plan,
             default_prompt: None,
             review_prompt: None,
             orchestrator_prompt: None,
@@ -2915,6 +2917,7 @@ mod tests {
             additions: 10,
             deletions: 5,
             head_branch: "feature".to_string(),
+            is_cross_repository: false,
         };
         app.projects[0]
             .live
