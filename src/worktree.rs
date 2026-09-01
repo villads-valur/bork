@@ -61,7 +61,7 @@ pub fn slugify_title(title: &str) -> String {
 /// resolve against fresh remote refs. Failure (offline, no remote) is
 /// non-fatal and must never block worktree creation.
 fn fetch_origin(main_dir: &Path) -> bool {
-    Command::new("git")
+    crate::external::git_command()
         .args(["fetch", "origin", "--quiet"])
         .current_dir(main_dir)
         .stdout(Stdio::null())
@@ -74,7 +74,7 @@ fn fetch_origin(main_dir: &Path) -> bool {
 /// Run a git command in `dir` and return its trimmed stdout, or `None` if
 /// the command failed.
 fn git_stdout(dir: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
+    let output = crate::external::git_command()
         .args(args)
         .current_dir(dir)
         .stderr(Stdio::null())
@@ -165,7 +165,7 @@ pub fn create_worktree_in(
         args.push(base);
     }
 
-    let status = Command::new("git")
+    let status = crate::external::git_command()
         .args(&args)
         .current_dir(&main_dir)
         .status()
@@ -228,7 +228,7 @@ pub fn remove_worktree_in(
     let worktree_path = config.project_root.join(worktree_dir);
     if !worktree_path.exists() {
         // Directory already gone; clean up any stale worktree metadata.
-        let _ = Command::new("git")
+        let _ = crate::external::git_command()
             .args(["worktree", "prune"])
             .current_dir(&main_dir)
             .status();
@@ -255,7 +255,7 @@ pub fn remove_worktree_in(
         args.push("--force");
     }
 
-    let status = Command::new("git")
+    let status = crate::external::git_command()
         .args(&args)
         .current_dir(&main_dir)
         .status()

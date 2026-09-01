@@ -7,7 +7,6 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::process::Command;
 
 use crate::app::Project;
 use crate::types::{Column, Issue, WorktreeStatus};
@@ -202,7 +201,7 @@ pub fn execute_removals(project_root: &Path, worktrees: &[String]) -> PruneOutco
 }
 
 fn run_git_worktree_remove(main_dir: &Path, worktree_path: &Path) -> RemoveOutcome {
-    let output = Command::new("git")
+    let output = crate::external::git_command()
         .args(["worktree", "remove"])
         .arg(worktree_path)
         .current_dir(main_dir)

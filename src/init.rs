@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use anyhow::{bail, Context};
 
@@ -100,7 +100,7 @@ pub fn run_init(
 
     // Clone the repository into <container>/main with live progress output
     println!("Cloning {} into {}/main ...", clone_url, dir_name);
-    let status = Command::new("git")
+    let status = crate::external::git_command()
         .args([
             "clone",
             "--progress",
@@ -189,6 +189,8 @@ pub fn run_init(
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
+
     use super::*;
 
     fn with_isolated_config(tmp: &Path, test: impl FnOnce()) {

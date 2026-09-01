@@ -106,7 +106,7 @@ fn current_commit() -> Option<String> {
             }
 
             let repo = resolve_source_repo().ok()?;
-            let output = Command::new("git")
+            let output = crate::external::git_command()
                 .args(["rev-parse", "HEAD"])
                 .current_dir(&repo)
                 .stdout(Stdio::piped())
@@ -128,7 +128,7 @@ fn github_repo() -> Option<&'static str> {
 
 /// Query GitHub for the current `main` HEAD sha.
 fn fetch_remote_head_sha(repo: &str) -> Option<String> {
-    let output = Command::new("gh")
+    let output = crate::external::gh_command()
         .args(["api", &format!("repos/{repo}/commits/main"), "--jq", ".sha"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -144,7 +144,7 @@ fn fetch_remote_head_sha(repo: &str) -> Option<String> {
 /// Returns how many commits `main` on GitHub is ahead of `local_sha`.
 /// Returns `None` on any error (gh not available, network issue, sha unknown to GitHub).
 fn fetch_commits_behind(repo: &str, local_sha: &str) -> Option<u32> {
-    let output = Command::new("gh")
+    let output = crate::external::gh_command()
         .args([
             "api",
             &format!("repos/{repo}/compare/{local_sha}...main"),
@@ -344,7 +344,7 @@ fn kill_tui_tmux_session() -> std::io::Result<()> {
 /// Count commits on `origin/main` not reachable from `from`. Returns `None` if
 /// the rev-list call fails (e.g. unknown SHA), so callers can fall back.
 fn count_commits_behind_origin(repo: &PathBuf, from: &str) -> Option<u32> {
-    let output = Command::new("git")
+    let output = crate::external::git_command()
         .args(["rev-list", &format!("{from}..origin/main"), "--count"])
         .current_dir(repo)
         .stderr(Stdio::null())
@@ -358,7 +358,7 @@ fn count_commits_behind_origin(repo: &PathBuf, from: &str) -> Option<u32> {
 
 /// Read `origin/main`'s SHA via local git. `None` if the ref isn't resolvable.
 fn local_origin_main_sha(repo: &PathBuf) -> Option<String> {
-    let output = Command::new("git")
+    let output = crate::external::git_command()
         .args(["rev-parse", "origin/main"])
         .current_dir(repo)
         .stderr(Stdio::null())
@@ -384,7 +384,7 @@ pub fn run_update() -> anyhow::Result<()> {
     stop_running_instance();
 
     println!("Fetching latest...");
-    let fetch = Command::new("git")
+    let fetch = crate::external::git_command()
         .args(["fetch", "origin", "main", "--quiet"])
         .current_dir(&repo)
         .status()
@@ -415,7 +415,7 @@ pub fn run_update() -> anyhow::Result<()> {
     println!("{behind} new commit(s) available. Pulling...");
     println!();
 
-    let pull = Command::new("git")
+    let pull = crate::external::git_command()
         .args(["pull", "origin", "main"])
         .current_dir(&repo)
         .stdout(Stdio::inherit())
