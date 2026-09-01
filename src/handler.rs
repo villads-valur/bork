@@ -2917,6 +2917,7 @@ mod tests {
             additions: 10,
             deletions: 5,
             head_branch: "feature".to_string(),
+            is_cross_repository: false,
         };
         app.projects[0]
             .live

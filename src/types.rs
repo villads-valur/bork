@@ -598,6 +598,9 @@ pub struct PrStatus {
     pub additions: u32,
     pub deletions: u32,
     pub head_branch: String,
+    /// True when the head branch lives in a fork. Fork PRs are excluded from
+    /// branch-keyed indexing since their branch names can collide with upstream.
+    pub is_cross_repository: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -673,6 +676,7 @@ mod tests {
             additions: 10,
             deletions: 5,
             head_branch: "main".into(),
+            is_cross_repository: false,
         };
         let cloned = pr.clone();
         assert_eq!(cloned.number, 1);
