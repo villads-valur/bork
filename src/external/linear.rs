@@ -25,6 +25,7 @@ pub struct LinearPollResult {
 pub fn check_available() -> bool {
     Command::new("linear")
         .arg("--version")
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -44,6 +45,7 @@ pub fn fetch_assigned_issues() -> Result<Vec<LinearIssue>, AppError> {
     let output = Command::new("linear")
         .arg("api")
         .arg(QUERY)
+        .stdin(std::process::Stdio::null())
         .output()
         .map_err(|e| AppError::Linear(format!("failed to run linear cli: {e}")))?;
 

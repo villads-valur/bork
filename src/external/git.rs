@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::process::Command;
 
 use crate::types::WorktreeStatus;
 
@@ -87,7 +86,7 @@ pub(crate) fn parse_worktree_list(output: &str) -> HashMap<String, String> {
 }
 
 fn git_output(worktree_path: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
+    let output = crate::external::git_command()
         .arg("-C")
         .arg(worktree_path)
         .args(args)

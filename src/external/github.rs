@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Condvar, Mutex};
 
 use crate::types::{
@@ -102,7 +101,7 @@ fn get_repo_identity(main_worktree: &Path) -> Option<RepoIdentity> {
 }
 
 fn fetch_repo_identity(main_worktree: &Path) -> Option<RepoIdentity> {
-    let output = Command::new("gh")
+    let output = crate::external::gh_command()
         .args(["repo", "view", "--json", "owner,name"])
         .current_dir(main_worktree)
         .output()
@@ -133,7 +132,7 @@ pub fn fetch_prs(main_worktree: &Path) -> Vec<PrStatus> {
         }}"#
     );
 
-    let output = Command::new("gh")
+    let output = crate::external::gh_command()
         .args([
             "api",
             "graphql",
@@ -162,7 +161,7 @@ pub fn fetch_prs(main_worktree: &Path) -> Vec<PrStatus> {
 pub fn fetch_stacks(main_worktree: &Path) -> Option<Vec<GithubStack>> {
     let repo = get_repo_identity(main_worktree)?;
     let endpoint = format!("repos/{}/{}/stacks?per_page=100", repo.owner, repo.name);
-    let output = Command::new("gh")
+    let output = crate::external::gh_command()
         .args(["api", "--paginate", "--slurp", &endpoint])
         .current_dir(main_worktree)
         .output();
@@ -354,7 +353,7 @@ pub fn fetch_user_prs(main_worktree: &Path) -> Vec<PrStatus> {
         }}"#
     );
 
-    let output = Command::new("gh")
+    let output = crate::external::gh_command()
         .args([
             "api",
             "graphql",
@@ -411,7 +410,7 @@ pub fn fetch_review_requested_prs(main_worktree: &Path) -> Vec<PrStatus> {
 }
 
 fn fetch_search_query(main_worktree: &Path, graphql_query: &str, search: &str) -> Vec<PrStatus> {
-    let output = Command::new("gh")
+    let output = crate::external::gh_command()
         .args([
             "api",
             "graphql",
@@ -485,7 +484,7 @@ pub fn fetch_current_user(main_worktree: &Path) -> Option<String> {
 }
 
 fn fetch_current_user_uncached(main_worktree: &Path) -> Option<String> {
-    let output = Command::new("gh")
+    let output = crate::external::gh_command()
         .args(["api", "user", "-q", ".login"])
         .current_dir(main_worktree)
         .output()

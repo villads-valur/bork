@@ -60,9 +60,7 @@ pub fn save_global_config(config: &GlobalConfig) -> anyhow::Result<()> {
     let path = global_config_path();
     let json = serde_json::to_string_pretty(config)?;
 
-    let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
-    fs::write(&tmp_path, &json)?;
-    fs::rename(&tmp_path, &path)?;
+    crate::config::atomic_write(&path, json.as_bytes())?;
 
     Ok(())
 }
