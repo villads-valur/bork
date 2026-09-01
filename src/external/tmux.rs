@@ -265,8 +265,19 @@ pub fn pane_pids(name: &str) -> Result<Vec<i32>, AppError> {
     )))
 }
 
+/// Whether tmux's stderr means "the target does not exist", which callers
+/// treat as "nothing to do" rather than a failure.
+///
+/// tmux words this per command, not per target: `kill-session` says "can't
+/// find session" while `list-panes -s -t <session>` resolves the target
+/// through its window layer and says "can't find window" (tmux 3.7c). Missing
+/// the latter makes a dead session look like a hard error, which is enough to
+/// wedge a card that can then never be deleted.
 fn is_missing_session_error(stderr: &str) -> bool {
-    stderr.contains("can't find session") || stderr.contains("no server running")
+    stderr.contains("can't find session")
+        || stderr.contains("can't find window")
+        || stderr.contains("session not found")
+        || stderr.contains("no server running")
 }
 
 pub fn send_keys(session: &str, keys: &str) -> Result<(), AppError> {
@@ -364,8 +375,21 @@ mod tests {
 
     #[test]
     fn missing_session_errors_are_harmless() {
-        assert!(is_missing_session_error("can't find session: bork-1"));
-        assert!(is_missing_session_error("no server running on /tmp/tmux"));
+        // Every wording tmux uses for a target that does not exist. The
+        // window variant comes from `list-panes -s -t <session>`, verified
+        // against tmux 3.7c; treating it as a real error wedges a card so it
+        // can never be deleted.
+        for stderr in [
+            "can't find session: bork-1",
+            "can't find window: bork-1",
+            "session not found: bork-1",
+            "no server running on /tmp/tmux",
+        ] {
+            assert!(
+                is_missing_session_error(stderr),
+                "should be harmless: {stderr}"
+            );
+        }
     }
 
     #[test]
