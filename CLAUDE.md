@@ -124,7 +124,7 @@ State lives in `.bork/` at the container root. Config is detected by walking up 
 
 ## Global State
 
-- `~/.config/bork/config.toml` — global config layer (agents allowlist, default_agent, default_prompt, review_prompt, orchestrator_prompt, setup_script, teardown_script, auto_import_reviews, auto_import_authored_prs, etc.). Same flat schema as `<project>/.bork/config.toml`; project values override global. Scalar keys can be read/written with `bork config get|set|list`.
+- `~/.config/bork/config.toml` — global config layer (agents allowlist, default_agent, default_mode, default_prompt, review_prompt, orchestrator_prompt, setup_script, teardown_script, auto_import_reviews, auto_import_authored_prs, etc.). Same flat schema as `<project>/.bork/config.toml`; project values override global. `default_mode` (alias `agent_mode`) sets the default agent mode (plan/build/yolo) for new issues created via the TUI dialog or `bork issue create`/`bork issue start` when no `--mode` is given. Scalar keys can be read/written with `bork config get|set|list`.
 - `~/.config/bork/projects.json` — registry of all bork projects (auto-registered, auto-pruned, managed artifact)
 - `~/.config/bork/bork.pid` — flock-based single instance lock
 

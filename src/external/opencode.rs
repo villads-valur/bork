@@ -1215,6 +1215,7 @@ mod tests {
             project_name: "bork".to_string(),
             project_root: std::path::PathBuf::from("/tmp/test"),
             agent_kind: AgentKind::OpenCode,
+            agent_mode: AgentMode::Plan,
             default_prompt: Some("The source code is in main/.".to_string()),
             review_prompt: None,
             orchestrator_prompt: None,

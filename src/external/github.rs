@@ -275,16 +275,12 @@ fn parse_pr_node(node: &serde_json::Value) -> Option<PrStatus> {
         .unwrap_or(false);
     let head_branch = node.get("headRefName")?.as_str()?.to_string();
 
-    // Drop PRs from forks: their head branch can collide with upstream branch
-    // names and pollute the by-branch index. The field is optional so we treat
-    // missing as same-repo (e.g. for older fixtures or partial responses).
-    let is_cross_repo = node
+    // Kept but flagged so branch-keyed indexing can skip fork PRs, whose head
+    // branch can collide with upstream names. Missing means same-repo.
+    let is_cross_repository = node
         .get("isCrossRepository")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    if is_cross_repo {
-        return None;
-    }
 
     let state = match state_str {
         "OPEN" => PrState::Open,
@@ -329,6 +325,7 @@ fn parse_pr_node(node: &serde_json::Value) -> Option<PrStatus> {
         additions,
         deletions,
         head_branch,
+        is_cross_repository,
     })
 }
 
@@ -524,9 +521,13 @@ pub fn index_by_branch(prs: Vec<PrStatus>) -> HashMap<String, PrStatus> {
     // open one on a reused branch name), prefer the higher-priority state.
     // Open beats Merged/Closed; within the same priority the first PR wins,
     // and `fetch_prs` returns PRs ordered by UPDATED_AT DESC, so "first" means
-    // most recent.
+    // most recent. Fork PRs are skipped: their branch names live in another
+    // repo's namespace and would pollute the index.
     let mut map: HashMap<String, PrStatus> = HashMap::new();
     for pr in prs {
+        if pr.is_cross_repository {
+            continue;
+        }
         let new_priority = state_priority(&pr.state);
         match map.get(&pr.head_branch) {
             Some(existing) if state_priority(&existing.state) >= new_priority => {}
@@ -995,6 +996,7 @@ mod tests {
             additions: 0,
             deletions: 0,
             head_branch: branch.into(),
+            is_cross_repository: false,
         }
     }
 
@@ -1069,9 +1071,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_cross_repository_pr_returns_none() {
+    fn test_parse_cross_repository_pr_sets_flag() {
         let node = make_pr_node(r#"{"isCrossRepository": true}"#);
-        assert!(parse_pr_node(&node).is_none());
+        let pr = parse_pr_node(&node).unwrap();
+        assert_eq!(pr.number, 42);
+        assert!(pr.is_cross_repository);
     }
 
     #[test]
@@ -1079,6 +1083,7 @@ mod tests {
         let node = make_pr_node(r#"{"isCrossRepository": false}"#);
         let pr = parse_pr_node(&node).unwrap();
         assert_eq!(pr.number, 42);
+        assert!(!pr.is_cross_repository);
     }
 
     #[test]
@@ -1087,5 +1092,24 @@ mod tests {
         node.as_object_mut().unwrap().remove("isCrossRepository");
         let pr = parse_pr_node(&node).unwrap();
         assert_eq!(pr.number, 42);
+        assert!(!pr.is_cross_repository);
+    }
+
+    #[test]
+    fn test_index_skips_cross_repository_prs() {
+        let mut fork_pr = test_pr_status(1, "feature");
+        fork_pr.is_cross_repository = true;
+        let same_repo_pr = test_pr_status(2, "feature");
+        let map = index_by_branch(vec![fork_pr, same_repo_pr]);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["feature"].number, 2);
+    }
+
+    #[test]
+    fn test_index_only_cross_repository_pr_yields_empty() {
+        let mut fork_pr = test_pr_status(1, "feature");
+        fork_pr.is_cross_repository = true;
+        let map = index_by_branch(vec![fork_pr]);
+        assert!(map.is_empty());
     }
 }

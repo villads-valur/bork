@@ -312,6 +312,8 @@ Bork uses a single config schema in two layered locations. Project values overri
 project_name     = "myproject"                       # project file only
 agent_kind       = "opencode"                        # default agent for this project
 default_agent    = "claude"                          # alias for agent_kind, more natural in the global file
+agent_mode       = "plan"                            # default mode (plan/build/yolo) for new issues when --mode is omitted
+default_mode     = "plan"                             # alias for agent_mode, more natural in the global file
 agents           = ["opencode", "claude", "codex", "pi"]   # allowed agent picker entries (order matters)
 default_prompt   = "Check AGENTS.md for project context and start working on the issue."
 review_prompt    = "Read the diff and summarize findings."  # body for auto-imported review-requested PRs (bork prepends the PR number + link)
