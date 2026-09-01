@@ -52,7 +52,7 @@ use handler::{ActionResult, PostAction};
 use input::map_key_to_action;
 use types::{AgentKind, AgentMode, AgentStatusInfo, Column, IssueKind};
 
-use external::git::GitPollResult;
+use external::git::{GitPollResult, GitPoller, GitStatusPool, PollClass};
 use external::linear::LinearPollResult;
 use external::ports::PortPollResult;
 use types::{GithubStack, PrStatus};
@@ -75,7 +75,13 @@ const KITTY_KEYBOARD_FLAGS: KeyboardEnhancementFlags =
 const TICK_RATE: Duration = Duration::from_millis(50);
 const TMUX_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const AGENT_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Base git poll cadence. Hot (in-progress) worktrees refresh every cycle;
+/// cold worktrees refresh on a slower multiple (see `git::PollClass`).
 const GIT_POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// Global cap on concurrent `git status` subprocesses, shared across the
+/// focused project and every swimlane worker. Bounds subprocess load when many
+/// projects are open; per-worktree index locking makes parallel status safe.
+const GIT_STATUS_CONCURRENCY: usize = 4;
 // `lsof -iTCP` scans every process and routinely takes 100ms+ on macOS, so the
 // port poll runs at a slower cadence than the other pollers.
 const PORT_POLL_INTERVAL: Duration = Duration::from_secs(10);
@@ -255,21 +261,31 @@ impl AgentStatusCache {
 
 fn spawn_git_status_worker(
     project_root: PathBuf,
-    skip: Arc<Mutex<HashSet<String>>>,
+    classes: Arc<Mutex<HashMap<String, PollClass>>>,
+    pool: GitStatusPool,
     suspended: Arc<AtomicBool>,
     wake_rx: mpsc::Receiver<()>,
 ) -> mpsc::Receiver<GitPollResult> {
     let (tx, rx) = mpsc::channel();
 
-    thread::spawn(move || loop {
-        wait_while_suspended(&suspended);
-        let skip_set = skip.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let result = external::git::poll_all_worktrees(&project_root, &skip_set);
-        if tx.send(result).is_err() {
-            break;
-        }
-        if !sleep_with_wake(&wake_rx, GIT_POLL_INTERVAL) {
-            break;
+    thread::spawn(move || {
+        let mut poller = GitPoller::new(project_root, pool);
+        // The first cycle refreshes everything; later cycles honor the adaptive
+        // cadence unless a wake forces a full refresh.
+        let mut force_all = true;
+        loop {
+            wait_while_suspended(&suspended);
+            let snapshot = classes.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let classify = |name: &str| snapshot.get(name).copied().unwrap_or(PollClass::Cold);
+            let result = poller.poll(&classify, force_all);
+            if tx.send(result).is_err() {
+                break;
+            }
+            match sleep_until_wake(&wake_rx, GIT_POLL_INTERVAL) {
+                WakeReason::Disconnected => break,
+                WakeReason::Woken => force_all = true,
+                WakeReason::Timeout => force_all = false,
+            }
         }
     });
 
@@ -279,15 +295,34 @@ fn spawn_git_status_worker(
 /// Sleep until `interval` elapses or `wake_rx` signals.
 /// Returns `false` if the wake channel disconnected (caller should exit).
 fn sleep_with_wake(wake_rx: &mpsc::Receiver<()>, interval: Duration) -> bool {
+    !matches!(
+        sleep_until_wake(wake_rx, interval),
+        WakeReason::Disconnected
+    )
+}
+
+/// Why a `sleep_until_wake` call returned.
+enum WakeReason {
+    /// The wake channel signaled (a user action wants an immediate refresh).
+    Woken,
+    /// The sleep interval elapsed with no wake.
+    Timeout,
+    /// The wake channel disconnected; the caller should exit.
+    Disconnected,
+}
+
+/// Sleep until `interval` elapses or `wake_rx` signals, reporting which
+/// happened so callers can distinguish a forced refresh from a routine poll.
+fn sleep_until_wake(wake_rx: &mpsc::Receiver<()>, interval: Duration) -> WakeReason {
     match wake_rx.recv_timeout(interval) {
         Ok(()) => {
             // Drain queued wakes so mashing a refresh key triggers one
             // poll round, not N back-to-back rounds.
             while wake_rx.try_recv().is_ok() {}
-            true
+            WakeReason::Woken
         }
-        Err(mpsc::RecvTimeoutError::Timeout) => true,
-        Err(mpsc::RecvTimeoutError::Disconnected) => false,
+        Err(mpsc::RecvTimeoutError::Timeout) => WakeReason::Timeout,
+        Err(mpsc::RecvTimeoutError::Disconnected) => WakeReason::Disconnected,
     }
 }
 
@@ -1558,7 +1593,7 @@ struct ProjectWorkers {
     session_wake_tx: mpsc::Sender<()>,
     git_rx: mpsc::Receiver<GitPollResult>,
     git_wake_tx: mpsc::Sender<()>,
-    git_skip_set: Arc<Mutex<HashSet<String>>>,
+    git_classes: Arc<Mutex<HashMap<String, PollClass>>>,
     pr_rx: mpsc::Receiver<PrPollResult>,
     pr_wake_tx: mpsc::Sender<()>,
 }
@@ -1592,18 +1627,23 @@ fn spawn_shared_workers() -> SharedWorkers {
     }
 }
 
-fn spawn_project_workers(project: &app::Project, suspended: &Arc<AtomicBool>) -> ProjectWorkers {
+fn spawn_project_workers(
+    project: &app::Project,
+    suspended: &Arc<AtomicBool>,
+    git_pool: &GitStatusPool,
+) -> ProjectWorkers {
     let project_root = project.config.project_root.clone();
 
     let status_dir = config::agent_status_dir(&project_root);
     let (session_wake_tx, session_wake_rx) = mpsc::channel::<()>();
     let session_rx = spawn_agent_status_worker(status_dir, suspended.clone(), session_wake_rx);
 
-    let git_skip_set = Arc::new(Mutex::new(project.done_worktree_names()));
+    let git_classes = Arc::new(Mutex::new(project.worktree_poll_classes()));
     let (git_wake_tx, git_wake_rx) = mpsc::channel::<()>();
     let git_rx = spawn_git_status_worker(
         project_root.clone(),
-        git_skip_set.clone(),
+        git_classes.clone(),
+        git_pool.clone(),
         suspended.clone(),
         git_wake_rx,
     );
@@ -1617,7 +1657,7 @@ fn spawn_project_workers(project: &app::Project, suspended: &Arc<AtomicBool>) ->
         session_wake_tx,
         git_rx,
         git_wake_tx,
-        git_skip_set,
+        git_classes,
         pr_rx,
         pr_wake_tx,
     }
@@ -1770,13 +1810,22 @@ fn drain_project_workers(
         }
     }
 
-    // --- Update git skip set when issues changed columns or git data arrived ---
+    // --- Update git poll classes when issues changed columns or git data arrived ---
+    // Drives the worker's adaptive cadence: in-progress worktrees hot, done
+    // skipped, the rest cold. When the classification actually changes (e.g. a
+    // card moved columns), wake the worker so a newly-cold worktree's pending
+    // edits show immediately instead of waiting out its slow cadence.
     if git_data_changed || project.state_dirty {
-        let mut skip = workers
-            .git_skip_set
+        let next = project.worktree_poll_classes();
+        let mut classes = workers
+            .git_classes
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        *skip = project.done_worktree_names();
+        if *classes != next {
+            *classes = next;
+            drop(classes);
+            let _ = workers.git_wake_tx.send(());
+        }
     }
 
     DrainOutcome {
@@ -1946,7 +1995,10 @@ fn run_tui() -> anyhow::Result<()> {
     let (action_tx, action_rx) = mpsc::channel::<ActionResult>();
     let (reload_tx, reload_rx) = mpsc::channel::<ReloadResult>();
     let mut shared = spawn_shared_workers();
-    let mut workers = spawn_project_workers(app.project(), &shared.poll_suspended);
+    // Global bound on concurrent `git status` subprocesses, shared across the
+    // focused project and every swimlane worker.
+    let git_pool = GitStatusPool::new(GIT_STATUS_CONCURRENCY);
+    let mut workers = spawn_project_workers(app.project(), &shared.poll_suspended, &git_pool);
     let mut swimlane_workers: HashMap<ProjectId, ProjectWorkers> = HashMap::new();
 
     // --- Activity poller for sidebar markers ---
@@ -2121,6 +2173,7 @@ fn run_tui() -> anyhow::Result<()> {
                                                 spawn_project_workers(
                                                     app.project(),
                                                     &shared.poll_suspended,
+                                                    &git_pool,
                                                 ),
                                             )
                                         };
@@ -2280,7 +2333,7 @@ fn run_tui() -> anyhow::Result<()> {
                     if let Some(project) = app.find_project(id) {
                         swimlane_workers.insert(
                             id.clone(),
-                            spawn_project_workers(project, &shared.poll_suspended),
+                            spawn_project_workers(project, &shared.poll_suspended, &git_pool),
                         );
                     }
                 }
