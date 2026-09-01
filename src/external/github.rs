@@ -121,7 +121,7 @@ pub fn fetch_stacks(main_worktree: &Path) -> Option<Vec<GithubStack>> {
     let repo = get_repo_identity(main_worktree)?;
     let endpoint = format!("repos/{}/{}/stacks?per_page=100", repo.owner, repo.name);
     let output = Command::new("gh")
-        .args(["api", &endpoint])
+        .args(["api", "--paginate", "--slurp", &endpoint])
         .current_dir(main_worktree)
         .output();
 
@@ -140,7 +140,17 @@ fn parse_stacks_response(json_str: &str) -> Option<Vec<GithubStack>> {
         return None;
     };
     let stacks = parsed.as_array()?;
-    Some(stacks.iter().filter_map(parse_stack).collect())
+    let mut parsed_stacks = Vec::new();
+    if stacks.iter().all(serde_json::Value::is_array) {
+        for page in stacks {
+            if let Some(page) = page.as_array() {
+                parsed_stacks.extend(page.iter().filter_map(parse_stack));
+            }
+        }
+    } else {
+        parsed_stacks.extend(stacks.iter().filter_map(parse_stack));
+    }
+    Some(parsed_stacks)
 }
 
 fn parse_stack(value: &serde_json::Value) -> Option<GithubStack> {
@@ -787,6 +797,28 @@ mod tests {
         let stacks = stacks.unwrap();
         assert_eq!(stacks.len(), 1);
         assert_eq!(stacks[0].number, 8);
+    }
+
+    #[test]
+    fn test_parse_paginated_stacks_response() {
+        let response = serde_json::json!([
+            [{
+                "number": 7,
+                "base": { "ref": "main" },
+                "pull_requests": []
+            }],
+            [{
+                "number": 8,
+                "base": { "ref": "main" },
+                "pull_requests": []
+            }]
+        ]);
+
+        let stacks = parse_stacks_response(&response.to_string()).unwrap();
+        assert_eq!(
+            stacks.iter().map(|stack| stack.number).collect::<Vec<_>>(),
+            [7, 8]
+        );
     }
 
     #[test]

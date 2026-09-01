@@ -720,11 +720,6 @@ impl Project {
 
     pub fn pr_for(&self, issue: &Issue) -> Option<&PrStatus> {
         let live = &self.live;
-        if let Some(branch) = self.branch_for(issue) {
-            if let Some(pr) = live.pr_statuses.get(branch) {
-                return Some(pr);
-            }
-        }
         for link in &issue.github_pr_links {
             if let Some(pr) = live.pr_statuses_by_number.get(&link.number) {
                 return Some(pr);
@@ -739,6 +734,11 @@ impl Project {
                 return found;
             }
         }
+        if let Some(branch) = self.branch_for(issue) {
+            if let Some(pr) = live.pr_statuses.get(branch) {
+                return Some(pr);
+            }
+        }
         None
     }
 
@@ -747,6 +747,16 @@ impl Project {
             .github_stacks
             .iter()
             .find(|stack| stack.pull_requests.iter().any(|pr| pr.number == number))
+    }
+
+    pub fn stack_for_issue(&self, issue: &Issue) -> Option<&GithubStack> {
+        if let Some(pr) = self.pr_for(issue) {
+            return self.stack_for_pr(pr.number);
+        }
+        issue
+            .github_pr_links
+            .iter()
+            .find_map(|link| self.stack_for_pr(link.number))
     }
 
     pub fn sync_prs_as_issues(&mut self) -> (bool, Option<String>) {

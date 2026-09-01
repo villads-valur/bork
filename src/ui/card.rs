@@ -429,6 +429,7 @@ fn format_pr_line(
             spans.extend(extra_pr_spans);
             spans.push(Span::raw(" "));
             spans.push(Span::styled(label, Style::default().fg(color)));
+            append_stack_badge(&mut spans, stack, pr.number);
             Line::from(spans)
         }
         PrState::Open => {
@@ -508,6 +509,7 @@ fn format_pr_compact(
             spans.extend(extra_pr_spans);
             spans.push(Span::raw(" "));
             spans.push(Span::styled(label, Style::default().fg(color)));
+            append_stack_badge(&mut spans, stack, pr.number);
             Line::from(spans)
         }
         PrState::Open => {
