@@ -17,8 +17,14 @@ pub fn signal_received() -> bool {
 /// SIGINT is already captured by crossterm in raw mode.
 pub fn install_signal_handlers() {
     unsafe {
-        libc::signal(libc::SIGTERM, signal_handler as libc::sighandler_t);
-        libc::signal(libc::SIGHUP, signal_handler as libc::sighandler_t);
+        libc::signal(
+            libc::SIGTERM,
+            signal_handler as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGHUP,
+            signal_handler as *const () as libc::sighandler_t,
+        );
     }
 }
 

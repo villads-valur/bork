@@ -36,6 +36,11 @@ pub struct AppConfig {
     /// Allowed agents for this project, if explicitly configured.
     /// `None` means "no restriction; use whatever is installed".
     pub agents_allowlist: Option<Vec<AgentKind>>,
+    /// Auto-prompt threshold: prompt the user to prune when on-disk worktree
+    /// count meets or exceeds this number.
+    pub prune_threshold: u64,
+    /// Minimum seconds between auto-prune prompts.
+    pub auto_prune_check_interval: u64,
     /// Per-agent launch overrides. Keyed by `AgentKind`. Use
     /// [`AppConfig::launch_args_for`] to resolve mode-specific args.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -82,6 +87,8 @@ impl AppConfig {
 }
 
 pub const DEFAULT_DONE_SESSION_TTL: u64 = 300;
+pub const DEFAULT_PRUNE_THRESHOLD: u64 = 10;
+pub const DEFAULT_AUTO_PRUNE_CHECK_INTERVAL: u64 = 86_400;
 
 pub const DEFAULT_AGENT_MODE: AgentMode = AgentMode::Plan;
 
@@ -116,6 +123,8 @@ impl Default for AppConfig {
             auto_import_reviews: true,
             auto_import_authored_prs: true,
             agents_allowlist: None,
+            prune_threshold: DEFAULT_PRUNE_THRESHOLD,
+            auto_prune_check_interval: DEFAULT_AUTO_PRUNE_CHECK_INTERVAL,
             agent_launch: HashMap::new(),
         }
     }
@@ -124,6 +133,9 @@ impl Default for AppConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppState {
     pub issues: Vec<Issue>,
+    /// Unix timestamp of the last completed prune. `None` if never pruned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_prune_at: Option<u64>,
 }
 
 /// Walk up from cwd looking for a `.bork/` directory.
@@ -196,6 +208,8 @@ pub struct PartialConfig {
     pub auto_import_reviews: Option<bool>,
     pub auto_import_authored_prs: Option<bool>,
     pub agents_allowlist: Option<Vec<AgentKind>>,
+    pub prune_threshold: Option<u64>,
+    pub auto_prune_check_interval: Option<u64>,
     /// Per-agent launch overrides parsed from `[agent.<name>]` sections.
     pub agent_launch: HashMap<AgentKind, PartialAgentLaunch>,
 }
@@ -256,6 +270,10 @@ impl PartialConfig {
                 .auto_import_authored_prs
                 .or(self.auto_import_authored_prs),
             agents_allowlist: other.agents_allowlist.or(self.agents_allowlist),
+            prune_threshold: other.prune_threshold.or(self.prune_threshold),
+            auto_prune_check_interval: other
+                .auto_prune_check_interval
+                .or(self.auto_prune_check_interval),
             agent_launch,
         }
     }
@@ -303,6 +321,10 @@ fn materialize(merged: PartialConfig, project_root: &Path) -> AppConfig {
         auto_import_reviews: merged.auto_import_reviews.unwrap_or(true),
         auto_import_authored_prs: merged.auto_import_authored_prs.unwrap_or(true),
         agents_allowlist: merged.agents_allowlist,
+        prune_threshold: merged.prune_threshold.unwrap_or(DEFAULT_PRUNE_THRESHOLD),
+        auto_prune_check_interval: merged
+            .auto_prune_check_interval
+            .unwrap_or(DEFAULT_AUTO_PRUNE_CHECK_INTERVAL),
         agent_launch,
     }
 }
@@ -408,6 +430,10 @@ fn partial_from_table(table: &Table) -> PartialConfig {
             .collect::<Vec<_>>()
     });
 
+    let prune_threshold = table.get("prune_threshold").and_then(|v| v.as_u64());
+    let auto_prune_check_interval = table
+        .get("auto_prune_check_interval")
+        .and_then(|v| v.as_u64());
     let agent_launch = collect_agent_launch(table);
 
     PartialConfig {
@@ -424,6 +450,8 @@ fn partial_from_table(table: &Table) -> PartialConfig {
         auto_import_reviews,
         auto_import_authored_prs,
         agents_allowlist,
+        prune_threshold,
+        auto_prune_check_interval,
         agent_launch,
     }
 }
@@ -492,8 +520,13 @@ pub fn try_load_state(project_root: &Path) -> Option<AppState> {
             return None;
         }
     };
+    let mut legacy_stores = crate::external::opencode::LegacySessionStores::new(project_root);
     for issue in &mut state.issues {
-        issue.migrate_legacy_fields();
+        if let Some(sid) = issue.migrate_legacy_fields() {
+            if let Some(owner) = legacy_stores.attribute(&sid, issue.agent_kind) {
+                issue.sessions.entry(owner).or_insert(sid);
+            }
+        }
     }
     Some(state)
 }
@@ -1037,7 +1070,48 @@ debug = true
         assert_eq!(cfg.done_session_ttl, DEFAULT_DONE_SESSION_TTL);
         assert!(!cfg.debug);
         assert!(cfg.agents_allowlist.is_none());
+        assert_eq!(cfg.prune_threshold, DEFAULT_PRUNE_THRESHOLD);
+        assert_eq!(
+            cfg.auto_prune_check_interval,
+            DEFAULT_AUTO_PRUNE_CHECK_INTERVAL
+        );
         assert!(cfg.agent_launch.is_empty());
+    }
+
+    #[test]
+    fn parse_partial_prune_keys() {
+        let p = parse_partial(
+            r#"
+prune_threshold = 15
+auto_prune_check_interval = 3600
+"#,
+        );
+        assert_eq!(p.prune_threshold, Some(15));
+        assert_eq!(p.auto_prune_check_interval, Some(3600));
+    }
+
+    #[test]
+    fn state_roundtrips_last_prune_at() {
+        let state = AppState {
+            issues: Vec::new(),
+            last_prune_at: Some(1_700_000_000),
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let roundtrip: AppState = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip.last_prune_at, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn state_without_last_prune_at_defaults_to_none() {
+        let state: AppState = serde_json::from_str(r#"{"issues":[]}"#).unwrap();
+        assert_eq!(state.last_prune_at, None);
+    }
+
+    #[test]
+    fn state_omits_last_prune_at_when_none() {
+        let state = AppState::default();
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(!json.contains("last_prune_at"));
     }
 
     // --- agent_launch parsing ---
@@ -1207,6 +1281,7 @@ args = ["--dangerously-skip-permissions"]
                 crate::types::Column::Todo,
                 AgentKind::OpenCode,
             )],
+            last_prune_at: None,
         };
         save_state(&state, dir.path()).unwrap();
         let loaded = load_state(dir.path());

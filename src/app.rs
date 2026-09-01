@@ -9,14 +9,15 @@ const BUSY_MIN_VISIBLE: Duration = Duration::from_millis(250);
 
 use crate::config::{AppConfig, AppState, DEFAULT_REVIEW_PROMPT};
 use crate::external::linear::LinearIssue;
+use crate::prune::{PruneAction, PruneCandidate};
 use crate::types::{
-    AgentKind, AgentMode, AgentStatus, AgentStatusInfo, Column, Issue, IssueKind, LinkedGithubPr,
-    PrImportSource, PrState, PrStatus, WorktreeStatus,
+    AgentKind, AgentMode, AgentStatus, AgentStatusInfo, Column, GithubStack, Issue, IssueKind,
+    LinkedGithubPr, PrImportSource, PrState, PrStatus, WorktreeStatus,
 };
 
 pub type ProjectId = PathBuf;
 
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -34,6 +35,7 @@ pub enum InputMode {
     Help,
     DebugInspector,
     Sidebar,
+    PruneDialog,
 }
 
 #[derive(Default)]
@@ -44,6 +46,8 @@ pub struct LiveState {
     pub worktree_statuses: HashMap<String, WorktreeStatus>,
     pub worktree_branches: HashMap<String, String>,
     pub pr_statuses: HashMap<String, PrStatus>,
+    pub pr_statuses_by_number: HashMap<u32, PrStatus>,
+    pub github_stacks: Vec<GithubStack>,
     pub frozen_worktree_statuses: HashMap<String, WorktreeStatus>,
     pub frozen_worktree_branches: HashMap<String, String>,
     pub linear_issues: Vec<LinearIssue>,
@@ -71,6 +75,7 @@ pub struct Project {
     pub available_agents: Vec<AgentKind>,
     pub selected_column: usize,
     pub selected_row: [usize; 4],
+    pub marked_issues: HashSet<String>,
     /// When set, the board shows only the connected component of links that
     /// contains this issue id (the anchor itself plus everything reachable
     /// through `linked_issues`). Cleared with the same key or Esc.
@@ -81,6 +86,11 @@ pub struct Project {
     pub state_dirty: bool,
     pub base_issues: Vec<Issue>,
     pub last_state_mtime: Option<SystemTime>,
+    /// Unix timestamp of the last completed prune, persisted in state.json.
+    pub last_prune_at: Option<u64>,
+    /// Most recent time we ran the auto-prune threshold check for this
+    /// project. Ephemeral; throttles both the check and its toast.
+    pub last_auto_prune_check: Option<Instant>,
     pub last_config_mtime: Option<SystemTime>,
 }
 
@@ -105,6 +115,7 @@ impl Project {
             available_agents: AgentKind::ALL.to_vec(),
             selected_column: 0,
             selected_row: [0; 4],
+            marked_issues: HashSet::new(),
             link_filter: None,
             linear_available: false,
             tuicr_available: false,
@@ -112,6 +123,8 @@ impl Project {
             state_dirty: false,
             base_issues,
             last_state_mtime,
+            last_prune_at: state.last_prune_at,
+            last_auto_prune_check: None,
             last_config_mtime,
         }
     }
@@ -171,6 +184,7 @@ impl Project {
     pub fn to_state(&self) -> AppState {
         AppState {
             issues: self.issues.clone(),
+            last_prune_at: self.last_prune_at,
         }
     }
 
@@ -180,6 +194,9 @@ impl Project {
     }
 
     pub fn merge_external_state(&mut self, file_state: AppState) {
+        // Timestamps only move forward, so the later value wins regardless
+        // of whether it came from memory or an external writer.
+        self.last_prune_at = self.last_prune_at.max(file_state.last_prune_at);
         let file_issues = file_state.issues;
 
         if !self.state_dirty {
@@ -187,6 +204,7 @@ impl Project {
             self.issues = file_issues.clone();
             self.base_issues = file_issues;
             self.clear_stale_link_filter();
+            self.clear_stale_marks();
             self.clamp_all_rows("");
             return;
         }
@@ -227,6 +245,7 @@ impl Project {
 
         self.base_issues = file_issues;
         self.clear_stale_link_filter();
+        self.clear_stale_marks();
         self.clamp_all_rows("");
     }
 
@@ -243,6 +262,11 @@ impl Project {
         if stale {
             self.link_filter = None;
         }
+    }
+
+    fn clear_stale_marks(&mut self) {
+        let ids: HashSet<String> = self.issues.iter().map(|i| i.id.to_lowercase()).collect();
+        self.marked_issues.retain(|id| ids.contains(id));
     }
 
     pub fn issues_in_column(&self, column: Column, query: &str) -> Vec<(usize, &Issue)> {
@@ -277,6 +301,10 @@ impl Project {
                 .linear_links
                 .iter()
                 .any(|l| l.identifier.to_lowercase().contains(query))
+            || issue
+                .github_pr_links
+                .iter()
+                .any(|link| format!("#{}", link.number).contains(query))
             || self
                 .branch_for(issue)
                 .is_some_and(|b| b.to_lowercase().contains(query))
@@ -393,38 +421,92 @@ impl Project {
         }
     }
 
-    pub fn move_issue_right(&mut self, query: &str) {
-        let Some(idx) = self.selected_issue_index(query) else {
-            return;
-        };
-        let Some(next) = self.issues[idx].column.next() else {
-            return;
-        };
-        self.move_issue_to_column(idx, next);
+    pub fn toggle_mark(&mut self, query: &str) -> Option<usize> {
+        let issue_id = self.selected_issue(query)?.id.to_lowercase();
+        if !self.marked_issues.insert(issue_id.clone()) {
+            self.marked_issues.remove(&issue_id);
+        }
+        Some(self.marked_issues.len())
     }
 
-    pub fn move_issue_left(&mut self, query: &str) {
-        let Some(idx) = self.selected_issue_index(query) else {
-            return;
-        };
-        let Some(prev) = self.issues[idx].column.prev() else {
-            return;
-        };
-        self.move_issue_to_column(idx, prev);
+    pub fn mark_linked_component(&mut self, query: &str) -> Option<usize> {
+        let issue_id = self.selected_issue(query)?.id.clone();
+        for linked_id in self.linked_component(&issue_id) {
+            self.marked_issues.insert(linked_id);
+        }
+        Some(self.marked_issues.len())
     }
 
-    pub fn move_to_done(&mut self, query: &str) {
-        let Some(idx) = self.selected_issue_index(query) else {
-            return;
-        };
-        self.move_issue_to_column(idx, Column::Done);
+    pub fn clear_marks(&mut self) {
+        self.marked_issues.clear();
     }
 
-    pub fn move_to_todo(&mut self, query: &str) {
+    fn marked_issue_indices(&self) -> Vec<usize> {
+        self.issues
+            .iter()
+            .enumerate()
+            .filter(|(_, issue)| self.marked_issues.contains(&issue.id.to_lowercase()))
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    pub fn move_issue_right(&mut self, query: &str) -> usize {
+        if !self.marked_issues.is_empty() {
+            return self.move_marked(query, |column| column.next());
+        }
+        self.move_selected(query, |column| column.next())
+    }
+
+    pub fn move_issue_left(&mut self, query: &str) -> usize {
+        if !self.marked_issues.is_empty() {
+            return self.move_marked(query, |column| column.prev());
+        }
+        self.move_selected(query, |column| column.prev())
+    }
+
+    pub fn move_to_done(&mut self, query: &str) -> usize {
+        if !self.marked_issues.is_empty() {
+            return self.move_marked(query, |_| Some(Column::Done));
+        }
+        self.move_selected(query, |_| Some(Column::Done))
+    }
+
+    pub fn move_to_todo(&mut self, query: &str) -> usize {
+        if !self.marked_issues.is_empty() {
+            return self.move_marked(query, |_| Some(Column::Todo));
+        }
+        self.move_selected(query, |_| Some(Column::Todo))
+    }
+
+    /// Move the selected issue to the column produced by `target`. Returns the
+    /// number of issues moved (0 or 1).
+    fn move_selected(&mut self, query: &str, target: impl Fn(Column) -> Option<Column>) -> usize {
         let Some(idx) = self.selected_issue_index(query) else {
-            return;
+            return 0;
         };
-        self.move_issue_to_column(idx, Column::Todo);
+        let Some(target) = target(self.issues[idx].column) else {
+            return 0;
+        };
+        self.move_issue_to_column(idx, target);
+        1
+    }
+
+    /// Move every marked issue to the column produced by `target`, skipping any
+    /// that have no valid target. Clears the marks afterward and returns the
+    /// number of issues actually moved.
+    fn move_marked(&mut self, query: &str, target: impl Fn(Column) -> Option<Column>) -> usize {
+        let mut moved = 0;
+        for idx in self.marked_issue_indices() {
+            let column = self.issues[idx].column;
+            let Some(target) = target(column).filter(|t| *t != column) else {
+                continue;
+            };
+            self.move_issue_to_column(idx, target);
+            moved += 1;
+        }
+        self.clear_marks();
+        self.clamp_all_rows(query);
+        moved
     }
 
     pub fn move_issue_up(&mut self, query: &str) {
@@ -565,7 +647,7 @@ impl Project {
         }
 
         for (i, wt) in assignments {
-            self.issues[i].worktree = Some(wt.clone());
+            self.issues[i].attach_worktree(wt.clone());
             if self.issues[i].column == Column::Done {
                 self.freeze_worktree_status(&wt);
             }
@@ -642,12 +724,10 @@ impl Project {
 
     pub fn pr_for(&self, issue: &Issue) -> Option<&PrStatus> {
         let live = &self.live;
-        if let Some(branch) = self.branch_for(issue) {
-            if let Some(pr) = live.pr_statuses.get(branch) {
+        for link in &issue.github_pr_links {
+            if let Some(pr) = live.pr_statuses_by_number.get(&link.number) {
                 return Some(pr);
             }
-        }
-        for link in &issue.github_pr_links {
             let found = live
                 .pr_statuses
                 .values()
@@ -658,7 +738,29 @@ impl Project {
                 return found;
             }
         }
+        if let Some(branch) = self.branch_for(issue) {
+            if let Some(pr) = live.pr_statuses.get(branch) {
+                return Some(pr);
+            }
+        }
         None
+    }
+
+    pub fn stack_for_pr(&self, number: u32) -> Option<&GithubStack> {
+        self.live
+            .github_stacks
+            .iter()
+            .find(|stack| stack.pull_requests.iter().any(|pr| pr.number == number))
+    }
+
+    pub fn stack_for_issue(&self, issue: &Issue) -> Option<&GithubStack> {
+        if let Some(pr) = self.pr_for(issue) {
+            return self.stack_for_pr(pr.number);
+        }
+        issue
+            .github_pr_links
+            .iter()
+            .find_map(|link| self.stack_for_pr(link.number))
     }
 
     pub fn sync_prs_as_issues(&mut self) -> (bool, Option<String>) {
@@ -1059,9 +1161,81 @@ pub struct LinkPickerState {
 }
 
 #[derive(Debug, Clone)]
+pub struct PruneDialogState {
+    pub project_id: ProjectId,
+    pub candidates: Vec<PruneCandidate>,
+    pub selected: usize,
+    pub error: Option<String>,
+}
+
+impl PruneDialogState {
+    pub fn new(project_id: ProjectId, candidates: Vec<PruneCandidate>) -> Self {
+        Self {
+            project_id,
+            candidates,
+            selected: 0,
+            error: None,
+        }
+    }
+
+    pub fn move_up(&mut self) {
+        if self.selected > 0 {
+            self.selected -= 1;
+        }
+    }
+
+    pub fn move_down(&mut self) {
+        if self.selected + 1 < self.candidates.len() {
+            self.selected += 1;
+        }
+    }
+
+    pub fn toggle_current(&mut self) {
+        let Some(candidate) = self.candidates.get_mut(self.selected) else {
+            return;
+        };
+        candidate.action = match candidate.action {
+            PruneAction::Keep => PruneAction::Remove,
+            PruneAction::Remove => PruneAction::Keep,
+        };
+        self.error = None;
+    }
+
+    pub fn select_all_remove(&mut self) {
+        self.set_all(PruneAction::Remove);
+    }
+
+    pub fn select_all_keep(&mut self) {
+        self.set_all(PruneAction::Keep);
+    }
+
+    fn set_all(&mut self, action: PruneAction) {
+        for candidate in &mut self.candidates {
+            candidate.action = action;
+        }
+        self.error = None;
+    }
+
+    pub fn remove_count(&self) -> usize {
+        self.candidates
+            .iter()
+            .filter(|c| c.action == PruneAction::Remove)
+            .count()
+    }
+
+    pub fn dirty_remove_count(&self) -> usize {
+        self.candidates
+            .iter()
+            .filter(|c| c.action == PruneAction::Remove && c.is_dirty())
+            .count()
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum ConfirmAction {
     KillSession {
         session_name: String,
+        issue_id: String,
         project_id: ProjectId,
     },
     DeleteIssue {
@@ -1088,7 +1262,14 @@ pub use crate::dialog_state::{DialogField, DialogState};
 
 /// 3-way field merge: for each field, if file diverged from base but memory didn't,
 /// take the file value. If both diverged, memory wins.
+fn crossed_orchestrator_boundary(issue: &Issue, base: &Issue) -> bool {
+    (issue.kind == IssueKind::Orchestrator) != (base.kind == IssueKind::Orchestrator)
+}
+
 fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
+    // Must be captured before merge_field!(kind) overwrites memory.kind.
+    let memory_crossed_boundary = crossed_orchestrator_boundary(memory, base);
+
     macro_rules! merge_field {
         ($field:ident) => {
             if memory.$field == base.$field && file.$field != base.$field {
@@ -1104,14 +1285,49 @@ fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
     merge_field!(prompt);
     merge_field!(worktree);
     merge_field!(done_at);
-    merge_field!(session_id);
+    merge_field!(pruned_at);
+    merge_field!(setup_ran);
     merge_field!(linear_links);
     merge_field!(github_pr_links);
     merge_field!(linked_issues);
+
+    // `sessions` merges entry-wise: per-agent entries are independent, so a
+    // concurrent write to one agent's session (e.g. `bork issue start` from a
+    // spawned agent) must not clobber another agent's entry held in memory.
+    // Exception: a memory-side crossing of the orchestrator boundary cleared
+    // the whole map, and that clear must win over concurrent file-side
+    // inserts — resuming any pre-conversion session would skip the new
+    // kind's prompt.
+    if !memory_crossed_boundary {
+        for agent in AgentKind::ALL {
+            if memory.sessions.get(&agent) == base.sessions.get(&agent)
+                && file.sessions.get(&agent) != base.sessions.get(&agent)
+            {
+                match file.sessions.get(&agent) {
+                    Some(sid) => memory.sessions.insert(agent, sid.clone()),
+                    None => memory.sessions.remove(&agent),
+                };
+            }
+        }
+    }
+
+    // A file-side crossing of the orchestrator boundary clears sessions
+    // atomically with the kind (`set_kind`). When that kind change won the
+    // merge, its session clear must win too — otherwise a concurrent
+    // memory-side session write survives and resumes the pre-conversion
+    // conversation on the next launch.
+    let file_crossed_boundary = crossed_orchestrator_boundary(file, base);
+    // Skip when memory crossed too: its own set_kind already cleared the
+    // pre-conversion sessions, and anything it recorded since (e.g. the new
+    // orchestrator's session) is newer than the file's empty map.
+    if file_crossed_boundary && !memory_crossed_boundary && memory.kind == file.kind {
+        memory.sessions = file.sessions.clone();
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MessageKind {
+    #[default]
     Info,
     Warning,
     Error,
@@ -1127,6 +1343,7 @@ pub struct App {
     pub confirm_message: Option<String>,
     pub pending_confirm: Option<ConfirmAction>,
     pub dialog: Option<DialogState>,
+    pub prune_dialog: Option<PruneDialogState>,
     pub should_quit: bool,
     pub message: Option<(String, MessageKind)>,
     pub message_set_at: Option<Instant>,
@@ -1139,6 +1356,10 @@ pub struct App {
     /// Issue IDs with a session launch currently in flight. Guards against
     /// double-launch races from repeated keypresses.
     pub launches_in_flight: HashSet<String>,
+    /// Issue IDs whose in-flight launch was invalidated (session killed
+    /// mid-detection). The landing result's session id and setup flag are
+    /// discarded — the pane the detectors were watching is gone.
+    pub launches_invalidated: HashSet<String>,
     pub linear_picker: Option<LinearPickerState>,
     pub linear_picker_context: LinearPickerContext,
     pub picker_tab: ImportSource,
@@ -1162,6 +1383,7 @@ impl App {
             confirm_message: None,
             pending_confirm: None,
             dialog: None,
+            prune_dialog: None,
             should_quit: false,
             message: None,
             message_set_at: None,
@@ -1169,6 +1391,7 @@ impl App {
             busy_visible_since: None,
             spinner_tick: 0,
             launches_in_flight: HashSet::new(),
+            launches_invalidated: HashSet::new(),
             linear_picker: None,
             linear_picker_context: LinearPickerContext::Import,
             picker_tab: ImportSource::Linear,
@@ -1363,6 +1586,17 @@ impl App {
         self.busy_count += 1;
     }
 
+    /// Mark an issue's in-flight launch as invalidated (its session was
+    /// killed mid-detection), so the landing handler drops the result's
+    /// session id and setup flag. Guarded on the launch actually being in
+    /// flight — an unconditional insert would leave a stale entry that
+    /// poisons the issue's next launch.
+    pub fn invalidate_inflight_launch(&mut self, issue_id: &str) {
+        if self.launches_in_flight.contains(issue_id) {
+            self.launches_invalidated.insert(issue_id.to_string());
+        }
+    }
+
     /// Whether the spinner should currently be drawn. True while any
     /// background action is in flight, and for at least `BUSY_MIN_VISIBLE`
     /// after the last one finishes.
@@ -1448,6 +1682,21 @@ impl App {
 
     pub fn close_dialog(&mut self) {
         self.dialog = None;
+        self.input_mode = InputMode::Normal;
+    }
+
+    pub fn open_prune_dialog(&mut self, ctx: &ActionContext) {
+        let candidates = crate::prune::scan_candidates(self.context_project(ctx));
+        if candidates.is_empty() {
+            self.set_message("No worktrees to prune");
+            return;
+        }
+        self.prune_dialog = Some(PruneDialogState::new(ctx.project_id.clone(), candidates));
+        self.input_mode = InputMode::PruneDialog;
+    }
+
+    pub fn close_prune_dialog(&mut self) {
+        self.prune_dialog = None;
         self.input_mode = InputMode::Normal;
     }
 
@@ -1606,8 +1855,11 @@ impl App {
     }
 
     pub fn clear_search(&mut self, ctx: &ActionContext) {
-        // Esc clears the link filter first, then the search query, so a single
-        // press peels off one filter at a time.
+        if !self.active_project().marked_issues.is_empty() {
+            self.context_project_mut(ctx).clear_marks();
+            return;
+        }
+        // Esc peels off one active board filter at a time.
         if self.active_project().link_filter.is_some() {
             self.clear_link_filter(ctx);
             return;
@@ -1753,6 +2005,8 @@ mod tests {
             auto_import_reviews: true,
             auto_import_authored_prs: true,
             agents_allowlist: None,
+            prune_threshold: crate::config::DEFAULT_PRUNE_THRESHOLD,
+            auto_prune_check_interval: crate::config::DEFAULT_AUTO_PRUNE_CHECK_INTERVAL,
             agent_launch: std::collections::HashMap::new(),
         }
     }
@@ -1773,7 +2027,10 @@ mod tests {
     }
 
     fn test_app(issues: Vec<Issue>) -> App {
-        let state = AppState { issues };
+        let state = AppState {
+            issues,
+            last_prune_at: None,
+        };
         App::new(test_config(), state)
     }
 
@@ -2105,6 +2362,24 @@ mod tests {
         let changed = app.project_mut().auto_assign_worktrees();
         assert!(!changed);
         assert!(app.project().issues[0].worktree.is_none());
+    }
+
+    #[test]
+    fn test_auto_assign_clears_pruned_at() {
+        let mut issue = test_issue("bork-8", Column::InProgress);
+        issue.pruned_at = Some(1_700_000_000);
+        let mut app = test_app(vec![issue]);
+        app.project_mut()
+            .live
+            .worktree_branches
+            .insert("bork-8".into(), "bork-8/init-cli".into());
+        let changed = app.project_mut().auto_assign_worktrees();
+        assert!(changed);
+        assert_eq!(app.project().issues[0].worktree, Some("bork-8".into()));
+        assert!(
+            app.project().issues[0].pruned_at.is_none(),
+            "pruned_at should clear when a new worktree gets attached"
+        );
     }
 
     #[test]
@@ -2920,6 +3195,7 @@ mod tests {
         let mut issue = test_issue("bork-1", Column::Done);
         issue.done_at = None;
         let state = AppState {
+            last_prune_at: None,
             issues: vec![issue],
         };
         let app = App::new(test_config(), state);
@@ -2934,6 +3210,7 @@ mod tests {
         let mut issue = test_issue("bork-1", Column::Done);
         issue.done_at = Some(1000);
         let state = AppState {
+            last_prune_at: None,
             issues: vec![issue],
         };
         let app = App::new(test_config(), state);
@@ -2945,6 +3222,7 @@ mod tests {
         let mut issue = test_issue("bork-1", Column::Todo);
         issue.done_at = None;
         let state = AppState {
+            last_prune_at: None,
             issues: vec![issue],
         };
         let app = App::new(test_config(), state);
@@ -4124,6 +4402,7 @@ mod tests {
         let mut app = App::new(
             test_config_named("alpha"),
             AppState {
+                last_prune_at: None,
                 issues: vec![
                     test_issue_titled("alpha-1", "Fix login", Column::Todo),
                     test_issue_titled("alpha-2", "Add feature", Column::Todo),
@@ -4133,6 +4412,7 @@ mod tests {
         app.add_background_project(
             test_config_named("beta"),
             AppState {
+                last_prune_at: None,
                 issues: vec![
                     test_issue_titled("beta-1", "Fix crash", Column::Todo),
                     test_issue_titled("beta-2", "Dark mode", Column::Todo),
@@ -4183,6 +4463,7 @@ mod tests {
         let mut app = App::new(
             test_config_named("alpha"),
             AppState {
+                last_prune_at: None,
                 issues: vec![
                     test_issue_titled("alpha-1", "Fix login", Column::Todo),
                     test_issue_titled("alpha-2", "Add feature", Column::Todo),
@@ -4192,6 +4473,7 @@ mod tests {
         app.add_background_project(
             test_config_named("beta"),
             AppState {
+                last_prune_at: None,
                 issues: vec![
                     test_issue_titled("beta-1", "Fix crash", Column::Todo),
                     test_issue_titled("beta-2", "Dark mode", Column::Todo),
@@ -4222,6 +4504,7 @@ mod tests {
         let mut app = App::new(
             test_config_named("alpha"),
             AppState {
+                last_prune_at: None,
                 issues: vec![
                     test_issue_titled("alpha-1", "Fix login", Column::Todo),
                     test_issue_titled("alpha-2", "Add feature", Column::Todo),
@@ -4231,6 +4514,7 @@ mod tests {
         app.add_background_project(
             test_config_named("beta"),
             AppState {
+                last_prune_at: None,
                 issues: vec![test_issue_titled("beta-1", "Fix crash", Column::Todo)],
             },
         );
@@ -4258,6 +4542,7 @@ mod tests {
         let mut app = App::new(
             test_config_named("alpha"),
             AppState {
+                last_prune_at: None,
                 issues: vec![
                     test_issue_titled("alpha-1", "Fix login", Column::Todo),
                     test_issue_titled("alpha-2", "Add feature", Column::Todo),
@@ -4267,6 +4552,7 @@ mod tests {
         app.add_background_project(
             test_config_named("beta"),
             AppState {
+                last_prune_at: None,
                 issues: vec![test_issue_titled("beta-1", "Fix crash", Column::Todo)],
             },
         );
@@ -4492,6 +4778,8 @@ mod tests {
             auto_import_reviews: true,
             auto_import_authored_prs: true,
             agents_allowlist: None,
+            prune_threshold: crate::config::DEFAULT_PRUNE_THRESHOLD,
+            auto_prune_check_interval: crate::config::DEFAULT_AUTO_PRUNE_CHECK_INTERVAL,
             agent_launch: std::collections::HashMap::new(),
         }
     }
@@ -4500,12 +4788,14 @@ mod tests {
         let mut app = App::new(
             test_config_named("alpha"),
             AppState {
+                last_prune_at: None,
                 issues: vec![test_issue("alpha-1", Column::Todo)],
             },
         );
         app.add_background_project(
             test_config_named("beta"),
             AppState {
+                last_prune_at: None,
                 issues: vec![
                     test_issue("beta-1", Column::Todo),
                     test_issue("beta-2", Column::InProgress),
@@ -4515,6 +4805,7 @@ mod tests {
         app.add_background_project(
             test_config_named("gamma"),
             AppState {
+                last_prune_at: None,
                 issues: vec![test_issue("gamma-1", Column::CodeReview)],
             },
         );
@@ -4615,7 +4906,7 @@ mod tests {
     fn add_background_project() {
         let mut app = test_app(vec![test_issue("a-1", Column::Todo)]);
         assert_eq!(app.projects.len(), 1);
-        app.add_background_project(test_config_named("other"), AppState { issues: vec![] });
+        app.add_background_project(test_config_named("other"), AppState::default());
         assert_eq!(app.projects.len(), 2);
         assert_eq!(app.projects[1].config.project_name, "other");
     }
@@ -4626,7 +4917,7 @@ mod tests {
         app.enable_sidebar();
         assert!(app.sidebar.is_none());
 
-        app.add_background_project(test_config_named("b"), AppState { issues: vec![] });
+        app.add_background_project(test_config_named("b"), AppState::default());
         app.enable_sidebar();
         assert!(app.sidebar.is_some());
     }
@@ -4686,7 +4977,7 @@ mod tests {
         let mut app = test_multi_app();
         let original_focused = app.focused_project.clone();
 
-        app.add_background_project(test_config_named("delta"), AppState { issues: vec![] });
+        app.add_background_project(test_config_named("delta"), AppState::default());
 
         assert_eq!(app.focused_project, original_focused);
         assert_eq!(app.project().config.project_name, "alpha");
@@ -4899,6 +5190,112 @@ mod tests {
     }
 
     #[test]
+    fn merge_sessions_entrywise_keeps_both_sides() {
+        let base = test_issue_titled("a", "Original", Column::Todo);
+        let mut memory = base.clone();
+        memory
+            .sessions
+            .insert(AgentKind::Claude, "uuid-local".to_string());
+        let mut file = base.clone();
+        file.sessions
+            .insert(AgentKind::OpenCode, "ses_external".to_string());
+
+        merge_issue_fields(&mut memory, &base, &file);
+        assert_eq!(
+            memory.sessions.get(&AgentKind::Claude).map(String::as_str),
+            Some("uuid-local"),
+            "memory-side entry survives"
+        );
+        assert_eq!(
+            memory
+                .sessions
+                .get(&AgentKind::OpenCode)
+                .map(String::as_str),
+            Some("ses_external"),
+            "file-side entry merges in"
+        );
+    }
+
+    #[test]
+    fn merge_memory_side_conversion_rejects_file_session_insert() {
+        // TUI converts to orchestrator (clears sessions) while an external
+        // `bork issue start` writes a brand-new session entry to disk. The
+        // in-memory clear is part of the conversion and must win.
+        let base = test_issue_titled("a", "Original", Column::Todo);
+        let mut memory = base.clone();
+        let _ = memory.set_kind(IssueKind::Orchestrator);
+        let mut file = base.clone();
+        file.sessions
+            .insert(AgentKind::OpenCode, "ses_external".to_string());
+
+        merge_issue_fields(&mut memory, &base, &file);
+        assert_eq!(memory.kind, IssueKind::Orchestrator);
+        assert!(
+            memory.sessions.is_empty(),
+            "conversion's clear must not adopt concurrent file-side sessions"
+        );
+    }
+
+    #[test]
+    fn merge_pruned_at_and_setup_ran_adopt_file_changes() {
+        let base = test_issue_titled("a", "Original", Column::Todo);
+        let mut memory = base.clone();
+        let mut file = base.clone();
+        file.pruned_at = Some(1_700_000_000);
+        file.setup_ran = true;
+
+        merge_issue_fields(&mut memory, &base, &file);
+        assert_eq!(memory.pruned_at, Some(1_700_000_000));
+        assert!(memory.setup_ran);
+    }
+
+    #[test]
+    fn merge_orchestrator_conversion_clears_memory_sessions() {
+        // File side converted to orchestrator (set_kind cleared sessions);
+        // a concurrent memory-side session write must not survive the merge.
+        let base = test_issue_titled("a", "Original", Column::Todo);
+        let mut memory = base.clone();
+        memory
+            .sessions
+            .insert(AgentKind::OpenCode, "ses_stale".to_string());
+        let mut file = base.clone();
+        file.kind = IssueKind::Orchestrator;
+
+        merge_issue_fields(&mut memory, &base, &file);
+        assert_eq!(memory.kind, IssueKind::Orchestrator);
+        assert!(
+            memory.sessions.is_empty(),
+            "conversion's session clear wins over the concurrent write"
+        );
+    }
+
+    #[test]
+    fn merge_double_crossing_keeps_memory_post_conversion_session() {
+        // Both sides converted to orchestrator; memory then launched it and
+        // recorded the new orchestrator's session. The file's empty map is
+        // older than that write and must not wipe it.
+        let base = test_issue_titled("a", "Original", Column::Todo);
+        let mut memory = base.clone();
+        let _ = memory.set_kind(IssueKind::Orchestrator);
+        memory
+            .sessions
+            .insert(AgentKind::OpenCode, "ses_orch".to_string());
+        let mut file = base.clone();
+        let _ = file.set_kind(IssueKind::Orchestrator);
+
+        merge_issue_fields(&mut memory, &base, &file);
+        assert_eq!(memory.kind, IssueKind::Orchestrator);
+        assert_eq!(
+            memory
+                .sessions
+                .get(&AgentKind::OpenCode)
+                .map(String::as_str),
+            Some("ses_orch"),
+            "memory's post-conversion session survives a concurrent file-side conversion"
+        );
+    }
+
+    #[test]
     fn merge_fields_independent_per_field() {
         let base = test_issue_titled("a", "Original", Column::Todo);
         let mut memory = base.clone();
@@ -4920,6 +5317,7 @@ mod tests {
 
     fn test_project(issues: Vec<Issue>) -> Project {
         let state = AppState {
+            last_prune_at: None,
             issues: issues.clone(),
         };
         let mut project = Project::new(test_config(), state);
@@ -4930,11 +5328,30 @@ mod tests {
     }
 
     #[test]
+    fn merge_takes_later_last_prune_at() {
+        let mut project = test_project(vec![]);
+        project.last_prune_at = Some(100);
+
+        // External writer recorded a later prune.
+        let file_state = AppState {
+            last_prune_at: Some(200),
+            issues: vec![],
+        };
+        project.merge_external_state(file_state);
+        assert_eq!(project.last_prune_at, Some(200));
+
+        // A file without the field never regresses the in-memory value.
+        project.merge_external_state(AppState::default());
+        assert_eq!(project.last_prune_at, Some(200));
+    }
+
+    #[test]
     fn merge_clean_state_replaces_entirely() {
         let mut project = test_project(vec![test_issue("a", Column::Todo)]);
         assert!(!project.state_dirty);
 
         let file_state = AppState {
+            last_prune_at: None,
             issues: vec![test_issue("b", Column::InProgress)],
         };
         project.merge_external_state(file_state);
@@ -4950,6 +5367,7 @@ mod tests {
         project.mark_dirty();
 
         let file_state = AppState {
+            last_prune_at: None,
             issues: vec![
                 test_issue("a", Column::Todo),
                 test_issue("b", Column::InProgress),
@@ -4972,6 +5390,7 @@ mod tests {
         project.mark_dirty();
 
         let file_state = AppState {
+            last_prune_at: None,
             issues: vec![test_issue("a", Column::Todo)],
         };
         project.merge_external_state(file_state);
@@ -4993,6 +5412,7 @@ mod tests {
         let mut file_issue = original;
         file_issue.title = "Renamed externally".to_string();
         let file_state = AppState {
+            last_prune_at: None,
             issues: vec![file_issue],
         };
         project.merge_external_state(file_state);
@@ -5018,6 +5438,7 @@ mod tests {
 
         // External file still only has "a"
         let file_state = AppState {
+            last_prune_at: None,
             issues: vec![test_issue("a", Column::Todo)],
         };
         project.merge_external_state(file_state);
@@ -5042,6 +5463,7 @@ mod tests {
 
         // External change removes 2 issues
         let file_state = AppState {
+            last_prune_at: None,
             issues: vec![test_issue("a", Column::Todo)],
         };
         project.merge_external_state(file_state);
@@ -5057,7 +5479,7 @@ mod tests {
             test_issue("b", Column::InProgress),
         ]);
 
-        let file_state = AppState { issues: vec![] };
+        let file_state = AppState::default();
         project.merge_external_state(file_state);
 
         assert!(project.issues.is_empty());
@@ -5068,6 +5490,7 @@ mod tests {
         let mut project = test_project(vec![]);
 
         let file_state = AppState {
+            last_prune_at: None,
             issues: vec![test_issue("new", Column::Todo)],
         };
         project.merge_external_state(file_state);
@@ -5085,6 +5508,7 @@ mod tests {
         let mut project = test_project(issues.clone());
 
         let file_state = AppState {
+            last_prune_at: None,
             issues: issues.clone(),
         };
         project.merge_external_state(file_state);
@@ -5102,6 +5526,7 @@ mod tests {
             test_issue("b", Column::InProgress),
         ];
         let file_state = AppState {
+            last_prune_at: None,
             issues: new_issues.clone(),
         };
         project.merge_external_state(file_state);
@@ -5187,6 +5612,205 @@ mod tests {
         assert!(!app.clear_expired_message());
     }
 
+    // ================================================================
+    // PruneDialogState
+    // ================================================================
+
+    use crate::prune::PruneCandidate;
+
+    // Orphan + clean => seeded action is Remove.
+    fn make_candidate(name: &str) -> PruneCandidate {
+        PruneCandidate::new(
+            name.to_string(),
+            Some(crate::types::WorktreeStatus {
+                staged: 0,
+                unstaged: 0,
+            }),
+            None,
+            false,
+        )
+    }
+
+    // Dirty => seeded action is Keep.
+    fn make_dirty_candidate(name: &str) -> PruneCandidate {
+        PruneCandidate::new(
+            name.to_string(),
+            Some(crate::types::WorktreeStatus {
+                staged: 0,
+                unstaged: 1,
+            }),
+            None,
+            false,
+        )
+    }
+
+    fn make_prune_dialog(candidates: Vec<PruneCandidate>) -> PruneDialogState {
+        PruneDialogState::new(std::path::PathBuf::from("/x"), candidates)
+    }
+
+    #[test]
+    fn prune_dialog_new_seeds_actions_from_defaults() {
+        let dialog = make_prune_dialog(vec![
+            make_candidate("a"),
+            make_dirty_candidate("b"),
+            make_candidate("c"),
+        ]);
+        assert_eq!(dialog.candidates[0].action, PruneAction::Remove);
+        assert_eq!(dialog.candidates[1].action, PruneAction::Keep);
+        assert_eq!(dialog.candidates[2].action, PruneAction::Remove);
+        assert_eq!(dialog.selected, 0);
+        assert!(dialog.error.is_none());
+    }
+
+    #[test]
+    fn prune_dialog_move_up_at_top_is_noop() {
+        let mut dialog = make_prune_dialog(vec![make_candidate("a"), make_candidate("b")]);
+        assert_eq!(dialog.selected, 0);
+        dialog.move_up();
+        assert_eq!(dialog.selected, 0);
+    }
+
+    #[test]
+    fn prune_dialog_move_down_stops_at_last_row() {
+        let mut dialog = make_prune_dialog(vec![make_candidate("a"), make_candidate("b")]);
+        dialog.move_down();
+        dialog.move_down();
+        dialog.move_down();
+        assert_eq!(dialog.selected, 1);
+    }
+
+    #[test]
+    fn prune_dialog_move_up_after_down_returns() {
+        let mut dialog = make_prune_dialog(vec![make_candidate("a"), make_candidate("b")]);
+        dialog.move_down();
+        assert_eq!(dialog.selected, 1);
+        dialog.move_up();
+        assert_eq!(dialog.selected, 0);
+    }
+
+    #[test]
+    fn prune_dialog_toggle_current_flips_action_and_clears_error() {
+        let mut dialog = make_prune_dialog(vec![make_candidate("a")]);
+        dialog.error = Some("old".into());
+        dialog.toggle_current();
+        assert_eq!(dialog.candidates[0].action, PruneAction::Keep);
+        assert!(dialog.error.is_none());
+        dialog.toggle_current();
+        assert_eq!(dialog.candidates[0].action, PruneAction::Remove);
+    }
+
+    #[test]
+    fn prune_dialog_toggle_with_no_rows_is_safe() {
+        let mut dialog = make_prune_dialog(vec![]);
+        // selected = 0 but no rows; toggle must not panic.
+        dialog.toggle_current();
+        assert!(dialog.candidates.is_empty());
+    }
+
+    #[test]
+    fn prune_dialog_select_all_remove_and_keep_clear_error() {
+        let mut dialog = make_prune_dialog(vec![make_candidate("a"), make_dirty_candidate("b")]);
+        dialog.error = Some("err".into());
+        dialog.select_all_keep();
+        assert!(dialog
+            .candidates
+            .iter()
+            .all(|c| c.action == PruneAction::Keep));
+        assert!(dialog.error.is_none());
+
+        dialog.error = Some("err2".into());
+        dialog.select_all_remove();
+        assert!(dialog
+            .candidates
+            .iter()
+            .all(|c| c.action == PruneAction::Remove));
+        assert!(dialog.error.is_none());
+    }
+
+    #[test]
+    fn prune_dialog_counts_track_selection() {
+        let mut dialog = make_prune_dialog(vec![
+            make_candidate("clean"),
+            make_dirty_candidate("dirty"),
+            make_candidate("also-clean"),
+        ]);
+        // Defaults: clean rows Remove, dirty row Keep.
+        assert_eq!(dialog.remove_count(), 2);
+        assert_eq!(dialog.dirty_remove_count(), 0);
+
+        dialog.select_all_remove();
+        assert_eq!(dialog.remove_count(), 3);
+        assert_eq!(dialog.dirty_remove_count(), 1);
+
+        dialog.select_all_keep();
+        assert_eq!(dialog.remove_count(), 0);
+        assert_eq!(dialog.dirty_remove_count(), 0);
+    }
+
+    // ================================================================
+    // build_candidates (name discovery itself is disk-based and tested
+    // in prune.rs; these cover the live-cache enrichment)
+    // ================================================================
+
+    #[test]
+    fn build_candidates_without_poll_data_defaults_keep() {
+        let app = test_app(vec![]);
+        let candidates = crate::prune::build_candidates(app.project(), vec!["wt-1".into()]);
+        assert_eq!(candidates.len(), 1);
+        // Status unknown (poll hasn't reached it) => never pre-selected.
+        assert!(candidates[0].status.is_none());
+        assert_eq!(candidates[0].action, PruneAction::Keep);
+    }
+
+    #[test]
+    fn build_candidates_reads_status_from_live_cache() {
+        let mut app = test_app(vec![]);
+        app.project_mut().live.worktree_statuses.insert(
+            "wt-1".into(),
+            WorktreeStatus {
+                staged: 0,
+                unstaged: 0,
+            },
+        );
+        let candidates = crate::prune::build_candidates(app.project(), vec!["wt-1".into()]);
+        // Known-clean orphan => pre-selected for removal.
+        assert_eq!(candidates[0].action, PruneAction::Remove);
+    }
+
+    #[test]
+    fn build_candidates_falls_back_to_frozen_status() {
+        let mut app = test_app(vec![]);
+        app.project_mut().live.frozen_worktree_statuses.insert(
+            "wt-frozen".into(),
+            WorktreeStatus {
+                staged: 0,
+                unstaged: 2,
+            },
+        );
+        let candidates = crate::prune::build_candidates(app.project(), vec!["wt-frozen".into()]);
+        assert!(candidates[0].is_dirty());
+        assert_eq!(candidates[0].action, PruneAction::Keep);
+    }
+
+    #[test]
+    fn build_candidates_links_to_matching_issue() {
+        let mut issue = test_issue("bork-1", Column::Done);
+        issue.worktree = Some("wt-1".into());
+        let mut app = test_app(vec![issue]);
+        app.project_mut().live.worktree_statuses.insert(
+            "wt-1".into(),
+            WorktreeStatus {
+                staged: 0,
+                unstaged: 0,
+            },
+        );
+        let candidates = crate::prune::build_candidates(app.project(), vec!["wt-1".into()]);
+        assert_eq!(candidates[0].issue_id.as_deref(), Some("bork-1"));
+        assert_eq!(candidates[0].issue_column, Some(Column::Done));
+        // Done + clean + no session => default Remove
+        assert_eq!(candidates[0].action, PruneAction::Remove);
+    }
+
     fn linked_issue(id: &str, links: &[&str]) -> Issue {
         let mut issue = test_issue(id, Column::Todo);
         issue.linked_issues = links.iter().map(|s| s.to_string()).collect();
@@ -5247,8 +5871,10 @@ mod tests {
 
         // Simulate the anchor being deleted externally (e.g. `bork issue delete`).
         let remaining = vec![linked_issue("bork-2", &[])];
-        app.active_project_mut()
-            .merge_external_state(AppState { issues: remaining });
+        app.active_project_mut().merge_external_state(AppState {
+            issues: remaining,
+            ..Default::default()
+        });
 
         assert!(app.active_project().link_filter.is_none());
     }
@@ -5266,8 +5892,10 @@ mod tests {
             linked_issue("bork-1", &["bork-2"]),
             linked_issue("bork-2", &["bork-1"]),
         ];
-        app.active_project_mut()
-            .merge_external_state(AppState { issues: same });
+        app.active_project_mut().merge_external_state(AppState {
+            issues: same,
+            ..Default::default()
+        });
 
         assert_eq!(app.active_project().link_filter.as_deref(), Some("bork-1"));
     }

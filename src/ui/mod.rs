@@ -5,6 +5,7 @@ pub mod dialog;
 pub mod help;
 pub mod linear_picker;
 pub mod link_picker;
+pub mod prune_dialog;
 pub mod sidebar;
 pub mod status_bar;
 pub mod styles;
@@ -67,6 +68,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     dialog::render_dialog(frame, app);
     linear_picker::render_import_picker(frame, app);
     link_picker::render_link_picker(frame, app);
+    prune_dialog::render_prune_dialog(frame, app);
     help::render_help(frame, app);
     debug_inspector::render_debug_inspector(frame, app);
 }

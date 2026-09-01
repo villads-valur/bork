@@ -125,7 +125,7 @@ fn render_column(
     let selected_row = project.selected_row[column.index()];
     let card_h = effective_card_height(card_size);
 
-    let border_style = styles::card_border_style(is_selected_col);
+    let border_style = styles::card_border_style(is_selected_col, false);
     let title_style = styles::column_header_style(is_selected_col);
     let title = format!(" {} ({}) ", column, count);
 
@@ -185,10 +185,12 @@ fn render_column(
 
         let card_area = Rect::new(inner.x, card_y, inner.width, card_h);
         let is_selected = is_selected_col && (viewport_start + visible_idx) == selected_row;
+        let marked = project.marked_issues.contains(&issue.id.to_lowercase());
 
         let ctx = card::CardContext {
             issue,
             selected: is_selected,
+            marked,
             session_alive: project
                 .is_session_alive(&issue.session_name(&project.config.project_name)),
             agent_status: project.resolved_agent_status(issue),
@@ -196,6 +198,7 @@ fn render_column(
             branch: project.branch_for(issue),
             git_status: project.worktree_status_for(issue),
             pr: project.pr_for(issue),
+            stack: project.stack_for_issue(issue),
             ports: project.listening_ports_for(issue),
             search_query,
         };

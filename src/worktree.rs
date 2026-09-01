@@ -182,7 +182,7 @@ pub fn create_worktree_in(
         .iter_mut()
         .find(|i| i.id.eq_ignore_ascii_case(issue_id))
     {
-        issue.worktree = Some(worktree_dir.to_string());
+        issue.attach_worktree(worktree_dir.to_string());
     } else if let Some(title) = title {
         let issue = Issue {
             worktree: Some(worktree_dir.to_string()),
@@ -368,6 +368,8 @@ mod tests {
             auto_import_reviews: true,
             auto_import_authored_prs: true,
             agents_allowlist: None,
+            prune_threshold: crate::config::DEFAULT_PRUNE_THRESHOLD,
+            auto_prune_check_interval: crate::config::DEFAULT_AUTO_PRUNE_CHECK_INTERVAL,
             agent_launch: std::collections::HashMap::new(),
         }
     }
@@ -421,6 +423,29 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("already exists"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_worktree_clears_pruned_at_on_existing_issue() {
+        let (tmp, project, cfg) = setup_test_project();
+
+        // Seed the issue with a pruned_at marker.
+        let state_path = project.join(".bork/state.json");
+        let seeded = r#"{"issues":[{"id":"bork-1","title":"Test","column":"Todo","agent_kind":"OpenCode","agent_mode":"Plan","prompt":null,"worktree":null,"done_at":null,"pruned_at":1700000000}]}"#;
+        fs::write(&state_path, seeded).unwrap();
+
+        let result = create_worktree_in(&cfg, "bork-1", Some("retry"), None, None);
+        assert!(result.is_ok(), "run_worktree failed: {:?}", result.err());
+
+        let state = config::load_state(&project);
+        let issue = state.issues.iter().find(|i| i.id == "bork-1").unwrap();
+        assert_eq!(issue.worktree, Some("bork-1-retry".to_string()));
+        assert!(
+            issue.pruned_at.is_none(),
+            "pruned_at should clear when a worktree is reattached via CLI"
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }

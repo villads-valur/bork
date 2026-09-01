@@ -64,6 +64,8 @@ const SECTIONS: &[Section] = &[
     Section {
         title: "Move Issues",
         bindings: &[
+            ("Space", "Mark / unmark issue"),
+            ("m", "Mark linked group"),
             ("H / L", "Move left / right"),
             ("K / J", "Move up / down"),
             ("D", "Move to Done"),
@@ -79,10 +81,11 @@ const SECTIONS: &[Section] = &[
         bindings: &[
             ("/", "Search"),
             ("P", "Sync PRs"),
+            ("W", "Prune worktrees"),
             ("o", "Open PR in browser"),
             ("O", "Open in Linear"),
             ("I", "Import from Linear"),
-            ("W", "Assign worktree"),
+            ("w", "Assign worktree"),
             ("q", "Quit"),
         ],
     },

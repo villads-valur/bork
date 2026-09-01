@@ -190,13 +190,11 @@ pub fn run_init(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    // Serialize tests that call run_init (which writes to global config)
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn with_isolated_config(tmp: &Path, test: impl FnOnce()) {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::XDG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let config_dir = tmp.join("xdg-config");
         let _ = fs::create_dir_all(&config_dir);
         let old = std::env::var("XDG_CONFIG_HOME").ok();

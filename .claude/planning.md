@@ -1,57 +1,44 @@
-# Current Work
+# bork-146: clean up zsh and other processes when killing an issue
 
-> Last updated: 2026-04-10
+> Last updated: 2026-08-26
 
-## Active Task
+## Findings
 
-**Task:** Add assigned GitHub review requests to the Code Review column
-**Status:** Implementation complete, pending review
+- zsh itself is not leaking: the apparent PID 1 children belong to active
+  pane TTYs and exit when tmux closes the pane.
+- Codex, OpenCode, and self-daemonizing commands can outlive the tmux session.
+- `bork issue delete` did not terminate its issue session.
+- `tmux::kill_session` discarded failures and always reported success.
 
-## Changes
+## Implementation
 
-### types.rs
-- Added `PrImportSource` enum (`Authored`, `ReviewRequested`) with Display impl
-- Added `pr_import_source: Option<PrImportSource>` field to `Issue`
+- Snapshot the POSIX session ID for every tmux pane before teardown, then kill
+  survivors that retain those IDs after the pane closes.
+- On Linux, also identify survivors through the inherited `BORK_SESSION`
+  environment marker so descendants that call `setsid` remain discoverable.
+- Escalate survivor cleanup from SIGTERM to SIGKILL after a grace period.
+- Route issue kill, delete, archive, kind-change, and TTL cleanup through one
+  cleanup function.
+- Validate tmux exit status and clean transient status/prompt files.
+- Preserve issues when teardown fails: CLI delete/archive now return the
+  failure, and TUI delete waits for successful asynchronous cleanup before
+  removing the card.
 
-### external/github.rs
-- Added `fetch_review_requested_prs()` using GitHub search: `is:pr is:open review-requested:<user> -author:<user>`
+## Status
 
-### main.rs
-- Extended `PrPollResult` with `review_requested_prs` field
-- Added 4th parallel thread in PR poll worker for review-requested PRs
-- Store `review_requested_prs` in live state, include in title sync
+- [x] Investigation and isolated reproduction
+- [x] Initial implementation and unit tests
+- [x] Sync worktree with current `origin/main`
+- [x] Review cleanup safety and portability
+- [x] Code-review and simplification pass
+- [x] Formatting, clippy, and all 787 tests pass
+- [x] End-to-end test: detached `nohup` processes from two tmux windows are
+      both terminated by `bork issue delete`
 
-### app.rs
-- Extended `LiveState` with `review_requested_prs: Vec<PrStatus>`
-- Updated `has_github_prs()` to include review-requested PRs
-- Updated `branch_for()` and `pr_for()` to search review-requested PRs
-- Rewrote `sync_prs_as_issues()`:
-  - Imports from union of authored + review-requested PRs
-  - Authored imports: removed when PR disappears (existing behavior)
-  - ReviewRequested imports: auto-moved to Done when no longer pending
-  - Review imports get a review-focused default prompt
-- Updated `filtered_github_prs()` to include review-requested PRs in picker
-- Added `pr_import_source` to `merge_issue_fields`
+## Limitation
 
-### ui/card.rs
-- Shows yellow "review" badge on status line for ReviewRequested issues
-
-### handler.rs
-- Added `pr_import_source` to all Issue construction sites
-- Manual picker import sets `PrImportSource::Authored`
-- Dialog attach/clear resets `pr_import_source` to None
-
-### worktree.rs, external/opencode.rs
-- Added `pr_import_source: None` to Issue construction in tests/CLI
-
-## Progress
-
-- [x] PrImportSource enum + Issue field
-- [x] fetch_review_requested_prs() in github.rs
-- [x] PR poll worker extended with 4th parallel fetch
-- [x] LiveState + sync_prs_as_issues() rewritten
-- [x] pr_for() / branch_for() / filtered_github_prs() updated
-- [x] Review badge on cards
-- [x] All Issue construction sites updated
-- [x] Build passes (cargo check + clippy + fmt)
-- [x] Tests pass (460/460)
+On macOS, a process that deliberately calls `setsid` before tmux teardown can
+escape the pane's POSIX session, and the OS does not expose detached-process
+environments to recover the `BORK_SESSION` marker. Such fully daemonized
+services still require the project's `teardown_script`. Normal background and
+`nohup` jobs, agent subprocesses, zsh helpers, and every tmux window are covered.

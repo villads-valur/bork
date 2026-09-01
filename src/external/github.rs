@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 
-use crate::types::{ChecksStatus, PrState, PrStatus, ReviewDecision};
+use crate::types::{
+    ChecksStatus, GithubStack, GithubStackPullRequest, PrState, PrStatus, ReviewDecision,
+};
 
 #[derive(Clone)]
 struct RepoIdentity {
@@ -113,6 +115,91 @@ pub fn fetch_prs(main_worktree: &Path) -> Vec<PrStatus> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     parse_graphql_response(&stdout)
+}
+
+pub fn fetch_stacks(main_worktree: &Path) -> Option<Vec<GithubStack>> {
+    let repo = get_repo_identity(main_worktree)?;
+    let endpoint = format!("repos/{}/{}/stacks?per_page=100", repo.owner, repo.name);
+    let output = Command::new("gh")
+        .args(["api", "--paginate", "--slurp", &endpoint])
+        .current_dir(main_worktree)
+        .output();
+
+    let Ok(output) = output else {
+        return None;
+    };
+    if !output.status.success() {
+        return None;
+    }
+
+    parse_stacks_response(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_stacks_response(json_str: &str) -> Option<Vec<GithubStack>> {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) else {
+        return None;
+    };
+    let stacks = parsed.as_array()?;
+    let mut parsed_stacks = Vec::new();
+    if stacks.iter().all(serde_json::Value::is_array) {
+        for page in stacks {
+            if let Some(page) = page.as_array() {
+                parsed_stacks.extend(page.iter().filter_map(parse_stack));
+            }
+        }
+    } else {
+        parsed_stacks.extend(stacks.iter().filter_map(parse_stack));
+    }
+    Some(parsed_stacks)
+}
+
+fn parse_stack(value: &serde_json::Value) -> Option<GithubStack> {
+    let number = value.get("number")?.as_u64()? as u32;
+    let url = value
+        .get("url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let base_ref = value.pointer("/base/ref")?.as_str()?.to_string();
+    let open = value.get("open").and_then(|v| v.as_bool()).unwrap_or(true);
+    let pull_requests = value
+        .get("pull_requests")
+        .and_then(|v| v.as_array())?
+        .iter()
+        .filter_map(parse_stack_pull_request)
+        .collect();
+
+    Some(GithubStack {
+        number,
+        url,
+        base_ref,
+        open,
+        pull_requests,
+    })
+}
+
+fn parse_stack_pull_request(value: &serde_json::Value) -> Option<GithubStackPullRequest> {
+    let number = value.get("number")?.as_u64()? as u32;
+    let state = match value.get("merged_at").and_then(|v| v.as_str()) {
+        Some(_) => PrState::Merged,
+        None => match value.get("state")?.as_str()?.to_ascii_lowercase().as_str() {
+            "open" => PrState::Open,
+            "closed" => PrState::Closed,
+            _ => return None,
+        },
+    };
+    let is_draft = value
+        .get("draft")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let head_branch = value.pointer("/head/ref")?.as_str()?.to_string();
+
+    Some(GithubStackPullRequest {
+        number,
+        state,
+        is_draft,
+        head_branch,
+    })
 }
 
 fn parse_graphql_response(json_str: &str) -> Vec<PrStatus> {
@@ -352,13 +439,6 @@ pub fn fetch_current_user(main_worktree: &Path) -> Option<String> {
     let mut cached = GITHUB_USER.lock().unwrap_or_else(|e| e.into_inner());
     *cached = Some(login.clone());
     Some(login)
-}
-
-pub fn open_pr_in_browser(pr_number: u32, main_worktree: &Path) {
-    let _ = Command::new("gh")
-        .args(["pr", "view", &pr_number.to_string(), "--web"])
-        .current_dir(main_worktree)
-        .output();
 }
 
 /// Build the canonical github.com URL for a PR, given the project's main worktree.
@@ -663,6 +743,82 @@ mod tests {
         let response = r#"{"data": {"repository": {"pullRequests": {"nodes": null}}}}"#;
         let prs = parse_graphql_response(response);
         assert!(prs.is_empty());
+    }
+
+    #[test]
+    fn test_parse_stacks_response_preserves_order_and_membership() {
+        let response = serde_json::json!([{
+            "number": 7,
+            "url": "https://api.github.com/repos/test/repo/stacks/7",
+            "base": { "ref": "main" },
+            "open": true,
+            "pull_requests": [
+                {
+                    "number": 10,
+                    "state": "open",
+                    "draft": false,
+                    "merged_at": null,
+                    "head": { "ref": "feature/base" }
+                },
+                {
+                    "number": 11,
+                    "state": "closed",
+                    "draft": true,
+                    "merged_at": "2026-08-28T10:00:00Z",
+                    "head": { "ref": "feature/top" }
+                }
+            ]
+        }]);
+
+        let stacks = parse_stacks_response(&response.to_string());
+        let stacks = stacks.unwrap();
+        assert_eq!(stacks.len(), 1);
+        assert_eq!(stacks[0].number, 7);
+        assert_eq!(stacks[0].base_ref, "main");
+        assert_eq!(stacks[0].pull_requests[0].number, 10);
+        assert_eq!(stacks[0].pull_requests[0].state, PrState::Open);
+        assert_eq!(stacks[0].pull_requests[1].number, 11);
+        assert_eq!(stacks[0].pull_requests[1].state, PrState::Merged);
+        assert!(stacks[0].pull_requests[1].is_draft);
+    }
+
+    #[test]
+    fn test_parse_stacks_response_skips_invalid_entries() {
+        let response = serde_json::json!([{
+            "number": 7,
+            "pull_requests": [{ "number": 10 }]
+        }, {
+            "number": 8,
+            "base": { "ref": "main" },
+            "pull_requests": []
+        }]);
+
+        let stacks = parse_stacks_response(&response.to_string());
+        let stacks = stacks.unwrap();
+        assert_eq!(stacks.len(), 1);
+        assert_eq!(stacks[0].number, 8);
+    }
+
+    #[test]
+    fn test_parse_paginated_stacks_response() {
+        let response = serde_json::json!([
+            [{
+                "number": 7,
+                "base": { "ref": "main" },
+                "pull_requests": []
+            }],
+            [{
+                "number": 8,
+                "base": { "ref": "main" },
+                "pull_requests": []
+            }]
+        ]);
+
+        let stacks = parse_stacks_response(&response.to_string()).unwrap();
+        assert_eq!(
+            stacks.iter().map(|stack| stack.number).collect::<Vec<_>>(),
+            [7, 8]
+        );
     }
 
     #[test]

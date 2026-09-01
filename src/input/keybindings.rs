@@ -25,6 +25,23 @@ pub fn map_key_to_action(
         InputMode::Help => map_help_key(key),
         InputMode::DebugInspector => map_debug_inspector_key(key),
         InputMode::Sidebar => map_sidebar_key(key),
+        InputMode::PruneDialog => map_prune_dialog_key(key),
+    }
+}
+
+fn map_prune_dialog_key(key: KeyEvent) -> Action {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        return Action::PruneCancel;
+    }
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => Action::PruneCancel,
+        KeyCode::Enter => Action::PruneConfirm,
+        KeyCode::Char(' ') => Action::PruneToggle,
+        KeyCode::Char('a') => Action::PruneSelectAllRemove,
+        KeyCode::Char('n') => Action::PruneSelectAllKeep,
+        KeyCode::Char('j') | KeyCode::Down => Action::PruneMoveDown,
+        KeyCode::Char('k') | KeyCode::Up => Action::PruneMoveUp,
+        _ => Action::Noop,
     }
 }
 
@@ -71,6 +88,8 @@ fn map_normal_key(key: KeyEvent, swimlane_count: usize) -> Action {
         KeyCode::Char('J') => Action::MoveIssueDown,
         KeyCode::Char('D') => Action::MoveToDone,
         KeyCode::Char('T') => Action::MoveToTodo,
+        KeyCode::Char(' ') => Action::ToggleMark,
+        KeyCode::Char('m') => Action::MarkLinkedComponent,
 
         KeyCode::Char('g') => Action::ScrollToTop,
         KeyCode::Char('G') => Action::ScrollToBottom,
@@ -81,7 +100,8 @@ fn map_normal_key(key: KeyEvent, swimlane_count: usize) -> Action {
         KeyCode::Char('P') => Action::SyncPRs,
         KeyCode::Char('o') => Action::OpenPR,
         KeyCode::Char('O') => Action::OpenLinear,
-        KeyCode::Char('W') => Action::AssignWorktree,
+        KeyCode::Char('w') => Action::AssignWorktree,
+        KeyCode::Char('W') => Action::OpenPruneDialog,
 
         KeyCode::Char('/') => Action::SearchStart,
         KeyCode::Char('?') => Action::ShowHelp,
@@ -427,8 +447,12 @@ mod tests {
             Action::OpenLinear
         );
         assert_eq!(
-            map_normal_key(key(KeyCode::Char('W')), 1),
+            map_normal_key(key(KeyCode::Char('w')), 1),
             Action::AssignWorktree
+        );
+        assert_eq!(
+            map_normal_key(key(KeyCode::Char('W')), 1),
+            Action::OpenPruneDialog
         );
         assert_eq!(
             map_normal_key(key(KeyCode::Char('I')), 1),

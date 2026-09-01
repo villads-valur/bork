@@ -10,11 +10,18 @@ mod init;
 mod input;
 mod lock;
 mod ops;
+mod prune;
 mod toml_lite;
 mod types;
 mod ui;
 mod update;
 mod worktree;
+
+/// Serializes tests (global_config, init) that mutate the process-global
+/// `XDG_CONFIG_HOME`. One lock per module would not exclude the other
+/// module's tests, so the env races and the assertions flake.
+#[cfg(test)]
+pub(crate) static XDG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -39,7 +46,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
-use app::{App, InputMode, ProjectId};
+use app::{App, InputMode, Project, ProjectId};
 use global_config::ReloadResult;
 use handler::{ActionResult, PostAction};
 use input::map_key_to_action;
@@ -48,10 +55,12 @@ use types::{AgentKind, AgentMode, AgentStatusInfo, Column, IssueKind};
 use external::git::GitPollResult;
 use external::linear::LinearPollResult;
 use external::ports::PortPollResult;
-use types::PrStatus;
+use types::{GithubStack, PrStatus};
 
 struct PrPollResult {
     prs: HashMap<String, PrStatus>,
+    prs_by_number: HashMap<u32, PrStatus>,
+    stacks: Option<Vec<GithubStack>>,
     user_prs: Vec<PrStatus>,
     review_requested_prs: Vec<PrStatus>,
     github_user: Option<String>,
@@ -72,6 +81,10 @@ const PORT_POLL_INTERVAL: Duration = Duration::from_secs(10);
 const LINEAR_POLL_INTERVAL: Duration = Duration::from_secs(45);
 const PR_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const STATE_POLL_TICKS: usize = 40; // 40 * 50ms = 2s
+/// Minimum interval between auto-prune checks (and thus toasts) for the same
+/// project. Keeps the tick loop from counting worktrees constantly and the
+/// message from re-flashing once the threshold is hit.
+const PRUNE_PROMPT_MIN_GAP: Duration = Duration::from_secs(300);
 
 /// Sleep while polling is suspended (e.g. a tmux popup owns the terminal).
 /// Keeps workers from spawning subprocesses nobody will consume.
@@ -79,6 +92,19 @@ fn wait_while_suspended(suspended: &AtomicBool) {
     while suspended.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(200));
     }
+}
+
+fn flush_project_state(project: &mut Project) {
+    let current_mtime = config::state_mtime(&project.config.project_root);
+    if current_mtime != project.last_state_mtime {
+        if let Some(new_state) = config::try_load_state(&project.config.project_root) {
+            project.merge_external_state(new_state);
+        }
+    }
+
+    let _ = config::save_state(&project.to_state(), &project.config.project_root);
+    project.state_dirty = false;
+    project.update_base_snapshot();
 }
 
 /// Single shared `tmux list-sessions` poller. Tmux sessions are server-global,
@@ -239,19 +265,22 @@ fn spawn_pr_poll_worker(
 
     thread::spawn(move || loop {
         wait_while_suspended(&suspended);
-        // Run the 4 independent gh api calls in parallel
+        // Run the independent GitHub calls in parallel.
         let result = thread::scope(|s| {
-            let prs_handle = s.spawn(|| {
-                let prs = external::github::fetch_prs(&main_worktree);
-                external::github::index_by_branch(prs)
-            });
+            let prs_handle = s.spawn(|| external::github::fetch_prs(&main_worktree));
             let user_prs_handle = s.spawn(|| external::github::fetch_user_prs(&main_worktree));
             let review_handle =
                 s.spawn(|| external::github::fetch_review_requested_prs(&main_worktree));
             let user_handle = s.spawn(|| external::github::fetch_current_user(&main_worktree));
+            let stacks_handle = s.spawn(|| external::github::fetch_stacks(&main_worktree));
+
+            let prs = prs_handle.join().unwrap_or_default();
+            let prs_by_number = prs.iter().map(|pr| (pr.number, pr.clone())).collect();
 
             PrPollResult {
-                prs: prs_handle.join().unwrap_or_default(),
+                prs: external::github::index_by_branch(prs),
+                prs_by_number,
+                stacks: stacks_handle.join().unwrap_or(None),
                 user_prs: user_prs_handle.join().unwrap_or_default(),
                 review_requested_prs: review_handle.join().unwrap_or_default(),
                 github_user: user_handle.join().ok().flatten(),
@@ -403,6 +432,25 @@ enum Command {
         /// within seconds.
         #[arg(long)]
         check: bool,
+    },
+
+    /// Prune stale worktrees from the project on disk.
+    Prune {
+        /// Print what would be removed without touching anything
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip the interactive prompt and remove all default-Remove candidates
+        #[arg(long)]
+        yes: bool,
+
+        /// Force-include extra worktree directory names in the removal set
+        #[arg(long)]
+        include: Vec<String>,
+
+        /// Skip these worktree directory names
+        #[arg(long)]
+        exclude: Vec<String>,
     },
 }
 
@@ -587,14 +635,18 @@ enum IssueCommand {
         json: bool,
     },
 
-    /// Move an issue to a column
+    /// Move issues to a column
     Move {
-        /// Issue ID (e.g. bork-1)
-        id: String,
+        /// Issue IDs followed by the target column, unless --to is used
+        args: Vec<String>,
+
+        /// Move all issues linked to this issue id (its connected component)
+        #[arg(long)]
+        linked: Option<String>,
 
         /// Target column (todo, in-progress, code-review, done)
-        #[arg(value_parser = parse_column)]
-        column: Column,
+        #[arg(long, value_parser = parse_column)]
+        to: Option<Column>,
     },
 }
 
@@ -764,8 +816,129 @@ fn main() -> anyhow::Result<()> {
                 update::run_update()
             }
         }
+        Some(Command::Prune {
+            dry_run,
+            yes,
+            include,
+            exclude,
+        }) => run_prune_command(dry_run, yes, &include, &exclude),
         None => run_tui(),
     }
+}
+
+fn run_prune_command(
+    dry_run: bool,
+    yes: bool,
+    include: &[String],
+    exclude: &[String],
+) -> anyhow::Result<()> {
+    use crate::prune::{
+        apply_outcome_to_issues, execute_removals, partition_selection, PruneAction,
+        PruneCandidate, RemoveOutcome,
+    };
+    use std::collections::HashSet;
+    use std::io::Write;
+
+    let config = config::load_config();
+    let mut state = config::load_state(&config.project_root);
+
+    let poll = external::git::poll_all_worktrees(&config.project_root, &HashSet::new());
+
+    let mut candidates: Vec<PruneCandidate> = poll
+        .branches
+        .keys()
+        .filter(|n| n.as_str() != "main")
+        .map(|name| {
+            let issue = state
+                .issues
+                .iter()
+                .find(|i| i.worktree.as_deref() == Some(name.as_str()));
+            // The CLI can't see tmux sessions, so session_alive is false;
+            // git's dirty refusal still protects in-flight work.
+            PruneCandidate::new(name.clone(), poll.statuses.get(name).cloned(), issue, false)
+        })
+        .collect();
+    candidates.sort_by(|a, b| a.worktree.cmp(&b.worktree));
+
+    if candidates.is_empty() {
+        println!("No prunable worktrees found.");
+        return Ok(());
+    }
+
+    let include_set: HashSet<&str> = include.iter().map(String::as_str).collect();
+    let exclude_set: HashSet<&str> = exclude.iter().map(String::as_str).collect();
+    for c in &mut candidates {
+        if exclude_set.contains(c.worktree.as_str()) {
+            c.action = PruneAction::Keep;
+        } else if include_set.contains(c.worktree.as_str()) {
+            c.action = PruneAction::Remove;
+        }
+    }
+
+    println!("Worktrees:");
+    for c in &candidates {
+        let marker = match c.action {
+            PruneAction::Remove => "[remove]",
+            PruneAction::Keep => "[keep]  ",
+        };
+        let dirty = if c.is_dirty() { " (dirty)" } else { "" };
+        let issue = c.issue_id.as_deref().unwrap_or("(orphan)");
+        println!("  {marker} {:<32}  {issue}{dirty}", c.worktree);
+    }
+
+    let (to_remove, dirty_names) = partition_selection(&candidates);
+    if !dirty_names.is_empty() {
+        eprintln!(
+            "Refusing: dirty worktrees can't be pruned: {}",
+            dirty_names.join(", ")
+        );
+        anyhow::bail!("aborting; clean or stash these worktrees first");
+    }
+
+    if dry_run {
+        println!(
+            "\nDry run: {} worktree(s) would be removed",
+            to_remove.len()
+        );
+        return Ok(());
+    }
+
+    if to_remove.is_empty() {
+        println!("\nNothing to prune.");
+        return Ok(());
+    }
+
+    if !yes {
+        print!(
+            "\nProceed and remove {} worktree(s)? [y/N] ",
+            to_remove.len()
+        );
+        std::io::stdout().flush().ok();
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let answer = input.trim().to_lowercase();
+        if answer != "y" && answer != "yes" {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let outcome = execute_removals(&config.project_root, &to_remove);
+
+    for result in &outcome.results {
+        match &result.outcome {
+            RemoveOutcome::Removed => println!("Removed: {}", result.worktree),
+            RemoveOutcome::Failed(msg) => println!("Failed: {} ({})", result.worktree, msg),
+        }
+    }
+
+    let now = app::unix_now();
+    apply_outcome_to_issues(&mut state.issues, &outcome, now);
+    state.last_prune_at = Some(now);
+    config::save_state(&state, &config.project_root)?;
+
+    println!("\nDone. Pruned {} worktree(s).", outcome.removed_count());
+    Ok(())
 }
 
 fn run_project_command(command: ProjectCommand) -> anyhow::Result<()> {
@@ -1064,9 +1237,30 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
             println!("{}", output);
             Ok(())
         }
-        IssueCommand::Move { id, column } => {
-            let issue = ops::move_issue(&project_root, &id, column)?;
-            println!("Moved {} to {}", issue.id, issue.column);
+        IssueCommand::Move {
+            mut args,
+            linked,
+            to,
+        } => {
+            let to = match to {
+                Some(column) => column,
+                None => {
+                    let Some(column) = args.pop() else {
+                        anyhow::bail!("provide a target column or --to <column>");
+                    };
+                    parse_column(&column).map_err(|err| anyhow::anyhow!(err))?
+                }
+            };
+            let ids = args;
+            if ids.is_empty() && linked.is_none() {
+                anyhow::bail!("provide at least one issue id or --linked <id>");
+            }
+
+            let report = ops::move_issues(&project_root, &ids, linked.as_deref(), to)?;
+            println!("Moved {} issues to {}", report.moved.len(), to);
+            if !report.skipped.is_empty() {
+                eprintln!("Skipped missing issues: {}", report.skipped.join(", "));
+            }
             Ok(())
         }
     }
@@ -1151,12 +1345,14 @@ fn start_issue(project_root: &Path, opts: StartIssueOptions) -> anyhow::Result<S
             None,
             opts.base_branch.as_deref(),
         )?;
-        issue.worktree = Some(result.worktree_dir.clone());
+        issue.attach_worktree(result.worktree_dir.clone());
         Some(result.worktree_dir)
     };
 
-    let (session_name, agent_session_id) = external::opencode::launch_session(&issue, &config)
-        .map_err(|e| anyhow::anyhow!("Failed to launch agent: {e}"))?;
+    let launched_agent = issue.agent_kind;
+    let (session_name, agent_session_id, setup_ran) =
+        external::opencode::launch_session(&issue, &config)
+            .map_err(|e| anyhow::anyhow!("Failed to launch agent: {e}"))?;
 
     // Resolve the link target: explicit --link wins, else the spawning agent's
     // issue from BORK_ISSUE_ID. Only link when the target exists in this same
@@ -1173,8 +1369,16 @@ fn start_issue(project_root: &Path, opts: StartIssueOptions) -> anyhow::Result<S
         if saved.column == Column::Todo {
             saved.column = Column::InProgress;
         }
-        if let Some(sid) = agent_session_id {
-            saved.session_id = Some(sid);
+        // A kind change during the launch detached what it produced (see
+        // Issue::accepts_launch_result); setup_ran additionally ignores
+        // agent changes since the setup script is agent-independent.
+        if setup_ran && saved.kind == issue.kind {
+            saved.setup_ran = true;
+        }
+        if let Some(sid) =
+            agent_session_id.filter(|_| saved.accepts_launch_result(issue.kind, launched_agent))
+        {
+            saved.sessions.insert(launched_agent, sid);
         }
     }
     config::save_state(&state, project_root)?;
@@ -1621,12 +1825,7 @@ fn run_tui() -> anyhow::Result<()> {
                                 popup_title,
                             } => {
                                 if app.project().state_dirty {
-                                    let _ = config::save_state(
-                                        &app.project().to_state(),
-                                        &app.project().config.project_root,
-                                    );
-                                    app.project_mut().state_dirty = false;
-                                    app.project_mut().update_base_snapshot();
+                                    flush_project_state(app.project_mut());
                                 }
                                 open_tmux_popup(
                                     &mut terminal,
@@ -1668,12 +1867,7 @@ fn run_tui() -> anyhow::Result<()> {
                                     app.debug_inspector_json = None;
                                     app.input_mode = InputMode::Normal;
                                     if app.project().state_dirty {
-                                        let _ = config::save_state(
-                                            &app.project().to_state(),
-                                            &app.project().config.project_root,
-                                        );
-                                        app.project_mut().state_dirty = false;
-                                        app.project_mut().update_base_snapshot();
+                                        flush_project_state(app.project_mut());
                                     }
 
                                     let old_focused = app.focused_project.clone();
@@ -1734,17 +1928,50 @@ fn run_tui() -> anyhow::Result<()> {
             app.busy_count = app.busy_count.saturating_sub(1);
             app.show_message(result.message, result.message_kind);
 
-            if let Some((issue_id, agent_sid)) = result.session_id {
-                for project in &mut app.projects {
-                    if let Some(issue) = project.issues.iter_mut().find(|i| i.id == issue_id) {
-                        issue.session_id = Some(agent_sid);
-                        project.mark_dirty();
-                        break;
-                    }
+            if let Some((project_id, outcome)) = result.prune_outcome {
+                if let Some(project) = app.find_project_mut(&project_id) {
+                    let now = app::unix_now();
+                    prune::apply_outcome_to_issues(&mut project.issues, &outcome, now);
+                    project.last_prune_at = Some(now);
+                    project.mark_dirty();
+                    // Reset cooldown so we don't immediately re-prompt.
+                    project.last_auto_prune_check = Some(std::time::Instant::now());
                 }
             }
 
+            if let Some((project_id, issue_id)) = result.issue_to_delete {
+                handler::delete_issue_from_app(&mut app, &project_id, &issue_id);
+            }
+
             if let Some(launch_id) = result.launched_issue_id {
+                // A kill during the detection window (x kill, done-TTL)
+                // invalidated whatever this launch produced: the setup may
+                // have been interrupted and any detected id belongs to a
+                // dead pane.
+                let invalidated = app.launches_invalidated.remove(&launch_id);
+                for project in &mut app.projects {
+                    let Some(issue) = project.issues.iter_mut().find(|i| i.id == launch_id) else {
+                        continue;
+                    };
+                    let mut dirty = false;
+                    // setup_ran is recorded independently of session
+                    // detection: the setup script ran even when the id was
+                    // never captured, and it must not run a second time.
+                    if result.launched_setup_ran && !invalidated && !issue.setup_ran {
+                        issue.setup_ran = true;
+                        dirty = true;
+                    }
+                    if let Some(launched) = result.launched_session.filter(|_| !invalidated) {
+                        if issue.accepts_launch_result(launched.kind, launched.agent) {
+                            issue.sessions.insert(launched.agent, launched.session_id);
+                            dirty = true;
+                        }
+                    }
+                    if dirty {
+                        project.mark_dirty();
+                    }
+                    break;
+                }
                 app.launches_in_flight.remove(&launch_id);
                 let pending = pending_popup_for_launch.remove(&launch_id);
                 // Only act on a successful launch; failures already surfaced
@@ -1786,12 +2013,7 @@ fn run_tui() -> anyhow::Result<()> {
 
         if let Some((session_name, popup_title)) = pending_popup_session.take() {
             // Flush state before yielding terminal to tmux popup (could last a long time)
-            let _ = config::save_state(
-                &app.project().to_state(),
-                &app.project().config.project_root,
-            );
-            app.project_mut().state_dirty = false;
-            app.project_mut().update_base_snapshot();
+            flush_project_state(app.project_mut());
             open_tmux_popup(
                 &mut terminal,
                 &session_name,
@@ -1870,15 +2092,19 @@ fn run_tui() -> anyhow::Result<()> {
             needs_redraw = true;
             let session_name =
                 app.project().issues[idx].session_name(&app.project().config.project_name);
-            let status_file = config::agent_status_dir(&app.project().config.project_root)
-                .join(format!("{}.json", session_name));
-            let sn = session_name.clone();
+            let project_root = app.project().config.project_root.clone();
+            let issue_id = app.project().issues[idx].id.clone();
+            app.invalidate_inflight_launch(&issue_id);
+            let tx = action_tx.clone();
             app.project_mut().live.active_sessions.remove(&session_name);
             thread::spawn(move || {
-                let _ = external::tmux::kill_session(&sn);
-                let _ = std::fs::remove_file(&status_file);
+                let _ = tx.send(handler::terminate_to_result(
+                    &project_root,
+                    &session_name,
+                    format!("Auto-killed session '{}' (done TTL)", session_name),
+                    format!("Session '{}' was already stopped", session_name),
+                ));
             });
-            app.set_message(format!("Auto-killed session '{}' (done TTL)", session_name));
         }
 
         let mut git_data_changed = false;
@@ -1903,6 +2129,11 @@ fn run_tui() -> anyhow::Result<()> {
             let live = &mut app.project_mut().live;
             let changed = !live.pr_poll_done
                 || live.pr_statuses != pr_result.prs
+                || live.pr_statuses_by_number != pr_result.prs_by_number
+                || pr_result
+                    .stacks
+                    .as_ref()
+                    .is_some_and(|stacks| live.github_stacks != *stacks)
                 || live.user_prs != pr_result.user_prs
                 || live.review_requested_prs != pr_result.review_requested_prs;
             if pr_result.github_user.is_some() && live.github_user != pr_result.github_user {
@@ -1915,6 +2146,10 @@ fn run_tui() -> anyhow::Result<()> {
             needs_redraw = true;
             pr_data_changed = true;
             live.pr_statuses = pr_result.prs;
+            live.pr_statuses_by_number = pr_result.prs_by_number;
+            if let Some(stacks) = pr_result.stacks {
+                live.github_stacks = stacks;
+            }
             live.user_prs = pr_result.user_prs;
             live.review_requested_prs = pr_result.review_requested_prs;
             live.pr_poll_done = true;
@@ -2080,10 +2315,19 @@ fn run_tui() -> anyhow::Result<()> {
                 }
                 if !live.pr_poll_done
                     || live.pr_statuses != pr_result.prs
+                    || live.pr_statuses_by_number != pr_result.prs_by_number
+                    || pr_result
+                        .stacks
+                        .as_ref()
+                        .is_some_and(|stacks| live.github_stacks != *stacks)
                     || live.user_prs != pr_result.user_prs
                     || live.review_requested_prs != pr_result.review_requested_prs
                 {
                     live.pr_statuses = pr_result.prs;
+                    live.pr_statuses_by_number = pr_result.prs_by_number;
+                    if let Some(stacks) = pr_result.stacks {
+                        live.github_stacks = stacks;
+                    }
                     live.user_prs = pr_result.user_prs;
                     live.review_requested_prs = pr_result.review_requested_prs;
                     live.pr_poll_done = true;
@@ -2190,12 +2434,17 @@ fn run_tui() -> anyhow::Result<()> {
             }
         }
 
+        // --- Auto-prune prompt: surface a toast when there are a lot of
+        // worktrees on disk and we haven't prompted recently. ---
+        if let Some(msg) = maybe_auto_prune_message(&mut app) {
+            app.set_message(msg);
+            needs_redraw = true;
+        }
+
         // --- Flush dirty state to disk (once per tick, not per action) ---
         for project in &mut app.projects {
             if project.state_dirty {
-                let _ = config::save_state(&project.to_state(), &project.config.project_root);
-                project.state_dirty = false;
-                project.update_base_snapshot();
+                flush_project_state(project);
             }
         }
 
@@ -2206,9 +2455,9 @@ fn run_tui() -> anyhow::Result<()> {
 
     shared.shutdown.store(true, Ordering::Relaxed);
 
-    for project in &app.projects {
+    for project in &mut app.projects {
         if project.state_dirty {
-            let _ = config::save_state(&project.to_state(), &project.config.project_root);
+            flush_project_state(project);
         }
     }
     lock::release_lock(&lock_root);
@@ -2227,6 +2476,43 @@ fn push_kitty_flags<W: io::Write>(out: &mut W) {
 
 fn pop_kitty_flags<W: io::Write>(out: &mut W) {
     let _ = execute!(out, PopKeyboardEnhancementFlags);
+}
+
+/// Check every visible project for a worktree count above its prune threshold
+/// and return a single toast string suggesting a prune (taking the first
+/// project that qualifies). Runs every tick, so the cheap timestamp gates
+/// come first; `last_auto_prune_check` is stamped on every real check, which
+/// throttles both the counting work and the toast to once per gap.
+fn maybe_auto_prune_message(app: &mut app::App) -> Option<String> {
+    let now_inst = std::time::Instant::now();
+    let now_secs = app::unix_now();
+
+    for project in &mut app.projects {
+        if project.config.prune_threshold == 0 {
+            continue;
+        }
+        if let Some(prev) = project.last_auto_prune_check {
+            if now_inst.duration_since(prev) < PRUNE_PROMPT_MIN_GAP {
+                continue;
+            }
+        }
+        // Honour the per-project interval since the last completed prune.
+        if let Some(last) = project.last_prune_at {
+            if now_secs.saturating_sub(last) < project.config.auto_prune_check_interval {
+                continue;
+            }
+        }
+        project.last_auto_prune_check = Some(now_inst);
+        let count = prune::discover_worktree_names(&project.config.project_root).len();
+        if (count as u64) < project.config.prune_threshold {
+            continue;
+        }
+        return Some(format!(
+            "{} ({} worktrees): press W to prune",
+            project.config.project_name, count
+        ));
+    }
+    None
 }
 
 /// RAII guard that pauses worker polling for its lifetime. Used while the
@@ -2362,6 +2648,53 @@ mod tests {
         assert_eq!(parse_issue_kind("planner"), Ok(IssueKind::Orchestrator));
         assert_eq!(parse_issue_kind("todo"), Ok(IssueKind::NonAgentic));
         assert!(parse_issue_kind("bogus").is_err());
+    }
+
+    #[test]
+    fn flush_project_state_merges_external_issue_before_save() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = config::AppConfig {
+            project_name: "bork".to_string(),
+            project_root: dir.path().to_path_buf(),
+            ..config::AppConfig::default()
+        };
+
+        let issue_a = types::Issue::new(
+            "bork-1".to_string(),
+            "Existing".to_string(),
+            Column::Todo,
+            AgentKind::OpenCode,
+        );
+        let initial_state = config::AppState {
+            issues: vec![issue_a.clone()],
+            ..Default::default()
+        };
+        config::save_state(&initial_state, dir.path()).unwrap();
+
+        let mut project = Project::new(config, initial_state);
+        project.mark_dirty();
+
+        let issue_b = types::Issue::new(
+            "bork-2".to_string(),
+            "Created externally".to_string(),
+            Column::Todo,
+            AgentKind::OpenCode,
+        );
+        config::save_state(
+            &config::AppState {
+                issues: vec![issue_a, issue_b],
+                ..Default::default()
+            },
+            dir.path(),
+        )
+        .unwrap();
+        project.last_state_mtime = Some(SystemTime::UNIX_EPOCH);
+
+        flush_project_state(&mut project);
+
+        let state = config::load_state(dir.path());
+        let ids: Vec<&str> = state.issues.iter().map(|issue| issue.id.as_str()).collect();
+        assert_eq!(ids, vec!["bork-1", "bork-2"]);
     }
 
     // The wrapper tmux session name must never collide with agent session names.
