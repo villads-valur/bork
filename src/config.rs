@@ -14,6 +14,9 @@ pub struct AppConfig {
     pub project_name: String,
     pub project_root: PathBuf,
     pub agent_kind: AgentKind,
+    /// Default agent mode for new issues when `--mode` is omitted (CLI) or no
+    /// explicit mode is chosen (TUI dialog).
+    pub agent_mode: AgentMode,
     pub default_prompt: Option<String>,
     pub review_prompt: Option<String>,
     pub orchestrator_prompt: Option<String>,
@@ -87,6 +90,8 @@ pub const DEFAULT_DONE_SESSION_TTL: u64 = 300;
 pub const DEFAULT_PRUNE_THRESHOLD: u64 = 10;
 pub const DEFAULT_AUTO_PRUNE_CHECK_INTERVAL: u64 = 86_400;
 
+pub const DEFAULT_AGENT_MODE: AgentMode = AgentMode::Plan;
+
 pub const DEFAULT_PROMPT_FALLBACK: &str = "The source code is in main/. Use `bork issue start \"Title\" --project <name-or-path> --prompt \"Details...\"` to spin off new issues with their own worktrees and agents.";
 
 pub const DEFAULT_REVIEW_PROMPT: &str = "Read the diff, check for correctness, regressions, missing tests, and edge cases. Summarize your findings. Use any code review skills that might be installed. Categorize call outs in High, Medium, Low importance. Add file name, linenumber to each call out.";
@@ -107,6 +112,7 @@ impl Default for AppConfig {
             project_name: default_project_name(&project_root),
             project_root,
             agent_kind: AgentKind::OpenCode,
+            agent_mode: DEFAULT_AGENT_MODE,
             default_prompt: None,
             review_prompt: None,
             orchestrator_prompt: None,
@@ -191,6 +197,7 @@ pub fn legacy_agents_config_path() -> PathBuf {
 pub struct PartialConfig {
     pub project_name: Option<String>,
     pub agent_kind: Option<AgentKind>,
+    pub agent_mode: Option<AgentMode>,
     pub default_prompt: Option<String>,
     pub review_prompt: Option<String>,
     pub orchestrator_prompt: Option<String>,
@@ -250,6 +257,7 @@ impl PartialConfig {
         PartialConfig {
             project_name: other.project_name.or(self.project_name),
             agent_kind: other.agent_kind.or(self.agent_kind),
+            agent_mode: other.agent_mode.or(self.agent_mode),
             default_prompt: other.default_prompt.or(self.default_prompt),
             review_prompt: other.review_prompt.or(self.review_prompt),
             orchestrator_prompt: other.orchestrator_prompt.or(self.orchestrator_prompt),
@@ -302,6 +310,7 @@ fn materialize(merged: PartialConfig, project_root: &Path) -> AppConfig {
         project_name,
         project_root: project_root.to_path_buf(),
         agent_kind: merged.agent_kind.unwrap_or(AgentKind::OpenCode),
+        agent_mode: merged.agent_mode.unwrap_or(DEFAULT_AGENT_MODE),
         default_prompt: merged.default_prompt,
         review_prompt: merged.review_prompt,
         orchestrator_prompt: merged.orchestrator_prompt,
@@ -374,6 +383,14 @@ fn partial_from_table(table: &Table) -> PartialConfig {
         .and_then(|v| v.as_str())
         .and_then(AgentKind::parse);
 
+    // Accept both `agent_mode` (project-flavoured) and `default_mode`
+    // (global-flavoured). They mean the same thing.
+    let agent_mode = table
+        .get("agent_mode")
+        .or_else(|| table.get("default_mode"))
+        .and_then(|v| v.as_str())
+        .and_then(AgentMode::parse);
+
     let default_prompt = table
         .get("default_prompt")
         .and_then(|v| v.as_str())
@@ -422,6 +439,7 @@ fn partial_from_table(table: &Table) -> PartialConfig {
     PartialConfig {
         project_name,
         agent_kind,
+        agent_mode,
         default_prompt,
         review_prompt,
         orchestrator_prompt,
@@ -813,6 +831,36 @@ teardown_script = "docker compose down"
     fn parse_partial_default_agent_alias() {
         let p = parse_partial(r#"default_agent = "claude""#);
         assert_eq!(p.agent_kind, Some(AgentKind::Claude));
+    }
+
+    #[test]
+    fn parse_partial_agent_mode() {
+        let p = parse_partial(r#"agent_mode = "yolo""#);
+        assert_eq!(p.agent_mode, Some(AgentMode::Yolo));
+    }
+
+    #[test]
+    fn parse_partial_default_mode_alias() {
+        let p = parse_partial(r#"default_mode = "build""#);
+        assert_eq!(p.agent_mode, Some(AgentMode::Build));
+    }
+
+    #[test]
+    fn materialize_defaults_agent_mode_to_plan_when_unset() {
+        let cfg = merge_to_app("", "");
+        assert_eq!(cfg.agent_mode, AgentMode::Plan);
+    }
+
+    #[test]
+    fn merge_project_agent_mode_overrides_global() {
+        let cfg = merge_to_app(r#"default_mode = "plan""#, r#"agent_mode = "yolo""#);
+        assert_eq!(cfg.agent_mode, AgentMode::Yolo);
+    }
+
+    #[test]
+    fn merge_global_agent_mode_used_when_project_unset() {
+        let cfg = merge_to_app(r#"default_mode = "build""#, "");
+        assert_eq!(cfg.agent_mode, AgentMode::Build);
     }
 
     #[test]

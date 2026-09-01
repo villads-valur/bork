@@ -180,7 +180,7 @@ pub fn create_issue(project_root: &Path, opts: CreateOptions) -> anyhow::Result<
     let column = opts.column.unwrap_or(Column::Todo);
     let kind = opts.kind.unwrap_or(IssueKind::Agentic);
     let agent_kind = opts.agent_kind.unwrap_or(config.agent_kind);
-    let agent_mode = opts.agent_mode.unwrap_or(AgentMode::Plan);
+    let agent_mode = opts.agent_mode.unwrap_or(config.agent_mode);
 
     let issue = Issue {
         kind,
