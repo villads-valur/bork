@@ -1,6 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -517,6 +519,8 @@ pub fn try_load_state(project_root: &Path) -> Option<AppState> {
         Ok(state) => state,
         Err(err) => {
             eprintln!("bork: warning: {} is corrupt: {err}", path.display());
+            // Flag the file so the next save backs it up before clobbering it.
+            flag_corrupt_state(&path);
             return None;
         }
     };
@@ -535,35 +539,39 @@ pub fn state_mtime(project_root: &Path) -> Option<SystemTime> {
     fs::metadata(state_path(project_root)).ok()?.modified().ok()
 }
 
-pub fn save_state(state: &AppState, project_root: &Path) -> anyhow::Result<()> {
-    let dir = config_dir(project_root);
-    fs::create_dir_all(&dir)?;
+/// Paths that `try_load_state` found corrupt on disk. `save_state` consumes
+/// (and clears) an entry to decide whether to back the file up before it
+/// clobbers it, so we only pay for the corrupt-file reread when a load
+/// actually flagged the file. Keyed by the resolved `state.json` path.
+static CORRUPT_STATE_PATHS: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
 
-    let path = state_path(project_root);
-    let json = serde_json::to_string_pretty(state)?;
+fn flag_corrupt_state(path: &Path) {
+    let mut guard = CORRUPT_STATE_PATHS.lock().unwrap();
+    guard
+        .get_or_insert_with(HashSet::new)
+        .insert(path.to_path_buf());
+}
 
-    // If the existing file is unparseable, this rename is the moment its
-    // content would be lost forever. Preserve a copy for recovery first.
-    if let Ok(existing) = fs::read_to_string(&path) {
-        if serde_json::from_str::<AppState>(&existing).is_err() {
-            let backup = path.with_extension("json.corrupt");
-            let _ = fs::copy(&path, &backup);
-            eprintln!(
-                "bork: warning: overwriting corrupt {}; original preserved at {}",
-                path.display(),
-                backup.display()
-            );
-        }
-    }
+/// Returns whether `path` was flagged corrupt by a prior load, clearing the
+/// flag so a subsequent save won't redundantly back the file up.
+fn take_corrupt_flag(path: &Path) -> bool {
+    let mut guard = CORRUPT_STATE_PATHS.lock().unwrap();
+    guard.as_mut().is_some_and(|set| set.remove(path))
+}
 
-    // Write + fsync the tmp file before the atomic rename so a crash or power
-    // loss can't leave a truncated state.json behind the journaled rename.
+/// Atomically write `bytes` to `path`: write to a per-process temp sibling,
+/// `fsync` it, then `rename` over the destination. The fsync is the durability
+/// guarantee the design relies on: without it a crash or power loss could leave
+/// a truncated file behind the journaled rename. The temp file is cleaned up on
+/// any failure. The temp name (`<stem>.tmp.<pid>`) is what `sweep_stale_tmp_files`
+/// reclaims, so all writers share it.
+pub fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
     let result = (|| -> anyhow::Result<()> {
         let mut file = fs::File::create(&tmp_path)?;
-        std::io::Write::write_all(&mut file, json.as_bytes())?;
+        file.write_all(bytes)?;
         file.sync_all()?;
-        fs::rename(&tmp_path, &path)?;
+        fs::rename(&tmp_path, path)?;
         Ok(())
     })();
     if result.is_err() {
@@ -572,8 +580,38 @@ pub fn save_state(state: &AppState, project_root: &Path) -> anyhow::Result<()> {
     result
 }
 
-/// Remove leftover `state.tmp.*` files from writers that crashed before the
-/// atomic rename. Called once per project at TUI startup.
+pub fn save_state(state: &AppState, project_root: &Path) -> anyhow::Result<()> {
+    let dir = config_dir(project_root);
+    fs::create_dir_all(&dir)?;
+
+    let path = state_path(project_root);
+    let json = serde_json::to_string_pretty(state)?;
+
+    // Only reread the on-disk file when a prior load flagged it corrupt. This
+    // rename is the moment that corrupt content would be lost forever, so
+    // preserve a copy for recovery first. Re-checking here (rather than trusting
+    // the flag blindly) guards against a concurrent writer having already fixed
+    // the file since the load.
+    if take_corrupt_flag(&path) {
+        if let Ok(existing) = fs::read_to_string(&path) {
+            if serde_json::from_str::<AppState>(&existing).is_err() {
+                let backup = path.with_extension("json.corrupt");
+                let _ = fs::copy(&path, &backup);
+                eprintln!(
+                    "bork: warning: overwriting corrupt {}; original preserved at {}",
+                    path.display(),
+                    backup.display()
+                );
+            }
+        }
+    }
+
+    atomic_write(&path, json.as_bytes())
+}
+
+/// Remove leftover `*.tmp.<pid>` files from any [`atomic_write`] caller that
+/// crashed before the atomic rename (e.g. `state.tmp.*`, `config.tmp.*`,
+/// `projects.tmp.*`). Called once per project at TUI startup.
 pub fn sweep_stale_tmp_files(project_root: &Path) {
     let dir = config_dir(project_root);
     let Ok(entries) = fs::read_dir(&dir) else {
@@ -584,7 +622,9 @@ pub fn sweep_stale_tmp_files(project_root: &Path) {
         let Some(name) = name.to_str() else {
             continue;
         };
-        if !name.starts_with("state.tmp.") {
+        // `atomic_write` names temps `<stem>.tmp.<pid>`, so match the shared
+        // `.tmp.<digits>` suffix across all writers rather than just state.
+        if !is_stale_tmp_name(name) {
             continue;
         }
         // Leave fresh tmp files alone: another process may be mid-write.
@@ -598,6 +638,15 @@ pub fn sweep_stale_tmp_files(project_root: &Path) {
             let _ = fs::remove_file(entry.path());
         }
     }
+}
+
+/// True if `name` looks like an [`atomic_write`] temp file: a `.tmp.<pid>`
+/// suffix where `<pid>` is all digits (matching `with_extension("tmp.<pid>")`).
+fn is_stale_tmp_name(name: &str) -> bool {
+    let Some(pid) = name.rsplit_once(".tmp.").map(|(_, rest)| rest) else {
+        return false;
+    };
+    !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Modification time of a project's `.bork/config.toml`, if it exists.
@@ -634,9 +683,7 @@ pub fn set_config_value(
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
-    fs::write(&tmp_path, updated)?;
-    fs::rename(&tmp_path, &path)?;
+    atomic_write(&path, updated.as_bytes())?;
 
     Ok(path)
 }
@@ -1310,6 +1357,9 @@ args = ["--dangerously-skip-permissions"]
         let path = dir.path().join(".bork").join("state.json");
         fs::write(&path, "{ this is not json").unwrap();
 
+        // The load path flags the file corrupt; the next save honors that flag
+        // and backs the file up before clobbering it.
+        assert!(try_load_state(dir.path()).is_none());
         save_state(&AppState::default(), dir.path()).unwrap();
 
         // New state written, original corrupt content preserved for recovery.
@@ -1319,26 +1369,64 @@ args = ["--dangerously-skip-permissions"]
     }
 
     #[test]
+    fn save_state_skips_backup_when_load_did_not_flag_corruption() {
+        let dir = temp_project();
+        let path = dir.path().join(".bork").join("state.json");
+        fs::write(&path, "{ this is not json").unwrap();
+
+        // Without a load flagging corruption, save_state does not pay the
+        // reread and does not produce a backup (the common, healthy path).
+        save_state(&AppState::default(), dir.path()).unwrap();
+
+        assert!(load_state(dir.path()).issues.is_empty());
+        let backup = path.with_extension("json.corrupt");
+        assert!(!backup.exists());
+    }
+
+    #[test]
     fn sweep_removes_only_stale_tmp_files() {
         let dir = temp_project();
         let bork = dir.path().join(".bork");
-        let stale = bork.join("state.tmp.12345");
+        // Stale temps from every atomic_write caller must be reclaimed, not
+        // just state.tmp.* (config.tmp.* / projects.tmp.* previously leaked).
+        let stale_state = bork.join("state.tmp.12345");
+        let stale_config = bork.join("config.tmp.12345");
+        let stale_projects = bork.join("projects.tmp.12345");
         let fresh = bork.join("state.tmp.67890");
         let unrelated = bork.join("state.json");
-        fs::write(&stale, "old").unwrap();
+        fs::write(&stale_state, "old").unwrap();
+        fs::write(&stale_config, "old").unwrap();
+        fs::write(&stale_projects, "old").unwrap();
         fs::write(&fresh, "new").unwrap();
         fs::write(&unrelated, "{}").unwrap();
 
-        // Backdate the stale file beyond the 60s threshold.
+        // Backdate the stale files beyond the 60s threshold.
         let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
-        let file = fs::File::options().write(true).open(&stale).unwrap();
-        file.set_modified(old_time).unwrap();
-        drop(file);
+        for stale in [&stale_state, &stale_config, &stale_projects] {
+            let file = fs::File::options().write(true).open(stale).unwrap();
+            file.set_modified(old_time).unwrap();
+        }
 
         sweep_stale_tmp_files(dir.path());
 
-        assert!(!stale.exists(), "stale tmp file should be removed");
+        assert!(!stale_state.exists(), "stale state tmp should be removed");
+        assert!(!stale_config.exists(), "stale config tmp should be removed");
+        assert!(
+            !stale_projects.exists(),
+            "stale projects tmp should be removed"
+        );
         assert!(fresh.exists(), "fresh tmp file must be left alone");
         assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn is_stale_tmp_name_matches_only_pid_suffixed_temps() {
+        assert!(is_stale_tmp_name("state.tmp.12345"));
+        assert!(is_stale_tmp_name("config.tmp.9"));
+        assert!(is_stale_tmp_name("projects.tmp.0"));
+        assert!(!is_stale_tmp_name("state.json"));
+        assert!(!is_stale_tmp_name("state.tmp."));
+        assert!(!is_stale_tmp_name("state.tmp.abc"));
+        assert!(!is_stale_tmp_name("notes.tmp.md"));
     }
 }
