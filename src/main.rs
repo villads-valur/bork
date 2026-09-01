@@ -1624,11 +1624,17 @@ fn spawn_project_workers(project: &app::Project, suspended: &Arc<AtomicBool>) ->
 }
 
 /// Outcome of draining one project's worker channels for a single tick.
+#[derive(Default)]
 struct DrainOutcome {
     needs_redraw: bool,
     /// Status message produced by `sync_prs_as_issues`, surfaced by the caller
     /// (the helper owns only the `Project`, not the `App`).
     message: Option<String>,
+    /// Error message when a Done-TTL session hit the kill-attempt cap.
+    error_message: Option<String>,
+    /// Issue ids whose in-flight launch must be invalidated (their session was
+    /// auto-killed mid-detection). The caller owns the `App` launch state.
+    invalidate_issue_ids: Vec<String>,
 }
 
 /// Drains the per-project agent-status, git, and PR worker channels for one
@@ -1638,9 +1644,38 @@ struct DrainOutcome {
 /// imported issue titles are rewritten from fresh PR titles, and a git wake is
 /// sent after any worktree reassignment. Diff-before-assign gating is preserved
 /// so an idle project never rebuilds its widget tree.
-fn drain_project_workers(project: &mut app::Project, workers: &ProjectWorkers) -> DrainOutcome {
+fn drain_project_workers(
+    project: &mut app::Project,
+    workers: &ProjectWorkers,
+    action_tx: &mpsc::Sender<ActionResult>,
+    now: u64,
+) -> DrainOutcome {
+    let mut outcome = DrainOutcome::default();
     let mut needs_redraw = false;
     let mut message = None;
+
+    // --- Auto-kill Done sessions past TTL ---
+    // Runs for every worker-owning project (focused + swimlanes). Attempts are
+    // capped in ephemeral LiveState so an undying session can't retry forever.
+    let cleanup = project.drive_session_cleanup(now);
+    if cleanup.needs_redraw {
+        needs_redraw = true;
+    }
+    outcome.error_message = cleanup.give_up_message;
+    outcome.invalidate_issue_ids = cleanup.invalidate_issue_ids;
+    let project_root = project.config.project_root.clone();
+    for session_name in cleanup.kill_sessions {
+        let tx = action_tx.clone();
+        let root = project_root.clone();
+        thread::spawn(move || {
+            let _ = tx.send(handler::terminate_to_result(
+                &root,
+                &session_name,
+                format!("Auto-killed session '{}' (done TTL)", session_name),
+                format!("Session '{}' was already stopped", session_name),
+            ));
+        });
+    }
 
     // --- Agent status ---
     while let Ok(statuses) = workers.session_rx.try_recv() {
@@ -1750,9 +1785,26 @@ fn drain_project_workers(project: &mut app::Project, workers: &ProjectWorkers) -
         *skip = project.done_worktree_names();
     }
 
-    DrainOutcome {
-        needs_redraw,
-        message,
+    outcome.needs_redraw = needs_redraw;
+    outcome.message = message;
+    outcome
+}
+
+/// Apply a `DrainOutcome` to the `App`: invalidate any auto-killed in-flight
+/// launches, surface messages, and set the redraw flag. Kept at the App level
+/// because the drain helper owns only a single `Project`.
+fn apply_drain_outcome(app: &mut app::App, outcome: DrainOutcome, needs_redraw: &mut bool) {
+    if outcome.needs_redraw {
+        *needs_redraw = true;
+    }
+    for issue_id in &outcome.invalidate_issue_ids {
+        app.invalidate_inflight_launch(issue_id);
+    }
+    // A give-up error takes precedence over the routine sync message.
+    if let Some(err) = outcome.error_message {
+        app.set_error(err);
+    } else if let Some(msg) = outcome.message {
+        app.set_message(msg);
     }
 }
 
@@ -2265,39 +2317,13 @@ fn run_tui() -> anyhow::Result<()> {
             }
         }
 
-        // --- Auto-kill Done sessions past TTL ---
+        // --- Drain focused-project workers (session, git, pr, done-TTL cleanup) ---
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let cleanup_indices = app.project().issues_needing_session_cleanup(now);
-        for idx in cleanup_indices {
-            needs_redraw = true;
-            let session_name =
-                app.project().issues[idx].session_name(&app.project().config.project_name);
-            let project_root = app.project().config.project_root.clone();
-            let issue_id = app.project().issues[idx].id.clone();
-            app.invalidate_inflight_launch(&issue_id);
-            let tx = action_tx.clone();
-            app.project_mut().live.active_sessions.remove(&session_name);
-            thread::spawn(move || {
-                let _ = tx.send(handler::terminate_to_result(
-                    &project_root,
-                    &session_name,
-                    format!("Auto-killed session '{}' (done TTL)", session_name),
-                    format!("Session '{}' was already stopped", session_name),
-                ));
-            });
-        }
-
-        // --- Drain focused-project workers (session, git, pr) ---
-        let outcome = drain_project_workers(app.project_mut(), &workers);
-        if outcome.needs_redraw {
-            needs_redraw = true;
-        }
-        if let Some(msg) = outcome.message {
-            app.set_message(msg);
-        }
+        let outcome = drain_project_workers(app.project_mut(), &workers, &action_tx, now);
+        apply_drain_outcome(&mut app, outcome, &mut needs_redraw);
 
         // --- Update check (periodic worker results) ---
         // The `bork update --check` cache-mtime poll lives in the 2s state
@@ -2366,13 +2392,8 @@ fn run_tui() -> anyhow::Result<()> {
             let Some(proj_pos) = app.projects.iter().position(|p| p.id() == *proj_id) else {
                 continue;
             };
-            let outcome = drain_project_workers(&mut app.projects[proj_pos], sw);
-            if outcome.needs_redraw {
-                needs_redraw = true;
-            }
-            if let Some(msg) = outcome.message {
-                app.set_message(msg);
-            }
+            let outcome = drain_project_workers(&mut app.projects[proj_pos], sw, &action_tx, now);
+            apply_drain_outcome(&mut app, outcome, &mut needs_redraw);
         }
 
         // Rebuild shared port sessions, but only when session data actually

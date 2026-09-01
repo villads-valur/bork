@@ -7,6 +7,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// actions don't appear as a single-frame flash.
 const BUSY_MIN_VISIBLE: Duration = Duration::from_millis(250);
 
+/// Maximum Done-TTL auto-kill attempts per session before giving up. A tmux
+/// session that refuses to die is re-reported by the poller every ~2s; without
+/// this cap the cleanup loop would spawn a kill thread indefinitely.
+const MAX_CLEANUP_ATTEMPTS: u32 = 5;
+
 use crate::config::{AppConfig, AppState, DEFAULT_REVIEW_PROMPT};
 use crate::external::linear::LinearIssue;
 use crate::prune::{PruneAction, PruneCandidate};
@@ -56,6 +61,25 @@ pub struct LiveState {
     pub github_user: Option<String>,
     pub git_poll_done: bool,
     pub pr_poll_done: bool,
+    /// Done-TTL auto-kill attempts per session name. Ephemeral (never
+    /// persisted): the tmux poller re-reports a session that refused to die
+    /// every ~2s, so without a cap the cleanup loop would spawn a kill thread
+    /// forever. Cleared when the session finally disappears.
+    pub cleanup_attempts: HashMap<String, u32>,
+}
+
+/// Work produced by one tick of `Project::drive_session_cleanup`, applied by
+/// the caller which owns the `App`-level launch state and the action channel.
+#[derive(Default)]
+pub struct SessionCleanupPlan {
+    pub needs_redraw: bool,
+    /// Session names to terminate in background threads this tick.
+    pub kill_sessions: Vec<String>,
+    /// Issue ids whose in-flight launch should be invalidated (their session
+    /// was killed mid-detection).
+    pub invalidate_issue_ids: Vec<String>,
+    /// Set when a session hit the attempt cap this tick; surfaced once.
+    pub give_up_message: Option<String>,
 }
 
 impl LiveState {
@@ -1036,10 +1060,67 @@ impl Project {
                     return false;
                 }
                 let session_name = issue.session_name(&self.config.project_name);
-                self.is_session_alive(&session_name)
+                if !self.is_session_alive(&session_name) {
+                    return false;
+                }
+                // Stop re-qualifying a session that already exhausted its kill
+                // attempts, otherwise the poller would keep it in the list every
+                // ~2s forever.
+                self.live
+                    .cleanup_attempts
+                    .get(&session_name)
+                    .copied()
+                    .unwrap_or(0)
+                    < MAX_CLEANUP_ATTEMPTS
             })
             .map(|(idx, _)| idx)
             .collect()
+    }
+
+    /// Drive one tick of Done-TTL session cleanup for this project. Increments
+    /// the per-session attempt counter, optimistically drops the session from
+    /// `active_sessions` (the poller re-adds it if the kill fails), and returns
+    /// the work the caller must perform: sessions to kill in background threads,
+    /// issue ids whose in-flight launch should be invalidated, and a one-shot
+    /// message when a session hits the attempt cap.
+    ///
+    /// Shared by the focused project and every swimlane so all worker-owning
+    /// projects get TTL cleanup, not just the focused one.
+    pub fn drive_session_cleanup(&mut self, now: u64) -> SessionCleanupPlan {
+        let mut plan = SessionCleanupPlan::default();
+
+        // Drop attempt counters for sessions that finally died so a future
+        // reuse of the same name starts fresh.
+        self.live
+            .cleanup_attempts
+            .retain(|name, _| self.live.active_sessions.contains(name));
+
+        for idx in self.issues_needing_session_cleanup(now) {
+            let session_name = self.issues[idx].session_name(&self.config.project_name);
+            let attempts = self
+                .live
+                .cleanup_attempts
+                .entry(session_name.clone())
+                .or_insert(0);
+            *attempts += 1;
+            let attempt_count = *attempts;
+
+            plan.needs_redraw = true;
+            plan.invalidate_issue_ids.push(self.issues[idx].id.clone());
+
+            // Optimistically remove: if the kill fails the tmux poller re-adds
+            // the session within ~2s, which re-qualifies it up to the cap.
+            self.live.active_sessions.remove(&session_name);
+
+            if attempt_count >= MAX_CLEANUP_ATTEMPTS {
+                plan.give_up_message = Some(format!(
+                    "Failed to kill session '{session_name}' after {MAX_CLEANUP_ATTEMPTS} attempts; giving up"
+                ));
+            }
+            plan.kill_sessions.push(session_name);
+        }
+
+        plan
     }
 
     pub fn has_github_prs(&self) -> bool {
@@ -3513,6 +3594,101 @@ mod tests {
             cleanup,
             vec![0],
             "Only expired issue should be in cleanup list"
+        );
+    }
+
+    fn expired_cleanup_app() -> App {
+        let mut issue = test_issue("bork-1", Column::Done);
+        issue.done_at = Some(1000);
+        let mut app = test_app(vec![issue]);
+        app.project_mut().config.done_session_ttl = 300;
+        app.project_mut()
+            .live
+            .active_sessions
+            .insert("bork-bork-1".to_string());
+        app
+    }
+
+    #[test]
+    fn drive_session_cleanup_first_attempt_kills_and_invalidates() {
+        let mut app = expired_cleanup_app();
+        let plan = app.project_mut().drive_session_cleanup(1600);
+
+        assert_eq!(plan.kill_sessions, vec!["bork-bork-1".to_string()]);
+        assert_eq!(plan.invalidate_issue_ids, vec!["bork-1".to_string()]);
+        assert!(plan.give_up_message.is_none());
+        assert!(plan.needs_redraw);
+        // Session removed optimistically; attempt counter recorded.
+        assert!(!app.project().live.active_sessions.contains("bork-bork-1"));
+        assert_eq!(
+            app.project().live.cleanup_attempts.get("bork-bork-1"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn drive_session_cleanup_caps_retries_and_surfaces_error() {
+        let mut app = expired_cleanup_app();
+
+        // Simulate a session that refuses to die: the poller re-adds it each
+        // tick. It should be killed exactly MAX_CLEANUP_ATTEMPTS times.
+        let mut kills = 0;
+        let mut give_up_seen = false;
+        for _ in 0..(MAX_CLEANUP_ATTEMPTS + 3) {
+            app.project_mut()
+                .live
+                .active_sessions
+                .insert("bork-bork-1".to_string());
+            let plan = app.project_mut().drive_session_cleanup(1600);
+            kills += plan.kill_sessions.len();
+            give_up_seen = give_up_seen || plan.give_up_message.is_some();
+        }
+
+        assert_eq!(
+            kills as u32, MAX_CLEANUP_ATTEMPTS,
+            "kill threads must be capped at MAX_CLEANUP_ATTEMPTS"
+        );
+        assert!(
+            give_up_seen,
+            "a give-up error must be surfaced once the cap is hit"
+        );
+        assert_eq!(
+            app.project().live.cleanup_attempts.get("bork-bork-1"),
+            Some(&MAX_CLEANUP_ATTEMPTS)
+        );
+    }
+
+    #[test]
+    fn drive_session_cleanup_resets_when_session_dies() {
+        let mut app = expired_cleanup_app();
+        app.project_mut().drive_session_cleanup(1600);
+        assert_eq!(
+            app.project().live.cleanup_attempts.get("bork-bork-1"),
+            Some(&1)
+        );
+
+        // Session finally died (poller no longer reports it): the next tick
+        // clears the stale attempt counter.
+        let plan = app.project_mut().drive_session_cleanup(1600);
+        assert!(plan.kill_sessions.is_empty());
+        assert!(
+            app.project().live.cleanup_attempts.is_empty(),
+            "attempt counter must clear once the session disappears"
+        );
+    }
+
+    #[test]
+    fn issues_needing_cleanup_skips_capped_session() {
+        let mut app = expired_cleanup_app();
+        app.project_mut()
+            .live
+            .cleanup_attempts
+            .insert("bork-bork-1".to_string(), MAX_CLEANUP_ATTEMPTS);
+
+        let cleanup = app.project().issues_needing_session_cleanup(1600);
+        assert!(
+            cleanup.is_empty(),
+            "a session at the attempt cap must not re-qualify for cleanup"
         );
     }
 
