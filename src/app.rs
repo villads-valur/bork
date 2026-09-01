@@ -26,6 +26,19 @@ pub(crate) fn unix_now() -> u64 {
         .as_secs()
 }
 
+/// Order-independent fingerprint of a collection: hash each item on its own and
+/// XOR the results, so iteration order (e.g. `HashMap` traversal) doesn't affect
+/// the output. Used as a cheap cache key for render-path memoization. XOR is
+/// safe against cancellation here because callers fingerprint over unique keys
+/// (issue ids, session names), so no two per-item hashes collide.
+fn xor_fingerprint<T: Hash>(items: impl Iterator<Item = T>) -> u64 {
+    items.fold(0u64, |acc, item| {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        item.hash(&mut hasher);
+        acc ^ hasher.finish()
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
     Normal,
@@ -355,15 +368,7 @@ impl Project {
     /// enough to recompute per frame and only changes when links or the issue
     /// set change, at which point the cached component is recomputed.
     fn link_graph_fingerprint(&self) -> u64 {
-        let mut acc: u64 = 0;
-        for issue in &self.issues {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            issue.id.hash(&mut hasher);
-            issue.linked_issues.hash(&mut hasher);
-            // XOR combine so issue order doesn't affect the fingerprint.
-            acc ^= hasher.finish();
-        }
-        acc
+        xor_fingerprint(self.issues.iter().map(|i| (&i.id, &i.linked_issues)))
     }
 
     fn issue_matches(&self, issue: &Issue, query: &str) -> bool {
@@ -692,15 +697,7 @@ impl Project {
     /// bounded by the number of live sessions (small), so hashing it per frame
     /// is far cheaper than the full `has_listening_ports` scan it guards.
     fn listening_ports_fingerprint(&self) -> u64 {
-        let mut acc: u64 = 0;
-        for (session, ports) in &self.live.listening_ports {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            session.hash(&mut hasher);
-            ports.hash(&mut hasher);
-            // XOR combine so map iteration order doesn't affect the result.
-            acc ^= hasher.finish();
-        }
-        acc
+        xor_fingerprint(self.live.listening_ports.iter())
     }
 
     pub fn worktree_for<'a>(&self, issue: &'a Issue) -> Option<&'a str> {
