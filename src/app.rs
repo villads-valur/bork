@@ -96,7 +96,14 @@ pub struct Project {
 
 impl Project {
     pub fn new(config: AppConfig, state: AppState) -> Self {
-        let mut issues = state.issues;
+        // Compile-time coverage guard: forces a build error when `AppState`
+        // grows a field, so a new persisted field can't be silently ignored
+        // when loading state into a Project. Wire it in below before renaming
+        // its binding here.
+        let AppState {
+            mut issues,
+            last_prune_at,
+        } = state;
         let now = unix_now();
         for issue in &mut issues {
             if issue.column == Column::Done && issue.done_at.is_none() {
@@ -123,7 +130,7 @@ impl Project {
             state_dirty: false,
             base_issues,
             last_state_mtime,
-            last_prune_at: state.last_prune_at,
+            last_prune_at,
             last_auto_prune_check: None,
             last_config_mtime,
         }
@@ -178,10 +185,18 @@ impl Project {
     }
 
     pub fn to_state(&self) -> AppState {
-        AppState {
+        let state = AppState {
             issues: self.issues.clone(),
             last_prune_at: self.last_prune_at,
-        }
+        };
+        // Compile-time coverage guard: forces a build error when `AppState`
+        // grows a field, so a new persisted field can't be silently dropped
+        // here. Add it to the literal above before renaming its binding.
+        let AppState {
+            issues: _,
+            last_prune_at: _,
+        } = &state;
+        state
     }
 
     pub fn update_base_snapshot(&mut self) {
@@ -1263,6 +1278,42 @@ fn crossed_orchestrator_boundary(issue: &Issue, base: &Issue) -> bool {
 }
 
 fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
+    // Compile-time coverage guard: destructuring forces a build error when
+    // `Issue` grows a field, so nobody can add one that silently falls through
+    // to memory-wins semantics. This binding does no work; it only names every
+    // field so the compiler flags omissions. When adding a field, wire it into
+    // a merge_field!() call below (or the sessions/kind logic) before renaming
+    // its binding here.
+    let Issue {
+        // Merged per-field via merge_field!() below.
+        id: _, // stable key, never merged
+        title: _,
+        kind: _,
+        column: _,
+        agent_kind: _,
+        agent_mode: _,
+        prompt: _,
+        worktree: _,
+        done_at: _,
+        pruned_at: _,
+        setup_ran: _,
+        linear_links: _,
+        github_pr_links: _,
+        linked_issues: _,
+        // Merged entry-wise, interleaved with the kind/orchestrator logic below.
+        sessions: _,
+        // Legacy fields are zeroed on both sides by migrate_legacy_fields at
+        // load (types.rs), so they never diverge and need no merge.
+        session_id: _,
+        linear_id: _,
+        linear_identifier: _,
+        linear_url: _,
+        linear_imported: _,
+        pr_number: _,
+        pr_imported: _,
+        pr_import_source: _,
+    } = memory;
+
     // Must be captured before merge_field!(kind) overwrites memory.kind.
     let memory_crossed_boundary = crossed_orchestrator_boundary(memory, base);
 
@@ -5294,6 +5345,50 @@ mod tests {
         merge_issue_fields(&mut memory, &base, &file);
         assert_eq!(memory.title, "Local title", "memory wins on title");
         assert_eq!(memory.column, Column::InProgress, "file wins on column");
+    }
+
+    #[test]
+    fn merge_covers_every_serialized_issue_field() {
+        // The compile-time destructuring guard in merge_issue_fields fails the
+        // build when Issue grows a field, but a `skip_serializing` field would
+        // trip that guard without needing a merge (they never persist). This
+        // test pins the serialized surface so a *persisted* field addition also
+        // shows up as a red test pointing back at the merge coverage.
+        //
+        // Legacy fields are `skip_serializing`, so they are absent here on
+        // purpose. When you add a field to this set, wire it into
+        // merge_issue_fields (a merge_field!() call or the sessions logic).
+        let mut issue = test_issue("a", Column::Todo);
+        issue.sessions.insert(AgentKind::OpenCode, "s".to_string());
+        let value = serde_json::to_value(&issue).expect("issue serializes");
+        let object = value.as_object().expect("issue is a JSON object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+
+        let mut expected = vec![
+            "id",
+            "title",
+            "kind",
+            "column",
+            "agent_kind",
+            "agent_mode",
+            "prompt",
+            "worktree",
+            "done_at",
+            "sessions",
+            "pruned_at",
+            "setup_ran",
+            "linear_links",
+            "github_pr_links",
+            "linked_issues",
+        ];
+        expected.sort_unstable();
+
+        assert_eq!(
+            keys, expected,
+            "serialized Issue fields changed; update merge_issue_fields coverage \
+             and this list together"
+        );
     }
 
     // ---------------------------------------------------------------
