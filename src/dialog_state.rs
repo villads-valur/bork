@@ -1,8 +1,6 @@
 //! New/edit issue dialog state: field ordering, focus, and the plain-text
 //! editing primitives used by the title field.
 
-use std::collections::HashMap;
-
 use ratatui::style::{Modifier, Style};
 use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 
@@ -107,8 +105,7 @@ impl DialogState {
         available_agents: Vec<AgentKind>,
         linear_available: bool,
         github_available: bool,
-        all_prs: &HashMap<String, PrStatus>,
-        user_prs: &[PrStatus],
+        live: &crate::app::LiveState,
     ) -> Self {
         let prompt_text = issue.prompt.as_deref().unwrap_or("");
 
@@ -131,9 +128,12 @@ impl DialogState {
             .github_pr_links
             .iter()
             .filter_map(|link| {
-                all_prs
+                // Include review_requested_prs: fork PRs are absent from the
+                // by-branch map and would otherwise vanish on the next save.
+                live.pr_statuses
                     .values()
-                    .chain(user_prs.iter())
+                    .chain(live.user_prs.iter())
+                    .chain(live.review_requested_prs.iter())
                     .find(|pr| pr.number == link.number)
                     .cloned()
             })

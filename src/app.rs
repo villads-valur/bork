@@ -711,6 +711,10 @@ impl Project {
                 .chain(live.review_requested_prs.iter())
                 .find(|p| p.number == link.number)
             {
+                // Fork PR branches don't exist locally, so skip them.
+                if pr.is_cross_repository {
+                    continue;
+                }
                 return Some(pr.head_branch.as_str());
             }
         }
@@ -842,20 +846,24 @@ impl Project {
             if pr.state != PrState::Open || pr.is_draft {
                 return false;
             }
-            let branch = &pr.head_branch;
-            if branch == "main" || branch == "master" {
-                return false;
-            }
-            if claimed_branches.contains(branch) {
-                return false;
-            }
-            let branch_lower = branch.to_lowercase();
-            let has_prefix_match = issue_ids.iter().any(|id| {
-                branch_lower.starts_with(&format!("{}/", id))
-                    || branch_lower.starts_with(&format!("{}-", id))
-            });
-            if has_prefix_match {
-                return false;
+            // Fork branches live in another repo's namespace, so skip the
+            // branch checks and dedup fork PRs by number only.
+            if !pr.is_cross_repository {
+                let branch = &pr.head_branch;
+                if branch == "main" || branch == "master" {
+                    return false;
+                }
+                if claimed_branches.contains(branch) {
+                    return false;
+                }
+                let branch_lower = branch.to_lowercase();
+                let has_prefix_match = issue_ids.iter().any(|id| {
+                    branch_lower.starts_with(&format!("{}/", id))
+                        || branch_lower.starts_with(&format!("{}-", id))
+                });
+                if has_prefix_match {
+                    return false;
+                }
             }
             if claimed_pr_numbers.contains(&pr.number) || new_pr_numbers.contains(&pr.number) {
                 return false;
@@ -1670,8 +1678,7 @@ impl App {
             p.available_agents.clone(),
             p.linear_available,
             github_available,
-            &live.pr_statuses,
-            &live.user_prs,
+            live,
         ));
         self.input_mode = InputMode::Dialog;
     }
@@ -2043,6 +2050,7 @@ mod tests {
             additions: 10,
             deletions: 5,
             head_branch: branch.into(),
+            is_cross_repository: false,
         }
     }
 
@@ -2663,6 +2671,60 @@ mod tests {
     }
 
     #[test]
+    fn sync_prs_imports_fork_review_pr() {
+        let mut app = test_app(vec![]);
+        let mut pr = test_pr(106, "linear-api-fallback");
+        pr.is_cross_repository = true;
+        app.project_mut().live.review_requested_prs = vec![pr];
+        app.project_mut().live.pr_poll_done = true;
+
+        assert!(app.project_mut().sync_prs_as_issues().0);
+        assert_eq!(app.project().issues.len(), 1);
+        assert!(app.project().issues[0].has_pr_number(106));
+        assert_eq!(
+            app.project().issues[0].primary_pr_import_source(),
+            Some(PrImportSource::ReviewRequested)
+        );
+    }
+
+    #[test]
+    fn sync_prs_fork_pr_skips_branch_checks() {
+        // Fork branches named like an issue id (or "main") live in another
+        // repo's namespace, so branch-based dedup must not apply.
+        let existing = test_issue("bork-1", Column::InProgress);
+        let mut app = test_app(vec![existing]);
+        let mut prefix_pr = test_pr(50, "bork-1/some-fork-branch");
+        prefix_pr.is_cross_repository = true;
+        let mut main_pr = test_pr(51, "main");
+        main_pr.is_cross_repository = true;
+        app.project_mut().live.review_requested_prs = vec![prefix_pr, main_pr];
+        app.project_mut().live.pr_poll_done = true;
+
+        assert!(app.project_mut().sync_prs_as_issues().0);
+        let issues = &app.project().issues;
+        assert!(issues.iter().any(|i| i.has_pr_number(50)));
+        assert!(issues.iter().any(|i| i.has_pr_number(51)));
+    }
+
+    #[test]
+    fn sync_prs_fork_pr_dedups_by_number() {
+        let mut existing = test_issue("bork-1", Column::CodeReview);
+        existing.github_pr_links = vec![LinkedGithubPr {
+            number: 106,
+            imported: true,
+            import_source: Some(PrImportSource::ReviewRequested),
+        }];
+        let mut app = test_app(vec![existing]);
+        let mut pr = test_pr(106, "linear-api-fallback");
+        pr.is_cross_repository = true;
+        app.project_mut().live.review_requested_prs = vec![pr];
+        app.project_mut().live.pr_poll_done = true;
+
+        assert!(!app.project_mut().sync_prs_as_issues().0);
+        assert_eq!(app.project().issues.len(), 1);
+    }
+
+    #[test]
     fn sync_prs_disabled_reviews_still_complete_existing() {
         // Throwaway-repo case: auto-import off, but a previously imported
         // review issue should still move to Done once the review clears.
@@ -3002,8 +3064,7 @@ mod tests {
             crate::types::AgentKind::ALL.to_vec(),
             false,
             false,
-            &std::collections::HashMap::new(),
-            &[],
+            &LiveState::default(),
         );
         assert_eq!(d.agent_kind, crate::types::AgentKind::Claude);
         assert_eq!(d.agent_mode, crate::types::AgentMode::Yolo);
@@ -3077,6 +3138,32 @@ mod tests {
     }
 
     #[test]
+    fn dialog_from_issue_resolves_fork_review_pr() {
+        let mut issue = test_issue("bork-1", Column::CodeReview);
+        issue.github_pr_links = vec![LinkedGithubPr {
+            number: 106,
+            imported: true,
+            import_source: Some(PrImportSource::ReviewRequested),
+        }];
+        let mut pr = test_pr(106, "linear-api-fallback");
+        pr.is_cross_repository = true;
+        let live = LiveState {
+            review_requested_prs: vec![pr],
+            ..Default::default()
+        };
+        let d = DialogState::from_issue(
+            &issue,
+            0,
+            crate::types::AgentKind::ALL.to_vec(),
+            false,
+            true,
+            &live,
+        );
+        assert_eq!(d.github_prs.len(), 1);
+        assert_eq!(d.github_prs[0].number, 106);
+    }
+
+    #[test]
     fn dialog_from_orchestrator_issue_focuses_title() {
         let mut issue = test_issue("bork-1", Column::Todo);
         issue.kind = IssueKind::Orchestrator;
@@ -3086,8 +3173,7 @@ mod tests {
             crate::types::AgentKind::ALL.to_vec(),
             true,
             true,
-            &std::collections::HashMap::new(),
-            &[],
+            &LiveState::default(),
         );
         assert_eq!(d.ordered_fields()[d.focused_field], DialogField::Title);
     }
@@ -3556,6 +3642,23 @@ mod tests {
             Some("feature/done"),
             "Done issue should get frozen branch"
         );
+    }
+
+    #[test]
+    fn branch_for_skips_fork_pr_branches() {
+        let mut issue = test_issue("bork-1", Column::CodeReview);
+        issue.github_pr_links = vec![LinkedGithubPr {
+            number: 106,
+            imported: true,
+            import_source: Some(PrImportSource::ReviewRequested),
+        }];
+        let mut app = test_app(vec![issue]);
+        let mut pr = test_pr(106, "linear-api-fallback");
+        pr.is_cross_repository = true;
+        app.project_mut().live.review_requested_prs = vec![pr];
+
+        let branch = app.project().branch_for(&app.project().issues[0].clone());
+        assert_eq!(branch, None, "Fork PR branch does not exist locally");
     }
 
     // ================================================================
@@ -4347,6 +4450,7 @@ mod tests {
             additions: 0,
             deletions: 0,
             head_branch: "bork-1/task".into(),
+            is_cross_repository: false,
         };
         app.project_mut()
             .live
