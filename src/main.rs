@@ -334,8 +334,17 @@ fn spawn_linear_worker(
 
     thread::spawn(move || loop {
         wait_while_suspended(&suspended);
-        let issues = external::linear::fetch_assigned_issues().unwrap_or_default();
-        if tx.send(LinearPollResult { issues }).is_err() {
+        let result = match external::linear::fetch_assigned_issues() {
+            Ok(issues) => LinearPollResult {
+                issues,
+                error: None,
+            },
+            Err(e) => LinearPollResult {
+                issues: Vec::new(),
+                error: Some(e.to_string()),
+            },
+        };
+        if tx.send(result).is_err() {
             break;
         }
         if !sleep_with_wake(&wake_rx, LINEAR_POLL_INTERVAL) {
@@ -2058,6 +2067,9 @@ fn run_tui() -> anyhow::Result<()> {
     // their results crossed: (project_id, popup_title, open_popup).
     let mut pending_popup_for_launch: HashMap<String, (ProjectId, String, bool)> = HashMap::new();
     let mut needs_redraw = true;
+    // Last Linear failure surfaced. The poll runs every 45 seconds, so a key
+    // that stays wrong would otherwise re-raise the same warning forever.
+    let mut last_linear_error: Option<String> = None;
     let mut state_poll_counter: usize = 0;
 
     // --- Main event loop ---
@@ -2413,6 +2425,17 @@ fn run_tui() -> anyhow::Result<()> {
         if let Some(ref rx) = shared.linear_rx {
             while let Ok(result) = rx.try_recv() {
                 needs_redraw = true;
+                // A failed poll carries no issues. Overwriting with that empties
+                // the picker and blanks every imported card's title on a blip,
+                // so the last good list stands until a poll succeeds.
+                if let Some(ref error) = result.error {
+                    if last_linear_error.as_deref() != Some(error.as_str()) {
+                        app.set_warning(format!("Linear: {error}"));
+                        last_linear_error = Some(error.clone());
+                    }
+                    continue;
+                }
+                last_linear_error = None;
                 for project in &mut app.projects {
                     project.live.linear_issues = result.issues.clone();
                     let linear_titles: Vec<(String, String)> = project

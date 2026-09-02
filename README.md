@@ -68,7 +68,7 @@ Press `n` to create an issue, `Enter` to launch an agent session. You're up and 
 - **Plan, Build, and Yolo modes** &mdash; Toggle between modes per issue; Claude and Codex support Yolo (skips all permission prompts)
 - **Vim-style navigation** &mdash; h/j/k/l, g/G, and familiar modal keybindings
 - **ANSI 16 colors** &mdash; Adapts to any terminal theme, no hardcoded RGB
-- **Linear integration** &mdash; Import and attach multiple Linear issues per card, sync state bidirectionally, open in Linear with a keypress
+- **Linear integration** &mdash; Import and attach multiple Linear issues per card, refresh their state and title on each poll, open in Linear with a keypress
 - **Auto-import PRs** &mdash; Open PRs authored by you are automatically added to the Code Review column
 - **Search and filter** &mdash; Type `/` to fuzzy-filter the board by title or issue ID
 - **Issue kinds** &mdash; Agentic issues launch AI sessions; non-agentic "todo" items skip the agent entirely; orchestrator issues launch a coordinating agent that breaks a goal into bork issues, spawns them via `bork issue start`, and monitors their agents
@@ -82,7 +82,7 @@ Press `n` to create an issue, `Enter` to launch an agent session. You're up and 
 | [tmux](https://github.com/tmux/tmux) | Session management and popup overlays |
 | [git](https://git-scm.com/) | Worktree status and branch detection |
 | [gh](https://cli.github.com/) | GitHub PR status polling (optional) |
-| [linear](https://linear.app/docs/cli) | Linear issue import and sync (optional) |
+| [Linear](https://linear.app) | Issue import, via `LINEAR_API_KEY` or a `linear` command (optional) |
 | [OpenCode](https://opencode.ai), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://developers.openai.com/codex), or [Pi](https://pi.dev) | AI coding agent (at least one) |
 | [Rust toolchain](https://rustup.rs/) | Building from source |
 
@@ -434,14 +434,37 @@ The `gh` CLI must be installed and authenticated. If `gh` is not available or th
 
 ## Linear Integration
 
-When the [Linear CLI](https://linear.app/docs/cli) is installed and authenticated, bork polls your assigned issues every 45 seconds and enables these features:
+Set `LINEAR_API_KEY` to a [Linear personal API key](https://linear.app/settings/api):
+
+```sh
+export LINEAR_API_KEY="lin_api_..."
+```
+
+It belongs in your shell profile rather than `config.toml` — that file lives
+inside the project directory and is easy to commit by accident. bork only reads
+your assigned issues, so a read-scoped key is enough.
+
+With a key set, bork polls your assigned issues every 45 seconds and enables:
 
 - **Import issues** &mdash; Press `I` to open a fuzzy-search picker of your assigned Linear issues. Imported issues use the Linear identifier as the bork issue ID (e.g. `BORK-14` becomes `bork-14`).
-- **Attach multiple issues** &mdash; In the issue dialog, the Linear field lets you link one or more Linear issues to a bork issue using a multi-select picker. Enter toggles selection, Backspace removes the last item.
+- **Attach issues to a card** &mdash; In the issue dialog, the Linear field opens a multi-select picker; Enter toggles selection, Backspace removes the last item. `bork integration attach-linear <issue-id> <identifier>` does the same from the CLI, and one card can hold several Linear issues.
 - **Open in Linear** &mdash; Press `O` to open all linked Linear issues in your browser.
-- **State sync** &mdash; Linear issue state is refreshed on each poll cycle. Imported issues also sync their title from Linear.
+- **State refresh** &mdash; Linear issue state is re-read on each poll cycle, and imported issues follow their Linear title. Nothing is written back to Linear.
 
-If the `linear` CLI is not found at startup, all Linear features are silently disabled.
+Unlike GitHub PRs, Linear issues are never auto-imported — the poll only fills
+the picker, so the board changes when you press `I` and not before.
+
+A failing poll surfaces its reason on the status line (an expired key, a wrong
+scope), and leaves the previous issue list in place.
+
+### Using a `linear` command instead
+
+A `linear` executable on `PATH` is used in preference to the API. It has to
+answer `linear --version`, and print the JSON response to
+`linear api '<graphql query>'`. Linear publishes no official CLI, so this suits
+a wrapper you have written yourself.
+
+With neither a key nor that command, all Linear features are silently disabled.
 
 ## Multi-Project View
 
