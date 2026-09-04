@@ -347,13 +347,13 @@ impl DialogState {
                     return;
                 }
                 if c == ' ' || c == 'h' || c == 'l' {
-                    self.agent_mode = match self.agent_kind {
-                        AgentKind::Claude | AgentKind::Codex => {
-                            self.agent_mode.next_for_yolo_agents()
-                        }
-                        // Pi has a single mode and no Mode field, so this arm
-                        // is unreachable in practice; toggle is a safe no-op.
-                        AgentKind::OpenCode | AgentKind::Pi => self.agent_mode.toggle(),
+                    // Yolo agents cycle Plan→Build→Yolo; the rest toggle
+                    // Plan↔Build. Pi has a single mode and no Mode field, so
+                    // its toggle is unreachable in practice but a safe no-op.
+                    self.agent_mode = if crate::external::agent::supports_yolo(self.agent_kind) {
+                        self.agent_mode.next_for_yolo_agents()
+                    } else {
+                        self.agent_mode.toggle()
                     };
                 }
             }

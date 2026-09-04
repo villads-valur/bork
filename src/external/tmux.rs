@@ -196,7 +196,7 @@ fn configure_extended_keys(session_name: &str) {
 /// Kill a tmux session. Returns whether a live session was killed; a missing
 /// session (or missing tmux entirely) is `Ok(false)`.
 ///
-/// Issue sessions should go through `opencode::terminate_session` instead,
+/// Issue sessions should go through `agent::terminate_session` instead,
 /// which also sweeps processes the agent leaked — calling this directly for
 /// an issue session reintroduces orphan leaks.
 pub fn kill_session(name: &str) -> Result<bool, AppError> {

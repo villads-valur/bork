@@ -79,35 +79,30 @@ impl AgentKind {
         AgentKind::Pi,
     ];
 
+    /// The exec / PATH-probe name for this agent, sourced from the provider
+    /// registry so binary names live in one place.
     pub fn command(self) -> &'static str {
-        match self {
-            AgentKind::OpenCode => "opencode",
-            AgentKind::Claude => "claude",
-            AgentKind::Codex => "codex",
-            AgentKind::Pi => "pi",
-        }
+        crate::external::agent::binary(self)
     }
 
     /// Whether this agent has bork-managed plan/build/yolo modes. Pi has a
-    /// single mode, so the dialog hides the mode picker for it.
+    /// single mode, so the dialog hides the mode picker for it. Sourced from
+    /// the provider registry.
     pub fn has_modes(self) -> bool {
-        !matches!(self, AgentKind::Pi)
+        crate::external::agent::has_modes(self)
     }
 
     pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "opencode" | "open_code" | "open-code" => Some(AgentKind::OpenCode),
-            "claude" => Some(AgentKind::Claude),
-            "codex" => Some(AgentKind::Codex),
-            "pi" => Some(AgentKind::Pi),
-            _ => None,
-        }
+        let value = value.trim().to_ascii_lowercase();
+        AgentKind::ALL
+            .into_iter()
+            .find(|kind| crate::external::agent::parse_aliases(*kind).contains(&value.as_str()))
     }
 }
 
 impl fmt::Display for AgentKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.command())
+        write!(f, "{}", crate::external::agent::display_name(*self))
     }
 }
 
@@ -466,7 +461,7 @@ impl Issue {
     /// and file into `sessions` — the legacy field could hold another
     /// agent's id (the pre-map mismatch this map fixes, bork-147), and
     /// telling the owners apart needs the agents' on-disk transcript stores
-    /// (`opencode::LegacySessionStores`), which this module can't touch.
+    /// (`agent::LegacySessionStores`), which this module can't touch.
     #[must_use]
     pub fn migrate_legacy_fields(&mut self) -> Option<String> {
         let legacy_session = self.session_id.take();
@@ -1165,7 +1160,7 @@ mod tests {
 
     #[test]
     fn migration_yields_legacy_session_id_for_attribution() {
-        // Keying is the caller's job (opencode::LegacySessionStores); types
+        // Keying is the caller's job (agent::LegacySessionStores); types
         // only surrenders the id, marks the launch, and clears the field.
         let json = r#"{
             "id": "bork-1",

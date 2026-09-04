@@ -6,7 +6,7 @@ Terminal kanban board for orchestrating OpenCode/Claude coding sessions across g
 
 - **Language**: Rust (no async runtime, pure `std::thread` + `mpsc`)
 - **TUI**: ratatui + crossterm
-- **External tools**: tmux, git, gh, linear (optional), opencode/claude/codex/pi (all via `std::process::Command`)
+- **External tools**: tmux, git, gh, linear (optional), and the coding agents (all via `std::process::Command`)
 
 ### Threading Model
 
@@ -68,11 +68,16 @@ src/
 ├── external/
 │   ├── mod.rs
 │   ├── tmux.rs       # Tmux session management
-│   ├── opencode.rs   # Agent session launcher (opencode/claude/codex/pi)
+│   ├── agent/        # Agent session launcher + provider registry
+│   │   ├── mod.rs    # Generic launcher, AgentProvider trait, AgentKind→provider dispatch, shared helpers
+│   │   ├── opencode.rs # OpenCode provider (mode flags, launch/resume, session detection, hooks)
+│   │   ├── claude.rs   # Claude provider
+│   │   ├── codex.rs    # Codex provider
+│   │   └── pi.rs       # Pi provider
 │   ├── git.rs        # Git worktree status polling
 │   ├── github.rs     # GitHub PR polling via gh api graphql (per-repo identity cache)
 │   ├── linear.rs     # Linear CLI integration (assigned issues via graphql)
-│   └── hooks.rs      # Agent status hooks (install/uninstall for opencode/claude/codex/pi)
+│   └── hooks.rs      # Shared hook install/uninstall helpers; install()/uninstall() iterate the registry
 └── ui/
     ├── mod.rs         # Root render, layout composition, swimlane splitting
     ├── board.rs       # 4-column kanban board with adaptive card sizes
@@ -158,7 +163,7 @@ The binary is symlinked to `/opt/homebrew/bin/bork`.
 
 ## Agent Sessions
 
-Each `Issue` stores agent session IDs in `sessions: BTreeMap<AgentKind, String>`, keyed by the agent that created them; launch/resume only reads the current agent's entry, so switching agents starts fresh while other agents' sessions stay resumable on switch-back. Agent changes go through `Issue::set_agent_kind()`, which (like `set_kind()`) tells the caller to kill the live tmux session but never clears the map. The worktree setup script runs once per worktree: `Issue::setup_ran` is set when a launch command that included the setup prefix is sent (independent of session-id capture, which can miss), cleared by `attach_worktree()` so a fresh checkout re-runs setup, and seeded from any recorded session id when migrating legacy states. The edit dialog marks resumable agents with `↺`, derived live from the issue's sessions map. Session teardown (kill + status-file removal) goes through `opencode::terminate_session()`, which reports whether a live session actually died.
+Each `Issue` stores agent session IDs in `sessions: BTreeMap<AgentKind, String>`, keyed by the agent that created them; launch/resume only reads the current agent's entry, so switching agents starts fresh while other agents' sessions stay resumable on switch-back. Agent changes go through `Issue::set_agent_kind()`, which (like `set_kind()`) tells the caller to kill the live tmux session but never clears the map. The worktree setup script runs once per worktree: `Issue::setup_ran` is set when a launch command that included the setup prefix is sent (independent of session-id capture, which can miss), cleared by `attach_worktree()` so a fresh checkout re-runs setup, and seeded from any recorded session id when migrating legacy states. The edit dialog marks resumable agents with `↺`, derived live from the issue's sessions map. Session teardown (kill + status-file removal) goes through `agent::terminate_session()`, which reports whether a live session actually died.
 
 ## Integration Data Model
 

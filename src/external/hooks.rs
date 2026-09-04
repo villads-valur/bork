@@ -127,13 +127,15 @@ const CODEX_HOOKS: &str = r#"{
   }
 }"#;
 
-/// Install bork hooks for OpenCode, Claude Code, and Codex.
+/// Install bork hooks for every registered agent that ships them.
 /// Also deploys agent skills if run from within a bork project.
+///
+/// Iterates `AgentKind::ALL` through the provider registry so a new harness
+/// with hooks is picked up without editing a hand-written call list here.
 pub fn install() -> anyhow::Result<()> {
-    install_opencode_plugin()?;
-    install_claude_hooks()?;
-    install_codex_hooks()?;
-    install_pi_extension()?;
+    for kind in crate::types::AgentKind::ALL {
+        crate::external::agent::provider(kind).install_hooks()?;
+    }
     install_skills();
     println!("bork hooks installed successfully");
     Ok(())
@@ -176,12 +178,11 @@ fn install_skills() {
     }
 }
 
-/// Remove bork hooks from OpenCode, Claude Code, and Codex.
+/// Remove bork hooks from every registered agent that ships them.
 pub fn uninstall() -> anyhow::Result<()> {
-    uninstall_opencode_plugin()?;
-    uninstall_claude_hooks()?;
-    uninstall_codex_hooks()?;
-    uninstall_pi_extension()?;
+    for kind in crate::types::AgentKind::ALL {
+        crate::external::agent::provider(kind).uninstall_hooks()?;
+    }
     println!("bork hooks uninstalled successfully");
     Ok(())
 }
@@ -191,7 +192,7 @@ fn opencode_plugin_path() -> PathBuf {
     config_dir.join("bork-status.ts")
 }
 
-fn install_opencode_plugin() -> anyhow::Result<()> {
+pub(crate) fn install_opencode_plugin() -> anyhow::Result<()> {
     let path = opencode_plugin_path();
 
     if path.exists() {
@@ -211,7 +212,7 @@ fn install_opencode_plugin() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn uninstall_opencode_plugin() -> anyhow::Result<()> {
+pub(crate) fn uninstall_opencode_plugin() -> anyhow::Result<()> {
     let path = opencode_plugin_path();
     if path.exists() {
         fs::remove_file(&path)?;
@@ -235,7 +236,7 @@ fn pi_extension_path() -> PathBuf {
     root.join("extensions").join("bork-status.ts")
 }
 
-fn install_pi_extension() -> anyhow::Result<()> {
+pub(crate) fn install_pi_extension() -> anyhow::Result<()> {
     let path = pi_extension_path();
 
     if file_has_content(&path, PI_EXTENSION) {
@@ -251,7 +252,7 @@ fn install_pi_extension() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn uninstall_pi_extension() -> anyhow::Result<()> {
+pub(crate) fn uninstall_pi_extension() -> anyhow::Result<()> {
     let path = pi_extension_path();
     if path.exists() {
         fs::remove_file(&path)?;
@@ -412,7 +413,7 @@ fn parse_hook_entries(
 
 // --- Claude hooks ---
 
-fn install_claude_hooks() -> anyhow::Result<()> {
+pub(crate) fn install_claude_hooks() -> anyhow::Result<()> {
     let path = claude_settings_path();
     let expected = parse_hook_entries(CLAUDE_HOOKS, None);
 
@@ -426,7 +427,7 @@ fn install_claude_hooks() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn uninstall_claude_hooks() -> anyhow::Result<()> {
+pub(crate) fn uninstall_claude_hooks() -> anyhow::Result<()> {
     let path = claude_settings_path();
     if remove_hooks_from_file(&path)? {
         println!("  Claude Code hooks removed from {}", path.display());
@@ -438,7 +439,7 @@ fn uninstall_claude_hooks() -> anyhow::Result<()> {
 
 // --- Codex hooks ---
 
-fn install_codex_hooks() -> anyhow::Result<()> {
+pub(crate) fn install_codex_hooks() -> anyhow::Result<()> {
     ensure_codex_hooks_feature_enabled()?;
 
     let path = codex_hooks_path();
@@ -454,7 +455,7 @@ fn install_codex_hooks() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn uninstall_codex_hooks() -> anyhow::Result<()> {
+pub(crate) fn uninstall_codex_hooks() -> anyhow::Result<()> {
     let path = codex_hooks_path();
     if remove_hooks_from_file(&path)? {
         println!("  Codex hooks removed from {}", path.display());
