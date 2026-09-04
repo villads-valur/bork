@@ -151,6 +151,25 @@ mod tests {
     }
 
     #[test]
+    fn resolve_with_installed_includes_cursor_when_installed() {
+        let prefs = AgentPreferences::default();
+        let selection = resolve_with_installed(prefs, &[AgentKind::Cursor]);
+        assert_eq!(selection.available, vec![AgentKind::Cursor]);
+        assert_eq!(selection.default_agent, Some(AgentKind::Cursor));
+    }
+
+    #[test]
+    fn resolve_with_installed_hides_cursor_when_not_installed() {
+        let prefs = AgentPreferences {
+            enabled: Some(vec![AgentKind::Cursor, AgentKind::OpenCode]),
+            default_agent: Some(AgentKind::Cursor),
+        };
+        let selection = resolve_with_installed(prefs, &[AgentKind::OpenCode]);
+        assert_eq!(selection.available, vec![AgentKind::OpenCode]);
+        assert_eq!(selection.default_agent, Some(AgentKind::OpenCode));
+    }
+
+    #[test]
     fn resolve_with_installed_falls_back_when_default_uninstalled() {
         let prefs = AgentPreferences {
             enabled: Some(vec![AgentKind::OpenCode, AgentKind::Claude]),

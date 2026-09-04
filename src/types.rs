@@ -69,14 +69,16 @@ pub enum AgentKind {
     Claude,
     Codex,
     Pi,
+    Cursor,
 }
 
 impl AgentKind {
-    pub const ALL: [AgentKind; 4] = [
+    pub const ALL: [AgentKind; 5] = [
         AgentKind::OpenCode,
         AgentKind::Claude,
         AgentKind::Codex,
         AgentKind::Pi,
+        AgentKind::Cursor,
     ];
 
     /// The exec / PATH-probe name for this agent, sourced from the provider
@@ -1124,7 +1126,29 @@ mod tests {
     #[test]
     fn agent_kind_all_includes_pi() {
         assert!(AgentKind::ALL.contains(&AgentKind::Pi));
-        assert_eq!(AgentKind::ALL.len(), 4);
+        assert_eq!(AgentKind::ALL.len(), 5);
+    }
+
+    #[test]
+    fn agent_kind_parse_cursor_accepts_aliases() {
+        assert_eq!(AgentKind::parse("cursor"), Some(AgentKind::Cursor));
+        assert_eq!(AgentKind::parse("CURSOR"), Some(AgentKind::Cursor));
+        assert_eq!(AgentKind::parse("cursor-agent"), Some(AgentKind::Cursor));
+        assert_eq!(AgentKind::parse("cursor_agent"), Some(AgentKind::Cursor));
+    }
+
+    #[test]
+    fn agent_kind_cursor_binary_and_display_differ() {
+        // The registry sources both: the binary is cursor-agent, but the
+        // config/display token is cursor.
+        assert_eq!(AgentKind::Cursor.command(), "cursor-agent");
+        assert_eq!(AgentKind::Cursor.to_string(), "cursor");
+    }
+
+    #[test]
+    fn agent_kind_all_includes_cursor() {
+        assert!(AgentKind::ALL.contains(&AgentKind::Cursor));
+        assert!(AgentKind::Cursor.has_modes());
     }
 
     // --- Issue sessions ---
