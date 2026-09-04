@@ -17,7 +17,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config;
-use crate::external::opencode;
+use crate::external::agent;
 use crate::types::{AgentKind, AgentMode, Column, Issue, IssueDraft, IssueKind};
 use crate::ui::styles::truncate;
 use crate::worktree;
@@ -254,7 +254,7 @@ pub fn update_issue(
         // aborts here, before the state is persisted below, so it cannot
         // leave an untracked old agent running against saved changes.
         let config = config::load_config_from(project_root);
-        opencode::terminate_session(project_root, &issue.session_name(&config.project_name))?;
+        agent::terminate_session(project_root, &issue.session_name(&config.project_name))?;
     }
 
     let updated = issue.clone();
@@ -271,7 +271,7 @@ pub fn delete_issue(project_root: &Path, issue_id: &str) -> anyhow::Result<Issue
 
     let config = config::load_config_from(project_root);
     let session_name = state.issues[idx].session_name(&config.project_name);
-    opencode::terminate_session(project_root, &session_name)?;
+    agent::terminate_session(project_root, &session_name)?;
 
     let removed = state.issues.remove(idx);
     remove_link_references(&mut state.issues, &removed.id);
@@ -595,7 +595,7 @@ pub fn archive_issue(
     let issue = state.issues[idx].clone();
 
     let session_name = issue.session_name(&app_config.project_name);
-    let session_killed = opencode::terminate_session(project_root, &session_name)?;
+    let session_killed = agent::terminate_session(project_root, &session_name)?;
 
     let worktree_removed = match issue.worktree.as_deref() {
         Some(dir) => {

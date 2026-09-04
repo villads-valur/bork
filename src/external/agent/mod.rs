@@ -10,9 +10,144 @@ use crate::external::process::{self, BORK_SESSION_VAR};
 use crate::external::{github, tmux};
 use crate::types::{AgentKind, AgentMode, Issue, IssueKind, LinkedGithubPr, LinkedLinear};
 
+mod claude;
+mod codex;
+mod opencode;
+mod pi;
+
+/// Per-provider surface behind the agent registry. One implementor per
+/// harness; `provider()` maps `AgentKind` to the matching `&'static dyn`.
+///
+/// Trait objects (not an enum of structs) keep the dispatch a single
+/// compiler-checked match while letting `AgentKind::ALL` iterate providers for
+/// help text, the yolo capability, and hooks. The surface is uniform across
+/// harnesses with no generics or lifetimes, so trait objects stay boring here.
+pub trait AgentProvider {
+    /// The exec / PATH-probe name (e.g. Cursor is `cursor-agent`).
+    fn binary(&self) -> &'static str;
+
+    /// Display / config token (equals `binary()` for every current harness).
+    fn display_name(&self) -> &'static str;
+
+    /// Accepted `AgentKind::parse` aliases (lowercased).
+    fn parse_aliases(&self) -> &'static [&'static str];
+
+    /// Built-in mode flag for `mode`, replaced by any `[agent.<name>.mode.<m>]`
+    /// override. Empty string means "no built-in flag".
+    fn mode_flag(&self, mode: AgentMode) -> &'static str;
+
+    /// Whether this agent exposes bork-managed plan/build/yolo modes.
+    fn has_modes(&self) -> bool;
+
+    /// Whether the dialog offers a yolo pip / the mode cycle includes Yolo.
+    fn supports_yolo(&self) -> bool;
+
+    /// Build the launch/resume command. Returns
+    /// (command, pre_assigned_session_id, prompt_contents), matching what
+    /// `build_agent_cmd` historically returned.
+    fn build_cmd(&self, ctx: &LaunchContext) -> (String, Option<String>, Option<String>);
+
+    /// Detect the session id created by a fresh launch, if this harness needs
+    /// post-launch detection (OpenCode/Codex/Pi). Claude pre-assigns instead.
+    fn detect_session_id(&self, _ctx: &DetectContext) -> Option<String> {
+        None
+    }
+
+    /// Install hooks (plugin/extension/settings) for this harness. Providers
+    /// with no status plumbing return `Ok(())` without touching disk.
+    fn install_hooks(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Remove hooks for this harness.
+    fn uninstall_hooks(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// Everything a provider needs to assemble its launch/resume command, computed
+/// once by `build_agent_cmd` so the provider bodies stay pure string assembly.
+pub struct LaunchContext<'a> {
+    pub issue: &'a Issue,
+    /// `export BORK_SESSION=... BORK_STATUS_DIR=... BORK_ISSUE_ID=...`
+    pub env_prefix: &'a str,
+    /// Trailing args (leading space when non-empty).
+    pub trailing: &'a str,
+    /// `"$(cat '<prompt-path>')"` — expands to the staged prompt at runtime.
+    pub prompt_subst: &'a str,
+    /// `; rm -f '<prompt-path>'` — removes the staged file after launch.
+    pub prompt_cleanup: &'a str,
+    /// The current agent's stored session id, if resuming.
+    pub current_session: Option<&'a str>,
+    /// Lazily builds the full issue prompt (only for fresh sessions).
+    build_prompt: &'a dyn Fn() -> String,
+}
+
+impl LaunchContext<'_> {
+    pub fn build_prompt(&self) -> String {
+        (self.build_prompt)()
+    }
+}
+
+/// Context for post-launch session-id detection.
+pub struct DetectContext<'a> {
+    pub project_root: &'a Path,
+    /// Session ids visible before launch (OpenCode uses this to adopt only a
+    /// genuinely new id).
+    pub before: &'a HashSet<String>,
+}
+
+/// Map an `AgentKind` to its provider. The one dispatch point — a match here is
+/// compiler-checked, so a new `AgentKind` variant fails to compile until wired.
+pub fn provider(kind: AgentKind) -> &'static dyn AgentProvider {
+    match kind {
+        AgentKind::OpenCode => &opencode::OpenCode,
+        AgentKind::Claude => &claude::Claude,
+        AgentKind::Codex => &codex::Codex,
+        AgentKind::Pi => &pi::Pi,
+    }
+}
+
+/// The exec / PATH-probe name for `kind` (e.g. Cursor's `cursor-agent`).
+pub fn binary(kind: AgentKind) -> &'static str {
+    provider(kind).binary()
+}
+
+/// Display / config token for `kind`.
+pub fn display_name(kind: AgentKind) -> &'static str {
+    provider(kind).display_name()
+}
+
+/// Accepted `AgentKind::parse` aliases for `kind`.
+pub fn parse_aliases(kind: AgentKind) -> &'static [&'static str] {
+    provider(kind).parse_aliases()
+}
+
+/// Whether `kind` exposes bork-managed plan/build/yolo modes.
+pub fn has_modes(kind: AgentKind) -> bool {
+    provider(kind).has_modes()
+}
+
+/// Comma-separated display names of every registered agent, in `AgentKind::ALL`
+/// order. Single source of truth for CLI help / error text so a new harness
+/// can't leave a stale hardcoded list behind.
+pub fn display_names_csv() -> String {
+    AgentKind::ALL
+        .iter()
+        .map(|kind| display_name(*kind))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Whether the given agent offers a yolo mode (drives the dialog yolo pip and
+/// the mode-cycle behaviour).
+pub fn supports_yolo(kind: AgentKind) -> bool {
+    provider(kind).supports_yolo()
+}
+
 /// Launch an agent session for an issue.
 /// Creates a tmux session with two windows:
-///   1. The agent (opencode/claude/codex/pi) launched at the project root with issue context
+///   1. The agent launched at the project root with issue context
 ///   2. A bare terminal
 ///
 /// Exports BORK_SESSION and BORK_STATUS_DIR so hooks/plugins can write status files.
@@ -74,7 +209,7 @@ pub fn launch_session(
     // global session could belong to any concurrent opencode run. (OpenCode
     // never pre-assigns an id, so agent kind alone gates the snapshot.)
     let opencode_before = if issue.agent_kind == AgentKind::OpenCode {
-        list_opencode_session_ids()
+        opencode::list_session_ids()
     } else {
         HashSet::new()
     };
@@ -84,15 +219,13 @@ pub fn launch_session(
     // Second window: bare terminal for ad-hoc commands
     tmux::create_window(&session_name, "terminal", cwd)?;
 
-    // For OpenCode/Codex, detect session IDs after launch
+    // For OpenCode/Codex/Pi, detect session IDs after launch.
     let agent_session_id = match pre_assigned_session_id {
         Some(id) => Some(id),
-        None => match issue.agent_kind {
-            AgentKind::OpenCode => detect_opencode_session_id(&opencode_before),
-            AgentKind::Claude => None,
-            AgentKind::Codex => detect_codex_session_id(),
-            AgentKind::Pi => detect_pi_session_id(&config.project_root),
-        },
+        None => provider(issue.agent_kind).detect_session_id(&DetectContext {
+            project_root: &config.project_root,
+            before: &opencode_before,
+        }),
     };
 
     Ok((session_name, agent_session_id, setup_ran))
@@ -239,29 +372,11 @@ fn build_agent_cmd(
     let prompt_subst = format!("\"$(cat '{}')\"", escaped_prompt_path);
     let prompt_cleanup = format!("; rm -f '{}'", escaped_prompt_path);
 
+    let provider = provider(issue.agent_kind);
+
     // Built-in mode flags. These are replaced when the user configured
     // per-mode args under `[agent.<name>.mode.<mode>]`.
-    let builtin_mode_flag = match issue.agent_kind {
-        AgentKind::OpenCode => match issue.agent_mode {
-            // OpenCode has no yolo mode; treat it as Build.
-            AgentMode::Plan => "--agent plan",
-            AgentMode::Build | AgentMode::Yolo => "",
-        },
-        AgentKind::Claude => match issue.agent_mode {
-            AgentMode::Plan => "--permission-mode plan",
-            AgentMode::Yolo => "--dangerously-skip-permissions",
-            AgentMode::Build => "",
-        },
-        AgentKind::Codex => match issue.agent_mode {
-            // `--full-auto` is deprecated upstream; use explicit sandbox + approval flags.
-            AgentMode::Plan => "--sandbox workspace-write --ask-for-approval on-request",
-            AgentMode::Build => "--sandbox workspace-write --ask-for-approval never",
-            AgentMode::Yolo => "--dangerously-bypass-approvals-and-sandbox",
-        },
-        // Pi has a single mode and no built-in plan/yolo flags. Users can still
-        // add per-mode args via `[agent.pi.mode.<mode>]` if desired.
-        AgentKind::Pi => "",
-    };
+    let builtin_mode_flag = provider.mode_flag(issue.agent_mode);
 
     let trailing = trailing_args(
         config,
@@ -270,100 +385,17 @@ fn build_agent_cmd(
         builtin_mode_flag,
     );
 
-    let current_session = issue.current_session_id();
+    let ctx = LaunchContext {
+        issue,
+        env_prefix: &env_prefix,
+        trailing: &trailing,
+        prompt_subst: &prompt_subst,
+        prompt_cleanup: &prompt_cleanup,
+        current_session: issue.current_session_id(),
+        build_prompt: &build_prompt_contents,
+    };
 
-    match issue.agent_kind {
-        AgentKind::OpenCode => {
-            if let Some(sid) = current_session {
-                // Resume existing session — skip --prompt, history is preserved
-                let escaped_sid = shell_escape_single_quotes(sid);
-                let cmd = format!(
-                    "{} && opencode --session '{}'{}",
-                    env_prefix, escaped_sid, trailing,
-                );
-                (cmd, None, None)
-            } else {
-                let cmd = format!(
-                    "{} && opencode --prompt {}{}{}",
-                    env_prefix, prompt_subst, trailing, prompt_cleanup,
-                );
-                (cmd, None, Some(build_prompt_contents()))
-            }
-        }
-        AgentKind::Claude => {
-            let session_display_name = format!("{}: {}", issue.id, issue.title);
-            let escaped_name = shell_escape_single_quotes(&session_display_name);
-
-            if let Some(sid) = current_session {
-                // Resume existing session — skip the prompt, history is preserved
-                let escaped_sid = shell_escape_single_quotes(sid);
-                let cmd = format!(
-                    "{} && claude --name '{}'{} --resume '{}'",
-                    env_prefix, escaped_name, trailing, escaped_sid,
-                );
-                (cmd, Some(sid.to_string()), None)
-            } else {
-                // Fresh session: stage prompt and optionally pre-assign a UUID
-                let prompt = build_prompt_contents();
-                let uuid = generate_uuid().unwrap_or_default();
-                if uuid.is_empty() {
-                    let cmd = format!(
-                        "{} && claude --name '{}'{} {}{}",
-                        env_prefix, escaped_name, trailing, prompt_subst, prompt_cleanup,
-                    );
-                    (cmd, None, Some(prompt))
-                } else {
-                    let escaped_uuid = shell_escape_single_quotes(&uuid);
-                    let cmd = format!(
-                        "{} && claude --name '{}'{} --session-id '{}' {}{}",
-                        env_prefix,
-                        escaped_name,
-                        trailing,
-                        escaped_uuid,
-                        prompt_subst,
-                        prompt_cleanup,
-                    );
-                    (cmd, Some(uuid), Some(prompt))
-                }
-            }
-        }
-        AgentKind::Codex => {
-            if let Some(sid) = current_session {
-                let escaped_sid = shell_escape_single_quotes(sid);
-                let cmd = format!(
-                    "{} && codex resume '{}'{}",
-                    env_prefix, escaped_sid, trailing
-                );
-                (cmd, Some(sid.to_string()), None)
-            } else {
-                let cmd = format!(
-                    "{} && codex{} {}{}",
-                    env_prefix, trailing, prompt_subst, prompt_cleanup,
-                );
-                (cmd, None, Some(build_prompt_contents()))
-            }
-        }
-        AgentKind::Pi => {
-            let session_display_name = format!("{}: {}", issue.id, issue.title);
-            let escaped_name = shell_escape_single_quotes(&session_display_name);
-
-            if let Some(sid) = current_session {
-                // Resume existing session — skip the prompt, history is preserved.
-                let escaped_sid = shell_escape_single_quotes(sid);
-                let cmd = format!(
-                    "{} && pi --session '{}'{}",
-                    env_prefix, escaped_sid, trailing,
-                );
-                (cmd, Some(sid.to_string()), None)
-            } else {
-                let cmd = format!(
-                    "{} && pi --name '{}'{} {}{}",
-                    env_prefix, escaped_name, trailing, prompt_subst, prompt_cleanup,
-                );
-                (cmd, None, Some(build_prompt_contents()))
-            }
-        }
-    }
+    provider.build_cmd(&ctx)
 }
 
 /// Build the trailing args string (always starts with a leading space when
@@ -412,33 +444,13 @@ fn trailing_args(
 }
 
 /// Generate a UUID using the system `uuidgen` command.
-fn generate_uuid() -> Option<String> {
+pub(crate) fn generate_uuid() -> Option<String> {
     Command::new("uuidgen")
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_lowercase())
         .filter(|s| !s.is_empty())
-}
-
-/// Poll `opencode session list` until an id appears that wasn't in the
-/// pre-launch snapshot. Returns it if found within ~5 seconds, otherwise
-/// None — the newest global session could belong to any concurrent
-/// opencode run, so only a genuinely new id is trusted.
-fn detect_opencode_session_id(before: &HashSet<String>) -> Option<String> {
-    // Give OpenCode a moment to create its session before polling
-    std::thread::sleep(Duration::from_millis(800));
-
-    for _ in 0..9 {
-        if let Some(sid) = list_opencode_session_ids()
-            .into_iter()
-            .find(|id| !before.contains(id))
-        {
-            return Some(sid);
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    None
 }
 
 /// Attributes legacy (pre-map) session ids to the agent that minted them,
@@ -473,11 +485,11 @@ impl LegacySessionStores {
         }
         let (codex_ids, pi_ids) = self.stores.get_or_insert_with(|| {
             (
-                codex_sessions_root()
-                    .map(|root| collect_codex_session_ids(&root))
+                codex::sessions_root()
+                    .map(|root| codex::collect_session_ids(&root))
                     .unwrap_or_default(),
-                pi_sessions_dir(&self.project_root)
-                    .map(|dir| collect_pi_session_ids(&dir))
+                pi::sessions_dir(&self.project_root)
+                    .map(|dir| pi::collect_session_ids(&dir))
                     .unwrap_or_default(),
             )
         });
@@ -508,18 +520,13 @@ fn attribute_uuid_against_stores(
     }
 }
 
-fn codex_sessions_root() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".codex").join("sessions"))
-}
-
 /// Sleep 800ms for the agent to create its session, then poll ~5s for an id
 /// the pre-launch snapshot lacks. Only a genuinely new id is trusted: the
 /// globally newest one could be any unrelated conversation (concurrent runs,
 /// or a launch that failed or was killed mid-flight), and returning None
 /// just means the next launch starts fresh instead of resuming a foreign
 /// session.
-fn poll_for_new_session_id(
+pub(crate) fn poll_for_new_session_id(
     before: &HashSet<String>,
     snapshot: impl Fn() -> HashSet<String>,
 ) -> Option<String> {
@@ -534,55 +541,7 @@ fn poll_for_new_session_id(
     None
 }
 
-/// Detect a newly created Codex session UUID by scanning ~/.codex/sessions.
-fn detect_codex_session_id() -> Option<String> {
-    let sessions_root = codex_sessions_root()?;
-    let before = collect_codex_session_ids(&sessions_root);
-    poll_for_new_session_id(&before, || collect_codex_session_ids(&sessions_root))
-}
-
-/// Collect all Codex session IDs.
-fn collect_codex_session_ids(sessions_root: &Path) -> HashSet<String> {
-    let mut sessions = HashSet::new();
-    let mut stack = vec![sessions_root.to_path_buf()];
-
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            let Some(session_id) = parse_codex_session_id_from_filename(file_name) else {
-                continue;
-            };
-            sessions.insert(session_id);
-        }
-    }
-
-    sessions
-}
-
-fn parse_codex_session_id_from_filename(file_name: &str) -> Option<String> {
-    let stem = file_name.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
-    if stem.len() < 36 {
-        return None;
-    }
-    let candidate = &stem[stem.len() - 36..];
-    if is_uuid_like(candidate) {
-        Some(candidate.to_string())
-    } else {
-        None
-    }
-}
-
-fn is_uuid_like(value: &str) -> bool {
+pub(crate) fn is_uuid_like(value: &str) -> bool {
     if value.len() != 36 {
         return false;
     }
@@ -593,97 +552,6 @@ fn is_uuid_like(value: &str) -> bool {
             ch.is_ascii_hexdigit()
         }
     })
-}
-
-/// Detect a newly created Pi session UUID by scanning Pi's per-cwd session
-/// directory. Pi stores sessions under `<sessions_root>/--<cwd>--/` as
-/// `<timestamp>_<uuid>.jsonl`, where `<cwd>` has `/` replaced by `-`.
-fn detect_pi_session_id(project_root: &Path) -> Option<String> {
-    let sessions_dir = pi_sessions_dir(project_root)?;
-    let before = collect_pi_session_ids(&sessions_dir);
-    poll_for_new_session_id(&before, || collect_pi_session_ids(&sessions_dir))
-}
-
-/// Resolve Pi's session directory for a given working directory.
-/// Honors `PI_CODING_AGENT_SESSION_DIR` (flat dir) and `PI_CODING_AGENT_DIR`
-/// overrides, falling back to `~/.pi/agent/sessions/--<cwd>--/`.
-fn pi_sessions_dir(project_root: &Path) -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("PI_CODING_AGENT_SESSION_DIR") {
-        return Some(PathBuf::from(dir));
-    }
-
-    let root = if let Ok(dir) = std::env::var("PI_CODING_AGENT_DIR") {
-        PathBuf::from(dir)
-    } else {
-        let home = std::env::var("HOME").ok()?;
-        PathBuf::from(home).join(".pi").join("agent")
-    };
-
-    let cwd = project_root.to_str()?;
-    Some(
-        root.join("sessions")
-            .join(format!("--{}--", cwd.replace('/', "-"))),
-    )
-}
-
-/// Collect Pi session UUIDs from a session dir.
-fn collect_pi_session_ids(sessions_dir: &Path) -> HashSet<String> {
-    let mut sessions = HashSet::new();
-    let Ok(entries) = fs::read_dir(sessions_dir) else {
-        return sessions;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            continue;
-        }
-        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        let Some(session_id) = parse_pi_session_id_from_filename(file_name) else {
-            continue;
-        };
-        sessions.insert(session_id);
-    }
-    sessions
-}
-
-/// Extract the session UUID from a Pi session filename (`<timestamp>_<uuid>.jsonl`).
-fn parse_pi_session_id_from_filename(file_name: &str) -> Option<String> {
-    let stem = file_name.strip_suffix(".jsonl")?;
-    let candidate = stem.rsplit('_').next()?;
-    if is_uuid_like(candidate) {
-        Some(candidate.to_string())
-    } else {
-        None
-    }
-}
-
-/// Run `opencode session list` and return every session ID found.
-/// Session IDs start with "ses_", one per line.
-fn list_opencode_session_ids() -> HashSet<String> {
-    let Ok(output) = Command::new("opencode").args(["session", "list"]).output() else {
-        return HashSet::new();
-    };
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_all_session_ids(&stdout)
-}
-
-/// Parse every session ID from `opencode session list` output.
-/// Expected format: each line starts with the session ID (ses_xxx).
-fn parse_all_session_ids(output: &str) -> HashSet<String> {
-    output
-        .lines()
-        .filter_map(|line| {
-            let token = line.split_whitespace().next()?;
-            if token.starts_with("ses_") {
-                Some(token.to_string())
-            } else {
-                None
-            }
-        })
-        .collect()
 }
 
 /// Build the full prompt sent to the agent.
@@ -768,7 +636,7 @@ fn append_section<T>(
 }
 
 /// Escape a string for use inside single quotes in a shell command.
-fn shell_escape_single_quotes(s: &str) -> String {
+pub(crate) fn shell_escape_single_quotes(s: &str) -> String {
     s.replace('\'', "'\\''")
 }
 
@@ -1191,6 +1059,77 @@ mod tests {
         assert!(!result.contains("GitHub PR"));
     }
 
+    // --- shared helpers used across providers ---
+
+    #[test]
+    fn shell_escape_no_quotes() {
+        assert_eq!(shell_escape_single_quotes("hello world"), "hello world");
+    }
+
+    #[test]
+    fn shell_escape_with_single_quotes() {
+        assert_eq!(shell_escape_single_quotes("it's a test"), "it'\\''s a test");
+    }
+
+    #[test]
+    fn is_uuid_like_validates_expected_shape() {
+        assert!(is_uuid_like("019d76ad-9734-77c0-8169-a727a5524013"));
+        assert!(!is_uuid_like("019d76ad973477c08169a727a5524013"));
+        assert!(!is_uuid_like("not-a-uuid"));
+    }
+
+    // --- legacy session attribution ---
+
+    const LEGACY_UUID: &str = "019d76ad-9734-77c0-8169-a727a5524013";
+
+    /// Attribution of LEGACY_UUID with each store either holding it or empty.
+    fn owner_of(current: AgentKind, in_codex: bool, in_pi: bool) -> Option<AgentKind> {
+        let store = |present: bool| -> HashSet<String> {
+            if present {
+                HashSet::from([LEGACY_UUID.to_string()])
+            } else {
+                HashSet::new()
+            }
+        };
+        attribute_uuid_against_stores(LEGACY_UUID, current, &store(in_codex), &store(in_pi))
+    }
+
+    #[test]
+    fn legacy_uuid_attribution_follows_stores_then_claude() {
+        // The pre-map bug could leave another agent's id under any current
+        // agent; the transcript stores decide, claude is the only fallback.
+        assert_eq!(
+            owner_of(AgentKind::Claude, true, false),
+            Some(AgentKind::Codex)
+        );
+        assert_eq!(owner_of(AgentKind::Codex, false, true), Some(AgentKind::Pi));
+        assert_eq!(
+            owner_of(AgentKind::Claude, false, false),
+            Some(AgentKind::Claude)
+        );
+        for current in [AgentKind::OpenCode, AgentKind::Codex, AgentKind::Pi] {
+            assert_eq!(
+                owner_of(current, false, false),
+                None,
+                "unattributable id must drop under {current}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_attribution_shape_checks_precede_store_lookups() {
+        // ses_ ids and non-uuid garbage resolve without touching the stores
+        // (a nonexistent project root would otherwise collect empty sets).
+        let mut stores = LegacySessionStores::new(Path::new("/nonexistent"));
+        assert_eq!(
+            stores.attribute("ses_abc123", AgentKind::Claude),
+            Some(AgentKind::OpenCode)
+        );
+        assert_eq!(stores.attribute("not-a-uuid", AgentKind::Claude), None);
+    }
+
+    // --- build_agent_cmd (cross-provider harness) ---
+
     fn test_issue(agent_kind: AgentKind, agent_mode: AgentMode) -> Issue {
         Issue {
             agent_mode,
@@ -1246,7 +1185,7 @@ mod tests {
         build_agent_cmd(issue, config, session, status_dir, TEST_PROMPT_PATH)
     }
 
-    // --- build_agent_cmd ---
+    // --- OpenCode ---
 
     #[test]
     fn opencode_fresh_plan() {
@@ -1356,6 +1295,8 @@ mod tests {
         assert!(!cmd.contains("--agent plan"));
     }
 
+    // --- Claude ---
+
     #[test]
     fn claude_fresh_plan() {
         let issue = test_issue(AgentKind::Claude, AgentMode::Plan);
@@ -1411,6 +1352,8 @@ mod tests {
         assert!(cmd.contains("--resume 'uuid-789'"));
         assert!(cmd.contains("--dangerously-skip-permissions"));
     }
+
+    // --- Codex ---
 
     #[test]
     fn codex_fresh_plan() {
@@ -1489,6 +1432,8 @@ mod tests {
         assert_eq!(path, PathBuf::from("/tmp/status/prompt-bork-bork-7.txt"));
     }
 
+    // --- Pi ---
+
     #[test]
     fn pi_fresh_uses_name_and_prompt() {
         let issue = test_issue(AgentKind::Pi, AgentMode::Build);
@@ -1542,18 +1487,6 @@ mod tests {
             sid,
             Some("019d76ad-9734-77c0-8169-a727a5524013".to_string())
         );
-    }
-
-    #[test]
-    fn pi_session_id_parsed_from_filename() {
-        assert_eq!(
-            parse_pi_session_id_from_filename(
-                "2024-12-03T14-00-00_019d76ad-9734-77c0-8169-a727a5524013.jsonl"
-            ),
-            Some("019d76ad-9734-77c0-8169-a727a5524013".to_string())
-        );
-        assert_eq!(parse_pi_session_id_from_filename("not-a-session.txt"), None);
-        assert_eq!(parse_pi_session_id_from_filename("123_short.jsonl"), None);
     }
 
     // --- per-agent sessions ---
@@ -1776,107 +1709,5 @@ mod tests {
         let config = config_with_launch(AgentKind::Claude, &["it's a flag"], &[]);
         let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         assert!(cmd.contains("'it'\\''s a flag'"));
-    }
-
-    #[test]
-    fn shell_escape_no_quotes() {
-        assert_eq!(shell_escape_single_quotes("hello world"), "hello world");
-    }
-
-    #[test]
-    fn shell_escape_with_single_quotes() {
-        assert_eq!(shell_escape_single_quotes("it's a test"), "it'\\''s a test");
-    }
-
-    #[test]
-    fn parse_all_session_ids_finds_every_ses_entry() {
-        let output = "ses_abc123   My session title   2024-01-15\nses_def456   Another session   2024-01-14\n";
-        let ids = parse_all_session_ids(output);
-        assert_eq!(ids.len(), 2);
-        assert!(ids.contains("ses_abc123"));
-        assert!(ids.contains("ses_def456"));
-    }
-
-    #[test]
-    fn parse_all_session_ids_empty_for_empty_output() {
-        assert!(parse_all_session_ids("").is_empty());
-    }
-
-    #[test]
-    fn parse_all_session_ids_ignores_non_ses_lines() {
-        let output = "No sessions found\n";
-        assert!(parse_all_session_ids(output).is_empty());
-    }
-
-    // --- legacy session attribution ---
-
-    const LEGACY_UUID: &str = "019d76ad-9734-77c0-8169-a727a5524013";
-
-    /// Attribution of LEGACY_UUID with each store either holding it or empty.
-    fn owner_of(current: AgentKind, in_codex: bool, in_pi: bool) -> Option<AgentKind> {
-        let store = |present: bool| -> HashSet<String> {
-            if present {
-                HashSet::from([LEGACY_UUID.to_string()])
-            } else {
-                HashSet::new()
-            }
-        };
-        attribute_uuid_against_stores(LEGACY_UUID, current, &store(in_codex), &store(in_pi))
-    }
-
-    #[test]
-    fn legacy_uuid_attribution_follows_stores_then_claude() {
-        // The pre-map bug could leave another agent's id under any current
-        // agent; the transcript stores decide, claude is the only fallback.
-        assert_eq!(
-            owner_of(AgentKind::Claude, true, false),
-            Some(AgentKind::Codex)
-        );
-        assert_eq!(owner_of(AgentKind::Codex, false, true), Some(AgentKind::Pi));
-        assert_eq!(
-            owner_of(AgentKind::Claude, false, false),
-            Some(AgentKind::Claude)
-        );
-        for current in [AgentKind::OpenCode, AgentKind::Codex, AgentKind::Pi] {
-            assert_eq!(
-                owner_of(current, false, false),
-                None,
-                "unattributable id must drop under {current}"
-            );
-        }
-    }
-
-    #[test]
-    fn legacy_attribution_shape_checks_precede_store_lookups() {
-        // ses_ ids and non-uuid garbage resolve without touching the stores
-        // (a nonexistent project root would otherwise collect empty sets).
-        let mut stores = LegacySessionStores::new(Path::new("/nonexistent"));
-        assert_eq!(
-            stores.attribute("ses_abc123", AgentKind::Claude),
-            Some(AgentKind::OpenCode)
-        );
-        assert_eq!(stores.attribute("not-a-uuid", AgentKind::Claude), None);
-    }
-
-    #[test]
-    fn parse_codex_session_id_from_filename_extracts_uuid() {
-        let file_name = "rollout-2026-04-10T11-16-21-019d76ad-9734-77c0-8169-a727a5524013.jsonl";
-        assert_eq!(
-            parse_codex_session_id_from_filename(file_name),
-            Some("019d76ad-9734-77c0-8169-a727a5524013".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_codex_session_id_from_filename_rejects_invalid() {
-        let file_name = "rollout-2026-04-10T11-16-21-not-a-uuid.jsonl";
-        assert_eq!(parse_codex_session_id_from_filename(file_name), None);
-    }
-
-    #[test]
-    fn is_uuid_like_validates_expected_shape() {
-        assert!(is_uuid_like("019d76ad-9734-77c0-8169-a727a5524013"));
-        assert!(!is_uuid_like("019d76ad973477c08169a727a5524013"));
-        assert!(!is_uuid_like("not-a-uuid"));
     }
 }

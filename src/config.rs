@@ -524,7 +524,7 @@ pub fn try_load_state(project_root: &Path) -> Option<AppState> {
             return None;
         }
     };
-    let mut legacy_stores = crate::external::opencode::LegacySessionStores::new(project_root);
+    let mut legacy_stores = crate::external::agent::LegacySessionStores::new(project_root);
     for issue in &mut state.issues {
         if let Some(sid) = issue.migrate_legacy_fields() {
             if let Some(owner) = legacy_stores.attribute(&sid, issue.agent_kind) {

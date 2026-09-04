@@ -614,7 +614,7 @@ fn render_mode_field(
         ),
     ];
 
-    if matches!(agent_kind, AgentKind::Claude | AgentKind::Codex) {
+    if crate::external::agent::supports_yolo(agent_kind) {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
             format!("[{} yolo]", indicator(yolo_selected)),

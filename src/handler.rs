@@ -7,7 +7,7 @@ use crate::app::{
     Project, ProjectId,
 };
 use crate::config::AppConfig;
-use crate::external::{browser, github, opencode, tmux, tuicr};
+use crate::external::{agent, browser, github, tmux, tuicr};
 use crate::global_config::ReloadResult;
 use crate::input::Action;
 use crate::types::{
@@ -930,7 +930,7 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
                 // before committing the edit so a failed cleanup can't leave
                 // an untracked old agent running, and drop the cached
                 // liveness so relaunch works before the next 2s tmux poll.
-                if let Err(e) = opencode::terminate_session(&p.config.project_root, &session_name) {
+                if let Err(e) = agent::terminate_session(&p.config.project_root, &session_name) {
                     app.set_error(format!("Failed to reset session: {e}"));
                     return;
                 }
@@ -1626,7 +1626,7 @@ fn archive_to_result(
     session_name: &str,
     worktree: Option<&str>,
 ) -> ActionResult {
-    let session_killed = match opencode::terminate_session(&config.project_root, session_name) {
+    let session_killed = match agent::terminate_session(&config.project_root, session_name) {
         Ok(killed) => killed,
         Err(e) => {
             return ActionResult {
@@ -1711,7 +1711,7 @@ pub fn delete_issue_from_app(app: &mut App, project_id: &ProjectId, issue_id: &s
 }
 
 fn launch_and_report(issue: Issue, config: AppConfig) -> ActionResult {
-    match opencode::launch_session(&issue, &config) {
+    match agent::launch_session(&issue, &config) {
         Ok((session_name, agent_sid, setup_ran)) => ActionResult {
             launched_setup_ran: setup_ran,
             message: format!("Session '{}' started", session_name),
@@ -1742,7 +1742,7 @@ pub fn terminate_to_result(
     killed_msg: String,
     absent_msg: String,
 ) -> ActionResult {
-    let (message, message_kind) = match opencode::terminate_session(project_root, session_name) {
+    let (message, message_kind) = match agent::terminate_session(project_root, session_name) {
         Ok(true) => (killed_msg, MessageKind::Info),
         Ok(false) => (absent_msg, MessageKind::Info),
         Err(e) => (

@@ -33,7 +33,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use crossterm::{
     event::{
         self, Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
@@ -398,9 +398,12 @@ fn spawn_pr_poll_worker(
 
 /// Quickstart block shown before Options on the top-level `bork --help`.
 /// Aimed at AI agents driving bork from the CLI: where to start, plus the
-/// --agent / --mode knobs. Kept accurate against external/opencode.rs and
-/// config.rs.
-const AGENTS_START_HERE: &str = "\
+/// --agent / --mode knobs. The agent list is derived from the provider
+/// registry (`AgentKind::ALL`, first entry is the default) so it can't drift.
+fn agents_start_here() -> String {
+    let agents = external::agent::display_names_csv().replacen(", ", " (default), ", 1);
+    format!(
+        "\
 Start here (for AI agents):
   bork issue list                List the kanban board (use --json to parse)
   bork issue create \"<title>\"    Add an issue to the board
@@ -413,7 +416,7 @@ Start here (for AI agents):
                                  (--force to discard uncommitted changes)
 
   Agentic issues each run one coding agent. Pick which and how with:
-    --agent   opencode (default), claude, codex     # must be on your PATH
+    --agent   {agents}     # must be on your PATH
     --mode    plan (read-only), build, yolo          # yolo: claude/codex only
     --kind    agentic (default), todo, orchestrator  # todo: no agent;
                                                      # orchestrator: plans,
@@ -422,7 +425,9 @@ Start here (for AI agents):
 
   Defaults + allowlist live in ~/.config/bork/config.toml
   (default_agent, default_mode, agents = [...], orchestrator_prompt);
-  per-project override in .bork/config.toml.";
+  per-project override in .bork/config.toml."
+    )
+}
 
 /// One-line pointer shown before Options on every subcommand `--help`, so the
 /// quickstart is discoverable at any level without repeating the full block.
@@ -473,8 +478,8 @@ enum Command {
         directory: Option<String>,
 
         /// Agent kind
-        #[arg(long, default_value = "opencode")]
-        agent: AgentKindArg,
+        #[arg(long, default_value = "opencode", value_parser = parse_agent_kind)]
+        agent: AgentKind,
     },
 
     /// Install agent status hooks (OpenCode/Pi plugins + Claude Code/Codex hooks)
@@ -834,8 +839,9 @@ fn parse_column(s: &str) -> Result<Column, String> {
 fn parse_agent_kind(s: &str) -> Result<AgentKind, String> {
     AgentKind::parse(s).ok_or_else(|| {
         format!(
-            "Unknown agent '{}'. Options: opencode, claude, codex, pi",
-            s
+            "Unknown agent '{}'. Options: {}",
+            s,
+            external::agent::display_names_csv()
         )
     })
 }
@@ -861,27 +867,8 @@ fn parse_issue_kind(s: &str) -> Result<IssueKind, String> {
     }
 }
 
-#[derive(Clone, ValueEnum)]
-enum AgentKindArg {
-    Opencode,
-    Claude,
-    Codex,
-    Pi,
-}
-
-impl From<AgentKindArg> for AgentKind {
-    fn from(arg: AgentKindArg) -> Self {
-        match arg {
-            AgentKindArg::Opencode => AgentKind::OpenCode,
-            AgentKindArg::Claude => AgentKind::Claude,
-            AgentKindArg::Codex => AgentKind::Codex,
-            AgentKindArg::Pi => AgentKind::Pi,
-        }
-    }
-}
-
 fn main() -> anyhow::Result<()> {
-    let command = apply_agents_help(Cli::command(), AGENTS_START_HERE);
+    let command = apply_agents_help(Cli::command(), &agents_start_here());
     let matches = command.get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
@@ -890,7 +877,7 @@ fn main() -> anyhow::Result<()> {
             repo,
             directory,
             agent,
-        }) => init::run_init(&repo, directory.as_deref(), agent.into(), None),
+        }) => init::run_init(&repo, directory.as_deref(), agent, None),
         Some(Command::Install) => external::hooks::install(),
         Some(Command::Uninstall) => external::hooks::uninstall(),
         Some(Command::Worktree {
@@ -1450,7 +1437,7 @@ fn start_issue(project_root: &Path, opts: StartIssueOptions) -> anyhow::Result<S
 
     let launched_agent = issue.agent_kind;
     let (session_name, agent_session_id, setup_ran) =
-        external::opencode::launch_session(&issue, &config)
+        external::agent::launch_session(&issue, &config)
             .map_err(|e| anyhow::anyhow!("Failed to launch agent: {e}"))?;
 
     // Resolve the link target: explicit --link wins, else the spawning agent's
