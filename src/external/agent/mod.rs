@@ -70,6 +70,10 @@ pub trait AgentProvider {
 /// once by `build_agent_cmd` so the provider bodies stay pure string assembly.
 pub struct LaunchContext<'a> {
     pub issue: &'a Issue,
+    /// The tmux session's launch cwd (the bork project root). Cursor mints its
+    /// chat id here so `create-chat` keys the chat to the same workspace the
+    /// agent is then launched in.
+    pub project_root: &'a Path,
     /// `export BORK_SESSION=... BORK_STATUS_DIR=... BORK_ISSUE_ID=...`
     pub env_prefix: &'a str,
     /// Trailing args (leading space when non-empty).
@@ -389,6 +393,7 @@ fn build_agent_cmd(
 
     let ctx = LaunchContext {
         issue,
+        project_root: &config.project_root,
         env_prefix: &env_prefix,
         trailing: &trailing,
         prompt_subst: &prompt_subst,
@@ -1492,24 +1497,68 @@ mod tests {
     }
 
     // --- Cursor ---
+    //
+    // Under test, `cursor::mint_chat_id` is stubbed: it returns a fixed id for
+    // any project root except the mint-failure sentinel `/tmp/cursor-mint-fails`,
+    // so these tests exercise both fresh paths without touching the binary.
+    const CURSOR_TEST_CHAT_ID: &str = "a506b8cb-b2ea-4b22-b0bb-7c449eb14606";
+    const CURSOR_MINT_FAILURE_ROOT: &str = "/tmp/cursor-mint-fails";
 
     #[test]
-    fn cursor_fresh_uses_prompt_file() {
+    fn cursor_fresh_with_chat_id() {
+        // Primary path: a chat id was minted, so the fresh launch resumes it and
+        // delivers the prompt as the first message (RECHECK-confirmed).
         let issue = test_issue(AgentKind::Cursor, AgentMode::Build);
         let config = test_config();
         let (cmd, sid, prompt) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         // Binary is cursor-agent, not cursor.
-        assert!(cmd.contains("cursor-agent "));
+        assert!(cmd.contains("cursor-agent --resume '"));
+        assert!(cmd.contains(CURSOR_TEST_CHAT_ID));
+        // --trust must survive on the resume line or the Workspace Trust gate hangs.
+        assert!(cmd.contains("--trust"));
+        // The prompt is delivered via the staged-file substitution.
         assert!(cmd.contains("\"$(cat '/tmp/status/prompt-bork-bork-1.txt')\""));
         assert!(cmd.contains("rm -f '/tmp/status/prompt-bork-bork-1.txt'"));
         // No --name flag exists on cursor-agent.
         assert!(!cmd.contains("--name"));
         // send-keys would mangle a literal newline in the typed command line.
         assert!(!cmd.contains('\n'));
+        assert_eq!(sid, Some(CURSOR_TEST_CHAT_ID.to_string()));
         assert!(prompt
             .unwrap()
             .contains("You are working on bork-1: Fix bug"));
+    }
+
+    #[test]
+    fn cursor_fresh_without_chat_id() {
+        // Minting failed: fall back to a bare fresh launch, no id captured, but
+        // still deliver the prompt.
+        let issue = test_issue(AgentKind::Cursor, AgentMode::Build);
+        let mut config = test_config();
+        config.project_root = std::path::PathBuf::from(CURSOR_MINT_FAILURE_ROOT);
+        let (cmd, sid, prompt) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        // Bare shape: no --resume, prompt still staged.
+        assert!(cmd.contains("cursor-agent --trust "));
+        assert!(!cmd.contains("--resume"));
+        assert!(cmd.contains("\"$(cat '/tmp/status/prompt-bork-bork-1.txt')\""));
         assert!(sid.is_none());
+        assert!(prompt
+            .unwrap()
+            .contains("You are working on bork-1: Fix bug"));
+    }
+
+    #[test]
+    fn cursor_resume_omits_prompt() {
+        // Resume path: history is preserved, so no prompt is re-sent.
+        let issue = resumable_issue(AgentKind::Cursor, AgentMode::Build, CURSOR_TEST_CHAT_ID);
+        let config = test_config();
+        let (cmd, sid, prompt) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(cmd.contains(&format!("cursor-agent --resume '{}'", CURSOR_TEST_CHAT_ID)));
+        assert!(cmd.contains("--trust"));
+        // No prompt substitution on resume.
+        assert!(!cmd.contains("$(cat"));
+        assert_eq!(sid, Some(CURSOR_TEST_CHAT_ID.to_string()));
+        assert!(prompt.is_none());
     }
 
     #[test]
@@ -1517,10 +1566,8 @@ mod tests {
         let issue = test_issue(AgentKind::Cursor, AgentMode::Yolo);
         let config = test_config();
         let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
-        // Built-in mode flags render bare, so Yolo lands as `--trust -f` right
-        // after the binary. Assert that exact form so a stray future flag
-        // merely containing "-f" can't mask a regression.
-        assert!(cmd.contains("cursor-agent --trust -f "));
+        // Yolo renders as `--trust -f` in the trailing args.
+        assert!(cmd.contains("--trust -f"));
         // Guard against a later switch to the newer-build --yolo alias: -f is
         // the stable spelling, and Yolo must not leak into Build via --trust.
         assert!(!cmd.contains("--yolo"));
