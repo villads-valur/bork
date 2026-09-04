@@ -12,6 +12,7 @@ use crate::types::{AgentKind, AgentMode, Issue, IssueKind, LinkedGithubPr, Linke
 
 mod claude;
 mod codex;
+mod cursor;
 mod opencode;
 mod pi;
 
@@ -105,6 +106,7 @@ pub fn provider(kind: AgentKind) -> &'static dyn AgentProvider {
         AgentKind::Claude => &claude::Claude,
         AgentKind::Codex => &codex::Codex,
         AgentKind::Pi => &pi::Pi,
+        AgentKind::Cursor => &cursor::Cursor,
     }
 }
 
@@ -1487,6 +1489,74 @@ mod tests {
             sid,
             Some("019d76ad-9734-77c0-8169-a727a5524013".to_string())
         );
+    }
+
+    // --- Cursor ---
+
+    #[test]
+    fn cursor_fresh_uses_prompt_file() {
+        let issue = test_issue(AgentKind::Cursor, AgentMode::Build);
+        let config = test_config();
+        let (cmd, sid, prompt) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        // Binary is cursor-agent, not cursor.
+        assert!(cmd.contains("cursor-agent "));
+        assert!(cmd.contains("\"$(cat '/tmp/status/prompt-bork-bork-1.txt')\""));
+        assert!(cmd.contains("rm -f '/tmp/status/prompt-bork-bork-1.txt'"));
+        // No --name flag exists on cursor-agent.
+        assert!(!cmd.contains("--name"));
+        // send-keys would mangle a literal newline in the typed command line.
+        assert!(!cmd.contains('\n'));
+        assert!(prompt
+            .unwrap()
+            .contains("You are working on bork-1: Fix bug"));
+        assert!(sid.is_none());
+    }
+
+    #[test]
+    fn cursor_yolo_uses_force_flag() {
+        let issue = test_issue(AgentKind::Cursor, AgentMode::Yolo);
+        let config = test_config();
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        // Built-in mode flags render bare, so Yolo lands as `--trust -f` right
+        // after the binary. Assert that exact form so a stray future flag
+        // merely containing "-f" can't mask a regression.
+        assert!(cmd.contains("cursor-agent --trust -f "));
+        // Guard against a later switch to the newer-build --yolo alias: -f is
+        // the stable spelling, and Yolo must not leak into Build via --trust.
+        assert!(!cmd.contains("--yolo"));
+        assert!(!cmd.contains("--dangerously"));
+    }
+
+    #[test]
+    fn cursor_trust_on_every_mode() {
+        // A fresh worktree hits the Workspace Trust gate on first run, so every
+        // mode must pass --trust or the launch hangs.
+        let config = test_config();
+        for mode in [AgentMode::Plan, AgentMode::Build, AgentMode::Yolo] {
+            let issue = test_issue(AgentKind::Cursor, mode);
+            let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+            assert!(cmd.contains("--trust"), "mode {:?} missing --trust", mode);
+        }
+    }
+
+    #[test]
+    fn cursor_plan_enforces_mode_plan() {
+        // Plan mode is enforced via `--mode plan`; Build must not carry it.
+        let config = test_config();
+        let (plan_cmd, _, _) = agent_cmd(
+            &test_issue(AgentKind::Cursor, AgentMode::Plan),
+            &config,
+            "bork-bork-1",
+            "/tmp/status",
+        );
+        let (build_cmd, _, _) = agent_cmd(
+            &test_issue(AgentKind::Cursor, AgentMode::Build),
+            &config,
+            "bork-bork-1",
+            "/tmp/status",
+        );
+        assert!(plan_cmd.contains("--mode plan"));
+        assert!(!build_cmd.contains("--mode plan"));
     }
 
     // --- per-agent sessions ---
