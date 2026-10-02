@@ -265,10 +265,12 @@ pub fn remove_worktree_in(
         let stderr = String::from_utf8_lossy(&output.stderr)
             .lines()
             .next()
-            .unwrap_or("git worktree remove failed")
+            .unwrap_or("")
             .trim()
             .to_string();
-        bail!("{stderr} (re-run with --force to discard changes)");
+        bail!(
+            "git worktree remove failed. The worktree may have uncommitted changes; re-run with --force to discard them. ({stderr})"
+        );
     }
 
     Ok(())
