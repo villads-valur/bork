@@ -406,6 +406,10 @@ impl Issue {
         }
     }
 
+    pub fn popup_title(&self) -> String {
+        format!("{}: {}", self.id, self.title)
+    }
+
     pub fn session_name(&self, project_name: &str) -> String {
         format!("{}-{}", project_name, self.id.to_lowercase())
     }

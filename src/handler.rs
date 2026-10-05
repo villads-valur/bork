@@ -62,9 +62,10 @@ pub enum PostAction {
         session_name: String,
         popup_title: String,
     },
-    LaunchAndOpenPopup {
-        issue_id: String,
-        popup_title: String,
+    /// Background session launches, one `(issue_id, popup_title)` per issue.
+    /// `open_popup` is only set for a single-issue Open.
+    Launch {
+        launches: Vec<(String, String)>,
         open_popup: bool,
     },
     OpenEditor {
@@ -178,6 +179,99 @@ fn bulk_move(
     if was_bulk {
         app.set_message(format!("Moved {} marked issues{}", moved, suffix));
     }
+}
+
+/// Start a session for every marked agentic issue in the context project,
+/// skipping issues that aren't agentic, already run, or are already launching.
+/// Clears the marks afterward.
+fn start_marked_sessions(
+    app: &mut App,
+    ctx: &ActionContext,
+    ch: &ActionChannels<'_>,
+) -> PostAction {
+    let project = app.context_project(ctx);
+    let marked = project.marked_issue_indices();
+    let startable: Vec<Issue> = marked
+        .iter()
+        .map(|&idx| &project.issues[idx])
+        .filter(|issue| {
+            issue.kind.is_agentic()
+                && !project.is_session_alive(&issue.session_name(&project.config.project_name))
+        })
+        .cloned()
+        .collect();
+    let config = project.config.clone();
+
+    let launches = spawn_launches(app, ch, startable, config);
+    let skipped = marked.len() - launches.len();
+    app.context_project_mut(ctx).clear_marks();
+
+    if launches.is_empty() {
+        app.set_warning("No marked issues could be started");
+        return PostAction::None;
+    }
+    let mut message = format!("Starting {} marked sessions", launches.len());
+    if skipped > 0 {
+        message.push_str(&format!(" ({} skipped)", skipped));
+    }
+    app.set_message(message);
+    PostAction::Launch {
+        launches,
+        open_popup: false,
+    }
+}
+
+/// Launch sessions for `issues` on one background thread, one after another,
+/// sending a result per issue. Running them in sequence matters: agents that
+/// detect their session id by diffing a global session list would otherwise
+/// pick up a sibling launch's id. Issues already launching are skipped.
+/// Returns `(issue_id, popup_title)` for each launch that was started.
+fn spawn_launches(
+    app: &mut App,
+    ch: &ActionChannels<'_>,
+    issues: Vec<Issue>,
+    config: AppConfig,
+) -> Vec<(String, String)> {
+    // Guard against double-launch: tmux::session_exists inside the
+    // launch thread is check-then-act, so a second keypress before
+    // the first launch completes would race it.
+    let issues: Vec<Issue> = issues
+        .into_iter()
+        .filter(|issue| app.launches_in_flight.insert(issue.id.clone()))
+        .collect();
+    if issues.is_empty() {
+        return Vec::new();
+    }
+
+    let launches = issues
+        .iter()
+        .map(|issue| {
+            app.begin_busy();
+            (issue.id.clone(), issue.popup_title())
+        })
+        .collect();
+
+    let tx = ch.action_tx.clone();
+    thread::spawn(move || {
+        for issue in issues {
+            let panic_issue_id = issue.id.clone();
+            // A panic in the launch path must still deliver a result,
+            // otherwise the in-flight guard for this issue leaks and
+            // blocks every future launch attempt until restart.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                launch_and_report(issue, config.clone())
+            }))
+            .unwrap_or_else(|_| ActionResult {
+                message: "Launch failed unexpectedly (internal panic)".to_string(),
+                message_kind: MessageKind::Error,
+                launched_issue_id: Some(panic_issue_id),
+                ..Default::default()
+            });
+            let _ = tx.send(result);
+        }
+    });
+
+    launches
 }
 
 fn handle_normal(
@@ -444,6 +538,10 @@ fn handle_normal(
             PostAction::None
         }
 
+        Action::StartSession if !app.context_project(ctx).marked_issues.is_empty() => {
+            start_marked_sessions(app, ctx, ch)
+        }
+
         Action::OpenSession | Action::StartSession => {
             let open_popup = action == Action::OpenSession;
 
@@ -458,7 +556,7 @@ fn handle_normal(
             }
 
             let session_name = issue.session_name(&app.context_project(ctx).config.project_name);
-            let popup_title = format!("{}: {}", issue.id, issue.title);
+            let popup_title = issue.popup_title();
 
             if app.context_project(ctx).is_session_alive(&session_name) {
                 if open_popup {
@@ -471,45 +569,21 @@ fn handle_normal(
                 return PostAction::None;
             }
 
-            // Guard against double-launch: tmux::session_exists inside the
-            // launch thread is check-then-act, so a second keypress before
-            // the first launch completes would race it.
-            if !app.launches_in_flight.insert(issue.id.clone()) {
+            let config = app.context_project(ctx).config.clone();
+            let launches = spawn_launches(app, ch, vec![issue], config);
+            if launches.is_empty() {
                 app.set_message("Session launch already in progress");
                 return PostAction::None;
             }
 
-            app.begin_busy();
             app.set_message(if open_popup {
                 "Launching session..."
             } else {
                 "Starting session..."
             });
 
-            let config = app.context_project(ctx).config.clone();
-            let tx = ch.action_tx.clone();
-            let issue_id = issue.id.clone();
-            let panic_issue_id = issue.id.clone();
-
-            thread::spawn(move || {
-                // A panic in the launch path must still deliver a result,
-                // otherwise the in-flight guard for this issue leaks and
-                // blocks every future launch attempt until restart.
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    launch_and_report(issue, config)
-                }))
-                .unwrap_or_else(|_| ActionResult {
-                    message: "Launch failed unexpectedly (internal panic)".to_string(),
-                    message_kind: MessageKind::Error,
-                    launched_issue_id: Some(panic_issue_id),
-                    ..Default::default()
-                });
-                let _ = tx.send(result);
-            });
-
-            PostAction::LaunchAndOpenPopup {
-                issue_id,
-                popup_title,
+            PostAction::Launch {
+                launches,
                 open_popup,
             }
         }
@@ -528,7 +602,7 @@ fn handle_normal(
             let session_name = issue.session_name(&app.context_project(ctx).config.project_name);
             let session_alive = app.context_project(ctx).is_session_alive(&session_name);
             let pr_mode = action == Action::OpenReviewPR;
-            let popup_title = format!("{}: {}", issue.id, issue.title);
+            let popup_title = issue.popup_title();
             let worktree_path = app.context_project(ctx).config.project_root.join(&wt);
             let tx = ch.action_tx.clone();
             app.begin_busy();
@@ -1960,7 +2034,7 @@ mod tests {
 
         assert!(matches!(
             post,
-            PostAction::LaunchAndOpenPopup {
+            PostAction::Launch {
                 open_popup: false,
                 ..
             }

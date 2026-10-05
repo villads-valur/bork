@@ -543,7 +543,7 @@ impl Project {
         self.marked_issues.clear();
     }
 
-    fn marked_issue_indices(&self) -> Vec<usize> {
+    pub(crate) fn marked_issue_indices(&self) -> Vec<usize> {
         self.issues
             .iter()
             .enumerate()
