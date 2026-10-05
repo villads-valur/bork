@@ -166,17 +166,21 @@ pub fn list_projects() -> Vec<ProjectEntry> {
 
 pub struct ReloadResult {
     pub new_projects: Vec<(AppConfig, AppState)>,
+    /// Loaded projects that are no longer in the registry (deleted or unregistered).
+    pub removed_projects: Vec<ProjectId>,
 }
 
 pub fn discover_new_projects(known_roots: HashSet<ProjectId>) -> ReloadResult {
     prune_stale_projects();
 
     let mut new_projects = Vec::new();
+    let mut registered_roots = HashSet::new();
     for entry in &load_global_config().projects {
         if !entry.path.join(".bork").join("config.toml").exists() {
             continue;
         }
         let canonical = fs::canonicalize(&entry.path).unwrap_or_else(|_| entry.path.clone());
+        registered_roots.insert(canonical.clone());
         if known_roots.contains(&canonical) {
             continue;
         }
@@ -185,7 +189,15 @@ pub fn discover_new_projects(known_roots: HashSet<ProjectId>) -> ReloadResult {
         new_projects.push((proj_config, proj_state));
     }
 
-    ReloadResult { new_projects }
+    let removed_projects = known_roots
+        .into_iter()
+        .filter(|root| !registered_roots.contains(root))
+        .collect();
+
+    ReloadResult {
+        new_projects,
+        removed_projects,
+    }
 }
 
 #[cfg(test)]
