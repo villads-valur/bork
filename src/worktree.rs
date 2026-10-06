@@ -255,15 +255,21 @@ pub fn remove_worktree_in(
         args.push("--force");
     }
 
-    let status = crate::external::git_command()
+    let output = crate::external::git_command()
         .args(&args)
         .current_dir(&main_dir)
-        .status()
+        .output()
         .context("Failed to run git worktree remove")?;
 
-    if !status.success() {
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
         bail!(
-            "git worktree remove failed. The worktree may have uncommitted changes; re-run with --force to discard them."
+            "git worktree remove failed. The worktree may have uncommitted changes; re-run with --force to discard them. ({stderr})"
         );
     }
 
