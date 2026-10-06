@@ -190,13 +190,10 @@ mod tests {
             while !ready.exists() && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(10));
             }
-            let signal = Command::new("sh")
-                .args(["-c", &format!("kill -INT -- -{}", child.id())])
-                .status()
-                .unwrap();
+            let signal = unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGINT) };
             let status = child.wait().unwrap();
             assert!(ready.exists());
-            assert!(signal.success());
+            assert_eq!(signal, 0);
             assert!(!status.success());
             let deadline = Instant::now() + Duration::from_secs(2);
             while !run.dir.join("result").exists() && Instant::now() < deadline {
