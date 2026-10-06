@@ -60,8 +60,15 @@ impl AgentProvider for Pi {
         }
     }
 
+    fn snapshot_session_ids(&self, project_root: &Path) -> HashSet<String> {
+        sessions_dir(project_root)
+            .map(|dir| collect_session_ids(&dir))
+            .unwrap_or_default()
+    }
+
     fn detect_session_id(&self, ctx: &DetectContext) -> Option<String> {
-        detect_session_id(ctx.project_root)
+        let dir = sessions_dir(ctx.project_root)?;
+        detect_session_id(&dir, ctx.before)
     }
 
     fn install_hooks(&self) -> anyhow::Result<()> {
@@ -73,13 +80,8 @@ impl AgentProvider for Pi {
     }
 }
 
-/// Detect a newly created Pi session UUID by scanning Pi's per-cwd session
-/// directory. Pi stores sessions under `<sessions_root>/--<cwd>--/` as
-/// `<timestamp>_<uuid>.jsonl`, where `<cwd>` has `/` replaced by `-`.
-fn detect_session_id(project_root: &Path) -> Option<String> {
-    let sessions_dir = sessions_dir(project_root)?;
-    let before = collect_session_ids(&sessions_dir);
-    poll_for_new_session_id(&before, || collect_session_ids(&sessions_dir))
+fn detect_session_id(dir: &Path, before: &HashSet<String>) -> Option<String> {
+    poll_for_new_session_id(before, || collect_session_ids(dir))
 }
 
 /// Resolve Pi's session directory for a given working directory.
@@ -140,6 +142,22 @@ fn parse_session_id_from_filename(file_name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_session_created_between_snapshot_and_polling() {
+        let dir = std::env::temp_dir().join(format!("bork-pi-snapshot-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let old = "019d76ad-9734-77c0-8169-a727a5524013";
+        let new = "019d76ad-9734-77c0-8169-a727a5524014";
+        fs::write(dir.join(format!("2026-04-10T11-16-21_{old}.jsonl")), "").unwrap();
+        let before = collect_session_ids(&dir);
+        fs::write(dir.join(format!("2026-04-10T11-16-22_{new}.jsonl")), "").unwrap();
+
+        let detected = detect_session_id(&dir, &before);
+        fs::remove_dir_all(dir).unwrap();
+        assert!(before.contains(old));
+        assert_eq!(detected.as_deref(), Some(new));
+    }
 
     #[test]
     fn pi_session_id_parsed_from_filename() {
