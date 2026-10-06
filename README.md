@@ -39,7 +39,10 @@ sudo ln -sf "$(pwd)/target/release/bork" /usr/local/bin/bork # Linux
 
 **2. Set up a project**
 
+`bork init` creates the project in the current directory, so run it from wherever you keep your projects, not from inside the bork checkout.
+
 ```bash
+cd ~/code                     # or wherever your projects live
 bork init owner/repo          # GitHub shorthand
 bork init git@github.com:owner/repo.git   # or SSH/HTTPS URL
 ```
