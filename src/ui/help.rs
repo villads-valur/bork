@@ -57,7 +57,7 @@ const SECTIONS: &[Section] = &[
         title: "Sessions",
         bindings: &[
             ("Enter", "Open session"),
-            ("Shift+Enter", "Start session"),
+            ("Shift+Enter", "Start session (or all marked)"),
             ("t", "Terminal"),
             ("x", "Kill session"),
         ],

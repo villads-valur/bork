@@ -2125,15 +2125,16 @@ fn run_tui() -> anyhow::Result<()> {
                                 )?;
                                 app.message = None;
                             }
-                            PostAction::LaunchAndOpenPopup {
-                                issue_id,
-                                popup_title,
+                            PostAction::Launch {
+                                launches,
                                 open_popup,
                             } => {
-                                pending_popup_for_launch.insert(
-                                    issue_id,
-                                    (app.active_project_id(), popup_title, open_popup),
-                                );
+                                for (issue_id, popup_title) in launches {
+                                    pending_popup_for_launch.insert(
+                                        issue_id,
+                                        (app.active_project_id(), popup_title, open_popup),
+                                    );
+                                }
                             }
                             PostAction::OpenEditor { initial_content } => {
                                 if let Some(edited) = open_external_editor(
