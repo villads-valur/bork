@@ -931,6 +931,32 @@ impl Project {
         });
         let removed = before - self.issues.len();
 
+        // A ReviewRequested tag is a one-time snapshot taken when the card was
+        // first imported. If that poll's authored-PR fetch came back empty
+        // for an unrelated reason (a `gh` hiccup, GitHub's search index
+        // lagging right after the PR was opened) while the review-requested
+        // fetch still matched it via `involves:`, a card for your own PR gets
+        // stuck tagged as someone else's review forever, sorting behind your
+        // real work. Reconcile it here whenever the PR's known author is you.
+        if let Some(me) = self.live.github_user.clone() {
+            let authors_by_number: HashMap<u32, &str> = self
+                .live
+                .pr_statuses_by_number
+                .iter()
+                .map(|(n, pr)| (*n, pr.author.as_str()))
+                .collect();
+            for issue in &mut self.issues {
+                if issue.primary_pr_import_source() != Some(PrImportSource::ReviewRequested) {
+                    continue;
+                }
+                for link in &mut issue.github_pr_links {
+                    if authors_by_number.get(&link.number) == Some(&me.as_str()) {
+                        link.import_source = Some(PrImportSource::Authored);
+                    }
+                }
+            }
+        }
+
         // Move review-requested issues to Done when no longer pending
         let now = unix_now();
         let mut completed = 0usize;
@@ -1048,7 +1074,17 @@ impl Project {
             }
             new_pr_numbers.insert(pr.number);
             let id = self.next_issue_id_after(new_issues.len() as u32);
-            new_issues.push(self.imported_pr_issue(id, pr, PrImportSource::ReviewRequested));
+            // `involves:` (used to fetch this list) also matches your own
+            // authored PRs; the dedup above normally lets the authored loop
+            // claim those first, but if that fetch came back empty this poll
+            // this loop sees them anyway. Don't mistag your own work as
+            // someone else's review just because of fetch ordering.
+            let source = if self.live.github_user.as_deref() == Some(pr.author.as_str()) {
+                PrImportSource::Authored
+            } else {
+                PrImportSource::ReviewRequested
+            };
+            new_issues.push(self.imported_pr_issue(id, pr, source));
         }
 
         let added = new_issues.len();
@@ -2985,6 +3021,50 @@ mod tests {
         assert_eq!(
             app.project().issues[0].primary_pr_import_source(),
             Some(PrImportSource::ReviewRequested)
+        );
+    }
+
+    #[test]
+    fn sync_prs_tags_own_pr_authored_even_via_involves_fetch() {
+        // `involves:` (behind review_requested_prs) also matches your own
+        // PRs. If the authored fetch came back empty this poll, the review
+        // loop must not tag your own work as someone else's review.
+        let mut app = test_app(vec![]);
+        app.project_mut().live.github_user = Some("testuser".into());
+        app.project_mut().live.review_requested_prs = vec![test_pr(7, "feature")];
+        app.project_mut().live.pr_poll_done = true;
+
+        assert!(app.project_mut().sync_prs_as_issues().0);
+        assert_eq!(
+            app.project().issues[0].primary_pr_import_source(),
+            Some(PrImportSource::Authored)
+        );
+    }
+
+    #[test]
+    fn sync_prs_reconciles_stale_review_tag_on_own_pr() {
+        // A card imported on a poll where the authored fetch missed this PR
+        // stays tagged ReviewRequested forever unless reconciled once the PR's
+        // real author is known.
+        let mut existing = test_issue("bork-1", Column::CodeReview);
+        existing.github_pr_links = vec![LinkedGithubPr {
+            number: 7,
+            imported: true,
+            import_source: Some(PrImportSource::ReviewRequested),
+        }];
+        let mut app = test_app(vec![existing]);
+        app.project_mut().live.github_user = Some("testuser".into());
+        app.project_mut()
+            .live
+            .pr_statuses_by_number
+            .insert(7, test_pr(7, "feature"));
+        app.project_mut().live.pr_poll_done = true;
+
+        app.project_mut().sync_prs_as_issues();
+
+        assert_eq!(
+            app.project().issues[0].primary_pr_import_source(),
+            Some(PrImportSource::Authored)
         );
     }
 
