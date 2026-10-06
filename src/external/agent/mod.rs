@@ -15,6 +15,7 @@ mod codex;
 mod cursor;
 mod opencode;
 mod pi;
+mod setup;
 
 /// Per-provider surface behind the agent registry. One implementor per
 /// harness; `provider()` maps `AgentKind` to the matching `&'static dyn`.
@@ -47,6 +48,11 @@ pub trait AgentProvider {
     /// (command, pre_assigned_session_id, prompt_contents), matching what
     /// `build_agent_cmd` historically returned.
     fn build_cmd(&self, ctx: &LaunchContext) -> (String, Option<String>, Option<String>);
+
+    /// Capture existing IDs before sending a fresh launch to tmux.
+    fn snapshot_session_ids(&self, _project_root: &Path) -> HashSet<String> {
+        HashSet::new()
+    }
 
     /// Detect the session id created by a fresh launch, if this harness needs
     /// post-launch detection (OpenCode/Codex/Pi). Claude pre-assigns instead.
@@ -93,8 +99,7 @@ impl LaunchContext<'_> {
 /// Context for post-launch session-id detection.
 pub struct DetectContext<'a> {
     pub project_root: &'a Path,
-    /// Session ids visible before launch (OpenCode uses this to adopt only a
-    /// genuinely new id).
+    /// Session ids visible before launch, excluded from post-launch detection.
     pub before: &'a HashSet<String>,
 }
 
@@ -196,22 +201,17 @@ pub fn launch_session(
         write_prompt_file(&prompt_path, contents)?;
     }
 
-    // Fresh sessions with a worktree run the configured setup script inside
-    // the worktree first; `&&` ensures the agent only starts if it succeeds
-    // and its output stays visible in the agent window.
-    let setup = setup_prefix(issue, config);
-    let setup_ran = setup.is_some();
-    let agent_cmd = match setup {
-        Some(prefix) => format!("{} && {}", prefix, agent_cmd),
+    let setup = setup_prefix(issue, config)
+        .map(|prefix| setup::SetupRun::prepare(&status_dir, &prefix))
+        .transpose()?;
+    let agent_cmd = match &setup {
+        Some(run) => format!("{} && {}", run.command(), agent_cmd),
         None => agent_cmd,
     };
 
-    // Snapshot opencode's visible sessions before the agent starts, so the
-    // post-launch detector only ever adopts a genuinely new id — the newest
-    // global session could belong to any concurrent opencode run. (OpenCode
-    // never pre-assigns an id, so agent kind alone gates the snapshot.)
-    let opencode_before = if issue.agent_kind == AgentKind::OpenCode {
-        opencode::list_session_ids()
+    let provider = provider(issue.agent_kind);
+    let before = if pre_assigned_session_id.is_none() {
+        provider.snapshot_session_ids(&config.project_root)
     } else {
         HashSet::new()
     };
@@ -221,16 +221,20 @@ pub fn launch_session(
     // Second window: bare terminal for ad-hoc commands
     tmux::create_window(&session_name, "terminal", cwd)?;
 
+    if let Some(run) = &setup {
+        run.wait(|| tmux::is_pane_alive(&session_name))?;
+    }
+
     // For OpenCode/Codex/Pi, detect session IDs after launch.
     let agent_session_id = match pre_assigned_session_id {
         Some(id) => Some(id),
-        None => provider(issue.agent_kind).detect_session_id(&DetectContext {
+        None => provider.detect_session_id(&DetectContext {
             project_root: &config.project_root,
-            before: &opencode_before,
+            before: &before,
         }),
     };
 
-    Ok((session_name, agent_session_id, setup_ran))
+    Ok((session_name, agent_session_id, setup.is_some()))
 }
 
 /// Kill an issue's tmux session and remove its transient hook/prompt files.
@@ -309,7 +313,7 @@ fn write_prompt_file(path: &Path, contents: &str) -> Result<(), AppError> {
 
 /// Build the agent launch command and return
 /// (command, pre_assigned_session_id, prompt_contents).
-/// For Claude, pre-assigns a UUID and returns it. For OpenCode, returns None (ID detected post-launch).
+/// Claude pre-assigns fresh IDs; resume commands return the stored ID.
 /// `prompt_contents` is `Some` for fresh sessions (staged to a file by the
 /// caller) and `None` for resume sessions, which carry no prompt.
 fn build_agent_cmd(
@@ -1285,16 +1289,18 @@ mod tests {
         assert!(cmd.contains("opencode --session 'ses_abc123'"));
         assert!(cmd.contains("--agent plan"));
         assert!(!cmd.contains("--prompt"));
-        assert!(sid.is_none());
+        assert_eq!(sid.as_deref(), Some("ses_abc123"));
     }
 
     #[test]
     fn opencode_resume_build() {
         let issue = resumable_issue(AgentKind::OpenCode, AgentMode::Build, "ses_abc123");
         let config = test_config();
-        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let (cmd, sid, prompt) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         assert!(cmd.contains("opencode --session 'ses_abc123'"));
         assert!(!cmd.contains("--agent plan"));
+        assert_eq!(sid.as_deref(), Some("ses_abc123"));
+        assert!(prompt.is_none());
     }
 
     // --- Claude ---

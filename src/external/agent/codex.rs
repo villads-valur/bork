@@ -59,8 +59,15 @@ impl AgentProvider for Codex {
         }
     }
 
-    fn detect_session_id(&self, _ctx: &DetectContext) -> Option<String> {
-        detect_session_id()
+    fn snapshot_session_ids(&self, _project_root: &Path) -> HashSet<String> {
+        sessions_root()
+            .map(|root| collect_session_ids(&root))
+            .unwrap_or_default()
+    }
+
+    fn detect_session_id(&self, ctx: &DetectContext) -> Option<String> {
+        let root = sessions_root()?;
+        detect_session_id(&root, ctx.before)
     }
 
     fn install_hooks(&self) -> anyhow::Result<()> {
@@ -77,11 +84,8 @@ pub(super) fn sessions_root() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".codex").join("sessions"))
 }
 
-/// Detect a newly created Codex session UUID by scanning ~/.codex/sessions.
-fn detect_session_id() -> Option<String> {
-    let sessions_root = sessions_root()?;
-    let before = collect_session_ids(&sessions_root);
-    poll_for_new_session_id(&before, || collect_session_ids(&sessions_root))
+fn detect_session_id(root: &Path, before: &HashSet<String>) -> Option<String> {
+    poll_for_new_session_id(before, || collect_session_ids(root))
 }
 
 /// Collect all Codex session IDs.
@@ -128,6 +132,30 @@ fn parse_session_id_from_filename(file_name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_session_created_between_snapshot_and_polling() {
+        let root = std::env::temp_dir().join(format!("bork-codex-snapshot-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let old = "019d76ad-9734-77c0-8169-a727a5524013";
+        let new = "019d76ad-9734-77c0-8169-a727a5524014";
+        fs::write(
+            root.join(format!("rollout-2026-04-10T11-16-21-{old}.jsonl")),
+            "",
+        )
+        .unwrap();
+        let before = collect_session_ids(&root);
+        fs::write(
+            root.join(format!("rollout-2026-04-10T11-16-22-{new}.jsonl")),
+            "",
+        )
+        .unwrap();
+
+        let detected = detect_session_id(&root, &before);
+        fs::remove_dir_all(root).unwrap();
+        assert!(before.contains(old));
+        assert_eq!(detected.as_deref(), Some(new));
+    }
 
     #[test]
     fn parse_codex_session_id_from_filename_extracts_uuid() {
