@@ -17,7 +17,7 @@ mod ui;
 mod update;
 mod worktree;
 
-/// Serializes tests (global_config, init) that mutate the process-global
+/// Serializes tests that mutate or write through the process-global
 /// `XDG_CONFIG_HOME`. One lock per module would not exclude the other
 /// module's tests, so the env races and the assertions flake.
 #[cfg(test)]
