@@ -9,13 +9,12 @@ pub struct AgentSelection {
     pub default_agent: Option<AgentKind>,
 }
 
-/// Resolve the available agent set + default from the layered config.
-///
-/// `project_root` is optional so this can run before a project has been
-/// chosen (e.g. cold startup with no `.bork/`). When provided, the project's
-/// allowlist and default override the global one.
-pub fn resolve_agent_selection(project_root: Option<&Path>) -> AgentSelection {
-    let prefs = load_layered_prefs(project_root);
+/// Resolve installed agents using the project's merged configuration.
+pub fn resolve_agent_selection(config: &config::AppConfig) -> AgentSelection {
+    let prefs = AgentPreferences {
+        enabled: config.agents_allowlist.clone(),
+        default_agent: Some(config.agent_kind),
+    };
     let installed: Vec<AgentKind> = AgentKind::ALL
         .into_iter()
         .filter(|kind| command_exists(kind.command()))
@@ -27,25 +26,6 @@ pub fn resolve_agent_selection(project_root: Option<&Path>) -> AgentSelection {
 struct AgentPreferences {
     enabled: Option<Vec<AgentKind>>,
     default_agent: Option<AgentKind>,
-}
-
-/// Read the layered config and project the agent-relevant fields out of it.
-/// `load_config_from` already handles the global + project merge, so we just
-/// pick what we need; for the no-project case we read the global layer alone.
-fn load_layered_prefs(project_root: Option<&Path>) -> AgentPreferences {
-    if let Some(root) = project_root {
-        let merged = config::load_config_from(root);
-        return AgentPreferences {
-            enabled: merged.agents_allowlist,
-            default_agent: Some(merged.agent_kind),
-        };
-    }
-
-    let global = config::load_global_partial();
-    AgentPreferences {
-        enabled: global.agents_allowlist,
-        default_agent: global.agent_kind,
-    }
 }
 
 /// In-process `which`: scan $PATH for an executable file. Avoids spawning a
