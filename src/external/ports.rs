@@ -11,7 +11,7 @@ pub struct PortPollResult {
 ///
 /// Strategy:
 /// 1. `tmux list-panes -a` to get all pane PIDs grouped by session
-/// 2. `lsof -iTCP -sTCP:LISTEN -P -n -F pn` to get all listening ports with PIDs
+/// 2. `lsof -iTCP -sTCP:LISTEN -P -n -F pcn` to get listening ports with PIDs and commands
 /// 3. `ps -eo pid,ppid` to build a process parent map
 /// 4. For each listening port PID, walk the parent chain to match a tmux pane PID
 pub fn poll_listening_ports(sessions: &HashSet<String>) -> HashMap<String, Vec<u16>> {
@@ -125,7 +125,7 @@ fn list_all_pane_pids(sessions: &HashSet<String>) -> HashMap<String, Vec<u32>> {
 /// Uses -F (field output) for reliable parsing.
 fn lsof_listening_ports() -> Vec<(u32, u16)> {
     let output = Command::new("lsof")
-        .args(["-iTCP", "-sTCP:LISTEN", "-P", "-n", "-F", "pn"])
+        .args(["-iTCP", "-sTCP:LISTEN", "-P", "-n", "-F", "pcn"])
         .output();
 
     let Ok(output) = output else {
@@ -138,9 +138,10 @@ fn lsof_listening_ports() -> Vec<(u32, u16)> {
     parse_lsof_field_output(&String::from_utf8_lossy(&output.stdout))
 }
 
-/// Parse lsof -F pn output.
+/// Parse lsof -F pcn output, excluding Codex's own internal listeners.
 /// Format:
 ///   p<pid>         (process ID line)
+///   c<command>     (process command name)
 ///   n<name>        (network name line, e.g. "*:3000" or "127.0.0.1:8080")
 ///
 /// We pair each 'n' line with the most recent 'p' line.
@@ -151,6 +152,11 @@ fn parse_lsof_field_output(output: &str) -> Vec<(u32, u16)> {
     for line in output.lines() {
         if let Some(pid_str) = line.strip_prefix('p') {
             current_pid = pid_str.parse().ok();
+        } else if let Some(command) = line.strip_prefix('c') {
+            // Filter only the listener owner; dev servers launched by Codex still count.
+            if command == "codex" {
+                current_pid = None;
+            }
         } else if let Some(name) = line.strip_prefix('n') {
             let Some(pid) = current_pid else {
                 continue;
@@ -227,6 +233,32 @@ mod tests {
     #[test]
     fn parse_lsof_empty() {
         assert!(parse_lsof_field_output("").is_empty());
+    }
+
+    #[test]
+    fn parse_lsof_ignores_codex_listeners_but_keeps_dev_servers() {
+        let output = "p100\nccodex\nf39\nn127.0.0.1:59346\nf40\nn[::1]:59346\n\
+                      p200\ncnode\nf10\nn*:3000\n\
+                      p300\nccodex\nf39\nn127.0.0.1:58835\n\
+                      p400\ncpython3\nf5\nn127.0.0.1:8000\n";
+        let listening = parse_lsof_field_output(output);
+        assert_eq!(listening, vec![(200, 3000), (400, 8000)]);
+
+        let pane_pids = [10].into();
+        let pid_to_session = [(10, "bork-bork-192".to_string())].into();
+        let parent_map = [(100, 10), (200, 100), (400, 10)].into();
+        for (pid, _) in listening {
+            assert_eq!(
+                find_ancestor_session(pid, &pane_pids, &pid_to_session, &parent_map),
+                Some("bork-bork-192".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn parse_lsof_resets_command_at_next_process() {
+        let output = "p100\nccodex\nn127.0.0.1:59346\np200\nn*:3000\n";
+        assert_eq!(parse_lsof_field_output(output), vec![(200, 3000)]);
     }
 
     #[test]
