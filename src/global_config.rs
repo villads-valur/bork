@@ -43,14 +43,14 @@ fn global_config_path() -> PathBuf {
 }
 
 pub fn load_global_config() -> GlobalConfig {
-    let path = global_config_path();
-    if !path.exists() {
-        return GlobalConfig::default();
-    }
-    let Ok(contents) = fs::read_to_string(&path) else {
-        return GlobalConfig::default();
-    };
-    serde_json::from_str(&contents).unwrap_or_default()
+    read_global_config().unwrap_or_default()
+}
+
+/// `None` when the registry is missing or unreadable, so callers can tell
+/// "no projects" apart from "couldn't read the file".
+fn read_global_config() -> Option<GlobalConfig> {
+    let contents = fs::read_to_string(global_config_path()).ok()?;
+    serde_json::from_str(&contents).ok()
 }
 
 pub fn save_global_config(config: &GlobalConfig) -> anyhow::Result<()> {
@@ -164,19 +164,35 @@ pub fn list_projects() -> Vec<ProjectEntry> {
     load_global_config().projects
 }
 
+#[derive(Default)]
 pub struct ReloadResult {
     pub new_projects: Vec<(AppConfig, AppState)>,
+    /// Loaded projects that are no longer in the registry (deleted or unregistered).
+    pub removed_projects: Vec<ProjectId>,
+}
+
+impl ReloadResult {
+    pub fn is_empty(&self) -> bool {
+        self.new_projects.is_empty() && self.removed_projects.is_empty()
+    }
 }
 
 pub fn discover_new_projects(known_roots: HashSet<ProjectId>) -> ReloadResult {
     prune_stale_projects();
 
+    // A bad read must not look like every project was unregistered.
+    let Some(config) = read_global_config() else {
+        return ReloadResult::default();
+    };
+
     let mut new_projects = Vec::new();
-    for entry in &load_global_config().projects {
+    let mut registered_roots = HashSet::new();
+    for entry in &config.projects {
         if !entry.path.join(".bork").join("config.toml").exists() {
             continue;
         }
-        let canonical = fs::canonicalize(&entry.path).unwrap_or_else(|_| entry.path.clone());
+        let canonical = normalize_path(&entry.path);
+        registered_roots.insert(canonical.clone());
         if known_roots.contains(&canonical) {
             continue;
         }
@@ -185,7 +201,15 @@ pub fn discover_new_projects(known_roots: HashSet<ProjectId>) -> ReloadResult {
         new_projects.push((proj_config, proj_state));
     }
 
-    ReloadResult { new_projects }
+    let removed_projects = known_roots
+        .into_iter()
+        .filter(|root| !registered_roots.contains(root))
+        .collect();
+
+    ReloadResult {
+        new_projects,
+        removed_projects,
+    }
 }
 
 #[cfg(test)]
@@ -227,6 +251,35 @@ mod tests {
         with_temp_config("empty", || {
             let config = load_global_config();
             assert!(config.projects.is_empty());
+        });
+    }
+
+    #[test]
+    fn discover_unreadable_registry_removes_nothing() {
+        with_temp_config("unreadable", || {
+            fs::create_dir_all(global_config_dir()).unwrap();
+            fs::write(global_config_path(), "{ not json").unwrap();
+
+            let known = HashSet::from([PathBuf::from("/some/project")]);
+            let result = discover_new_projects(known);
+            assert!(result.removed_projects.is_empty());
+        });
+    }
+
+    #[test]
+    fn discover_reports_unregistered_known_project() {
+        with_temp_config("discover-removed", || {
+            let dir = make_temp_dir("discover-removed");
+            fs::create_dir_all(dir.join(".bork")).unwrap();
+            fs::write(dir.join(".bork").join("config.toml"), "").unwrap();
+            register_project("kept", &dir).unwrap();
+
+            let kept = fs::canonicalize(&dir).unwrap();
+            let gone = PathBuf::from("/deleted/project");
+            let result = discover_new_projects(HashSet::from([kept, gone.clone()]));
+            assert_eq!(result.removed_projects, vec![gone]);
+            assert!(result.new_projects.is_empty());
+            let _ = fs::remove_dir_all(&dir);
         });
     }
 

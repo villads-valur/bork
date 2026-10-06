@@ -1702,12 +1702,48 @@ impl App {
     }
 
     pub fn apply_reload_result(&mut self, result: crate::global_config::ReloadResult) {
+        self.remove_projects(&result.removed_projects);
         for (config, state) in result.new_projects {
             self.add_background_project(config, state);
         }
         if self.projects.len() > 1 && self.sidebar.is_none() {
             self.enable_sidebar();
         }
+    }
+
+    /// Drops projects that left the registry. The focused project is kept so
+    /// the board always has something to show.
+    fn remove_projects(&mut self, ids: &[ProjectId]) {
+        let to_remove: HashSet<&ProjectId> = ids
+            .iter()
+            .filter(|id| **id != self.focused_project)
+            .collect();
+        // Selection and focused lane are indices, so remember what they point
+        // at and re-find it after the lists shrink.
+        let active_id = self.active_project_id();
+        let selected_id = self
+            .sidebar
+            .as_ref()
+            .and_then(|sidebar| self.projects.get(sidebar.selected))
+            .map(|p| p.id());
+
+        self.projects.retain(|p| !to_remove.contains(&p.id()));
+
+        let selected = selected_id
+            .and_then(|id| self.projects.iter().position(|p| p.id() == id))
+            .unwrap_or(0);
+        if let Some(ref mut sidebar) = self.sidebar {
+            sidebar.swimlanes.retain(|id| !to_remove.contains(id));
+            if sidebar.swimlanes.is_empty() {
+                sidebar.swimlanes.push(self.focused_project.clone());
+            }
+            sidebar.selected = selected;
+        }
+        self.focused_swimlane = self
+            .visible_swimlanes()
+            .iter()
+            .position(|id| *id == active_id)
+            .unwrap_or(0);
     }
 
     pub fn find_project(&self, id: &ProjectId) -> Option<&Project> {
@@ -5614,6 +5650,7 @@ mod tests {
 
         let result = crate::global_config::ReloadResult {
             new_projects: vec![(test_config_named("beta"), AppState::default())],
+            ..Default::default()
         };
         app.apply_reload_result(result);
 
@@ -5625,9 +5662,7 @@ mod tests {
     #[test]
     fn apply_reload_empty_is_noop() {
         let mut app = test_app(vec![]);
-        let result = crate::global_config::ReloadResult {
-            new_projects: vec![],
-        };
+        let result = crate::global_config::ReloadResult::default();
         app.apply_reload_result(result);
 
         assert_eq!(app.projects.len(), 1);
@@ -5641,9 +5676,7 @@ mod tests {
         app.sidebar.as_mut().unwrap().swimlanes = vec![app.projects[0].id(), beta_id.clone()];
         app.sidebar.as_mut().unwrap().selected = 1;
 
-        let result = crate::global_config::ReloadResult {
-            new_projects: vec![],
-        };
+        let result = crate::global_config::ReloadResult::default();
         app.apply_reload_result(result);
 
         let sidebar = app.sidebar.as_ref().unwrap();
@@ -5662,6 +5695,7 @@ mod tests {
                 (test_config_named("beta"), AppState::default()),
                 (test_config_named("gamma"), AppState::default()),
             ],
+            ..Default::default()
         };
         app.apply_reload_result(result);
 
@@ -5675,16 +5709,80 @@ mod tests {
 
         let result1 = crate::global_config::ReloadResult {
             new_projects: vec![(test_config_named("beta"), AppState::default())],
+            ..Default::default()
         };
         app.apply_reload_result(result1);
         assert_eq!(app.projects.len(), 2);
 
         let result2 = crate::global_config::ReloadResult {
             new_projects: vec![(test_config_named("gamma"), AppState::default())],
+            ..Default::default()
         };
         app.apply_reload_result(result2);
         assert_eq!(app.projects.len(), 3);
         assert_eq!(app.projects[2].config.project_name, "gamma");
+    }
+
+    #[test]
+    fn apply_reload_removes_unregistered_projects() {
+        let mut app = test_multi_app();
+        let alpha_id = app.projects[0].id();
+        let beta_id = app.projects[1].id();
+        let sidebar = app.sidebar.as_mut().unwrap();
+        sidebar.swimlanes = vec![alpha_id.clone(), beta_id.clone()];
+        sidebar.selected = 2;
+        app.focused_swimlane = 1;
+
+        let result = crate::global_config::ReloadResult {
+            new_projects: vec![],
+            removed_projects: vec![beta_id.clone()],
+        };
+        app.apply_reload_result(result);
+
+        assert_eq!(app.projects.len(), 2);
+        assert!(app.find_project(&beta_id).is_none());
+        let sidebar = app.sidebar.as_ref().unwrap();
+        assert_eq!(sidebar.swimlanes, vec![alpha_id]);
+        assert_eq!(sidebar.selected, 1);
+        assert_eq!(app.focused_swimlane, 0);
+    }
+
+    #[test]
+    fn apply_reload_keeps_selection_on_same_project() {
+        let mut app = test_multi_app();
+        let alpha_id = app.projects[0].id();
+        let beta_id = app.projects[1].id();
+        let gamma_id = app.projects[2].id();
+        app.focused_project = gamma_id.clone();
+        let sidebar = app.sidebar.as_mut().unwrap();
+        sidebar.swimlanes = vec![alpha_id.clone(), beta_id.clone(), gamma_id.clone()];
+        sidebar.selected = 1;
+        app.focused_swimlane = 1;
+
+        let result = crate::global_config::ReloadResult {
+            removed_projects: vec![alpha_id],
+            ..Default::default()
+        };
+        app.apply_reload_result(result);
+
+        assert_eq!(app.sidebar.as_ref().unwrap().selected, 0);
+        assert_eq!(app.focused_swimlane, 0);
+        assert_eq!(app.active_project_id(), beta_id);
+    }
+
+    #[test]
+    fn apply_reload_keeps_focused_project() {
+        let mut app = test_multi_app();
+        let alpha_id = app.focused_project.clone();
+
+        let result = crate::global_config::ReloadResult {
+            new_projects: vec![],
+            removed_projects: vec![alpha_id.clone()],
+        };
+        app.apply_reload_result(result);
+
+        assert_eq!(app.projects.len(), 3);
+        assert!(app.find_project(&alpha_id).is_some());
     }
 
     // ---------------------------------------------------------------

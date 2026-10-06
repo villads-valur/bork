@@ -2485,7 +2485,7 @@ fn run_tui() -> anyhow::Result<()> {
         }
 
         while let Ok(result) = reload_rx.try_recv() {
-            if !result.new_projects.is_empty() {
+            if !result.is_empty() {
                 app.apply_reload_result(result);
                 needs_redraw = true;
             }
