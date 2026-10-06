@@ -1,10 +1,14 @@
 use std::collections::HashSet;
+use std::path::Path;
 use std::process::Command;
 
 use crate::external::hooks;
 use crate::types::AgentMode;
 
-use super::{shell_escape_single_quotes, AgentProvider, DetectContext, LaunchContext};
+use super::{
+    poll_for_new_session_id, shell_escape_single_quotes, AgentProvider, DetectContext,
+    LaunchContext,
+};
 
 pub struct OpenCode;
 
@@ -45,7 +49,7 @@ impl AgentProvider for OpenCode {
                 "{} && opencode --session '{}'{}",
                 ctx.env_prefix, escaped_sid, ctx.trailing,
             );
-            (cmd, None, None)
+            (cmd, Some(sid.to_string()), None)
         } else {
             let cmd = format!(
                 "{} && opencode --prompt {}{}{}",
@@ -55,8 +59,12 @@ impl AgentProvider for OpenCode {
         }
     }
 
+    fn snapshot_session_ids(&self, _project_root: &Path) -> HashSet<String> {
+        list_session_ids()
+    }
+
     fn detect_session_id(&self, ctx: &DetectContext) -> Option<String> {
-        detect_session_id(ctx.before)
+        poll_for_new_session_id(ctx.before, list_session_ids)
     }
 
     fn install_hooks(&self) -> anyhow::Result<()> {
@@ -66,26 +74,6 @@ impl AgentProvider for OpenCode {
     fn uninstall_hooks(&self) -> anyhow::Result<()> {
         hooks::uninstall_opencode_plugin()
     }
-}
-
-/// Poll `opencode session list` until an id appears that wasn't in the
-/// pre-launch snapshot. Returns it if found within ~5 seconds, otherwise
-/// None — the newest global session could belong to any concurrent
-/// opencode run, so only a genuinely new id is trusted.
-fn detect_session_id(before: &HashSet<String>) -> Option<String> {
-    // Give OpenCode a moment to create its session before polling
-    std::thread::sleep(std::time::Duration::from_millis(800));
-
-    for _ in 0..9 {
-        if let Some(sid) = list_session_ids()
-            .into_iter()
-            .find(|id| !before.contains(id))
-        {
-            return Some(sid);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
-    None
 }
 
 /// Run `opencode session list` and return every session ID found.

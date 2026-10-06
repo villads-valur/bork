@@ -310,14 +310,103 @@ Bork uses a single config schema in two layered locations. Project values overri
 - Global: `~/.config/bork/config.toml` — defaults that apply to every project.
 - Project: `<project>/.bork/config.toml` — per-project overrides.
 
+`<project>` is the container directory containing `main/` and your issue worktrees. If `XDG_CONFIG_HOME` is set, the global file lives at `$XDG_CONFIG_HOME/bork/config.toml` instead.
+
+Jump to [default agent and mode](#default-agent-and-mode), [available agents](#choose-which-agents-a-project-can-use), [default launch flags](#default-flags-for-agent-launches), or [worktree scripts](#worktree-setup--teardown-scripts).
+
+### Common Configuration Examples
+
+#### Default Agent and Mode
+
+Run these commands from anywhere inside your bork project:
+
+```bash
+# Defaults for all projects.
+bork config set agent_kind claude --global
+bork config set agent_mode build --global
+
+# Override the defaults for this project.
+bork config set agent_kind opencode
+bork config set agent_mode plan
+
+# Check the effective settings after merging both files.
+bork config get agent_kind
+bork config get agent_mode
+```
+
+The equivalent project config is:
+
 ```toml
-# All keys are optional. The same flat schema is accepted in both files.
+default_agent = "opencode"
+default_mode = "plan"
+```
+
+In config files, `default_agent` and `default_mode` are aliases for `agent_kind` and `agent_mode`. The CLI requires `agent_kind` and `agent_mode`. Use one spelling for each setting in a file; if both appear, `agent_kind` and `agent_mode` take precedence.
+
+These defaults apply to new issues. Existing issues keep their saved agent and mode. Override either when creating an issue, or update an existing one:
+
+```bash
+bork issue create "Investigate slow startup" --agent claude --mode plan
+bork issue update myproject-1 --agent claude --mode build
+```
+
+#### Choose Which Agents a Project Can Use
+
+Edit `<project>/.bork/config.toml` to offer only Claude and OpenCode in that project's agent picker, with Claude selected by default:
+
+```toml
+agents = ["claude", "opencode"]
+default_agent = "claude"
+```
+
+Use the same keys in the global file to set your usual list. A project's `agents` list replaces the whole global list, so a project can include an agent excluded globally. The list controls picker choices, not a restriction on explicit CLI `--agent` overrides.
+
+Supported names are `opencode`, `claude`, `codex`, `pi`, and `cursor`. Only installed executables on `PATH` appear in the picker, with the default agent first and the remaining entries in configured order. If the default agent is unavailable or excluded, the picker selects the first available entry. With no `agents` setting in either file, bork detects all installed agents. An empty list (`agents = []`) leaves the picker with no agents.
+
+#### Default Flags for Agent Launches
+
+Edit `~/.config/bork/config.toml` to append flags whenever bork launches that agent, in any mode:
+
+```toml
+[agent.claude]
+args = ["--verbose"]
+```
+
+Each flag and its value must be separate array entries. For example, a mode-specific override for Claude looks like this:
+
+```toml
+[agent.claude.mode.plan]
+args = ["--permission-mode", "plan"]
+```
+
+`agent.<name>.args` adds to bork's mode flags. `agent.<name>.mode.<mode>.args` **replaces** the built-in flags for that mode; the agent's general `args` still apply afterward. Modes are `plan`, `build`, and `yolo`.
+
+To turn off inherited extra flags for one project, put this in `<project>/.bork/config.toml`:
+
+```toml
+[agent.claude]
+args = []
+```
+
+Lists replace each other per key; they are not combined. Clearing the general `args` does not clear a separate mode override. Set that mode's `args = []` to suppress its mode flags, or remove the override from both files to restore bork's built-in flags.
+
+Flags apply when bork launches or resumes an agent process, including sessions for existing issues. They do not change an already-running process. Each argument is shell-escaped individually, so a value containing spaces stays one argument.
+
+Agent lists and launch args must be edited in the config files; `bork config set` supports only the scalar keys shown by `bork config list`. Keep top-level settings such as `default_agent` above any `[agent.*]` section headers. Alternatively, use dotted keys at the top level:
+
+```toml
+agent.claude.args = ["--verbose"]
+agent.claude.mode.plan.args = ["--permission-mode", "plan"]
+```
+
+### Configuration Reference
+
+```toml
+# All keys are optional. The same schema is accepted in both files.
 project_name     = "myproject"                       # project file only
 agent_kind       = "opencode"                        # default agent for this project
-default_agent    = "claude"                          # alias for agent_kind, more natural in the global file
 agent_mode       = "plan"                            # default mode (plan/build/yolo) for new issues when --mode is omitted
-default_mode     = "plan"                             # alias for agent_mode, more natural in the global file
-agents           = ["opencode", "claude", "codex", "pi"]   # allowed agent picker entries (order matters)
+agents           = ["opencode", "claude", "codex", "pi", "cursor"]   # allowed agent picker entries (order matters)
 default_prompt   = "Check AGENTS.md for project context and start working on the issue."
 review_prompt    = "Read the diff and summarize findings."  # body for auto-imported review-requested PRs (bork prepends the PR number + link)
 orchestrator_prompt = "Coordinate the work across issues." # body for orchestrator issues (bork appends the planning file path)
@@ -331,22 +420,22 @@ debug            = false                             # enable debug-only keybind
 
 Set `auto_import_reviews = false` (or `auto_import_authored_prs = false`) on a throwaway clone of a repo where you don't want to be pestered by PRs. Existing imported issues keep their lifecycle (completed reviews still move to Done); only new auto-imports stop. Manual import from the PR picker still works.
 
-Resolution order (highest wins): built-in defaults → `~/.config/bork/config.toml` → `<project>/.bork/config.toml` → CLI flags.
+Resolution order (later values win): built-in defaults → `~/.config/bork/config.toml` → `<project>/.bork/config.toml` → CLI flags.
 
-You can also read and write these keys from the CLI without editing files by hand:
+You can also read and write scalar settings from the CLI:
 
 ```bash
-bork config list                              # show all resolved values
+bork config list                              # show resolved scalar settings
 bork config get auto_import_reviews           # print a single resolved value
 bork config set auto_import_reviews false     # write to <project>/.bork/config.toml
-bork config set default_agent claude --global # write to ~/.config/bork/config.toml
+bork config set agent_kind claude --global # write to ~/.config/bork/config.toml
 ```
 
-A running TUI picks up project config changes within ~2 seconds.
+A running TUI picks up project config changes within ~2 seconds. Restart bork after changing global defaults or the agent picker list.
 
 ### Worktree Setup & Teardown Scripts
 
-Fresh git worktrees are bare checkouts: no installed dependencies, no untracked config like `.env`. `setup_script` fixes that. When an agent session is launched for an issue with a worktree, the script runs inside that worktree first, chained with `&&` so the agent only starts if setup succeeds. Output is visible in the agent's tmux window. Resumed sessions skip it.
+Fresh git worktrees are bare checkouts: no installed dependencies, no untracked config like `.env`. `setup_script` fixes that. When an agent session is launched for an issue with a worktree, the script runs inside that worktree first, chained with `&&` so the agent only starts if setup succeeds. Output is visible in the agent's tmux window. Bork waits for the script's exit status before recording setup as complete. A failed or interrupted setup is reported as an error and is retried when the session is recreated. Once setup succeeds, subsequent launches for that worktree skip it.
 
 `teardown_script` is the mirror hook: `bork issue archive <id>` runs it inside the worktree before removal, for cleanup that `git worktree remove` can't do (stopping services, dropping per-worktree databases). A failing teardown aborts the archive unless `--force` is passed.
 
@@ -357,38 +446,11 @@ teardown_script = "docker compose down"
 
 Both keys accept a single shell command line and can live in either config layer. Scripts should be idempotent — setup may run again if a session is recreated for an existing worktree.
 
-### Agent Picker
+### Agent Configuration Notes
 
-The new/edit issue dialog includes an Agent field that lets you pick which coding agent to use per issue. Only agents that are actually installed on your system appear in the picker. When a single agent is installed, the field is hidden.
+The new/edit issue dialog hides the Agent field when only one agent is available. Pi has a single mode and no built-in mode flags; its general launch args still apply, and mode overrides can supply additional flags.
 
-`agents` and `default_agent` (or `agent_kind`) are both optional. Without them, bork auto-detects every installed agent via `which`. A project-level `agents = [...]` overrides the global allowlist for that project, useful for locking a team to a specific agent.
-
-> Note: `~/.config/bork/agents.toml` from earlier versions is no longer read. Move its keys into `~/.config/bork/config.toml`.
-
-### Agent Launch Args
-
-Per-agent invocation args can be customized in either layer. Useful for flags bork doesn't know about, or for replacing the built-in mode flags entirely.
-
-```toml
-# Always append `--verbose` to every Claude invocation.
-[agent.claude]
-args = ["--verbose"]
-
-# Replace bork's built-in "plan" mode flags for Claude. Set to `[]` to
-# launch without any mode flags.
-[agent.claude.mode.plan]
-args = ["--dangerously-skip-permissions"]
-
-# Dotted-key form is also supported, equivalent to a section header.
-agent.codex.mode.yolo.args = ["--dangerously-bypass-approvals-and-sandbox"]
-```
-
-Semantics:
-- `[agent.<name>].args` are always appended after bork's own flags.
-- `[agent.<name>.mode.<mode>].args` *replace* bork's built-in flags for that agent/mode. Omit the key to keep the defaults; set to `[]` to launch with no mode flags.
-- Pi has a single mode and no built-in mode flags, so `[agent.pi]` args always apply; `[agent.pi.mode.<mode>]` keys are effectively a way to inject extra flags (e.g. a plan-mode extension via `--extension`).
-- Project config overrides global config per key.
-- Each configured arg is shell-escaped individually, so values containing spaces or quotes are passed through safely.
+`~/.config/bork/agents.toml` from earlier versions is no longer read. Move its `agents` and `default_agent` keys into `~/.config/bork/config.toml`.
 
 ### State
 

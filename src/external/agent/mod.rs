@@ -15,6 +15,7 @@ mod codex;
 mod cursor;
 mod opencode;
 mod pi;
+mod setup;
 
 /// Per-provider surface behind the agent registry. One implementor per
 /// harness; `provider()` maps `AgentKind` to the matching `&'static dyn`.
@@ -48,6 +49,11 @@ pub trait AgentProvider {
     /// `build_agent_cmd` historically returned.
     fn build_cmd(&self, ctx: &LaunchContext) -> (String, Option<String>, Option<String>);
 
+    /// Capture existing IDs before sending a fresh launch to tmux.
+    fn snapshot_session_ids(&self, _project_root: &Path) -> HashSet<String> {
+        HashSet::new()
+    }
+
     /// Detect the session id created by a fresh launch, if this harness needs
     /// post-launch detection (OpenCode/Codex/Pi). Claude pre-assigns instead.
     fn detect_session_id(&self, _ctx: &DetectContext) -> Option<String> {
@@ -67,9 +73,11 @@ pub trait AgentProvider {
 }
 
 /// Everything a provider needs to assemble its launch/resume command, computed
-/// once by `build_agent_cmd` so the provider bodies stay pure string assembly.
+/// once by `build_agent_cmd`, including the cwd for pre-launch session creation.
 pub struct LaunchContext<'a> {
     pub issue: &'a Issue,
+    /// The tmux launch cwd, also used when minting workspace-scoped chat ids.
+    pub project_root: &'a Path,
     /// `export BORK_SESSION=... BORK_STATUS_DIR=... BORK_ISSUE_ID=...`
     pub env_prefix: &'a str,
     /// Trailing args (leading space when non-empty).
@@ -93,8 +101,7 @@ impl LaunchContext<'_> {
 /// Context for post-launch session-id detection.
 pub struct DetectContext<'a> {
     pub project_root: &'a Path,
-    /// Session ids visible before launch (OpenCode uses this to adopt only a
-    /// genuinely new id).
+    /// Session ids visible before launch, excluded from post-launch detection.
     pub before: &'a HashSet<String>,
 }
 
@@ -196,22 +203,17 @@ pub fn launch_session(
         write_prompt_file(&prompt_path, contents)?;
     }
 
-    // Fresh sessions with a worktree run the configured setup script inside
-    // the worktree first; `&&` ensures the agent only starts if it succeeds
-    // and its output stays visible in the agent window.
-    let setup = setup_prefix(issue, config);
-    let setup_ran = setup.is_some();
-    let agent_cmd = match setup {
-        Some(prefix) => format!("{} && {}", prefix, agent_cmd),
+    let setup = setup_prefix(issue, config)
+        .map(|prefix| setup::SetupRun::prepare(&status_dir, &prefix))
+        .transpose()?;
+    let agent_cmd = match &setup {
+        Some(run) => format!("{} && {}", run.command(), agent_cmd),
         None => agent_cmd,
     };
 
-    // Snapshot opencode's visible sessions before the agent starts, so the
-    // post-launch detector only ever adopts a genuinely new id — the newest
-    // global session could belong to any concurrent opencode run. (OpenCode
-    // never pre-assigns an id, so agent kind alone gates the snapshot.)
-    let opencode_before = if issue.agent_kind == AgentKind::OpenCode {
-        opencode::list_session_ids()
+    let provider = provider(issue.agent_kind);
+    let before = if pre_assigned_session_id.is_none() {
+        provider.snapshot_session_ids(&config.project_root)
     } else {
         HashSet::new()
     };
@@ -221,16 +223,20 @@ pub fn launch_session(
     // Second window: bare terminal for ad-hoc commands
     tmux::create_window(&session_name, "terminal", cwd)?;
 
+    if let Some(run) = &setup {
+        run.wait(|| tmux::is_pane_alive(&session_name))?;
+    }
+
     // For OpenCode/Codex/Pi, detect session IDs after launch.
     let agent_session_id = match pre_assigned_session_id {
         Some(id) => Some(id),
-        None => provider(issue.agent_kind).detect_session_id(&DetectContext {
+        None => provider.detect_session_id(&DetectContext {
             project_root: &config.project_root,
-            before: &opencode_before,
+            before: &before,
         }),
     };
 
-    Ok((session_name, agent_session_id, setup_ran))
+    Ok((session_name, agent_session_id, setup.is_some()))
 }
 
 /// Kill an issue's tmux session and remove its transient hook/prompt files.
@@ -309,7 +315,7 @@ fn write_prompt_file(path: &Path, contents: &str) -> Result<(), AppError> {
 
 /// Build the agent launch command and return
 /// (command, pre_assigned_session_id, prompt_contents).
-/// For Claude, pre-assigns a UUID and returns it. For OpenCode, returns None (ID detected post-launch).
+/// Claude pre-assigns fresh IDs; resume commands return the stored ID.
 /// `prompt_contents` is `Some` for fresh sessions (staged to a file by the
 /// caller) and `None` for resume sessions, which carry no prompt.
 fn build_agent_cmd(
@@ -389,6 +395,7 @@ fn build_agent_cmd(
 
     let ctx = LaunchContext {
         issue,
+        project_root: &config.project_root,
         env_prefix: &env_prefix,
         trailing: &trailing,
         prompt_subst: &prompt_subst,
@@ -1285,16 +1292,18 @@ mod tests {
         assert!(cmd.contains("opencode --session 'ses_abc123'"));
         assert!(cmd.contains("--agent plan"));
         assert!(!cmd.contains("--prompt"));
-        assert!(sid.is_none());
+        assert_eq!(sid.as_deref(), Some("ses_abc123"));
     }
 
     #[test]
     fn opencode_resume_build() {
         let issue = resumable_issue(AgentKind::OpenCode, AgentMode::Build, "ses_abc123");
         let config = test_config();
-        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        let (cmd, sid, prompt) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         assert!(cmd.contains("opencode --session 'ses_abc123'"));
         assert!(!cmd.contains("--agent plan"));
+        assert_eq!(sid.as_deref(), Some("ses_abc123"));
+        assert!(prompt.is_none());
     }
 
     // --- Claude ---
@@ -1492,6 +1501,7 @@ mod tests {
     }
 
     // --- Cursor ---
+    const CURSOR_TEST_CHAT_ID: &str = "a506b8cb-b2ea-4b22-b0bb-7c449eb14606";
 
     #[test]
     fn cursor_fresh_uses_prompt_file() {
@@ -1500,16 +1510,32 @@ mod tests {
         let (cmd, sid, prompt) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         // Binary is cursor-agent, not cursor.
         assert!(cmd.contains("cursor-agent "));
+        assert!(cmd.contains("--trust"));
+        // The prompt is delivered via the staged-file substitution.
         assert!(cmd.contains("\"$(cat '/tmp/status/prompt-bork-bork-1.txt')\""));
         assert!(cmd.contains("rm -f '/tmp/status/prompt-bork-bork-1.txt'"));
         // No --name flag exists on cursor-agent.
         assert!(!cmd.contains("--name"));
         // send-keys would mangle a literal newline in the typed command line.
         assert!(!cmd.contains('\n'));
+        assert!(sid.is_none());
         assert!(prompt
             .unwrap()
             .contains("You are working on bork-1: Fix bug"));
-        assert!(sid.is_none());
+    }
+
+    #[test]
+    fn cursor_resume_omits_prompt() {
+        // Resume path: history is preserved, so no prompt is re-sent.
+        let issue = resumable_issue(AgentKind::Cursor, AgentMode::Build, CURSOR_TEST_CHAT_ID);
+        let config = test_config();
+        let (cmd, sid, prompt) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(cmd.contains(&format!("cursor-agent --resume '{}'", CURSOR_TEST_CHAT_ID)));
+        assert!(cmd.contains("--trust"));
+        // No prompt substitution on resume.
+        assert!(!cmd.contains("$(cat"));
+        assert_eq!(sid, Some(CURSOR_TEST_CHAT_ID.to_string()));
+        assert!(prompt.is_none());
     }
 
     #[test]
@@ -1517,10 +1543,8 @@ mod tests {
         let issue = test_issue(AgentKind::Cursor, AgentMode::Yolo);
         let config = test_config();
         let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
-        // Built-in mode flags render bare, so Yolo lands as `--trust -f` right
-        // after the binary. Assert that exact form so a stray future flag
-        // merely containing "-f" can't mask a regression.
-        assert!(cmd.contains("cursor-agent --trust -f "));
+        // Yolo renders as `--trust -f` in the trailing args.
+        assert!(cmd.contains("--trust -f"));
         // Guard against a later switch to the newer-build --yolo alias: -f is
         // the stable spelling, and Yolo must not leak into Build via --trust.
         assert!(!cmd.contains("--yolo"));
