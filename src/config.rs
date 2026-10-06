@@ -339,12 +339,6 @@ fn default_project_name(project_root: &Path) -> String {
         .to_string()
 }
 
-/// Load only the global config layer. Used by `agent_config` to seed agent
-/// resolution before any project is selected.
-pub fn load_global_partial() -> PartialConfig {
-    read_partial(&global_config_path())
-}
-
 fn read_partial(path: &Path) -> PartialConfig {
     if !path.exists() {
         return PartialConfig::default();

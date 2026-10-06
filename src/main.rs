@@ -1960,11 +1960,6 @@ fn run_tui() -> anyhow::Result<()> {
     // One-time warning if user still has the legacy agents.toml lying around.
     agent_config::warn_if_legacy_agents_file();
 
-    // Resolve available agents from layered config + PATH detection.
-    let agent_selection =
-        agent_config::resolve_agent_selection(Some(&app.project().config.project_root));
-    app.set_available_agents(agent_selection.available, agent_selection.default_agent);
-
     // --- Register current project and load others for multi-project sidebar ---
     let current_root = app.project().config.project_root.clone();
     let _ = global_config::register_if_absent(&app.project().config.project_name, &current_root);

@@ -172,11 +172,11 @@ impl Project {
         let id = std::fs::canonicalize(&config.project_root)
             .unwrap_or_else(|_| config.project_root.clone());
         let last_config_mtime = crate::config::config_mtime(&config.project_root);
-        Project {
+        let mut project = Project {
             id,
             issues,
             config,
-            available_agents: AgentKind::ALL.to_vec(),
+            available_agents: Vec::new(),
             selected_column: 0,
             selected_row: [0; 4],
             marked_issues: HashSet::new(),
@@ -191,14 +191,15 @@ impl Project {
             last_auto_prune_check: None,
             last_config_mtime,
             render_cache: RefCell::new(RenderCache::default()),
-        }
+        };
+        project.refresh_available_agents();
+        project
     }
 
-    /// Re-read the layered config from disk, replacing `self.config`. Used to
-    /// pick up `bork config set` edits without a TUI restart. Leaves
-    /// `available_agents` (resolved at startup) untouched.
+    /// Pick up config edits, including agent preferences, without a restart.
     pub fn reload_config(&mut self) {
         self.config = crate::config::load_config_from(&self.config.project_root);
+        self.refresh_available_agents();
         self.last_config_mtime = crate::config::config_mtime(&self.config.project_root);
     }
 
@@ -206,13 +207,10 @@ impl Project {
         self.id.clone()
     }
 
-    pub fn set_available_agents(
-        &mut self,
-        available_agents: Vec<AgentKind>,
-        default_agent: Option<AgentKind>,
-    ) {
-        self.available_agents = available_agents;
-        let Some(default_agent) = default_agent else {
+    fn refresh_available_agents(&mut self) {
+        let selection = crate::agent_config::resolve_agent_selection(&self.config);
+        self.available_agents = selection.available;
+        let Some(default_agent) = selection.default_agent else {
             return;
         };
         let Some(index) = self
@@ -1675,16 +1673,6 @@ impl App {
         self.projects.push(Project::new(config, state));
     }
 
-    pub fn set_available_agents(
-        &mut self,
-        available_agents: Vec<AgentKind>,
-        default_agent: Option<AgentKind>,
-    ) {
-        for project in &mut self.projects {
-            project.set_available_agents(available_agents.clone(), default_agent);
-        }
-    }
-
     pub fn enable_sidebar(&mut self) {
         if self.projects.len() > 1 {
             self.sidebar = Some(SidebarState {
@@ -2312,6 +2300,41 @@ mod tests {
             auto_prune_check_interval: crate::config::DEFAULT_AUTO_PRUNE_CHECK_INTERVAL,
             agent_launch: std::collections::HashMap::new(),
         }
+    }
+
+    #[test]
+    fn background_project_uses_its_own_agent_allowlist() {
+        let mut app = test_app(Vec::new());
+        let focused_agents = app.project().available_agents.clone();
+        let mut config = test_config_named("background");
+        config.agents_allowlist = Some(Vec::new());
+
+        app.add_background_project(config, AppState::default());
+
+        assert!(app.projects[1].available_agents.is_empty());
+        assert_eq!(app.project().available_agents, focused_agents);
+    }
+
+    #[test]
+    fn reload_config_refreshes_agent_preferences() {
+        let root = tempfile::tempdir().unwrap();
+        let config_dir = root.path().join(".bork");
+        std::fs::create_dir(&config_dir).unwrap();
+        let mut config = test_config();
+        config.project_root = root.path().to_path_buf();
+        let mut project = Project::new(config, AppState::default());
+        project.available_agents = AgentKind::ALL.to_vec();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "agents = []\ndefault_agent = \"claude\"\nagent_mode = \"build\"\n",
+        )
+        .unwrap();
+
+        project.reload_config();
+
+        assert!(project.available_agents.is_empty());
+        assert_eq!(project.config.agent_kind, AgentKind::Claude);
+        assert_eq!(project.config.agent_mode, crate::types::AgentMode::Build);
     }
 
     fn test_issue(id: &str, column: Column) -> Issue {
