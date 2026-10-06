@@ -67,12 +67,10 @@ pub trait AgentProvider {
 }
 
 /// Everything a provider needs to assemble its launch/resume command, computed
-/// once by `build_agent_cmd` so the provider bodies stay pure string assembly.
+/// once by `build_agent_cmd`, including the cwd for pre-launch session creation.
 pub struct LaunchContext<'a> {
     pub issue: &'a Issue,
-    /// The tmux session's launch cwd (the bork project root). Cursor mints its
-    /// chat id here so `create-chat` keys the chat to the same workspace the
-    /// agent is then launched in.
+    /// The tmux launch cwd, also used when minting workspace-scoped chat ids.
     pub project_root: &'a Path,
     /// `export BORK_SESSION=... BORK_STATUS_DIR=... BORK_ISSUE_ID=...`
     pub env_prefix: &'a str,
@@ -1497,24 +1495,15 @@ mod tests {
     }
 
     // --- Cursor ---
-    //
-    // Under test, `cursor::mint_chat_id` is stubbed: it returns a fixed id for
-    // any project root except the mint-failure sentinel `/tmp/cursor-mint-fails`,
-    // so these tests exercise both fresh paths without touching the binary.
     const CURSOR_TEST_CHAT_ID: &str = "a506b8cb-b2ea-4b22-b0bb-7c449eb14606";
-    const CURSOR_MINT_FAILURE_ROOT: &str = "/tmp/cursor-mint-fails";
 
     #[test]
-    fn cursor_fresh_with_chat_id() {
-        // Primary path: a chat id was minted, so the fresh launch resumes it and
-        // delivers the prompt as the first message (RECHECK-confirmed).
+    fn cursor_fresh_uses_prompt_file() {
         let issue = test_issue(AgentKind::Cursor, AgentMode::Build);
         let config = test_config();
         let (cmd, sid, prompt) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         // Binary is cursor-agent, not cursor.
-        assert!(cmd.contains("cursor-agent --resume '"));
-        assert!(cmd.contains(CURSOR_TEST_CHAT_ID));
-        // --trust must survive on the resume line or the Workspace Trust gate hangs.
+        assert!(cmd.contains("cursor-agent "));
         assert!(cmd.contains("--trust"));
         // The prompt is delivered via the staged-file substitution.
         assert!(cmd.contains("\"$(cat '/tmp/status/prompt-bork-bork-1.txt')\""));
@@ -1523,24 +1512,6 @@ mod tests {
         assert!(!cmd.contains("--name"));
         // send-keys would mangle a literal newline in the typed command line.
         assert!(!cmd.contains('\n'));
-        assert_eq!(sid, Some(CURSOR_TEST_CHAT_ID.to_string()));
-        assert!(prompt
-            .unwrap()
-            .contains("You are working on bork-1: Fix bug"));
-    }
-
-    #[test]
-    fn cursor_fresh_without_chat_id() {
-        // Minting failed: fall back to a bare fresh launch, no id captured, but
-        // still deliver the prompt.
-        let issue = test_issue(AgentKind::Cursor, AgentMode::Build);
-        let mut config = test_config();
-        config.project_root = std::path::PathBuf::from(CURSOR_MINT_FAILURE_ROOT);
-        let (cmd, sid, prompt) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
-        // Bare shape: no --resume, prompt still staged.
-        assert!(cmd.contains("cursor-agent --trust "));
-        assert!(!cmd.contains("--resume"));
-        assert!(cmd.contains("\"$(cat '/tmp/status/prompt-bork-bork-1.txt')\""));
         assert!(sid.is_none());
         assert!(prompt
             .unwrap()

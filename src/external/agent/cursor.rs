@@ -45,49 +45,46 @@ impl AgentProvider for Cursor {
     }
 
     fn build_cmd(&self, ctx: &LaunchContext) -> (String, Option<String>, Option<String>) {
-        if let Some(sid) = ctx.current_session {
-            // Resume an existing chat — skip the prompt, history is preserved.
-            // `{trailing}` still carries --trust/--mode; a resume that drops
-            // --trust hangs on the Workspace Trust gate.
-            let escaped_sid = shell_escape_single_quotes(sid);
-            let cmd = format!(
-                "{} && cursor-agent --resume '{}'{}",
-                ctx.env_prefix, escaped_sid, ctx.trailing,
-            );
-            return (cmd, Some(sid.to_string()), None);
-        }
+        build_cmd_with_minter(ctx, mint_chat_id)
+    }
+}
 
-        // Fresh launch. Mint a chat id up front (mirroring Claude's pre-assigned
-        // --session-id) so bork can resume the same chat later. cursor-agent has
-        // no --name flag, so the chat stays unlabelled.
-        let prompt = ctx.build_prompt();
-        match mint_chat_id(ctx.project_root) {
-            Some(chat_id) => {
-                let escaped_id = shell_escape_single_quotes(&chat_id);
-                let cmd = format!(
-                    "{} && cursor-agent --resume '{}'{} {}{}",
-                    ctx.env_prefix, escaped_id, ctx.trailing, ctx.prompt_subst, ctx.prompt_cleanup,
-                );
-                (cmd, Some(chat_id), Some(prompt))
-            }
-            None => {
-                // Minting failed: launch a bare fresh chat. No id is captured, so
-                // the next launch starts fresh (same degraded behaviour as every
-                // other harness on a detection miss).
-                let cmd = format!(
-                    "{} && cursor-agent{} {}{}",
-                    ctx.env_prefix, ctx.trailing, ctx.prompt_subst, ctx.prompt_cleanup,
-                );
-                (cmd, None, Some(prompt))
-            }
+fn build_cmd_with_minter(
+    ctx: &LaunchContext,
+    mint: impl FnOnce(&Path) -> Option<String>,
+) -> (String, Option<String>, Option<String>) {
+    if let Some(sid) = ctx.current_session {
+        // Preserve history without re-sending the prompt; keep --trust on resume.
+        let escaped_sid = shell_escape_single_quotes(sid);
+        let cmd = format!(
+            "{} && cursor-agent --resume '{}'{}",
+            ctx.env_prefix, escaped_sid, ctx.trailing,
+        );
+        return (cmd, Some(sid.to_string()), None);
+    }
+
+    let prompt = ctx.build_prompt();
+    match mint(ctx.project_root) {
+        Some(chat_id) => {
+            let escaped_id = shell_escape_single_quotes(&chat_id);
+            let cmd = format!(
+                "{} && cursor-agent --resume '{}'{} {}{}",
+                ctx.env_prefix, escaped_id, ctx.trailing, ctx.prompt_subst, ctx.prompt_cleanup,
+            );
+            (cmd, Some(chat_id), Some(prompt))
+        }
+        None => {
+            // Without a captured id, the next launch also starts fresh.
+            let cmd = format!(
+                "{} && cursor-agent{} {}{}",
+                ctx.env_prefix, ctx.trailing, ctx.prompt_subst, ctx.prompt_cleanup,
+            );
+            (cmd, None, Some(prompt))
         }
     }
 }
 
-/// Shell out to `cursor-agent create-chat` in `project_root` (the same cwd the
-/// agent is later launched in, so the chat keys to the right workspace) and
-/// return the minted chat id. `None` on any failure — the caller falls back to a
-/// bare fresh launch.
+/// Mint in the agent's launch cwd so the chat belongs to the same workspace.
 #[cfg(not(test))]
 fn mint_chat_id(project_root: &Path) -> Option<String> {
     let output = Command::new("cursor-agent")
@@ -102,27 +99,13 @@ fn mint_chat_id(project_root: &Path) -> Option<String> {
     parse_cursor_chat_id(&stdout)
 }
 
-/// Test stub: never talks to the `cursor-agent` binary. Returns a fixed id so
-/// the fresh-with-id path is deterministic, or `None` when the project root is
-/// the mint-failure sentinel, exercising the fresh-without-id fallback.
+// Cross-provider tests must not invoke a locally installed agent.
 #[cfg(test)]
-fn mint_chat_id(project_root: &Path) -> Option<String> {
-    if project_root == Path::new(MINT_FAILURE_ROOT) {
-        None
-    } else {
-        Some(TEST_CHAT_ID.to_string())
-    }
+fn mint_chat_id(_project_root: &Path) -> Option<String> {
+    None
 }
 
-#[cfg(test)]
-const TEST_CHAT_ID: &str = "a506b8cb-b2ea-4b22-b0bb-7c449eb14606";
-
-#[cfg(test)]
-const MINT_FAILURE_ROOT: &str = "/tmp/cursor-mint-fails";
-
-/// Parse the chat id from `cursor-agent create-chat` output. The command prints
-/// a bare 36-byte UUID (no banner, no trailing newline); trim and validate.
-/// Kept pure so it is unit-testable without a subprocess.
+/// `create-chat` prints a bare UUID; reject banners or other extra output.
 fn parse_cursor_chat_id(stdout: &str) -> Option<String> {
     let trimmed = stdout.trim();
     if is_uuid_like(trimmed) {
@@ -135,6 +118,64 @@ fn parse_cursor_chat_id(stdout: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CHAT_ID: &str = "a506b8cb-b2ea-4b22-b0bb-7c449eb14606";
+
+    fn command(
+        current_session: Option<&str>,
+        mint: impl FnOnce(&Path) -> Option<String>,
+    ) -> (String, Option<String>, Option<String>) {
+        let issue = crate::types::Issue::new(
+            "bork-1",
+            "Test",
+            crate::types::Column::InProgress,
+            crate::types::AgentKind::Cursor,
+        );
+        let ctx = LaunchContext {
+            issue: &issue,
+            project_root: Path::new("/project-root"),
+            env_prefix: "export BORK_SESSION='test'",
+            trailing: " --trust --mode plan",
+            prompt_subst: "\"$(cat '/prompt')\"",
+            prompt_cleanup: "; rm -f '/prompt'",
+            current_session,
+            build_prompt: &|| {
+                assert!(current_session.is_none(), "resume must not build a prompt");
+                "First message".to_string()
+            },
+        };
+        build_cmd_with_minter(&ctx, mint)
+    }
+
+    #[test]
+    fn cursor_fresh_with_chat_id() {
+        let (cmd, sid, prompt) = command(None, |cwd| {
+            assert_eq!(cwd, Path::new("/project-root"));
+            Some(CHAT_ID.to_string())
+        });
+        assert!(cmd.contains(&format!("--resume '{CHAT_ID}' --trust --mode plan")));
+        assert!(cmd.contains("\"$(cat '/prompt')\"; rm -f '/prompt'"));
+        assert_eq!(sid.as_deref(), Some(CHAT_ID));
+        assert_eq!(prompt.as_deref(), Some("First message"));
+    }
+
+    #[test]
+    fn cursor_fresh_without_chat_id() {
+        let (cmd, sid, prompt) = command(None, |_| None);
+        assert!(cmd.contains("cursor-agent --trust --mode plan \"$(cat '/prompt')\""));
+        assert!(!cmd.contains("--resume"));
+        assert_eq!(sid, None);
+        assert_eq!(prompt.as_deref(), Some("First message"));
+    }
+
+    #[test]
+    fn cursor_resume_omits_prompt() {
+        let (cmd, sid, prompt) = command(Some(CHAT_ID), |_| panic!("resume must not mint"));
+        assert!(cmd.ends_with(&format!("--resume '{CHAT_ID}' --trust --mode plan")));
+        assert!(!cmd.contains("$(cat"));
+        assert_eq!(sid.as_deref(), Some(CHAT_ID));
+        assert_eq!(prompt, None);
+    }
 
     #[test]
     fn parse_cursor_chat_id_accepts_bare_uuid() {
