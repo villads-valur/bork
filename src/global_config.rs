@@ -26,14 +26,24 @@ fn dirs_path() -> PathBuf {
     if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
         return PathBuf::from(dir);
     }
-    if let Some(home) = home_dir() {
-        return home.join(".config");
+    // Tests toggle XDG_CONFIG_HOME process-wide (see XDG_ENV_LOCK), so a
+    // concurrent test thread can read the variable in the window where it is
+    // unset. Falling through to the real ~/.config there would let a test
+    // overwrite the developer's own project registry.
+    #[cfg(test)]
+    return std::env::temp_dir().join(format!("bork-test-config-{}", std::process::id()));
+    #[cfg(not(test))]
+    {
+        if let Some(home) = home_dir() {
+            return home.join(".config");
+        }
+        // Fallback: $HOME and $XDG_CONFIG_HOME both unset (broken environment).
+        // Creates config relative to cwd, which is non-ideal but avoids a hard error.
+        PathBuf::from(".config")
     }
-    // Fallback: $HOME and $XDG_CONFIG_HOME both unset (broken environment).
-    // Creates config relative to cwd, which is non-ideal but avoids a hard error.
-    PathBuf::from(".config")
 }
 
+#[cfg(not(test))]
 fn home_dir() -> Option<PathBuf> {
     std::env::var("HOME").ok().map(PathBuf::from)
 }
@@ -218,7 +228,12 @@ mod tests {
     fn make_temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("bork-proj-{}-{}", name, std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        // A registered project carries .bork/config.toml in reality, and
+        // prune_stale_projects drops entries without one. A sidebar-reload
+        // test's background discover thread prunes concurrently, so a bare
+        // directory here flakes any test that registered it.
+        fs::create_dir_all(dir.join(".bork")).unwrap();
+        fs::write(dir.join(".bork/config.toml"), "project_name = \"t\"\n").unwrap();
         dir
     }
 
