@@ -24,8 +24,10 @@ pub fn render_import_picker(frame: &mut Frame, app: &App) {
     let show_tabs = has_linear && has_github;
 
     let area = frame.area();
-    let width = (area.width * 70 / 100).clamp(PICKER_MIN_WIDTH, PICKER_MAX_WIDTH);
-    let height = (VISIBLE_ITEMS as u16 + if show_tabs { 10 } else { 7 }).min(area.height);
+    let width = (area.width * 70 / 100)
+        .clamp(PICKER_MIN_WIDTH, PICKER_MAX_WIDTH)
+        .min(area.width);
+    let height = (VISIBLE_ITEMS as u16 + if show_tabs { 11 } else { 8 }).min(area.height);
     let x = area.width.saturating_sub(width) / 2;
     let y = area.height.saturating_sub(height) / 2;
 
@@ -98,7 +100,7 @@ pub fn render_import_picker(frame: &mut Frame, app: &App) {
     row_y += 1;
 
     let list_start_y = row_y;
-    let available_rows = inner.height.saturating_sub(row_y - inner.y + 2) as usize;
+    let available_rows = inner.height.saturating_sub(row_y - inner.y + 3) as usize;
     let visible_count = available_rows.min(VISIBLE_ITEMS);
 
     match app.picker_tab {
@@ -122,45 +124,101 @@ pub fn render_import_picker(frame: &mut Frame, app: &App) {
         ),
     }
 
+    if app.picker_tab == ImportSource::GitHub {
+        let hint = if app.active_project().live.gh_missing {
+            ""
+        } else if let Some((
+            message,
+            crate::app::MessageKind::Warning | crate::app::MessageKind::Error,
+        )) = &app.message
+        {
+            message.as_str()
+        } else if let Some(error) = &app.active_project().live.github_error {
+            error.as_str()
+        } else {
+            ""
+        };
+        frame.render_widget(
+            Paragraph::new(hint).style(styles::dim_style()),
+            Rect::new(inner.x + 1, inner.y + inner.height - 2, inner.width - 2, 1),
+        );
+    }
     let footer_y = inner.y + inner.height - 1;
     let footer_area = Rect::new(inner.x + 1, footer_y, inner.width - 2, 1);
+    let loading =
+        app.picker_tab == ImportSource::GitHub && app.active_project().live.github_fetching();
+    let mut content_area = footer_area;
+    if loading {
+        content_area.width = content_area
+            .width
+            .saturating_sub(super::status_bar::SPINNER_WIDTH);
+    }
 
     let count = match app.picker_tab {
         ImportSource::Linear => app.filtered_linear_issues().len(),
         ImportSource::GitHub => app.filtered_github_prs().len(),
     };
 
-    let select_hint = if app.linear_picker_context == LinearPickerContext::Attach {
-        ":toggle  "
-    } else {
-        ":import  "
-    };
-
-    let mut footer_spans = vec![
-        Span::styled("Enter", styles::statusbar_key_style()),
-        Span::styled(select_hint, styles::statusbar_desc_style()),
-        Span::styled("\u{2191}\u{2193}", styles::statusbar_key_style()),
-        Span::styled(":navigate  ", styles::statusbar_desc_style()),
-    ];
-
-    if show_tabs {
-        footer_spans.push(Span::styled(
-            "\u{2190}\u{2192}",
-            styles::statusbar_key_style(),
-        ));
-        footer_spans.push(Span::styled(":switch  ", styles::statusbar_desc_style()));
+    let footer = picker_footer(
+        app.picker_tab,
+        app.linear_picker_context,
+        count.min(picker.selected + 1),
+        count,
+        content_area.width as usize,
+        app.active_project().live.stacks_available && !app.active_project().live.gh_missing,
+    );
+    frame.render_widget(Paragraph::new(footer), content_area);
+    if loading {
+        super::status_bar::render_loading_spinner(frame, app, footer_area);
     }
+}
 
-    footer_spans.push(Span::styled("Ctrl+r", styles::statusbar_key_style()));
-    footer_spans.push(Span::styled(":refresh  ", styles::statusbar_desc_style()));
-    footer_spans.push(Span::styled("Esc", styles::statusbar_key_style()));
-    footer_spans.push(Span::styled(":close", styles::statusbar_desc_style()));
-    footer_spans.push(Span::styled(
-        format!("  {}/{}", count.min(picker.selected + 1), count),
-        styles::dim_style(),
+fn picker_footer(
+    source: ImportSource,
+    context: LinearPickerContext,
+    selected: usize,
+    count: usize,
+    width: usize,
+    stacks_available: bool,
+) -> Line<'static> {
+    let select = if context == LinearPickerContext::Attach {
+        "toggle"
+    } else {
+        "import"
+    };
+    let counter = format!("{selected}/{count}");
+    let mut bindings = vec![("Enter", select)];
+    if source == ImportSource::GitHub && stacks_available {
+        bindings.push(("Ctrl+s", "stack"));
+    }
+    let required = bindings
+        .iter()
+        .map(|(key, label)| key.len() + label.len() + 3)
+        .sum::<usize>()
+        + "Esc close".len()
+        + counter.len()
+        + 2;
+    if required + "Ctrl+r refresh  ".len() <= width {
+        bindings.push(("Ctrl+r", "refresh"));
+    }
+    bindings.push(("Esc", "close"));
+    let mut spans = Vec::new();
+    for (index, (key, label)) in bindings.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(*key, styles::statusbar_key_style()));
+        spans.push(Span::styled(
+            format!(" {label}"),
+            styles::statusbar_desc_style(),
+        ));
+    }
+    let used: usize = spans.iter().map(Span::width).sum();
+    spans.push(Span::raw(
+        " ".repeat(width.saturating_sub(used + counter.len()).max(1)),
     ));
-
-    frame.render_widget(Paragraph::new(Line::from(footer_spans)), footer_area);
+    spans.push(Span::styled(counter, styles::dim_style()));
+    Line::from(spans)
 }
 
 fn render_tab_bar(frame: &mut Frame, active: ImportSource, area: Rect) {
@@ -201,7 +259,7 @@ fn render_linear_list(
     let count = filtered.len();
 
     let imported_ids: HashSet<&str> = app
-        .project()
+        .active_project()
         .issues
         .iter()
         .flat_map(|i| i.linear_links.iter().map(|l| l.id.as_str()))
@@ -316,7 +374,7 @@ fn render_github_list(
     let count = filtered.len();
 
     let imported_pr_numbers: HashSet<u32> = app
-        .project()
+        .active_project()
         .issues
         .iter()
         .flat_map(|i| i.pr_numbers())
@@ -373,22 +431,48 @@ fn render_github_list(
                 "\u{25cf} "
             } else if is_imported {
                 "\u{2713} "
-            } else if pr.is_draft {
+            } else if pr.status.is_some_and(|status| status.is_draft) {
                 "\u{25cb} "
             } else {
                 "  "
             };
 
             let number_str = format!("#{}", pr.number);
-            let author_str = format!(" @{}", pr.author);
-            let diff_str = format!(" +{}/-{}", pr.additions, pr.deletions);
+            let author_str = pr
+                .status
+                .map(|status| format!(" @{}", status.author))
+                .unwrap_or_default();
+            let stack = app
+                .active_project()
+                .stack_for_pr(pr.number)
+                .filter(|_| app.active_project().live.stacks_available);
+            let stack_str = stack
+                .map(|stack| {
+                    let attached = if is_attach {
+                        app.dialog
+                            .as_ref()
+                            .is_some_and(|dialog| dialog.github_stack == Some(stack.number))
+                    } else {
+                        app.active_project()
+                            .issues
+                            .iter()
+                            .any(|issue| issue.github_stack == Some(stack.number))
+                    };
+                    let marker = if attached { "attached" } else { "stack" };
+                    format!(
+                        " {marker} #{} · {} PRs",
+                        stack.number,
+                        stack.pull_requests.len()
+                    )
+                })
+                .unwrap_or_default();
 
             let status_suffix = if is_imported {
                 " \u{25cf} on board".to_string()
             } else {
-                match pr.state {
-                    crate::types::PrState::Merged => " \u{25cf} merged".to_string(),
-                    crate::types::PrState::Closed => " \u{25cf} closed".to_string(),
+                match pr.status.map(|status| status.state) {
+                    Some(crate::types::PrState::Merged) => " \u{25cf} merged".to_string(),
+                    Some(crate::types::PrState::Closed) => " \u{25cf} closed".to_string(),
                     _ => String::new(),
                 }
             };
@@ -398,10 +482,19 @@ fn render_github_list(
                 + number_str.len()
                 + 1
                 + author_str.len()
-                + diff_str.len()
+                + stack_str.chars().count()
                 + status_suffix.len();
             let title_budget = field_width.saturating_sub(overhead);
-            let title = styles::truncate(&pr.title, title_budget);
+            let title = if app.active_project().live.gh_missing
+                || (pr.status.is_none() && app.active_project().live.github_loading())
+            {
+                ""
+            } else if pr.status.is_none() {
+                app.active_project().live.missing_github_status()
+            } else {
+                pr.title()
+            };
+            let title = styles::truncate(title, title_budget);
 
             let title_style = if is_imported {
                 styles::dim_style()
@@ -422,11 +515,60 @@ fn render_github_list(
                 Span::raw(" "),
                 Span::styled(title, title_style),
                 Span::styled(author_str, styles::dim_style()),
-                Span::styled(diff_str, styles::dim_style()),
+                Span::styled(stack_str, Style::default().fg(styles::ACCENT)),
                 Span::styled(status_suffix, styles::dim_style()),
             ]);
 
             frame.render_widget(Paragraph::new(line), row_area);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn github_footer_hides_optional_stack_shortcut() {
+        let line = picker_footer(
+            ImportSource::GitHub,
+            LinearPickerContext::Attach,
+            1,
+            3,
+            76,
+            false,
+        );
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(!text.contains("Ctrl+s"));
+        assert!(text.contains("Enter toggle"));
+    }
+
+    #[test]
+    fn github_footer_keeps_primary_actions_and_counter_at_narrow_widths() {
+        for width in [46, 76, 96] {
+            let line = picker_footer(
+                ImportSource::GitHub,
+                LinearPickerContext::Attach,
+                1,
+                554,
+                width,
+                true,
+            );
+            assert!(line.width() <= width);
+            let text: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            assert!(text.contains("Enter toggle"));
+            assert!(text.contains("Ctrl+s stack"));
+            assert!(text.contains("Esc close"));
+            assert!(text.ends_with("1/554"));
+            assert_eq!(text.matches("Enter").count(), 1);
         }
     }
 }

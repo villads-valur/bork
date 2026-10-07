@@ -196,10 +196,9 @@ fn render_column(
                 .is_session_alive(&issue.session_name(&project.config.project_name)),
             agent_status: project.resolved_agent_status(issue),
             activity: project.resolved_activity(issue),
-            branch: project.branch_for(issue),
             git_status: project.worktree_status_for(issue),
             pr,
-            stack: project.stack_for_issue_with_pr(issue, pr),
+            project,
             ports: project.listening_ports_for(issue),
             search_query,
         };

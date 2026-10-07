@@ -21,6 +21,15 @@ pub fn map_key_to_action(
         }
         InputMode::Search => map_search_key(key),
         InputMode::LinearPicker => map_linear_picker_key(key),
+        InputMode::StackDetails => match key.code {
+            KeyCode::Esc | KeyCode::Char('s') | KeyCode::Char('q') => Action::CloseStack,
+            KeyCode::Down | KeyCode::Char('j') => Action::StackDown,
+            KeyCode::Up | KeyCode::Char('k') => Action::StackUp,
+            KeyCode::Char('o') => Action::OpenPR,
+            KeyCode::Char('R') => Action::OpenReviewPR,
+            KeyCode::Char('P') => Action::SyncPRs,
+            _ => Action::Noop,
+        },
         InputMode::LinkPicker => map_link_picker_key(key),
         InputMode::Help => map_help_key(key),
         InputMode::DebugInspector => map_debug_inspector_key(key),
@@ -100,6 +109,7 @@ fn map_normal_key(key: KeyEvent, swimlane_count: usize) -> Action {
 
         KeyCode::Char('P') => Action::SyncPRs,
         KeyCode::Char('o') => Action::OpenPR,
+        KeyCode::Char('s') => Action::ExpandStack,
         KeyCode::Char('O') => Action::OpenLinear,
         KeyCode::Char('w') => Action::AssignWorktree,
         KeyCode::Char('W') => Action::OpenPruneDialog,
@@ -168,6 +178,7 @@ fn map_linear_picker_key(key: KeyEvent) -> Action {
             KeyCode::Char('n') => Action::LinearPickerDown,
             KeyCode::Char('p') => Action::LinearPickerUp,
             KeyCode::Char('r') => Action::LinearPickerRefresh,
+            KeyCode::Char('s') => Action::AttachStack,
             KeyCode::Char('l') => Action::PickerSwitchTab,
             KeyCode::Char('h') => Action::PickerSwitchTab,
             _ => Action::Noop,
@@ -557,6 +568,24 @@ mod tests {
         assert_eq!(
             map_search_key(key(KeyCode::Char('a'))),
             Action::SearchChar('a')
+        );
+    }
+
+    #[test]
+    fn stack_shortcut_preserves_picker_search_and_enter() {
+        assert_eq!(
+            map_linear_picker_key(key(KeyCode::Char('s'))),
+            Action::LinearPickerChar('s')
+        );
+        assert_eq!(map_linear_picker_key(ctrl('s')), Action::AttachStack);
+        assert_eq!(
+            map_linear_picker_key(key(KeyCode::Enter)),
+            Action::LinearPickerSelect
+        );
+        assert_eq!(map_normal_key(key(KeyCode::Char('o')), 1), Action::OpenPR);
+        assert_eq!(
+            map_normal_key(key(KeyCode::Char('R')), 1),
+            Action::OpenReviewPR
         );
     }
 

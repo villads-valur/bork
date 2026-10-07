@@ -52,7 +52,7 @@ fn parse_repo_identity(json_str: &str) -> Option<RepoIdentity> {
     Some(RepoIdentity { owner, name })
 }
 
-fn get_repo_identity(main_worktree: &Path) -> Option<RepoIdentity> {
+fn get_repo_identity(main_worktree: &Path) -> Result<RepoIdentity, String> {
     let canonical =
         std::fs::canonicalize(main_worktree).unwrap_or_else(|_| main_worktree.to_path_buf());
 
@@ -63,7 +63,7 @@ fn get_repo_identity(main_worktree: &Path) -> Option<RepoIdentity> {
         let mut cache = REPO_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             match cache.get_or_insert_with(HashMap::new).get(&canonical) {
-                Some(FetchState::Ready(identity)) => return Some(identity.clone()),
+                Some(FetchState::Ready(identity)) => return Ok(identity.clone()),
                 Some(FetchState::InFlight) => {
                     // Another thread is fetching this path; wait for it, then
                     // re-check (it may have produced a value or given up).
@@ -87,10 +87,10 @@ fn get_repo_identity(main_worktree: &Path) -> Option<RepoIdentity> {
     let mut cache = REPO_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let map = cache.get_or_insert_with(HashMap::new);
     match &identity {
-        Some(id) => {
+        Ok(id) => {
             map.insert(canonical, FetchState::Ready(id.clone()));
         }
-        None => {
+        Err(_) => {
             // Failed: drop the marker so a later poll retries (matches the
             // previous behaviour of not caching failures).
             map.remove(&canonical);
@@ -100,25 +100,31 @@ fn get_repo_identity(main_worktree: &Path) -> Option<RepoIdentity> {
     identity
 }
 
-fn fetch_repo_identity(main_worktree: &Path) -> Option<RepoIdentity> {
-    let output = crate::external::gh_command()
-        .args(["repo", "view", "--json", "owner,name"])
-        .current_dir(main_worktree)
-        .output()
-        .ok()?;
-
+fn checked_gh_output(output: std::io::Result<std::process::Output>) -> Result<String, String> {
+    let output = output.map_err(|error| format!("Could not run gh: {error}"))?;
     if !output.status.success() {
-        return None;
+        let message = String::from_utf8_lossy(&output.stderr);
+        return Err(message
+            .lines()
+            .next()
+            .unwrap_or("GitHub request failed")
+            .to_string());
     }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_repo_identity(&stdout)
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-pub fn fetch_prs(main_worktree: &Path) -> Vec<PrStatus> {
-    let Some(repo) = get_repo_identity(main_worktree) else {
-        return Vec::new();
-    };
+fn fetch_repo_identity(main_worktree: &Path) -> Result<RepoIdentity, String> {
+    let stdout = checked_gh_output(
+        crate::external::gh_command()
+            .args(["repo", "view", "--json", "owner,name"])
+            .current_dir(main_worktree)
+            .output(),
+    )?;
+    parse_repo_identity(&stdout).ok_or_else(|| "Invalid GitHub repository response".to_string())
+}
+
+pub fn fetch_prs(main_worktree: &Path) -> Result<Vec<PrStatus>, String> {
+    let repo = get_repo_identity(main_worktree)?;
 
     let query = format!(
         r#"query($owner: String!, $repo: String!) {{
@@ -146,19 +152,59 @@ pub fn fetch_prs(main_worktree: &Path) -> Vec<PrStatus> {
         .current_dir(main_worktree)
         .output();
 
-    let Ok(output) = output else {
-        return Vec::new();
-    };
-
-    if !output.status.success() {
-        return Vec::new();
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_graphql_response(&stdout)
+    let stdout = checked_gh_output(output)?;
+    Ok(parse_graphql_response(&stdout))
 }
 
-pub fn fetch_stacks(main_worktree: &Path) -> Option<Vec<GithubStack>> {
+pub fn fetch_missing_prs(
+    main_worktree: &Path,
+    requested: &[u32],
+    prs: &mut Vec<PrStatus>,
+) -> Result<(), String> {
+    let repo = get_repo_identity(main_worktree)?;
+    let known: std::collections::HashSet<_> = prs.iter().map(|pr| pr.number).collect();
+    let mut missing: Vec<_> = requested
+        .iter()
+        .copied()
+        .filter(|number| !known.contains(number))
+        .collect();
+    missing.sort_unstable();
+    missing.dedup();
+    for chunk in missing.chunks(50) {
+        let fields = chunk
+            .iter()
+            .map(|number| format!("pr{number}: pullRequest(number: {number}) {{ {PR_FIELDS} }}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let query = format!("query($owner: String!, $repo: String!) {{ repository(owner: $owner, name: $repo) {{ {fields} }} }}");
+        let output = crate::external::gh_command()
+            .args([
+                "api",
+                "graphql",
+                "-f",
+                &format!("query={query}"),
+                "-f",
+                &format!("owner={}", repo.owner),
+                "-f",
+                &format!("repo={}", repo.name),
+            ])
+            .current_dir(main_worktree)
+            .output();
+        let output = output.map_err(|error| format!("Could not run gh: {error}"))?;
+        let value = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .map_err(|_| "Invalid GitHub PR response".to_string())?;
+        if let Some(repository) = value
+            .pointer("/data/repository")
+            .and_then(|value| value.as_object())
+        {
+            prs.extend(repository.values().filter_map(parse_pr_node));
+        }
+        checked_gh_output(Ok(output))?;
+    }
+    Ok(())
+}
+
+pub fn fetch_stacks(main_worktree: &Path) -> Result<Option<Vec<GithubStack>>, String> {
     let repo = get_repo_identity(main_worktree)?;
     let endpoint = format!("repos/{}/{}/stacks?per_page=100", repo.owner, repo.name);
     let output = crate::external::gh_command()
@@ -166,14 +212,76 @@ pub fn fetch_stacks(main_worktree: &Path) -> Option<Vec<GithubStack>> {
         .current_dir(main_worktree)
         .output();
 
-    let Ok(output) = output else {
-        return None;
-    };
-    if !output.status.success() {
-        return None;
+    if output.as_ref().is_ok_and(|output| {
+        !output.status.success()
+            && stack_endpoint_unsupported(&String::from_utf8_lossy(&output.stderr))
+    }) {
+        return Ok(None);
     }
+    let stdout = checked_gh_output(output)?;
+    parse_stacks_response(&stdout)
+        .map(Some)
+        .ok_or_else(|| "Invalid GitHub stack response".to_string())
+}
 
-    parse_stacks_response(&String::from_utf8_lossy(&output.stdout))
+pub fn fetch_stack(main_worktree: &Path, number: u32) -> Result<GithubStack, String> {
+    let repo = get_repo_identity(main_worktree)?;
+    let endpoint = format!("repos/{}/{}/stacks/{number}", repo.owner, repo.name);
+    let stdout = checked_gh_output(
+        crate::external::gh_command()
+            .args(["api", &endpoint])
+            .current_dir(main_worktree)
+            .output(),
+    )?;
+    let value = serde_json::from_str(&stdout).map_err(|_| "Invalid GitHub stack response")?;
+    parse_stack(&value).ok_or_else(|| "Invalid GitHub stack response".to_string())
+}
+
+pub fn fetch_branch_prs(
+    main_worktree: &Path,
+    branches: &[String],
+) -> Result<Vec<PrStatus>, String> {
+    let repo = get_repo_identity(main_worktree)?;
+    let fields = branches.iter().enumerate().map(|(index, branch)| {
+        let branch = serde_json::to_string(branch).unwrap_or_default();
+        format!("b{index}: pullRequests(headRefName:{branch},first:1,orderBy:{{field:UPDATED_AT,direction:DESC}}){{nodes{{{PR_FIELDS}}}}}")
+    }).collect::<Vec<_>>().join(" ");
+    let query = format!(
+        "query($owner:String!,$repo:String!){{repository(owner:$owner,name:$repo){{{fields}}}}}"
+    );
+    let stdout = checked_gh_output(
+        crate::external::gh_command()
+            .args([
+                "api",
+                "graphql",
+                "-f",
+                &format!("query={query}"),
+                "-f",
+                &format!("owner={}", repo.owner),
+                "-f",
+                &format!("repo={}", repo.name),
+            ])
+            .current_dir(main_worktree)
+            .output(),
+    )?;
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout).map_err(|_| "Invalid GitHub branch response")?;
+    let repository = value
+        .pointer("/data/repository")
+        .and_then(|v| v.as_object())
+        .ok_or("Missing GitHub repository")?;
+    Ok(repository
+        .values()
+        .filter_map(|v| v.get("nodes").and_then(|v| v.as_array()))
+        .flatten()
+        .filter_map(parse_pr_node)
+        .collect())
+}
+
+fn stack_endpoint_unsupported(stderr: &str) -> bool {
+    ["HTTP 404", "HTTP 410", "HTTP 501"]
+        .iter()
+        .any(|status| stderr.contains(status))
 }
 
 fn parse_stacks_response(json_str: &str) -> Option<Vec<GithubStack>> {
@@ -207,8 +315,8 @@ fn parse_stack(value: &serde_json::Value) -> Option<GithubStack> {
         .get("pull_requests")
         .and_then(|v| v.as_array())?
         .iter()
-        .filter_map(parse_stack_pull_request)
-        .collect();
+        .map(parse_stack_pull_request)
+        .collect::<Option<Vec<_>>>()?;
 
     Some(GithubStack {
         number,
@@ -328,13 +436,9 @@ fn parse_pr_node(node: &serde_json::Value) -> Option<PrStatus> {
     })
 }
 
-pub fn fetch_user_prs(main_worktree: &Path) -> Vec<PrStatus> {
-    let Some(repo) = get_repo_identity(main_worktree) else {
-        return Vec::new();
-    };
-    let Some(user) = fetch_current_user(main_worktree) else {
-        return Vec::new();
-    };
+pub fn fetch_user_prs(main_worktree: &Path) -> Result<Vec<PrStatus>, String> {
+    let repo = get_repo_identity(main_worktree)?;
+    let user = fetch_current_user(main_worktree).ok_or("Could not fetch GitHub user")?;
 
     let search_query = format!(
         "repo:{}/{} is:pr is:open author:{}",
@@ -365,25 +469,13 @@ pub fn fetch_user_prs(main_worktree: &Path) -> Vec<PrStatus> {
         .current_dir(main_worktree)
         .output();
 
-    let Ok(output) = output else {
-        return Vec::new();
-    };
-
-    if !output.status.success() {
-        return Vec::new();
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_search_response(&stdout)
+    let stdout = checked_gh_output(output)?;
+    Ok(parse_search_response(&stdout))
 }
 
-pub fn fetch_review_requested_prs(main_worktree: &Path) -> Vec<PrStatus> {
-    let Some(repo) = get_repo_identity(main_worktree) else {
-        return Vec::new();
-    };
-    let Some(user) = fetch_current_user(main_worktree) else {
-        return Vec::new();
-    };
+pub fn fetch_review_requested_prs(main_worktree: &Path) -> Result<Vec<PrStatus>, String> {
+    let repo = get_repo_identity(main_worktree)?;
+    let user = fetch_current_user(main_worktree).ok_or("Could not fetch GitHub user")?;
 
     let graphql_query = format!(
         r#"query($search: String!) {{
@@ -409,7 +501,11 @@ pub fn fetch_review_requested_prs(main_worktree: &Path) -> Vec<PrStatus> {
     fetch_search_query(main_worktree, &graphql_query, &search_query)
 }
 
-fn fetch_search_query(main_worktree: &Path, graphql_query: &str, search: &str) -> Vec<PrStatus> {
+fn fetch_search_query(
+    main_worktree: &Path,
+    graphql_query: &str,
+    search: &str,
+) -> Result<Vec<PrStatus>, String> {
     let output = crate::external::gh_command()
         .args([
             "api",
@@ -422,16 +518,8 @@ fn fetch_search_query(main_worktree: &Path, graphql_query: &str, search: &str) -
         .current_dir(main_worktree)
         .output();
 
-    let Ok(output) = output else {
-        return Vec::new();
-    };
-
-    if !output.status.success() {
-        return Vec::new();
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_search_response(&stdout)
+    let stdout = checked_gh_output(output)?;
+    Ok(parse_search_response(&stdout))
 }
 
 fn parse_search_response(json_str: &str) -> Vec<PrStatus> {
@@ -507,7 +595,7 @@ fn fetch_current_user_uncached(main_worktree: &Path) -> Option<String> {
 /// the worktree isn't a GitHub remote). Uses the cached repo identity, so this is
 /// effectively free after the first call.
 pub fn pr_url(main_worktree: &Path, pr_number: u32) -> Option<String> {
-    let repo = get_repo_identity(main_worktree)?;
+    let repo = get_repo_identity(main_worktree).ok()?;
     Some(format_pr_url(&repo.owner, &repo.name, pr_number))
 }
 
@@ -596,6 +684,20 @@ mod tests {
     }
 
     // --- parse_pr_node ---
+
+    #[test]
+    fn unsupported_stack_endpoint_does_not_swallow_auth_or_network_errors() {
+        assert!(stack_endpoint_unsupported("gh: Not Found (HTTP 404)"));
+        assert!(stack_endpoint_unsupported("gh: Not Implemented (HTTP 501)"));
+        for error in [
+            "gh: Forbidden (HTTP 403)",
+            "gh: Unauthorized (HTTP 401)",
+            "connection refused",
+            "gh: Internal Server Error (HTTP 500)",
+        ] {
+            assert!(!stack_endpoint_unsupported(error));
+        }
+    }
 
     #[test]
     fn test_parse_full_pr_node() {
@@ -862,6 +964,21 @@ mod tests {
         let stacks = stacks.unwrap();
         assert_eq!(stacks.len(), 1);
         assert_eq!(stacks[0].number, 8);
+    }
+
+    #[test]
+    fn stack_with_incomplete_membership_is_not_actionable() {
+        let response = serde_json::json!([{
+            "number": 42,
+            "base": { "ref": "main" },
+            "pull_requests": [
+                { "number": 1, "state": "open", "head": { "ref": "first" } },
+                { "number": 2 }
+            ]
+        }]);
+        assert!(parse_stacks_response(&response.to_string())
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

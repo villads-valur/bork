@@ -295,6 +295,34 @@ pub fn send_keys(session: &str, keys: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+pub fn create_command_window(
+    session: &str,
+    name: &str,
+    cwd: &Path,
+    command: &str,
+) -> Result<(), AppError> {
+    let status = Command::new("tmux")
+        .args([
+            "new-window",
+            "-t",
+            session,
+            "-n",
+            name,
+            "-c",
+            cwd.to_str().unwrap_or("."),
+            command,
+        ])
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| AppError::Tmux(format!("failed to start '{name}': {error}")))?;
+    if !status.success() {
+        return Err(AppError::Tmux(format!(
+            "tmux new-window failed for '{session}:{name}'"
+        )));
+    }
+    Ok(())
+}
+
 pub fn create_window(session: &str, window_name: &str, cwd: &Path) -> Result<(), AppError> {
     let status = Command::new("tmux")
         .args([

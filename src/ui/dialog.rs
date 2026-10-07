@@ -8,7 +8,7 @@ use ratatui::Frame;
 
 use crate::app::{App, DialogField, DialogState};
 use crate::external::linear::LinearIssue;
-use crate::types::{AgentKind, AgentMode, IssueKind, PrStatus};
+use crate::types::{AgentKind, AgentMode, IssueKind, LinkedGithubPr};
 use crate::ui::styles;
 
 const DIALOG_HEIGHT: u16 = 34;
@@ -89,6 +89,7 @@ pub fn render_dialog(frame: &mut Frame, app: &App) {
         render_github_pr_field(
             frame,
             &dialog.github_prs,
+            dialog.github_stack,
             github_area,
             dialog.current_field() == DialogField::GithubPr,
             label_width,
@@ -527,7 +528,8 @@ fn render_linear_field(
 
 fn render_github_pr_field(
     frame: &mut Frame,
-    github_prs: &[PrStatus],
+    github_prs: &[LinkedGithubPr],
+    github_stack: Option<u32>,
     area: Rect,
     focused: bool,
     label_width: usize,
@@ -542,7 +544,10 @@ fn render_github_pr_field(
         label_style,
     )];
 
-    if github_prs.is_empty() {
+    if let Some(number) = github_stack {
+        spans.push(Span::styled(format!("Stack #{number}  "), accent_style));
+    }
+    if github_prs.is_empty() && github_stack.is_none() {
         spans.push(Span::styled("\u{2014}", styles::dim_style()));
     } else {
         let available = (area.width as usize).saturating_sub(label_width);

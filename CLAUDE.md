@@ -185,3 +185,16 @@ Issues can be tied to other issues in the same project via a symmetric `linked_i
 - **Filter**: `f` toggles the board to the selected issue's connected component; `Esc`/`f` clears. `bork issue list --linked <id>` does the same from the CLI.
 - Cards show a cyan `∞N` badge (link count). Deleting an issue strips its id from every other issue's `linked_issues` (`ops::remove_link_references`).
 - Any new `Issue` field (including `linked_issues`) must be added to `merge_issue_fields` in `app.rs` or concurrent TUI edits drop CLI-written values.
+
+## Loading indicators
+
+- Use the existing animated spinner for routine loading; do not add textual loaders such as `Loading...`, `Fetching...`, or `Refreshing...` to cards, rows, or modal summaries.
+- Put modal spinners at the bottom-right inside the modal and the global spinner at the bottom-right of the app. Reserve their space so shortcuts, counts, and update notices cannot overlap them.
+- Keep cached content visible during refresh. Spinners must track actual requests and clear on success or failure; missing tools and unsupported features must not leave a spinner running.
+- Keep errors and required user actions readable as text. A spinner does not replace an error message.
+
+## GitHub request scope
+
+- Keep review discovery automatic in the background. It must not depend on opening the picker or wait behind the Done backlog.
+- Fetch the repository-wide recent-PR list and stack discovery only when the GitHub picker is open. Board status polling covers linked PRs, attached stack members, and issue worktree branches.
+- Prioritize Code Review, In Progress, To Do, then Done. Reuse `.bork/github-cache.json` across restarts, batch and deduplicate requests, and preserve retry cooldowns. Do not reintroduce a sweep of every repository stack's PR statuses.

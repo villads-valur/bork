@@ -52,6 +52,7 @@ pub enum InputMode {
     Dialog,
     Search,
     LinearPicker,
+    StackDetails,
     LinkPicker,
     Help,
     DebugInspector,
@@ -69,6 +70,7 @@ pub struct LiveState {
     pub pr_statuses: HashMap<String, PrStatus>,
     pub pr_statuses_by_number: HashMap<u32, PrStatus>,
     pub github_stacks: Vec<GithubStack>,
+    pub stacks_available: bool,
     pub frozen_worktree_statuses: HashMap<String, WorktreeStatus>,
     pub frozen_worktree_branches: HashMap<String, String>,
     pub linear_issues: Vec<LinearIssue>,
@@ -77,6 +79,14 @@ pub struct LiveState {
     pub github_user: Option<String>,
     pub git_poll_done: bool,
     pub pr_poll_done: bool,
+    pub pr_loading_more: bool,
+    pub pr_refreshing: bool,
+    pub gh_missing: bool,
+    pub stacks_unsupported: bool,
+    pub github_error: Option<String>,
+    pub authored_prs_ready: Option<bool>,
+    pub review_prs_ready: Option<bool>,
+    pub stack_errors: HashMap<u32, String>,
     /// Done-TTL auto-kill attempts per session name. Ephemeral (never
     /// persisted): the tmux poller re-reports a session that refused to die
     /// every ~2s, so without a cap the cleanup loop would spawn a kill thread
@@ -99,6 +109,24 @@ pub struct SessionCleanupPlan {
 }
 
 impl LiveState {
+    pub fn github_fetching(&self) -> bool {
+        !self.gh_missing && (self.pr_refreshing || self.pr_loading_more)
+    }
+
+    pub fn github_loading(&self) -> bool {
+        !self.pr_poll_done || self.pr_refreshing || self.pr_loading_more
+    }
+
+    pub fn missing_github_status(&self) -> &'static str {
+        if self.github_loading() {
+            "loading..."
+        } else if self.github_error.is_some() {
+            "unavailable"
+        } else {
+            "not found"
+        }
+    }
+
     pub fn has_github_prs(&self) -> bool {
         !self.pr_statuses.is_empty()
             || !self.user_prs.is_empty()
@@ -122,6 +150,7 @@ pub struct Project {
     pub link_filter: Option<String>,
     pub linear_available: bool,
     pub tuicr_available: bool,
+    pub github_available: bool,
     pub live: LiveState,
     pub state_dirty: bool,
     pub base_issues: Vec<Issue>,
@@ -183,6 +212,7 @@ impl Project {
             link_filter: None,
             linear_available: false,
             tuicr_available: false,
+            github_available: false,
             live: LiveState::default(),
             state_dirty: false,
             base_issues,
@@ -407,6 +437,15 @@ impl Project {
                 .github_pr_links
                 .iter()
                 .any(|link| format!("#{}", link.number).contains(query))
+            || issue
+                .github_stack
+                .is_some_and(|number| format!("stack #{number}").contains(query))
+            || self.attached_stack(issue).is_some_and(|stack| {
+                stack
+                    .pull_requests
+                    .iter()
+                    .any(|pr| format!("#{}", pr.number).contains(query))
+            })
             || self
                 .branch_for(issue)
                 .is_some_and(|b| b.to_lowercase().contains(query))
@@ -882,23 +921,6 @@ impl Project {
             .find(|stack| stack.pull_requests.iter().any(|pr| pr.number == number))
     }
 
-    /// Resolves the GitHub stack for an issue given an already-resolved
-    /// `pr_for` result, so the render path can resolve `pr_for` once per card
-    /// instead of twice (once directly for the badge, once via the stack).
-    pub fn stack_for_issue_with_pr(
-        &self,
-        issue: &Issue,
-        pr: Option<&PrStatus>,
-    ) -> Option<&GithubStack> {
-        if let Some(pr) = pr {
-            return self.stack_for_pr(pr.number);
-        }
-        issue
-            .github_pr_links
-            .iter()
-            .find_map(|link| self.stack_for_pr(link.number))
-    }
-
     pub fn sync_prs_as_issues(&mut self) -> (bool, Option<String>) {
         if !self.live.pr_poll_done {
             return (false, None);
@@ -918,7 +940,10 @@ impl Project {
         // Review-requested issues are NOT removed, they get moved to Done instead.
         let before = self.issues.len();
         self.issues.retain(|issue| {
-            if !issue.is_any_pr_imported() {
+            if self.live.authored_prs_ready == Some(false) {
+                return true;
+            }
+            if issue.github_stack.is_some() || !issue.is_any_pr_imported() {
                 return true;
             }
             if issue.primary_pr_import_source() == Some(PrImportSource::ReviewRequested) {
@@ -935,7 +960,10 @@ impl Project {
         let now = unix_now();
         let mut completed = 0usize;
         for issue in &mut self.issues {
-            if !issue.is_any_pr_imported() {
+            if self.live.review_prs_ready == Some(false) {
+                continue;
+            }
+            if issue.github_stack.is_some() || !issue.is_any_pr_imported() {
                 continue;
             }
             if issue.primary_pr_import_source() != Some(PrImportSource::ReviewRequested) {
@@ -965,7 +993,7 @@ impl Project {
         let claimed_pr_numbers: HashSet<u32> = self
             .issues
             .iter()
-            .flat_map(|issue| issue.pr_numbers())
+            .flat_map(|issue| self.issue_pr_numbers(issue))
             .collect();
 
         let issue_ids: Vec<String> = self.issues.iter().map(|i| i.id.to_lowercase()).collect();
@@ -1010,7 +1038,9 @@ impl Project {
         let mut new_pr_numbers: HashSet<u32> = HashSet::new();
 
         // Import authored PRs
-        let authored_prs: &[PrStatus] = if self.config.auto_import_authored_prs {
+        let authored_prs: &[PrStatus] = if self.config.auto_import_authored_prs
+            && self.live.authored_prs_ready != Some(false)
+        {
             &self.live.user_prs
         } else {
             &[]
@@ -1031,12 +1061,21 @@ impl Project {
         }
 
         // Import review-requested PRs
-        let review_prs: &[PrStatus] = if self.config.auto_import_reviews {
-            &self.live.review_requested_prs
-        } else {
-            &[]
-        };
+        let review_prs: &[PrStatus] =
+            if self.config.auto_import_reviews && self.live.review_prs_ready != Some(false) {
+                &self.live.review_requested_prs
+            } else {
+                &[]
+            };
         for pr in review_prs {
+            if self
+                .live
+                .github_user
+                .as_deref()
+                .is_some_and(|user| pr.author.eq_ignore_ascii_case(user))
+            {
+                continue;
+            }
             if !should_import(
                 pr,
                 &claimed_branches,
@@ -1250,8 +1289,12 @@ impl Project {
         true
     }
 
+    pub fn can_browse_github(&self) -> bool {
+        self.github_available || self.has_github_prs()
+    }
+
     pub fn has_github_prs(&self) -> bool {
-        self.live.has_github_prs()
+        self.live.has_github_prs() || self.issues.iter().any(Issue::has_pr)
     }
 
     pub fn filtered_linear_issues<'a>(
@@ -1271,42 +1314,40 @@ impl Project {
             .collect()
     }
 
-    pub fn filtered_github_prs<'a>(&'a self, picker: &LinearPickerState) -> Vec<&'a PrStatus> {
+    pub fn filtered_github_prs<'a>(
+        &'a self,
+        picker: &LinearPickerState,
+    ) -> Vec<GithubPickerEntry<'a>> {
         let query = picker.search.to_lowercase();
-        let live = &self.live;
-
-        let mut seen: HashSet<u32> = HashSet::new();
-        let mut prs: Vec<&PrStatus> = Vec::new();
-
-        for pr in live.pr_statuses.values() {
-            if seen.insert(pr.number) {
-                prs.push(pr);
-            }
-        }
-        for pr in &live.user_prs {
-            if seen.insert(pr.number) {
-                prs.push(pr);
-            }
-        }
-        for pr in &live.review_requested_prs {
-            if seen.insert(pr.number) {
-                prs.push(pr);
-            }
-        }
-
-        prs.retain(|pr| {
-            query.is_empty()
-                || pr.title.to_lowercase().contains(&query)
-                || pr.number.to_string().contains(&query)
-                || pr.author.to_lowercase().contains(&query)
-                || pr.head_branch.to_lowercase().contains(&query)
-        });
-
-        prs.sort_by(|a, b| {
-            let a_open = a.state == PrState::Open;
-            let b_open = b.state == PrState::Open;
-            b_open.cmp(&a_open).then(b.number.cmp(&a.number))
-        });
+        let mut numbers = self.linked_pr_numbers();
+        numbers.extend(self.live.pr_statuses_by_number.keys().copied());
+        numbers.extend(
+            self.live
+                .pr_statuses
+                .values()
+                .chain(self.live.user_prs.iter())
+                .chain(self.live.review_requested_prs.iter())
+                .map(|pr| pr.number),
+        );
+        numbers.sort_unstable();
+        numbers.dedup();
+        let mut prs: Vec<_> = numbers
+            .into_iter()
+            .map(|number| GithubPickerEntry {
+                number,
+                status: self.pr_by_number(number),
+            })
+            .filter(|entry| {
+                query.is_empty()
+                    || entry.number.to_string().contains(&query)
+                    || entry.status.is_some_and(|pr| {
+                        pr.title.to_lowercase().contains(&query)
+                            || pr.author.to_lowercase().contains(&query)
+                            || pr.head_branch.to_lowercase().contains(&query)
+                    })
+            })
+            .collect();
+        prs.sort_by_key(|pr| std::cmp::Reverse(pr.number));
         prs
     }
 
@@ -1370,6 +1411,27 @@ pub enum CardSize {
 #[derive(Debug, Clone)]
 pub struct ActionContext {
     pub project_id: ProjectId,
+}
+
+#[derive(Debug)]
+pub struct StackDetailsState {
+    pub project_id: ProjectId,
+    pub issue_id: String,
+    pub selected: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct GithubPickerEntry<'a> {
+    pub number: u32,
+    pub status: Option<&'a PrStatus>,
+}
+
+impl GithubPickerEntry<'_> {
+    pub fn title(&self) -> &str {
+        self.status
+            .map(|pr| pr.title.as_str())
+            .unwrap_or("Status unavailable")
+    }
 }
 
 #[derive(Debug)]
@@ -1521,6 +1583,7 @@ fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
         setup_ran: _,
         linear_links: _,
         github_pr_links: _,
+        github_stack: _,
         linked_issues: _,
         // Merged entry-wise, interleaved with the kind/orchestrator logic below.
         sessions: _,
@@ -1558,6 +1621,7 @@ fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
     merge_field!(setup_ran);
     merge_field!(linear_links);
     merge_field!(github_pr_links);
+    merge_field!(github_stack);
     merge_field!(linked_issues);
 
     // `sessions` merges entry-wise: per-agent entries are independent, so a
@@ -1630,6 +1694,7 @@ pub struct App {
     /// discarded — the pane the detectors were watching is gone.
     pub launches_invalidated: HashSet<String>,
     pub linear_picker: Option<LinearPickerState>,
+    pub stack_details: Option<StackDetailsState>,
     pub linear_picker_context: LinearPickerContext,
     pub picker_tab: ImportSource,
     pub link_picker: Option<LinkPickerState>,
@@ -1662,6 +1727,7 @@ impl App {
             launches_in_flight: HashSet::new(),
             launches_invalidated: HashSet::new(),
             linear_picker: None,
+            stack_details: None,
             linear_picker_context: LinearPickerContext::Import,
             picker_tab: ImportSource::Linear,
             link_picker: None,
@@ -1901,6 +1967,13 @@ impl App {
         }
     }
 
+    pub fn github_loading_visible(&self) -> bool {
+        self.visible_swimlanes().iter().any(|id| {
+            self.find_project(id)
+                .is_some_and(|project| project.live.github_fetching())
+        })
+    }
+
     /// Whether the spinner should currently be drawn. True while any
     /// background action is in flight, and for at least `BUSY_MIN_VISIBLE`
     /// after the last one finishes.
@@ -1955,7 +2028,7 @@ impl App {
 
     pub fn open_dialog_in_column(&mut self, column: Column, ctx: &ActionContext) {
         let p = self.context_project(ctx);
-        let github_available = p.has_github_prs();
+        let github_available = p.can_browse_github();
         let mut state = DialogState::new(
             p.dialog_default_agent(),
             p.config.agent_mode,
@@ -1970,7 +2043,7 @@ impl App {
 
     pub fn open_edit_dialog(&mut self, issue: &Issue, index: usize, ctx: &ActionContext) {
         let p = self.context_project(ctx);
-        let github_available = p.has_github_prs();
+        let github_available = p.can_browse_github() || issue.has_pr();
         let live = &p.live;
         self.dialog = Some(DialogState::from_issue(
             issue,
@@ -2014,7 +2087,7 @@ impl App {
     ) {
         let p = self.context_project(ctx);
         let has_linear = !p.live.linear_issues.is_empty();
-        let has_github = p.has_github_prs();
+        let has_github = p.can_browse_github();
 
         if !has_linear && !has_github {
             if p.linear_available {
@@ -2031,6 +2104,7 @@ impl App {
             self.picker_tab = ImportSource::Linear;
         }
 
+        self.message = None;
         self.linear_picker_context = context;
         self.linear_picker = Some(LinearPickerState {
             search: String::new(),
@@ -2069,11 +2143,40 @@ impl App {
         self.active_project().filtered_linear_issues(picker)
     }
 
-    pub fn filtered_github_prs(&self) -> Vec<&PrStatus> {
+    pub fn filtered_github_prs(&self) -> Vec<GithubPickerEntry<'_>> {
         let Some(picker) = &self.linear_picker else {
             return Vec::new();
         };
-        self.active_project().filtered_github_prs(picker)
+        let project = self.active_project();
+        let mut prs = project.filtered_github_prs(picker);
+        if self.linear_picker_context == LinearPickerContext::Attach {
+            if let Some(dialog) = &self.dialog {
+                let mut attached: HashSet<u32> =
+                    dialog.github_prs.iter().map(|pr| pr.number).collect();
+                if let Some(stack) = project
+                    .live
+                    .github_stacks
+                    .iter()
+                    .find(|stack| Some(stack.number) == dialog.github_stack)
+                {
+                    attached.extend(stack.pull_requests.iter().map(|pr| pr.number));
+                }
+                prs.sort_by_key(|pr| {
+                    (!attached.contains(&pr.number), std::cmp::Reverse(pr.number))
+                });
+            }
+        }
+        prs
+    }
+
+    pub fn focus_github_picker_pr(&mut self, number: u32) {
+        let selected = self
+            .filtered_github_prs()
+            .iter()
+            .position(|pr| pr.number == number);
+        if let (Some(picker), Some(selected)) = (&mut self.linear_picker, selected) {
+            picker.selected = selected;
+        }
     }
 
     pub fn open_help(&mut self) {
@@ -2327,6 +2430,33 @@ mod tests {
         let mut issue = test_issue(id, column);
         issue.title = title.to_string();
         issue
+    }
+
+    #[test]
+    fn stack_attachment_merges_with_external_edits() {
+        let base = Issue::new("bork-1", "Before", Column::Todo, AgentKind::Codex);
+        let mut memory = base.clone();
+        memory.title = "Local edit".into();
+        let mut file = base.clone();
+        file.github_stack = Some(42);
+        merge_issue_fields(&mut memory, &base, &file);
+        assert_eq!(memory.title, "Local edit");
+        assert_eq!(memory.github_stack, Some(42));
+        let encoded = serde_json::to_string(&memory).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Issue>(&encoded)
+                .unwrap()
+                .github_stack,
+            Some(42)
+        );
+        let legacy = serde_json::to_string(&base).unwrap();
+        assert!(!legacy.contains("github_stack"));
+        assert_eq!(
+            serde_json::from_str::<Issue>(&legacy).unwrap().github_stack,
+            None
+        );
+        let _ = memory.set_kind(IssueKind::Orchestrator);
+        assert_eq!(memory.github_stack, None);
     }
 
     fn test_app(issues: Vec<Issue>) -> App {
@@ -3008,6 +3138,51 @@ mod tests {
 
         assert!(!app.project_mut().sync_prs_as_issues().0);
         assert!(app.project().issues.is_empty());
+    }
+
+    #[test]
+    fn incomplete_discovery_preserves_existing_imported_issues() {
+        let mut app = test_app(vec![]);
+        app.project_mut().live.pr_poll_done = true;
+        app.project_mut().live.user_prs = vec![test_pr(1, "my-feature")];
+        app.project_mut().live.review_requested_prs = vec![test_pr(2, "their-feature")];
+        app.project_mut().sync_prs_as_issues();
+        assert_eq!(app.project().issues.len(), 2);
+        let before = app.project().issues.clone();
+        app.project_mut().live.user_prs.clear();
+        app.project_mut().live.review_requested_prs.clear();
+        app.project_mut().live.authored_prs_ready = Some(false);
+        app.project_mut().live.review_prs_ready = Some(false);
+        app.project_mut().sync_prs_as_issues();
+        assert_eq!(app.project().issues, before);
+    }
+
+    #[test]
+    fn review_discovery_imports_others_before_authored_query_finishes() {
+        let mut app = test_app(vec![]);
+        let mut own = test_pr(1, "own-feature");
+        own.author = "me".into();
+        let mut other = test_pr(2, "other-feature");
+        other.author = "other".into();
+        app.project_mut().live.github_user = Some("me".into());
+        app.project_mut().live.review_requested_prs = vec![own, other];
+        app.project_mut().live.pr_poll_done = true;
+        app.project_mut().live.review_prs_ready = Some(true);
+        app.project_mut().live.authored_prs_ready = Some(false);
+        app.project_mut().sync_prs_as_issues();
+        assert_eq!(app.project().issues.len(), 1);
+        assert!(app.project().issues[0].has_pr_number(2));
+        assert_eq!(app.project().issues[0].column, Column::CodeReview);
+    }
+
+    #[test]
+    fn github_picker_can_open_before_any_prs_are_loaded() {
+        let mut app = test_app(vec![]);
+        app.project_mut().github_available = true;
+        let ctx = app.action_context();
+        app.open_import_picker(&ctx);
+        assert_eq!(app.input_mode, InputMode::LinearPicker);
+        assert_eq!(app.picker_tab, ImportSource::GitHub);
     }
 
     #[test]

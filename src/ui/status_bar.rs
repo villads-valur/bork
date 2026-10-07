@@ -50,7 +50,37 @@ pub fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(title), area);
 }
 
+pub const SPINNER_WIDTH: u16 = 8;
+
+pub fn render_loading_spinner(frame: &mut Frame, app: &App, area: Rect) {
+    if area.width < SPINNER_WIDTH || area.height == 0 {
+        return;
+    }
+    let target = Rect::new(
+        area.right() - SPINNER_WIDTH,
+        area.bottom() - 1,
+        SPINNER_WIDTH,
+        1,
+    );
+    let mut spans = vec![Span::raw("  ")];
+    spans.extend(spinner_spans(app));
+    spans.push(Span::raw(" "));
+    frame.render_widget(Paragraph::new(Line::from(spans)), target);
+}
+
 pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
+    let loading = app.is_busy_visible() || app.github_loading_visible();
+    let mut content = area;
+    if loading {
+        content.width = content.width.saturating_sub(SPINNER_WIDTH);
+    }
+    render_footer_content(frame, app, content);
+    if loading {
+        render_loading_spinner(frame, app, area);
+    }
+}
+
+fn render_footer_content(frame: &mut Frame, app: &App, area: Rect) {
     // Confirm mode
     if app.input_mode == InputMode::Confirm {
         if let Some(ref msg) = app.confirm_message {
@@ -102,6 +132,7 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     if matches!(
         app.input_mode,
         InputMode::Dialog
+            | InputMode::StackDetails
             | InputMode::LinearPicker
             | InputMode::LinkPicker
             | InputMode::Help
@@ -168,6 +199,15 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         ("q", "quit"),
     ];
 
+    if app
+        .active_project()
+        .selected_issue(&app.search_query)
+        .is_some_and(|issue| issue.github_stack.is_some())
+        && !app.active_project().live.gh_missing
+        && !app.active_project().live.stacks_unsupported
+    {
+        bindings.insert(0, ("s", "view stack"));
+    }
     if swimlane_count > 1 {
         bindings.insert(0, ("Tab", "lane"));
     }
@@ -207,14 +247,6 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         right_spans.push(update_span());
     }
 
-    if app.is_busy_visible() {
-        if !right_spans.is_empty() {
-            right_spans.push(Span::raw(" "));
-        }
-        right_spans.extend(spinner_spans(app));
-        right_spans.push(Span::raw(" "));
-    }
-
     if !right_spans.is_empty() {
         let left_width: usize = spans.iter().map(|s| s.width()).sum();
         let right_width: usize = right_spans.iter().map(|s| s.width()).sum();
@@ -231,7 +263,7 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
 
 fn update_span() -> Span<'static> {
     Span::styled(
-        "new update available (bork update) ",
+        "↑ Update Available ",
         Style::default()
             .fg(ratatui::style::Color::Yellow)
             .add_modifier(Modifier::BOLD),
@@ -242,13 +274,6 @@ fn render_right_indicators(frame: &mut Frame, app: &App, area: Rect) {
     let mut spans: Vec<Span<'static>> = Vec::new();
     if app.update_available {
         spans.push(update_span());
-    }
-    if app.is_busy_visible() {
-        if !spans.is_empty() {
-            spans.push(Span::raw(" "));
-        }
-        spans.extend(spinner_spans(app));
-        spans.push(Span::raw(" "));
     }
     if spans.is_empty() {
         return;

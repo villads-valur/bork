@@ -478,7 +478,11 @@ Each issue card shows the current agent status:
 
 ## GitHub PR Integration
 
-Bork polls GitHub for open PRs every 60 seconds using a single GraphQL query via the `gh` CLI. PRs are matched to issues by comparing the PR's head branch name against each issue's worktree branch. Open, non-draft PRs authored by the current GitHub user are also auto-imported as issues in the Code Review column, so you can track CI and review status without manual setup.
+Bork checks linked PRs, attached stacks, and issue worktree branches through the `gh` CLI. Status requests run in this order: Code Review (every minute), In Progress (every two minutes), To Do (every five minutes), then Done. Done PRs refresh hourly, or daily when already merged/closed, with at most 50 Done PR lookups per five-minute cycle.
+
+Review requests are discovered and imported automatically in the background every minute. Authored PR discovery runs every five minutes. Both respect their existing auto-import settings. The repository-wide recent-PR list and stack discovery load only when you open the GitHub picker; unrelated stacks do not trigger status lookups.
+
+Results and retry timing are cached in `.bork/github-cache.json`, so reopening Bork reuses fresh data. Requests are deduplicated and batched, failures back off, and rate limiting pauses the queue. Manual refresh bypasses normal freshness intervals, with a short cooldown to coalesce repeated key presses. Loading uses the existing spinner and keeps cached content visible.
 
 You can link multiple GitHub PRs to a single bork issue, either via the TUI dialog (multi-select picker) or the CLI (`bork integration attach-pr`). Cards show all linked PR numbers.
 
@@ -577,9 +581,8 @@ When multiple projects are visible as swimlanes, their kanban boards are stacked
 
 | Projects Visible | Card Height | Detail Level |
 |------------------|-------------|--------------|
-| 1 | Full (5 lines) | Title, status, PR line, branch, linear |
-| 2 | Medium (3 lines) | Title, status + git changes, PR badge |
-| 3 | Compact (2 lines) | Title, status icon + branch |
+| 1–2 | Full (5 content lines) | Title, status, up to two PR rows, footer |
+| 3 | Medium (4 content lines) | Title, status, PR summary, footer |
 
 Use **`Tab`** / **`Shift+Tab`** to switch focus between swimlanes. The focused swimlane has a highlighted header and receives all keyboard input (navigation, issue management, etc.).
 
@@ -644,3 +647,36 @@ Want to contribute? Open an issue or PR &mdash; contributions of all sizes are w
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
+
+### Attached PR stacks
+
+The GitHub picker marks PRs that belong to a stack. **Enter** still imports or
+attaches only the selected PR. **Ctrl+S** imports the whole stack, or toggles its
+attachment when editing an issue. Typing continues to search, including `s`.
+An issue can follow one stack alongside its existing individual PR links.
+
+An attached stack follows GitHub's current membership. Its card summarizes CI
+across open PRs, with failures, pending checks, and unknown checks shown separately.
+Small stacks show connected PR rows; larger stacks show a count and check summary.
+Merged and closed PRs remain visible in the expanded list. Stack cards omit diff
+counts. Individual PRs show additions/deletions, or `draft` while still in draft.
+Linked issues and Linear IDs sit at bottom-left. Selecting a stack issue shows
+`s view stack` in the app shortcut bar.
+Orchestrator and todo cards show their type beside the issue ID in the border.
+
+Stack controls appear only when the repository supports GitHub's stack API;
+no CLI extension is required. Without `gh`, live GitHub details are hidden and
+saved links remain editable. Loading is separate from errors. Failed refreshes
+keep cached status and show the error in the picker or stack details.
+
+- **s** expands the stack into a scrollable panel; **j/k** navigates and **Esc** closes.
+- **o** opens all open PRs in the attached stack, in stack order.
+- **R** reviews each open PR separately with `tuicr pr <number>`. After exiting a
+  review, press Enter for the next PR or `q` to stop. This needs a tuicr version
+  with the `pr` subcommand; an issue worktree is not required.
+- **P** refreshes GitHub data. When stack data is unavailable, stack-wide actions
+  wait for a successful refresh rather than opening a partial list.
+
+To detach a stack, edit the issue, focus GitHub, and press Backspace. Existing
+individual PR links remain attached. Issues without a stack keep their existing
+browser and review shortcuts.

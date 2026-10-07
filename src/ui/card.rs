@@ -4,14 +4,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-use crate::app::CardSize;
+use crate::app::{CardSize, Project};
 use crate::types::{
-    AgentStatus, GithubStack, Issue, IssueKind, PrImportSource, PrState, PrStatus, WorktreeStatus,
+    AgentStatus, Issue, IssueKind, PrImportSource, PrState, PrStatus, WorktreeStatus,
 };
 use crate::ui::styles;
 
 pub const CARD_HEIGHT: u16 = 7;
-pub const CARD_HEIGHT_MEDIUM: u16 = 5;
+pub const CARD_HEIGHT_MEDIUM: u16 = 6;
 
 pub struct CardContext<'a> {
     pub issue: &'a Issue,
@@ -20,10 +20,9 @@ pub struct CardContext<'a> {
     pub session_alive: bool,
     pub agent_status: AgentStatus,
     pub activity: Option<&'a str>,
-    pub branch: Option<&'a str>,
     pub git_status: Option<&'a WorktreeStatus>,
     pub pr: Option<&'a PrStatus>,
-    pub stack: Option<&'a GithubStack>,
+    pub project: &'a Project,
     pub ports: Option<&'a Vec<u16>>,
     pub search_query: &'a str,
 }
@@ -45,14 +44,23 @@ pub fn render_card(frame: &mut Frame, ctx: &CardContext, area: Rect, card_size: 
     } else {
         format!(" {} ", ctx.issue.id)
     };
+    let (type_label, type_style) = match ctx.issue.kind {
+        IssueKind::Orchestrator => ("· orch ", styles::orchestrator_badge_style()),
+        IssueKind::NonAgentic => ("· todo ", styles::dim_style()),
+        IssueKind::Agentic => ("", title_style),
+    };
+    let id_text = styles::truncate(
+        &id_text,
+        (area.width as usize).saturating_sub(Span::raw(type_label).width() + 3),
+    );
+    let mut title = highlight_spans(&id_text, ctx.search_query, title_style);
+    if !type_label.is_empty() {
+        title.push(Span::styled(type_label, type_style));
+    }
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
-        .title(Line::from(highlight_spans(
-            &id_text,
-            ctx.search_query,
-            title_style,
-        )));
+        .title(Line::from(title));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -79,15 +87,19 @@ fn render_full(
     let title_text = styles::truncate(&ctx.issue.title, max_width);
     let title_line = Line::from(highlight_spans(&title_text, ctx.search_query, title_style));
     let status_line = format_status_line(ctx);
-    let pr_line = format_pr_line(ctx.pr, ctx.issue, ctx.stack);
-    let bottom_line = format_bottom_line(ctx.issue, ctx.branch, ctx.ports, max_width);
+    let pr_lines = format_pr_rows(ctx, max_width, false);
+    let bottom_line = format_bottom_line(ctx.issue, ctx.ports, max_width);
 
     let mut lines = vec![title_line];
     if inner.height > 1 {
         lines.push(status_line);
     }
     if inner.height > 2 {
-        lines.push(pr_line);
+        lines.extend(
+            pr_lines
+                .into_iter()
+                .take(inner.height.saturating_sub(3) as usize),
+        );
     }
 
     let paragraph = Paragraph::new(lines);
@@ -109,14 +121,19 @@ fn render_medium(
     let title_text = styles::truncate(&ctx.issue.title, max_width);
     let title_line = Line::from(highlight_spans(&title_text, ctx.search_query, title_style));
     let status_line = format_status_line(ctx);
-    let pr_line = format_pr_compact(ctx.pr, ctx.issue, ctx.stack);
+    let pr_lines = format_pr_rows(ctx, max_width, true);
 
     let mut lines = vec![title_line, status_line];
     if inner.height > 2 {
-        lines.push(pr_line);
+        lines.extend(pr_lines.into_iter().take(1));
     }
 
     frame.render_widget(Paragraph::new(lines), inner);
+    if inner.height > 3 {
+        let footer = format_bottom_line(ctx.issue, ctx.ports, max_width);
+        let bottom = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
+        frame.render_widget(Paragraph::new(footer), bottom);
+    }
 }
 
 /// Splits `text` into spans, highlighting the first case-insensitive match of
@@ -159,12 +176,7 @@ fn link_badge(issue: &Issue) -> Option<Span<'static>> {
 
 fn format_status_line(ctx: &CardContext) -> Line<'static> {
     if ctx.issue.kind == IssueKind::NonAgentic {
-        let mut spans = vec![Span::raw("  "), Span::styled("Todo", styles::dim_style())];
-        if let Some(badge) = link_badge(ctx.issue) {
-            spans.push(Span::raw(" "));
-            spans.push(badge);
-        }
-        return Line::from(spans);
+        return Line::default();
     }
 
     let status_color = styles::agent_status_color(&ctx.agent_status);
@@ -194,19 +206,6 @@ fn format_status_line(ctx: &CardContext) -> Line<'static> {
         spans.push(Span::styled("review", Style::default().fg(Color::Yellow)));
     }
 
-    if ctx.issue.kind == IssueKind::Orchestrator {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            "\u{25c6} orch",
-            styles::orchestrator_badge_style(),
-        ));
-    }
-
-    if let Some(badge) = link_badge(ctx.issue) {
-        spans.push(Span::raw(" "));
-        spans.push(badge);
-    }
-
     let git_spans = format_git_status(ctx.git_status);
     if !git_spans.is_empty() {
         spans.push(Span::raw(" "));
@@ -216,103 +215,40 @@ fn format_status_line(ctx: &CardContext) -> Line<'static> {
     Line::from(spans)
 }
 
-fn format_bottom_line(
-    issue: &Issue,
-    branch: Option<&str>,
-    ports: Option<&Vec<u16>>,
-    max_width: usize,
-) -> Line<'static> {
-    let has_linear = issue.has_linear();
-    let has_missing_branch = branch.is_none();
-    let has_ports = ports.is_some_and(|p| !p.is_empty());
-    let pruned_indicator = pruned_indicator_text(issue);
-
-    if !has_linear && !has_missing_branch && !has_ports && pruned_indicator.is_none() {
-        return Line::from("");
+fn format_bottom_line(issue: &Issue, ports: Option<&Vec<u16>>, max_width: usize) -> Line<'static> {
+    let mut right = Vec::new();
+    if let Some(text) = pruned_indicator_text(issue) {
+        right.push(text);
     }
-
-    let mut left_spans: Vec<Span<'static>> = vec![Span::raw("  ")];
-    let mut left_width: usize = 2;
-
-    if has_linear {
-        let identifiers: Vec<&str> = issue.linear_identifiers();
-        let prefix = "\u{25c8} ";
-        left_spans.push(Span::styled(
-            prefix.to_string(),
+    if ports.is_some_and(|ports| !ports.is_empty()) {
+        right.push("🔌".to_string());
+    }
+    // Drop secondary indicators first when the footer gets narrow.
+    while right.len() > 1 && Span::raw(right.join(" ")).width() + 10 > max_width {
+        right.remove(0);
+    }
+    let right = Span::styled(right.join(" "), styles::dim_style());
+    let left_budget = max_width.saturating_sub(right.width() + 2);
+    let mut left = vec![Span::raw("  ")];
+    if let Some(badge) = link_badge(issue) {
+        left.push(badge);
+        left.push(Span::raw(" "));
+    }
+    let used = left.iter().map(Span::width).sum::<usize>();
+    if issue.has_linear() && left_budget > used + 2 {
+        let identifiers = issue.linear_identifiers().join(", ");
+        left.push(Span::styled(
+            styles::truncate(&format!("◈ {identifiers}"), left_budget - used),
             Style::default().fg(Color::Blue),
         ));
-        left_width += prefix.len();
-
-        let budget = max_width.saturating_sub(left_width + 6);
-        let mut used = 0;
-        for (i, ident) in identifiers.iter().enumerate() {
-            let sep = if i > 0 { ", " } else { "" };
-            let text = format!("{}{}", sep, ident);
-            if used + text.len() > budget && i > 0 {
-                let remaining = identifiers.len() - i;
-                let overflow = format!("+{}", remaining);
-                left_spans.push(Span::styled(
-                    overflow.clone(),
-                    Style::default().fg(Color::Blue),
-                ));
-                left_width += overflow.len();
-                break;
-            }
-            if i > 0 {
-                left_spans.push(Span::styled(", ", Style::default().fg(Color::Blue)));
-                left_width += 2;
-            }
-            left_spans.push(Span::styled(
-                ident.to_string(),
-                Style::default().fg(Color::Blue),
-            ));
-            left_width += ident.len();
-            used += text.len();
-        }
     }
-
-    let mut right_spans: Vec<Span<'static>> = Vec::new();
-    let mut right_width: usize = 0;
-
-    if has_ports {
-        right_spans.push(Span::styled("\u{1f50c}", Style::default()));
-        right_width += 2;
+    let used = left.iter().map(Span::width).sum::<usize>();
+    if right.width() > 0 && used + right.width() < max_width {
+        left.push(Span::raw(" ".repeat(max_width - used - right.width() - 1)));
+        left.push(right);
+        left.push(Span::raw(" "));
     }
-
-    if has_missing_branch {
-        if !right_spans.is_empty() {
-            right_spans.insert(0, Span::raw(" "));
-            right_width += 1;
-        }
-        right_spans.insert(
-            0,
-            Span::styled("\u{00f8}", Style::default().fg(styles::DIM)),
-        );
-        right_width += 1;
-    }
-
-    if let Some(text) = pruned_indicator.as_deref() {
-        if !right_spans.is_empty() {
-            right_spans.insert(0, Span::raw(" "));
-            right_width += 1;
-        }
-        right_spans.insert(0, Span::styled(text.to_string(), styles::dim_style()));
-        right_width += text.len();
-    }
-
-    if !right_spans.is_empty() {
-        let total = left_width + right_width + 1;
-        let gap = if total < max_width {
-            max_width - total
-        } else {
-            1
-        };
-        left_spans.push(Span::raw(" ".repeat(gap)));
-        left_spans.extend(right_spans);
-        left_spans.push(Span::raw(" "));
-    }
-
-    Line::from(left_spans)
+    Line::from(left)
 }
 
 /// "pruned 3d ago" indicator. Only shown when the issue has been pruned and
@@ -377,177 +313,207 @@ fn format_git_status(status: Option<&WorktreeStatus>) -> Vec<Span<'static>> {
     spans
 }
 
-fn format_pr_line(
-    pr: Option<&PrStatus>,
-    issue: &Issue,
-    stack: Option<&GithubStack>,
-) -> Line<'static> {
-    let Some(pr) = pr else {
-        if issue.github_pr_links.len() > 1 {
-            let mut spans = vec![Span::raw("  ")];
-            for (i, link) in issue.github_pr_links.iter().enumerate() {
-                if i > 0 {
-                    spans.push(Span::styled(", ", styles::dim_style()));
+fn format_pr_rows(ctx: &CardContext, width: usize, compact: bool) -> Vec<Line<'static>> {
+    if ctx.project.live.gh_missing {
+        return Vec::new();
+    }
+    if let Some(number) = ctx
+        .issue
+        .github_stack
+        .filter(|_| !ctx.project.live.stacks_unsupported)
+    {
+        let Some(stack) = ctx.project.attached_stack(ctx.issue) else {
+            if ctx.project.live.github_loading() {
+                return vec![Line::styled(
+                    format!("  Stack #{number}"),
+                    styles::dim_style(),
+                )];
+            }
+            return vec![Line::styled(
+                styles::truncate(
+                    &format!(
+                        "  Stack #{number} · {}",
+                        ctx.project.live.missing_github_status()
+                    ),
+                    width,
+                ),
+                styles::dim_style(),
+            )];
+        };
+        let count = stack.pull_requests.len();
+        if !compact && count <= 2 && count > 0 && ctx.project.live.stacks_available {
+            return stack
+                .pull_requests
+                .iter()
+                .enumerate()
+                .map(|(index, member)| {
+                    let connector = if count == 1 {
+                        "─"
+                    } else if index == 0 {
+                        "┌"
+                    } else {
+                        "└"
+                    };
+                    let mut spans = vec![
+                        Span::styled(format!("  {connector} "), Style::default().fg(Color::Cyan)),
+                        Span::styled(format!("#{}", member.number), styles::dim_style()),
+                    ];
+                    if member.state != PrState::Open {
+                        let (label, color) = styles::pr_state_style(&member.state);
+                        spans.push(Span::styled(
+                            format!(" {label}"),
+                            Style::default().fg(color),
+                        ));
+                    } else if let Some(pr) = ctx.project.pr_by_number(member.number) {
+                        spans.extend(pr_spans(pr));
+                    } else if !ctx.project.live.github_loading() {
+                        spans.push(Span::styled(
+                            format!(" {}", ctx.project.live.missing_github_status()),
+                            styles::dim_style(),
+                        ));
+                    }
+                    Line::from(spans)
+                })
+                .collect();
+        }
+        let mut header = vec![Span::styled(
+            format!("  {count} PRs"),
+            Style::default().fg(Color::Cyan),
+        )];
+        let mut status = Vec::new();
+        if !ctx.project.live.stacks_available {
+            if ctx.project.live.github_loading() {
+                return vec![Line::from(header)];
+            }
+            status.push(Span::styled(
+                ctx.project.live.missing_github_status(),
+                styles::dim_style(),
+            ));
+        } else {
+            let checks = ctx.project.stack_checks(stack);
+            let states = [
+                (checks.failed, "✗", "failed", Color::Red),
+                (checks.pending, "◌", "pending", Color::Yellow),
+                (checks.unknown, "?", "unknown", styles::DIM),
+                (checks.passed, "✓", "passed", Color::Green),
+            ];
+            let single_state = states.iter().filter(|(count, ..)| *count > 0).count() == 1;
+            for (count, symbol, label, color) in states {
+                if count > 0 {
+                    let text = if single_state {
+                        format!("{symbol} {count} {label}")
+                    } else {
+                        format!("{symbol} {count}")
+                    };
+                    status.push(Span::styled(text, Style::default().fg(color)));
                 }
-                spans.push(Span::styled(
-                    format!("#{}", link.number),
+            }
+            if status.is_empty() {
+                let merged = stack
+                    .pull_requests
+                    .iter()
+                    .filter(|pr| pr.state == PrState::Merged)
+                    .count();
+                status.push(Span::styled(
+                    format!("{merged} merged · {} closed", count - merged),
                     styles::dim_style(),
                 ));
             }
-            append_stack_badge(&mut spans, stack, issue.github_pr_links[0].number);
-            return Line::from(spans);
         }
-        if let Some(num) = issue.primary_pr_number() {
-            let mut spans = vec![
-                Span::raw("  "),
-                Span::styled(format!("#{}", num), styles::dim_style()),
-            ];
-            append_stack_badge(&mut spans, stack, num);
-            return Line::from(spans);
+        for (index, span) in status.iter().enumerate() {
+            let used = header.iter().map(Span::width).sum::<usize>();
+            let remaining = if index + 1 < status.len() { 2 } else { 0 };
+            if used + 3 + span.width() + remaining > width {
+                if used + 2 <= width {
+                    header.push(Span::styled(" …", styles::dim_style()));
+                }
+                break;
+            }
+            header.push(Span::styled(" · ", styles::dim_style()));
+            header.push(span.clone());
         }
-        return Line::from("");
-    };
+        return vec![Line::from(header)];
+    }
 
-    let pr_number = Span::styled(format!("#{}", pr.number), styles::dim_style());
-
-    let extra_pr_spans: Vec<Span<'static>> = issue
-        .github_pr_links
+    let mut numbers = ctx.issue.pr_numbers();
+    if numbers.is_empty() {
+        if let Some(pr) = ctx.pr {
+            numbers.push(pr.number);
+        }
+    }
+    let limit = if compact { 1 } else { 2 };
+    numbers
         .iter()
-        .filter(|l| l.number != pr.number)
-        .flat_map(|l| {
-            vec![
-                Span::styled(", ", styles::dim_style()),
-                Span::styled(format!("#{}", l.number), styles::dim_style()),
-            ]
-        })
-        .collect();
-
-    match &pr.state {
-        PrState::Merged | PrState::Closed => {
-            let (label, color) = styles::pr_state_style(&pr.state);
-            let mut spans = vec![Span::raw("  "), pr_number];
-            spans.extend(extra_pr_spans);
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(label, Style::default().fg(color)));
-            append_stack_badge(&mut spans, stack, pr.number);
-            Line::from(spans)
-        }
-        PrState::Open => {
-            let (checks_sym, checks_color) = styles::checks_icon(pr.checks);
-            let (review_sym, review_color) = styles::review_icon(pr.review);
-
-            let mut spans = vec![Span::raw("  "), pr_number];
-            spans.extend(extra_pr_spans);
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(checks_sym, Style::default().fg(checks_color)));
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(review_sym, Style::default().fg(review_color)));
-
-            if pr.additions > 0 || pr.deletions > 0 {
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled(
-                    format!("+{}", pr.additions),
+        .take(limit)
+        .enumerate()
+        .map(|(index, number)| {
+            let pr = ctx
+                .project
+                .pr_by_number(*number)
+                .or_else(|| ctx.pr.filter(|pr| pr.number == *number));
+            let suffix = if index + 1 == limit && numbers.len() > limit {
+                format!("  +{} PRs", numbers.len() - limit)
+            } else {
+                String::new()
+            };
+            let mut spans = vec![Span::styled(format!("  #{number}"), styles::dim_style())];
+            let mut status = pr.map(pr_spans).unwrap_or_else(|| {
+                if ctx.project.live.github_loading() {
+                    return Vec::new();
+                }
+                vec![Span::styled(
+                    format!(" {}", ctx.project.live.missing_github_status()),
+                    styles::dim_style(),
+                )]
+            });
+            if let Some(pr) = pr.filter(|pr| !pr.is_draft && pr.state != PrState::Merged) {
+                status.push(Span::styled(
+                    format!(" +{}", pr.additions),
                     Style::default().fg(Color::Green),
                 ));
-                spans.push(Span::styled("/", styles::dim_style()));
-                spans.push(Span::styled(
-                    format!("-{}", pr.deletions),
+                status.push(Span::styled(
+                    format!("/-{}", pr.deletions),
                     Style::default().fg(Color::Red),
                 ));
             }
-
-            if pr.is_draft {
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled("draft", styles::dim_style()));
+            while !status.is_empty()
+                && spans.iter().map(Span::width).sum::<usize>()
+                    + status.iter().map(Span::width).sum::<usize>()
+                    + suffix.len()
+                    > width
+            {
+                status.pop();
             }
-
-            append_stack_badge(&mut spans, stack, pr.number);
-
+            spans.extend(status);
+            spans.push(Span::styled(suffix, Style::default().fg(Color::Cyan)));
             Line::from(spans)
-        }
-    }
-}
-
-fn format_pr_compact(
-    pr: Option<&PrStatus>,
-    issue: &Issue,
-    stack: Option<&GithubStack>,
-) -> Line<'static> {
-    let Some(pr) = pr else {
-        if let Some(num) = issue.primary_pr_number() {
-            let mut spans = vec![Span::styled(format!("  #{}", num), styles::dim_style())];
-            for link in issue.github_pr_links.iter().skip(1) {
-                spans.push(Span::styled(
-                    format!(", #{}", link.number),
-                    styles::dim_style(),
-                ));
-            }
-            append_stack_badge(&mut spans, stack, num);
-            return Line::from(spans);
-        }
-        return Line::from("");
-    };
-
-    let pr_number = Span::styled(format!("  #{}", pr.number), styles::dim_style());
-
-    let extra_pr_spans: Vec<Span<'static>> = issue
-        .github_pr_links
-        .iter()
-        .filter(|l| l.number != pr.number)
-        .flat_map(|l| {
-            vec![
-                Span::styled(", ", styles::dim_style()),
-                Span::styled(format!("#{}", l.number), styles::dim_style()),
-            ]
         })
-        .collect();
-
-    match &pr.state {
-        PrState::Merged | PrState::Closed => {
-            let (label, color) = styles::pr_state_style(&pr.state);
-            let mut spans = vec![pr_number];
-            spans.extend(extra_pr_spans);
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(label, Style::default().fg(color)));
-            append_stack_badge(&mut spans, stack, pr.number);
-            Line::from(spans)
-        }
-        PrState::Open => {
-            let (checks_sym, checks_color) = styles::checks_icon(pr.checks);
-            let (review_sym, review_color) = styles::review_icon(pr.review);
-            let mut spans = vec![pr_number];
-            spans.extend(extra_pr_spans);
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(checks_sym, Style::default().fg(checks_color)));
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(review_sym, Style::default().fg(review_color)));
-            append_stack_badge(&mut spans, stack, pr.number);
-            Line::from(spans)
-        }
-    }
+        .collect()
 }
 
-fn append_stack_badge(spans: &mut Vec<Span<'static>>, stack: Option<&GithubStack>, pr_number: u32) {
-    let Some(stack) = stack else {
-        return;
-    };
-    let Some(position) = stack
-        .pull_requests
-        .iter()
-        .position(|pr| pr.number == pr_number)
-    else {
-        return;
-    };
-    spans.push(Span::raw(" "));
+pub(crate) fn pr_spans(pr: &PrStatus) -> Vec<Span<'static>> {
+    if pr.state != PrState::Open {
+        let (label, color) = styles::pr_state_style(&pr.state);
+        return vec![Span::styled(
+            format!(" {label}"),
+            Style::default().fg(color),
+        )];
+    }
+    let mut spans = Vec::new();
+    let (checks, checks_color) = styles::checks_icon(pr.checks);
+    let (review, review_color) = styles::review_icon(pr.review);
     spans.push(Span::styled(
-        format!(
-            "S{} {}/{}",
-            stack.number,
-            position + 1,
-            stack.pull_requests.len()
-        ),
-        Style::default().fg(Color::Cyan),
+        format!(" {checks}"),
+        Style::default().fg(checks_color),
     ));
+    spans.push(Span::styled(
+        format!(" {review}"),
+        Style::default().fg(review_color),
+    ));
+    if pr.is_draft {
+        spans.push(Span::styled(" draft", styles::dim_style()));
+    }
+    spans
 }
 
 #[cfg(test)]
