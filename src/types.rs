@@ -272,6 +272,16 @@ pub struct LinkedGithubPr {
     pub import_source: Option<PrImportSource>,
 }
 
+/// Original auto-import values used to identify cards safe to reconcile into a stack.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PrImportBaseline {
+    pub title: String,
+    pub prompt: Option<String>,
+    pub agent_kind: AgentKind,
+    pub number: u32,
+    pub source: PrImportSource,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Issue {
     pub id: String,
@@ -308,6 +318,8 @@ pub struct Issue {
     pub github_pr_links: Vec<LinkedGithubPr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_stack: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_import_baseline: Option<PrImportBaseline>,
 
     /// IDs of other issues in the same project this one is tied to.
     /// Links are symmetric: each side stores the other's id.
@@ -373,6 +385,7 @@ impl Issue {
             linear_links: Vec::new(),
             github_pr_links: Vec::new(),
             github_stack: None,
+            pr_import_baseline: None,
             linked_issues: Vec::new(),
             session_id: None,
             linear_id: None,
@@ -383,6 +396,28 @@ impl Issue {
             pr_imported: false,
             pr_import_source: None,
         }
+    }
+
+    pub fn is_untouched_pr_import(&self) -> bool {
+        let Some(baseline) = &self.pr_import_baseline else {
+            return false;
+        };
+        let expected = Self {
+            prompt: baseline.prompt.clone(),
+            github_pr_links: vec![LinkedGithubPr {
+                number: baseline.number,
+                imported: true,
+                import_source: Some(baseline.source),
+            }],
+            pr_import_baseline: Some(baseline.clone()),
+            ..Self::new(
+                &self.id,
+                &baseline.title,
+                Column::CodeReview,
+                baseline.agent_kind,
+            )
+        };
+        self == &expected
     }
 
     /// Build a fresh issue from a `draft`, stamping `done_at` with `now` when

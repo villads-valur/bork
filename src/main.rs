@@ -71,6 +71,8 @@ struct PrPollResult {
     prs: HashMap<String, PrStatus>,
     prs_by_number: HashMap<u32, PrStatus>,
     stacks: Option<Vec<GithubStack>>,
+    #[serde(skip)]
+    refreshed_stacks: Vec<u32>,
     user_prs: Vec<PrStatus>,
     review_requested_prs: Vec<PrStatus>,
     github_user: Option<String>,
@@ -1761,6 +1763,7 @@ fn drain_project_workers(
     action_tx: &mpsc::Sender<ActionResult>,
     now: u64,
     picker: bool,
+    protected_imports: &HashSet<String>,
 ) -> DrainOutcome {
     let mut needs_redraw = false;
     let mut message = None;
@@ -1823,6 +1826,7 @@ fn drain_project_workers(
 
     // --- PR status ---
     let mut pr_data_changed = false;
+    let mut refreshed_stacks = HashSet::new();
     while let Ok(pr_result) = workers.pr_rx.try_recv() {
         project.github_available = !pr_result.gh_missing;
         let live = &mut project.live;
@@ -1832,7 +1836,9 @@ fn drain_project_workers(
             needs_redraw = true;
             continue;
         }
-        let changed = live.gh_missing != pr_result.gh_missing
+        refreshed_stacks.extend(&pr_result.refreshed_stacks);
+        let changed = !pr_result.refreshed_stacks.is_empty()
+            || live.gh_missing != pr_result.gh_missing
             || live.stacks_unsupported != pr_result.stacks_unsupported
             || live.pr_refreshing
             || live.authored_prs_ready != Some(pr_result.authored_ready)
@@ -1898,9 +1904,15 @@ fn drain_project_workers(
 
     // --- Auto-import open PRs as issues (only when new PR data arrived) ---
     if pr_data_changed {
+        let reconciled = project.reconcile_stack_imports(&refreshed_stacks, protected_imports);
         let (changed, msg) = project.sync_prs_as_issues();
         message = msg;
-        if changed {
+        if reconciled > 0 {
+            let cleanup = format!("Removed {reconciled} duplicate stack imports");
+            message =
+                Some(message.map_or_else(|| cleanup.clone(), |msg| format!("{msg}, {cleanup}")));
+        }
+        if changed || reconciled > 0 {
             project.mark_dirty();
         }
     }
@@ -2488,7 +2500,22 @@ fn run_tui() -> anyhow::Result<()> {
             && app.picker_tab == app::ImportSource::GitHub)
             .then(|| app.active_project_id());
         let picker = picker_project.as_ref() == Some(&app.focused_project);
-        let outcome = drain_project_workers(app.project_mut(), &workers, &action_tx, now, picker);
+        let mut protected_imports = app.launches_in_flight.clone();
+        if let Some(id) = app
+            .dialog
+            .as_ref()
+            .and_then(|dialog| dialog.editing_issue_id.as_ref())
+        {
+            protected_imports.insert(id.clone());
+        }
+        let outcome = drain_project_workers(
+            app.project_mut(),
+            &workers,
+            &action_tx,
+            now,
+            picker,
+            &protected_imports,
+        );
         needs_redraw |= apply_drain_outcome(&mut app, outcome);
 
         // --- Update check (periodic worker results) ---
@@ -2575,6 +2602,7 @@ fn run_tui() -> anyhow::Result<()> {
                 &action_tx,
                 now,
                 picker_project.as_ref() == Some(proj_id),
+                &protected_imports,
             );
             needs_redraw |= apply_drain_outcome(&mut app, outcome);
         }

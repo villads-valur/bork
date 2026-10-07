@@ -20,7 +20,7 @@ use crate::external::linear::LinearIssue;
 use crate::prune::{PruneAction, PruneCandidate};
 use crate::types::{
     AgentKind, AgentStatus, AgentStatusInfo, Column, GithubStack, Issue, IssueKind, LinkedGithubPr,
-    PrImportSource, PrState, PrStatus, WorktreeStatus,
+    PrImportBaseline, PrImportSource, PrState, PrStatus, WorktreeStatus,
 };
 
 pub type ProjectId = PathBuf;
@@ -919,6 +919,65 @@ impl Project {
             .find(|stack| stack.pull_requests.iter().any(|pr| pr.number == number))
     }
 
+    pub fn reconcile_stack_imports(
+        &mut self,
+        refreshed: &HashSet<u32>,
+        protected: &HashSet<String>,
+    ) -> usize {
+        if refreshed.is_empty() {
+            return 0;
+        }
+        let members: HashSet<u32> = self
+            .issues
+            .iter()
+            .filter_map(|issue| issue.github_stack)
+            .filter(|number| {
+                refreshed.contains(number) && !self.live.stack_errors.contains_key(number)
+            })
+            .filter_map(|number| {
+                self.live
+                    .github_stacks
+                    .iter()
+                    .find(|stack| stack.number == number)
+            })
+            .flat_map(|stack| stack.pull_requests.iter().map(|pr| pr.number))
+            .collect();
+        if members.is_empty() {
+            return 0;
+        }
+        let referenced: HashSet<_> = self
+            .issues
+            .iter()
+            .flat_map(|issue| &issue.linked_issues)
+            .map(|id| id.to_lowercase())
+            .collect();
+        let removable: HashSet<_> = self
+            .issues
+            .iter()
+            .filter(|issue| {
+                let session = issue.session_name(&self.config.project_name);
+                issue.is_untouched_pr_import()
+                    && issue
+                        .github_pr_links
+                        .iter()
+                        .any(|link| members.contains(&link.number))
+                    && !protected.contains(&issue.id)
+                    && !referenced.contains(&issue.id.to_lowercase())
+                    && !self.marked_issues.contains(&issue.id.to_lowercase())
+                    && !self.live.active_sessions.contains(&session)
+                    && !self.live.agent_statuses.contains_key(&session)
+                    && self.detect_worktree(issue).is_none()
+            })
+            .map(|issue| issue.id.clone())
+            .collect();
+        if !removable.is_empty() {
+            self.issues.retain(|issue| !removable.contains(&issue.id));
+            self.clear_stale_link_filter();
+            self.clamp_all_rows("");
+        }
+        removable.len()
+    }
+
     pub fn sync_prs_as_issues(&mut self) -> (bool, Option<String>) {
         if !self.live.pr_poll_done {
             return (false, None);
@@ -1138,6 +1197,13 @@ impl Project {
             }
         };
         Issue {
+            pr_import_baseline: Some(PrImportBaseline {
+                title: pr.title.clone(),
+                prompt: prompt.clone(),
+                agent_kind: self.config.agent_kind,
+                number: pr.number,
+                source,
+            }),
             prompt,
             github_pr_links: vec![LinkedGithubPr {
                 number: pr.number,
@@ -1582,6 +1648,7 @@ fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
         linear_links: _,
         github_pr_links: _,
         github_stack: _,
+        pr_import_baseline: _,
         linked_issues: _,
         // Merged entry-wise, interleaved with the kind/orchestrator logic below.
         sessions: _,
@@ -1620,6 +1687,7 @@ fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
     merge_field!(linear_links);
     merge_field!(github_pr_links);
     merge_field!(github_stack);
+    merge_field!(pr_import_baseline);
     merge_field!(linked_issues);
 
     // `sessions` merges entry-wise: per-agent entries are independent, so a
@@ -3127,6 +3195,178 @@ mod tests {
     // ================================================================
     // sync_prs_as_issues (auto-import PRs)
     // ================================================================
+
+    fn stack_import_fixture(source: PrImportSource) -> App {
+        let mut owner = test_issue("bork-1", Column::InProgress);
+        owner.github_stack = Some(42);
+        let mut app = test_app(vec![owner]);
+        app.project_mut().config.auto_import_authored_prs = true;
+        app.project_mut().config.auto_import_reviews = true;
+        let pr = test_pr(44, "new-member");
+        let live = &mut app.project_mut().live;
+        live.pr_poll_done = true;
+        match source {
+            PrImportSource::Authored => live.user_prs.push(pr),
+            PrImportSource::ReviewRequested => live.review_requested_prs.push(pr),
+        }
+        assert!(app.project_mut().sync_prs_as_issues().0);
+        assert_eq!(app.project().issues.len(), 2);
+        app.project_mut().live.github_stacks = vec![GithubStack {
+            number: 42,
+            url: String::new(),
+            base_ref: "main".into(),
+            open: true,
+            pull_requests: vec![crate::types::GithubStackPullRequest {
+                number: 44,
+                state: PrState::Open,
+                is_draft: false,
+                head_branch: "new-member".into(),
+            }],
+        }];
+        app
+    }
+
+    #[test]
+    fn fresh_stack_membership_reconciles_untouched_imports_without_reimporting() {
+        for source in [PrImportSource::Authored, PrImportSource::ReviewRequested] {
+            let mut app = stack_import_fixture(source);
+            let empty = HashSet::new();
+            assert_eq!(
+                app.project_mut()
+                    .reconcile_stack_imports(&HashSet::new(), &empty),
+                0
+            );
+            app.project_mut()
+                .live
+                .stack_errors
+                .insert(42, "offline".into());
+            assert_eq!(
+                app.project_mut()
+                    .reconcile_stack_imports(&HashSet::from([42]), &empty),
+                0
+            );
+            app.project_mut().live.stack_errors.clear();
+            assert_eq!(
+                app.project_mut()
+                    .reconcile_stack_imports(&HashSet::from([42]), &empty),
+                1
+            );
+            app.project_mut().sync_prs_as_issues();
+            assert_eq!(app.project().issues.len(), 1);
+            assert_eq!(app.project().issues[0].id, "bork-1");
+            assert_eq!(
+                app.project_mut()
+                    .reconcile_stack_imports(&HashSet::from([42]), &empty),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn stack_reconciliation_preserves_edited_manual_and_legacy_cards() {
+        let edits: Vec<fn(&mut Issue)> = vec![
+            |i| i.title.push_str(" my notes"),
+            |i| i.prompt = Some("custom notes".into()),
+            |i| i.column = Column::Done,
+            |i| i.agent_mode = crate::types::AgentMode::Build,
+            |i| i.kind = IssueKind::NonAgentic,
+            |i| i.worktree = Some("worktree".into()),
+            |i| {
+                i.sessions.insert(AgentKind::Codex, "session".into());
+            },
+            |i| i.setup_ran = true,
+            |i| i.pruned_at = Some(100),
+            |i| i.linked_issues.push("bork-1".into()),
+            |i| {
+                i.linear_links.push(crate::types::LinkedLinear {
+                    id: "id".into(),
+                    identifier: "ENG-1".into(),
+                    url: "url".into(),
+                    imported: false,
+                })
+            },
+            |i| {
+                i.github_pr_links.push(LinkedGithubPr {
+                    number: 45,
+                    imported: false,
+                    import_source: None,
+                })
+            },
+            |i| i.github_pr_links[0].imported = false,
+            |i| i.pr_import_baseline = None,
+            |i| i.github_stack = Some(99),
+        ];
+        for edit in edits {
+            let mut app = stack_import_fixture(PrImportSource::ReviewRequested);
+            edit(&mut app.project_mut().issues[1]);
+            let before = app.project().issues.clone();
+            assert_eq!(
+                app.project_mut()
+                    .reconcile_stack_imports(&HashSet::from([42]), &HashSet::new()),
+                0
+            );
+            assert_eq!(app.project().issues, before);
+        }
+    }
+
+    #[test]
+    fn stack_reconciliation_preserves_running_referenced_and_protected_cards() {
+        for protection in 0..5 {
+            let mut app = stack_import_fixture(PrImportSource::ReviewRequested);
+            let issue = app.project().issues[1].clone();
+            let mut protected = HashSet::new();
+            match protection {
+                0 => {
+                    protected.insert(issue.id.clone());
+                }
+                1 => {
+                    let session = issue.session_name(&app.project().config.project_name);
+                    app.project_mut().live.active_sessions.insert(session);
+                }
+                2 => app.project_mut().issues[0]
+                    .linked_issues
+                    .push(issue.id.to_uppercase()),
+                3 => {
+                    app.project_mut()
+                        .live
+                        .worktree_branches
+                        .insert(format!("{}-work", issue.id), "branch".into());
+                }
+                _ => {
+                    app.project_mut()
+                        .marked_issues
+                        .insert(issue.id.to_lowercase());
+                }
+            }
+            assert_eq!(
+                app.project_mut()
+                    .reconcile_stack_imports(&HashSet::from([42]), &protected),
+                0
+            );
+            assert_eq!(app.project().issues.len(), 2);
+        }
+    }
+
+    #[test]
+    fn import_baseline_survives_restart_and_external_state_merge() {
+        let mut app = stack_import_fixture(PrImportSource::ReviewRequested);
+        let original = app.project().issues[1].clone();
+        let encoded = serde_json::to_string(&original).unwrap();
+        let loaded: Issue = serde_json::from_str(&encoded).unwrap();
+        assert!(loaded.is_untouched_pr_import());
+        app.project_mut().issues[1] = loaded;
+        app.project_mut().config.review_prompt = Some("new default".into());
+        assert_eq!(
+            app.project_mut()
+                .reconcile_stack_imports(&HashSet::from([42]), &HashSet::new()),
+            1
+        );
+        let mut base = original.clone();
+        base.pr_import_baseline = None;
+        let mut memory = base.clone();
+        merge_issue_fields(&mut memory, &base, &original);
+        assert_eq!(memory.pr_import_baseline, original.pr_import_baseline);
+    }
 
     #[test]
     fn sync_prs_imports_open_pr_as_issue() {
@@ -6166,6 +6406,13 @@ mod tests {
         // merge_issue_fields (a merge_field!() call or the sessions logic).
         let mut issue = test_issue("a", Column::Todo);
         issue.sessions.insert(AgentKind::OpenCode, "s".to_string());
+        issue.pr_import_baseline = Some(PrImportBaseline {
+            title: "original".into(),
+            prompt: None,
+            agent_kind: AgentKind::OpenCode,
+            number: 42,
+            source: PrImportSource::Authored,
+        });
         let value = serde_json::to_value(&issue).expect("issue serializes");
         let object = value.as_object().expect("issue is a JSON object");
         let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
@@ -6186,6 +6433,7 @@ mod tests {
             "setup_ran",
             "linear_links",
             "github_pr_links",
+            "pr_import_baseline",
             "linked_issues",
         ];
         expected.sort_unstable();

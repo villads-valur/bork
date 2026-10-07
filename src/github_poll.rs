@@ -134,6 +134,7 @@ impl Cache {
             });
         cache.result.started = false;
         cache.result.loading_more = false;
+        cache.result.refreshed_stacks.clear();
         cache.result.authored_ready = false;
         cache.result.reviews_ready = false;
         cache
@@ -359,6 +360,7 @@ pub fn poll(
         if throttled {
             return;
         }
+        cache.result.refreshed_stacks.clear();
         publish(cache, true);
         let response = fetch(&request);
         if response.cancelled {
@@ -452,6 +454,7 @@ pub fn poll(
                 }
             }
             for stack in stacks {
+                cache.result.refreshed_stacks.push(stack.number);
                 cache.result.stack_errors.remove(&stack.number);
                 cache
                     .stacks
@@ -637,6 +640,44 @@ mod tests {
             |_, _| {},
         );
         requests
+    }
+
+    #[test]
+    fn successful_stack_refresh_signal_is_not_replayed_from_cache_or_other_requests() {
+        let targets = Targets {
+            stacks: vec![(42, 0)],
+            auto_reviews: true,
+            ..Default::default()
+        };
+        let mut cache = Cache::default();
+        let mut signals = Vec::new();
+        poll(
+            &mut cache,
+            &targets,
+            1000,
+            false,
+            |request| match request {
+                Request::Stack(_) => Response {
+                    stacks: Some(vec![stack(42, 43)]),
+                    ..Default::default()
+                },
+                _ => Response::default(),
+            },
+            |cache, started| {
+                if !started {
+                    signals.push(cache.result.refreshed_stacks.clone());
+                }
+            },
+        );
+        assert_eq!(
+            signals.iter().filter(|numbers| !numbers.is_empty()).count(),
+            1
+        );
+        assert_eq!(signals[0], vec![42]);
+        cache.result.refreshed_stacks = vec![42];
+        let bytes = serde_json::to_vec(&cache).unwrap();
+        let loaded: Cache = serde_json::from_slice(&bytes).unwrap();
+        assert!(loaded.result.refreshed_stacks.is_empty());
     }
 
     #[test]
