@@ -427,7 +427,7 @@ fn spawn_pr_poll_worker(
                                 ..Default::default()
                             }
                         } else {
-                            cache.snapshot(&snapshot, app::unix_now())
+                            cache.snapshot(&snapshot)
                         };
                         if tx.send(result).is_err() {
                             disconnected.set(true);

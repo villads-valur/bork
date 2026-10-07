@@ -11,6 +11,7 @@ use crate::PrPollResult;
 const REVIEW_INTERVAL: u64 = 60;
 const DISCOVERY_INTERVAL: u64 = 300;
 const DONE_BATCH_LIMIT: usize = 50;
+const MEMBERSHIP_FAILURE_LIMIT: u8 = 3;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Wake {
@@ -154,19 +155,25 @@ impl Cache {
         }
     }
 
-    pub fn snapshot(&self, targets: &Targets, now: u64) -> PrPollResult {
+    pub fn snapshot(&self, targets: &Targets) -> PrPollResult {
         let mut result = self.result.clone();
-        let membership_ready = targets.stacks.iter().all(|(number, priority)| {
-            self.stacks.get(number).is_some_and(|stamp| {
-                stamp.success != 0
-                    && stamp.failures == 0
-                    && now >= stamp.success
-                    && now - stamp.success < interval(*priority, None)
-            }) && result
+        // Missing active membership briefly delays imports to avoid duplicate cards.
+        // Historical stacks and refresh failures must not disable background imports.
+        let membership_ready = result.stacks_unsupported
+            || targets
                 .stacks
-                .as_ref()
-                .is_some_and(|stacks| stacks.iter().any(|s| s.number == *number))
-        });
+                .iter()
+                .filter(|(_, priority)| *priority < 3)
+                .all(|(number, _)| {
+                    result
+                        .stacks
+                        .as_ref()
+                        .is_some_and(|stacks| stacks.iter().any(|s| s.number == *number))
+                        || self
+                            .stacks
+                            .get(number)
+                            .is_some_and(|stamp| stamp.failures >= MEMBERSHIP_FAILURE_LIMIT)
+                });
         result.reviews_ready &= membership_ready;
         result.authored_ready &= membership_ready;
         result
@@ -659,16 +666,137 @@ mod tests {
             },
             |cache, started| {
                 if !started {
-                    assert!(!cache.snapshot(&targets, 1000).reviews_ready);
+                    assert!(!cache.snapshot(&targets).reviews_ready);
                 }
             },
         );
         assert_eq!(calls, vec![Request::Stack(42), Request::Reviews]);
         assert!(cache.result.reviews_ready);
         cycle(&mut cache, &targets, 1060, false);
-        let snapshot = cache.snapshot(&targets, 1060);
+        let snapshot = cache.snapshot(&targets);
         assert!(snapshot.reviews_ready);
         assert_eq!(snapshot.stacks.unwrap()[0].pull_requests[0].number, 43);
+    }
+
+    #[test]
+    fn done_stacks_never_gate_discovery_even_when_missing_or_broken() {
+        for count in [1, 8, 13, 30] {
+            let targets = Targets {
+                auto_reviews: true,
+                auto_authored: true,
+                stacks: (1..=count).map(|number| (number, 3)).collect(),
+                ..Default::default()
+            };
+            let mut cache = Cache::default();
+            for now in (1000..15400).step_by(60) {
+                poll(
+                    &mut cache,
+                    &targets,
+                    now,
+                    false,
+                    |request| match request {
+                        Request::Stack(1) => Response {
+                            error: Some("HTTP 404".into()),
+                            ..Default::default()
+                        },
+                        Request::Stack(number) => Response {
+                            stacks: Some(vec![stack(*number, *number + 100)]),
+                            ..Default::default()
+                        },
+                        _ => Response::default(),
+                    },
+                    |cache, started| {
+                        if !started {
+                            let snapshot = cache.snapshot(&targets);
+                            assert_eq!(snapshot.reviews_ready, cache.result.reviews_ready);
+                            assert_eq!(snapshot.authored_ready, cache.result.authored_ready);
+                        }
+                    },
+                );
+                assert!(cache.snapshot(&targets).reviews_ready);
+                assert!(cache.snapshot(&targets).authored_ready);
+            }
+        }
+    }
+
+    #[test]
+    fn cached_membership_allows_imports_after_refresh_failure() {
+        let targets = Targets {
+            auto_reviews: true,
+            auto_authored: true,
+            stacks: vec![(42, 0)],
+            ..Default::default()
+        };
+        let mut cache = Cache::default();
+        cache.result.stacks = Some(vec![stack(42, 43)]);
+        poll(
+            &mut cache,
+            &targets,
+            1000,
+            false,
+            |request| match request {
+                Request::Stack(_) => Response {
+                    error: Some("offline".into()),
+                    ..Default::default()
+                },
+                _ => Response::default(),
+            },
+            |_, _| {},
+        );
+        assert!(cache.snapshot(&targets).reviews_ready);
+        assert!(cache.snapshot(&targets).authored_ready);
+        assert!(cache.result.stack_errors.contains_key(&42));
+    }
+
+    #[test]
+    fn unknown_active_membership_stops_gating_after_three_failures_and_restart() {
+        let targets = Targets {
+            auto_reviews: true,
+            auto_authored: true,
+            stacks: vec![(42, 0)],
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("github-cache.json");
+        let mut cache = Cache::load(&path, "repo");
+        for (now, ready) in [(1000, false), (1060, false), (1180, true), (1480, true)] {
+            poll(
+                &mut cache,
+                &targets,
+                now,
+                false,
+                |request| match request {
+                    Request::Stack(_) => Response {
+                        error: Some("HTTP 404".into()),
+                        ..Default::default()
+                    },
+                    _ => Response::default(),
+                },
+                |_, _| {},
+            );
+            assert_eq!(cache.snapshot(&targets).reviews_ready, ready);
+            assert_eq!(cache.snapshot(&targets).authored_ready, ready);
+            if now == 1180 {
+                cache.save(&path);
+                cache = Cache::load(&path, "repo");
+                assert_eq!(cache.stacks[&42].failures, 3);
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_stacks_do_not_gate_successful_discovery() {
+        let targets = Targets {
+            stacks: vec![(42, 0)],
+            ..Default::default()
+        };
+        let mut cache = Cache::default();
+        cache.result.stacks_unsupported = true;
+        assert!(!cache.snapshot(&targets).reviews_ready);
+        cache.result.reviews_ready = true;
+        cache.result.authored_ready = true;
+        assert!(cache.snapshot(&targets).reviews_ready);
+        assert!(cache.snapshot(&targets).authored_ready);
     }
 
     #[test]
