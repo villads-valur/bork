@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -116,6 +116,7 @@ pub struct Cache {
     picker_stacks: Stamp,
     done_batch: Stamp,
     retry_after: u64,
+    picker_numbers: HashSet<u32>,
 }
 
 impl Cache {
@@ -151,6 +152,74 @@ impl Cache {
         if std::fs::write(&temp, bytes).is_ok() {
             let _ = std::fs::rename(&temp, path);
         }
+    }
+
+    pub fn snapshot(&self, targets: &Targets, now: u64) -> PrPollResult {
+        let mut result = self.result.clone();
+        let membership_ready = targets.stacks.iter().all(|(number, priority)| {
+            self.stacks.get(number).is_some_and(|stamp| {
+                stamp.success != 0
+                    && stamp.failures == 0
+                    && now >= stamp.success
+                    && now - stamp.success < interval(*priority, None)
+            }) && result
+                .stacks
+                .as_ref()
+                .is_some_and(|stacks| stacks.iter().any(|s| s.number == *number))
+        });
+        result.reviews_ready &= membership_ready;
+        result.authored_ready &= membership_ready;
+        result
+    }
+
+    fn prune(&mut self, targets: &Targets, now: u64) {
+        let stack_numbers: HashSet<_> = targets.stacks.iter().map(|(n, _)| *n).collect();
+        let branches: HashSet<_> = targets.branches.iter().map(|(b, _)| b.as_str()).collect();
+        if now.saturating_sub(self.picker_prs.success) >= DISCOVERY_INTERVAL {
+            self.picker_numbers.clear();
+        }
+        if let Some(stacks) = &mut self.result.stacks {
+            stacks.retain(|s| {
+                stack_numbers.contains(&s.number)
+                    || now.saturating_sub(self.picker_stacks.success) < DISCOVERY_INTERVAL
+            });
+        }
+        let mut numbers: HashSet<_> = targets.prs.iter().map(|(n, _)| *n).collect();
+        for stack in self
+            .result
+            .stacks
+            .iter()
+            .flatten()
+            .filter(|s| stack_numbers.contains(&s.number))
+        {
+            numbers.extend(stack.pull_requests.iter().map(|pr| pr.number));
+        }
+        numbers.extend(&self.picker_numbers);
+        numbers.extend(
+            self.result
+                .user_prs
+                .iter()
+                .chain(&self.result.review_requested_prs)
+                .map(|p| p.number),
+        );
+        numbers.extend(
+            self.result
+                .prs
+                .values()
+                .filter(|p| branches.contains(p.head_branch.as_str()))
+                .map(|p| p.number),
+        );
+        self.result.prs_by_number.retain(|n, _| numbers.contains(n));
+        self.statuses.retain(|n, _| numbers.contains(n));
+        self.branches.retain(|b, _| branches.contains(b.as_str()));
+        self.stacks.retain(|n, _| {
+            stack_numbers.contains(n) || self.result.stacks.iter().flatten().any(|s| s.number == *n)
+        });
+        self.result
+            .stack_errors
+            .retain(|n, _| stack_numbers.contains(n));
+        self.result.prs =
+            github::index_by_branch(self.result.prs_by_number.values().cloned().collect());
     }
 
     fn incorporate(&mut self, prs: &[PrStatus], now: u64) {
@@ -232,6 +301,7 @@ pub enum Request {
 
 #[derive(Default)]
 pub struct Response {
+    pub cancelled: bool,
     prs: Vec<PrStatus>,
     stacks: Option<Vec<GithubStack>>,
     unsupported: bool,
@@ -275,6 +345,7 @@ pub fn poll(
     if !force && now < cache.retry_after {
         return;
     }
+    cache.prune(targets, now);
     let mut throttled = false;
     // Each call publishes completion, so empty queues and errors cannot leave a spinner running.
     let mut run = |cache: &mut Cache, request: Request| {
@@ -283,6 +354,10 @@ pub fn poll(
         }
         publish(cache, true);
         let response = fetch(&request);
+        if response.cancelled {
+            throttled = true;
+            return;
+        }
         let success = response.error.is_none();
         cache.result.error = response.error.clone();
         if response.error.as_ref().is_some_and(|error| {
@@ -310,7 +385,12 @@ pub fn poll(
                     cache.result.user_prs = response.prs.clone();
                 }
             }
-            Request::PickerPrs => cache.picker_prs.finish(now, success),
+            Request::PickerPrs => {
+                cache.picker_prs.finish(now, success);
+                if success {
+                    cache.picker_numbers = response.prs.iter().map(|p| p.number).collect();
+                }
+            }
             Request::PickerStacks => {
                 cache.picker_stacks.finish(now, success);
                 if success {
@@ -351,7 +431,12 @@ pub fn poll(
         cache.incorporate(&response.prs, now);
         if let Some(stacks) = response.stacks {
             if matches!(request, Request::PickerStacks) {
-                cache.result.stacks = Some(stacks.clone());
+                let stored = cache.result.stacks.get_or_insert_with(Vec::new);
+                stored.retain(|old| {
+                    targets.stacks.iter().any(|(n, _)| *n == old.number)
+                        && !stacks.iter().any(|new| new.number == old.number)
+                });
+                stored.extend(stacks.clone());
             } else {
                 let stored = cache.result.stacks.get_or_insert_with(Vec::new);
                 for stack in &stacks {
@@ -368,8 +453,24 @@ pub fn poll(
                     .finish(now, true);
             }
         }
+        cache.prune(targets, now);
         publish(cache, false);
     };
+
+    // Resolve active stack membership before publishing discovery to the board.
+    let mut active_stacks = targets.stacks.clone();
+    active_stacks.sort_unstable_by_key(|&(n, p)| (p, n));
+    for (number, priority) in active_stacks {
+        if priority < 3
+            && cache.stacks.get(&number).unwrap_or(&Stamp::default()).due(
+                now,
+                interval(priority, None),
+                force,
+            )
+        {
+            run(cache, Request::Stack(number));
+        }
+    }
 
     if targets.auto_reviews && cache.reviews.due(now, REVIEW_INTERVAL, force) {
         run(cache, Request::Reviews);
@@ -526,6 +627,144 @@ mod tests {
             |_, _| {},
         );
         requests
+    }
+
+    #[test]
+    fn discovery_waits_for_attached_membership_even_when_refresh_fails() {
+        let targets = Targets {
+            auto_reviews: true,
+            stacks: vec![(42, 0)],
+            ..Default::default()
+        };
+        let mut cache = Cache::default();
+        let mut calls = Vec::new();
+        poll(
+            &mut cache,
+            &targets,
+            1000,
+            false,
+            |request| {
+                calls.push(request.clone());
+                match request {
+                    Request::Stack(_) => Response {
+                        error: Some("offline".into()),
+                        ..Default::default()
+                    },
+                    Request::Reviews => Response {
+                        prs: vec![pr(43)],
+                        ..Default::default()
+                    },
+                    _ => Response::default(),
+                }
+            },
+            |cache, started| {
+                if !started {
+                    assert!(!cache.snapshot(&targets, 1000).reviews_ready);
+                }
+            },
+        );
+        assert_eq!(calls, vec![Request::Stack(42), Request::Reviews]);
+        assert!(cache.result.reviews_ready);
+        cycle(&mut cache, &targets, 1060, false);
+        let snapshot = cache.snapshot(&targets, 1060);
+        assert!(snapshot.reviews_ready);
+        assert_eq!(snapshot.stacks.unwrap()[0].pull_requests[0].number, 43);
+    }
+
+    #[test]
+    fn picker_preserves_attached_stacks_omitted_from_listing() {
+        let mut cache = Cache::default();
+        cache.result.stacks = Some(vec![stack(7, 8)]);
+        cache.stacks.entry(7).or_default().finish(1000, true);
+        let targets = Targets {
+            picker: true,
+            stacks: vec![(7, 0)],
+            ..Default::default()
+        };
+        cycle(&mut cache, &targets, 1010, false);
+        assert!(cache
+            .result
+            .stacks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|s| s.number == 7));
+        assert_eq!(cache.requested_prs(&targets), vec![(8, 0)]);
+    }
+
+    #[test]
+    fn cache_prunes_expired_picker_data_but_preserves_board_and_discovery() {
+        let mut cache = Cache::default();
+        let targets = Targets {
+            picker: true,
+            prs: vec![(1, 0)],
+            ..Default::default()
+        };
+        poll(
+            &mut cache,
+            &targets,
+            1000,
+            false,
+            |request| match request {
+                Request::PickerPrs => Response {
+                    prs: (1..101).map(pr).collect(),
+                    ..Default::default()
+                },
+                _ => Response::default(),
+            },
+            |_, _| {},
+        );
+        cache.result.review_requested_prs = vec![pr(2)];
+        cache
+            .branches
+            .entry("deleted".into())
+            .or_default()
+            .finish(1000, true);
+        cache.prune(
+            &Targets {
+                prs: vec![(1, 0)],
+                ..Default::default()
+            },
+            1400,
+        );
+        assert_eq!(cache.result.prs_by_number.len(), 2);
+        assert!(cache.result.prs_by_number.contains_key(&1));
+        assert!(cache.result.prs_by_number.contains_key(&2));
+        assert_eq!(cache.statuses.len(), 2);
+        assert!(cache.branches.is_empty());
+    }
+
+    #[test]
+    fn cancelled_request_stops_cycle_without_publishing_or_mutating_cache() {
+        let targets = Targets {
+            auto_reviews: true,
+            auto_authored: true,
+            ..Default::default()
+        };
+        let mut calls = 0;
+        let mut completed = 0;
+        let mut cache = Cache::default();
+        poll(
+            &mut cache,
+            &targets,
+            1000,
+            false,
+            |_| {
+                calls += 1;
+                Response {
+                    cancelled: true,
+                    ..Default::default()
+                }
+            },
+            |_, started| {
+                if !started {
+                    completed += 1;
+                }
+            },
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(completed, 0);
+        assert_eq!(cache.reviews.attempt, 0);
     }
 
     #[test]

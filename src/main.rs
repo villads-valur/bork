@@ -402,21 +402,45 @@ fn spawn_pr_poll_worker(
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
                     .clone();
+                let disconnected = std::cell::Cell::new(false);
                 github_poll::poll(
                     &mut cache,
                     &snapshot,
                     app::unix_now(),
                     force,
-                    |request| github_poll::fetch(&main_worktree, request),
+                    |request| {
+                        if disconnected.get() {
+                            let mut response = github_poll::Response::default();
+                            response.cancelled = true;
+                            response
+                        } else {
+                            github_poll::fetch(&main_worktree, request)
+                        }
+                    },
                     |cache, started| {
+                        if disconnected.get() {
+                            return;
+                        }
+                        let result = if started {
+                            PrPollResult {
+                                started: true,
+                                ..Default::default()
+                            }
+                        } else {
+                            cache.snapshot(&snapshot, app::unix_now())
+                        };
+                        if tx.send(result).is_err() {
+                            disconnected.set(true);
+                            return;
+                        }
                         if !started {
                             cache.save(&cache_path);
                         }
-                        let mut result = cache.result.clone();
-                        result.started = started;
-                        let _ = tx.send(result);
                     },
                 );
+                if disconnected.get() {
+                    return;
+                }
             } else {
                 cache.result.gh_missing = true;
                 let _ = tx.send(cache.result.clone());
@@ -1799,29 +1823,14 @@ fn drain_project_workers(
 
     // --- PR status ---
     let mut pr_data_changed = false;
-    while let Ok(mut pr_result) = workers.pr_rx.try_recv() {
+    while let Ok(pr_result) = workers.pr_rx.try_recv() {
         project.github_available = !pr_result.gh_missing;
         let live = &mut project.live;
         if pr_result.started {
             live.gh_missing = false;
             live.pr_refreshing = true;
-            live.github_error = None;
             needs_redraw = true;
             continue;
-        }
-        if pr_result.loading_more || pr_result.error.is_some() {
-            for (branch, status) in &live.pr_statuses {
-                pr_result
-                    .prs
-                    .entry(branch.clone())
-                    .or_insert_with(|| status.clone());
-            }
-            for (number, status) in &live.pr_statuses_by_number {
-                pr_result
-                    .prs_by_number
-                    .entry(*number)
-                    .or_insert_with(|| status.clone());
-            }
         }
         let changed = live.gh_missing != pr_result.gh_missing
             || live.stacks_unsupported != pr_result.stacks_unsupported

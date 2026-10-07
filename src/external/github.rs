@@ -191,15 +191,69 @@ pub fn fetch_missing_prs(
             .current_dir(main_worktree)
             .output();
         let output = output.map_err(|error| format!("Could not run gh: {error}"))?;
-        let value = serde_json::from_slice::<serde_json::Value>(&output.stdout)
-            .map_err(|_| "Invalid GitHub PR response".to_string())?;
-        if let Some(repository) = value
-            .pointer("/data/repository")
-            .and_then(|value| value.as_object())
-        {
-            prs.extend(repository.values().filter_map(parse_pr_node));
+        collect_status_response(output, prs)?;
+    }
+    Ok(())
+}
+
+fn collect_status_response(
+    output: std::process::Output,
+    prs: &mut Vec<PrStatus>,
+) -> Result<(), String> {
+    let value = match serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+        Ok(value) => value,
+        Err(_) => {
+            checked_gh_output(Ok(output))?;
+            return Err("Invalid GitHub PR response".into());
         }
-        checked_gh_output(Ok(output))?;
+    };
+    if let Some(repository) = value
+        .pointer("/data/repository")
+        .and_then(|v| v.as_object())
+    {
+        prs.extend(repository.values().filter_map(parse_pr_node));
+        // A missing PR is local to its alias; retain partial successes and retry only that number.
+        if let Some(errors) = value.get("errors").and_then(|v| v.as_array()) {
+            if !errors.is_empty()
+                && errors.iter().all(|error| {
+                    error.get("type").and_then(|v| v.as_str()) == Some("NOT_FOUND")
+                        && error
+                            .get("path")
+                            .and_then(|v| v.as_array())
+                            .is_some_and(|path| {
+                                path.len() == 2
+                                    && path[0] == "repository"
+                                    && path[1].as_str().is_some_and(|alias| {
+                                        repository.get(alias).is_some_and(|v| v.is_null())
+                                            && alias
+                                                .strip_prefix("pr")
+                                                .is_some_and(|n| n.parse::<u32>().is_ok())
+                                    })
+                            })
+                })
+            {
+                return Ok(());
+            }
+        }
+    }
+    checked_gh_output(Ok(output))?;
+    if let Some(errors) = value
+        .get("errors")
+        .and_then(|v| v.as_array())
+        .filter(|e| !e.is_empty())
+    {
+        return Err(errors[0]
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("GitHub PR request failed")
+            .into());
+    }
+    if value
+        .pointer("/data/repository")
+        .and_then(|v| v.as_object())
+        .is_none()
+    {
+        return Err("Missing GitHub repository".into());
     }
     Ok(())
 }
@@ -242,40 +296,94 @@ pub fn fetch_branch_prs(
     branches: &[String],
 ) -> Result<Vec<PrStatus>, String> {
     let repo = get_repo_identity(main_worktree)?;
-    let fields = branches.iter().enumerate().map(|(index, branch)| {
-        let branch = serde_json::to_string(branch).unwrap_or_default();
-        format!("b{index}: pullRequests(headRefName:{branch},first:1,orderBy:{{field:UPDATED_AT,direction:DESC}}){{nodes{{{PR_FIELDS}}}}}")
-    }).collect::<Vec<_>>().join(" ");
-    let query = format!(
-        "query($owner:String!,$repo:String!){{repository(owner:$owner,name:$repo){{{fields}}}}}"
-    );
-    let stdout = checked_gh_output(
-        crate::external::gh_command()
-            .args([
-                "api",
-                "graphql",
-                "-f",
-                &format!("query={query}"),
-                "-f",
-                &format!("owner={}", repo.owner),
-                "-f",
-                &format!("repo={}", repo.name),
-            ])
-            .current_dir(main_worktree)
-            .output(),
-    )?;
-    let value: serde_json::Value =
-        serde_json::from_str(&stdout).map_err(|_| "Invalid GitHub branch response")?;
-    let repository = value
-        .pointer("/data/repository")
-        .and_then(|v| v.as_object())
-        .ok_or("Missing GitHub repository")?;
-    Ok(repository
-        .values()
-        .filter_map(|v| v.get("nodes").and_then(|v| v.as_array()))
-        .flatten()
-        .filter_map(parse_pr_node)
-        .collect())
+    fetch_branch_pages(branches, |query| {
+        checked_gh_output(
+            crate::external::gh_command()
+                .args([
+                    "api",
+                    "graphql",
+                    "-f",
+                    &format!("query={query}"),
+                    "-f",
+                    &format!("owner={}", repo.owner),
+                    "-f",
+                    &format!("repo={}", repo.name),
+                ])
+                .current_dir(main_worktree)
+                .output(),
+        )
+    })
+}
+
+fn fetch_branch_pages(
+    branches: &[String],
+    mut fetch: impl FnMut(&str) -> Result<String, String>,
+) -> Result<Vec<PrStatus>, String> {
+    let mut pending: Vec<_> = branches
+        .iter()
+        .cloned()
+        .map(|branch| (branch, None::<String>))
+        .collect();
+    let mut selected = HashMap::<String, PrStatus>::new();
+    while !pending.is_empty() {
+        let fields = pending.iter().enumerate().map(|(index, (branch, cursor))| {
+            let branch = serde_json::to_string(branch).unwrap_or_default();
+            let after = cursor.as_ref().map(|cursor| format!(",after:{}", serde_json::to_string(cursor).unwrap_or_default())).unwrap_or_default();
+            format!("b{index}: pullRequests(headRefName:{branch},first:20{after},orderBy:{{field:UPDATED_AT,direction:DESC}}){{nodes{{{PR_FIELDS}}} pageInfo{{hasNextPage endCursor}}}}")
+        }).collect::<Vec<_>>().join(" ");
+        let query = format!("query($owner:String!,$repo:String!){{repository(owner:$owner,name:$repo){{{fields}}}}}");
+        let stdout = fetch(&query)?;
+        let value: serde_json::Value =
+            serde_json::from_str(&stdout).map_err(|_| "Invalid GitHub branch response")?;
+        let repository = value
+            .pointer("/data/repository")
+            .and_then(|v| v.as_object())
+            .ok_or("Missing GitHub repository")?;
+        let mut next = Vec::new();
+        for (index, (branch, previous_cursor)) in pending.into_iter().enumerate() {
+            let connection = repository
+                .get(&format!("b{index}"))
+                .ok_or("Missing GitHub branch response")?;
+            let nodes = connection
+                .get("nodes")
+                .and_then(|v| v.as_array())
+                .ok_or("Missing GitHub branch PRs")?;
+            for pr in nodes
+                .iter()
+                .filter_map(parse_pr_node)
+                .filter(|pr| !pr.is_cross_repository)
+            {
+                if selected
+                    .get(&branch)
+                    .is_none_or(|old| state_priority(&pr.state) > state_priority(&old.state))
+                {
+                    selected.insert(branch.clone(), pr);
+                }
+            }
+            if selected
+                .get(&branch)
+                .is_some_and(|pr| pr.state == PrState::Open)
+            {
+                continue;
+            }
+            if connection
+                .pointer("/pageInfo/hasNextPage")
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            {
+                let cursor = connection
+                    .pointer("/pageInfo/endCursor")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Missing GitHub branch cursor")?;
+                if previous_cursor.as_deref() == Some(cursor) {
+                    return Err("GitHub branch cursor did not advance".into());
+                }
+                next.push((branch, Some(cursor.into())));
+            }
+        }
+        pending = next;
+    }
+    Ok(selected.into_values().collect())
 }
 
 fn stack_endpoint_unsupported(stderr: &str) -> bool {
@@ -684,6 +792,65 @@ mod tests {
     }
 
     // --- parse_pr_node ---
+
+    #[test]
+    fn branch_lookup_skips_forks_and_finds_open_pr_on_later_page() {
+        let mut calls = 0;
+        let prs = fetch_branch_pages(&["feature".into()], |query| {
+            calls += 1;
+            let nodes = if calls == 1 {
+                assert!(query.contains("first:20"));
+                vec![
+                    make_pr_node(r#"{"number":9,"isCrossRepository":true}"#),
+                    make_pr_node(r#"{"number":8,"state":"MERGED"}"#),
+                ]
+            } else {
+                assert!(query.contains("after:\"cursor\""));
+                vec![make_pr_node(r#"{"number":7,"state":"OPEN"}"#)]
+            };
+            Ok(serde_json::json!({"data":{"repository":{"b0":{
+                "nodes":nodes,"pageInfo":{"hasNextPage":calls == 1,"endCursor":"cursor"}
+            }}}})
+            .to_string())
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(prs.len(), 1);
+        assert_eq!(prs[0].number, 7);
+        assert!(!prs[0].is_cross_repository);
+    }
+
+    #[test]
+    fn partial_not_found_is_local_but_auth_errors_keep_their_message() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut prs = Vec::new();
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(256),
+            stdout: serde_json::json!({"data":{"repository":{"pr42":make_pr_node(""),"pr999":null}},
+                "errors":[{"type":"NOT_FOUND","path":["repository","pr999"],"message":"Could not resolve to a PullRequest"}]}).to_string().into_bytes(),
+            stderr: b"gh: Could not resolve to a PullRequest".to_vec(),
+        };
+        assert!(collect_status_response(output, &mut prs).is_ok());
+        assert_eq!(prs.len(), 1);
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(256),
+            stdout: Vec::new(),
+            stderr: b"gh: not logged in".to_vec(),
+        };
+        assert_eq!(
+            collect_status_response(output, &mut prs).unwrap_err(),
+            "gh: not logged in"
+        );
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(256),
+            stdout: br#"{"data":{"repository":null},"errors":[{"type":"NOT_FOUND","path":["repository"]}]}"#.to_vec(),
+            stderr: b"repository inaccessible".to_vec(),
+        };
+        assert_eq!(
+            collect_status_response(output, &mut prs).unwrap_err(),
+            "repository inaccessible"
+        );
+    }
 
     #[test]
     fn unsupported_stack_endpoint_does_not_swallow_auth_or_network_errors() {
