@@ -464,7 +464,10 @@ pub fn poll(
         publish(cache, false);
     };
 
-    // Resolve active stack membership before publishing discovery to the board.
+    let reviews_due = targets.auto_reviews && cache.reviews.due(now, REVIEW_INTERVAL, force);
+    let authored_due = targets.auto_authored && cache.authored.due(now, DISCOVERY_INTERVAL, force);
+    // Discovery can find new members before the slower column-based refresh is due.
+    // Refresh active membership first, retaining per-stack failure/repeat cooldowns.
     let mut active_stacks = targets.stacks.clone();
     active_stacks.sort_unstable_by_key(|&(n, p)| (p, n));
     for (number, priority) in active_stacks {
@@ -472,17 +475,17 @@ pub fn poll(
             && cache.stacks.get(&number).unwrap_or(&Stamp::default()).due(
                 now,
                 interval(priority, None),
-                force,
+                force || reviews_due || authored_due,
             )
         {
             run(cache, Request::Stack(number));
         }
     }
 
-    if targets.auto_reviews && cache.reviews.due(now, REVIEW_INTERVAL, force) {
+    if reviews_due {
         run(cache, Request::Reviews);
     }
-    if targets.auto_authored && cache.authored.due(now, DISCOVERY_INTERVAL, force) {
+    if authored_due {
         run(cache, Request::Authored);
     }
 
@@ -797,6 +800,121 @@ mod tests {
         cache.result.authored_ready = true;
         assert!(cache.snapshot(&targets).reviews_ready);
         assert!(cache.snapshot(&targets).authored_ready);
+    }
+
+    #[test]
+    fn discovery_refreshes_slower_active_stacks_before_publishing_new_members() {
+        for priority in [1, 2] {
+            for authored in [false, true] {
+                let targets = Targets {
+                    stacks: vec![(42, priority), (42, priority)],
+                    auto_reviews: !authored,
+                    auto_authored: authored,
+                    ..Default::default()
+                };
+                let mut cache = Cache::default();
+                cycle(&mut cache, &targets, 1000, false);
+                let now = if authored {
+                    cycle(&mut cache, &targets, 1240, false);
+                    1300
+                } else {
+                    1060
+                };
+                let mut calls = Vec::new();
+                let discovery = if authored {
+                    Request::Authored
+                } else {
+                    Request::Reviews
+                };
+                poll(
+                    &mut cache,
+                    &targets,
+                    now,
+                    false,
+                    |request| {
+                        calls.push(request.clone());
+                        match request {
+                            Request::Stack(_) => Response {
+                                stacks: Some(vec![stack(42, 44)]),
+                                ..Default::default()
+                            },
+                            request if *request == discovery => Response {
+                                prs: vec![pr(44)],
+                                ..Default::default()
+                            },
+                            _ => Response::default(),
+                        }
+                    },
+                    |cache, started| {
+                        let snapshot = cache.snapshot(&targets);
+                        let imported = if authored {
+                            &snapshot.user_prs
+                        } else {
+                            &snapshot.review_requested_prs
+                        };
+                        if !started && imported.iter().any(|p| p.number == 44) {
+                            assert!(snapshot
+                                .stacks
+                                .unwrap()
+                                .iter()
+                                .any(|s| s.pull_requests.iter().any(|p| p.number == 44)));
+                        }
+                    },
+                );
+                assert_eq!(&calls[..2], &[Request::Stack(42), discovery]);
+                assert_eq!(
+                    calls
+                        .iter()
+                        .filter(|r| matches!(r, Request::Stack(_)))
+                        .count(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn discovery_does_not_bypass_stack_failure_backoff() {
+        let targets = Targets {
+            stacks: vec![(42, 2)],
+            auto_reviews: true,
+            ..Default::default()
+        };
+        let mut cache = Cache::default();
+        for now in [1000, 1060, 1120] {
+            let mut calls = Vec::new();
+            poll(
+                &mut cache,
+                &targets,
+                now,
+                false,
+                |request| {
+                    calls.push(request.clone());
+                    match request {
+                        Request::Stack(_) => Response {
+                            error: Some("offline".into()),
+                            ..Default::default()
+                        },
+                        _ => Response::default(),
+                    }
+                },
+                |_, _| {},
+            );
+            assert!(calls.contains(&Request::Reviews));
+            assert_eq!(calls.contains(&Request::Stack(42)), now != 1120);
+        }
+    }
+
+    #[test]
+    fn active_stacks_keep_column_cadence_without_due_discovery() {
+        let targets = Targets {
+            stacks: vec![(42, 1)],
+            ..Default::default()
+        };
+        let mut cache = Cache::default();
+        cycle(&mut cache, &targets, 1000, false);
+        assert!(cycle(&mut cache, &targets, 1060, false).is_empty());
+        assert!(cycle(&mut cache, &targets, 1120, false).contains(&Request::Stack(42)));
     }
 
     #[test]
