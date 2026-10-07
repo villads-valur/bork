@@ -435,7 +435,7 @@ A running TUI picks up project config changes within ~2 seconds. Restart bork af
 
 ### Worktree Setup & Teardown Scripts
 
-Fresh git worktrees are bare checkouts: no installed dependencies, no untracked config like `.env`. `setup_script` fixes that. When an agent session is launched for an issue with a worktree, the script runs inside that worktree first, chained with `&&` so the agent only starts if setup succeeds. Output is visible in the agent's tmux window. Resumed sessions skip it.
+Fresh git worktrees are bare checkouts: no installed dependencies, no untracked config like `.env`. `setup_script` fixes that. When an agent session is launched for an issue with a worktree, the script runs inside that worktree first, chained with `&&` so the agent only starts if setup succeeds. Output is visible in the agent's tmux window. Bork waits for the script's exit status before recording setup as complete. A failed or interrupted setup is reported as an error and is retried when the session is recreated. Once setup succeeds, subsequent launches for that worktree skip it.
 
 `teardown_script` is the mirror hook: `bork issue archive <id>` runs it inside the worktree before removal, for cleanup that `git worktree remove` can't do (stopping services, dropping per-worktree databases). A failing teardown aborts the archive unless `--force` is passed.
 

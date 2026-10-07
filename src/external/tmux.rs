@@ -113,7 +113,7 @@ pub fn session_exists(name: &str) -> bool {
 /// Check whether the first pane's process is still alive.
 /// After a crash or battery death, the tmux session may survive but the
 /// process inside it (bork) is dead. tmux marks this with `pane_dead`.
-fn is_pane_alive(session: &str) -> bool {
+pub fn is_pane_alive(session: &str) -> bool {
     let target = format!("{session}:0.0");
     let output = Command::new("tmux")
         .args(["display-message", "-t", &target, "-p", "#{pane_dead}"])

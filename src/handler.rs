@@ -2088,7 +2088,9 @@ mod tests {
 
     fn test_app() -> App {
         let state = crate::config::AppState::default();
-        App::new(test_config(), state)
+        let mut app = App::new(test_config(), state);
+        app.project_mut().available_agents = AgentKind::ALL.to_vec();
+        app
     }
 
     fn test_issue(id: &str, column: Column) -> crate::types::Issue {
@@ -3962,28 +3964,30 @@ mod tests {
 
     #[test]
     fn sidebar_toggle_opens_immediately_and_dispatches_reload() {
-        let mut app = test_multi_app();
-        assert_eq!(app.input_mode, InputMode::Normal);
-        assert!(!app.sidebar.as_ref().unwrap().visible);
+        crate::global_config::tests::with_temp_config("sidebar-reload", || {
+            let mut app = test_multi_app();
+            assert_eq!(app.input_mode, InputMode::Normal);
+            assert!(!app.sidebar.as_ref().unwrap().visible);
 
-        let (reload_tx, reload_rx) = mpsc::channel();
-        let ctx = app.action_context();
-        let ch = ActionChannels {
-            action_tx: Box::leak(Box::new(mpsc::channel().0)),
-            pr_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
-            linear_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
-            git_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
-            reload_tx: &reload_tx,
-        };
-        handle_action(&mut app, Action::ToggleSidebar, &ctx, &ch);
+            let (reload_tx, reload_rx) = mpsc::channel();
+            let ctx = app.action_context();
+            let ch = ActionChannels {
+                action_tx: Box::leak(Box::new(mpsc::channel().0)),
+                pr_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
+                linear_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
+                git_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
+                reload_tx: &reload_tx,
+            };
+            handle_action(&mut app, Action::ToggleSidebar, &ctx, &ch);
 
-        assert_eq!(app.input_mode, InputMode::Sidebar);
-        assert!(app.sidebar.as_ref().unwrap().visible);
-        assert!(app.sidebar.as_ref().unwrap().focused);
+            assert_eq!(app.input_mode, InputMode::Sidebar);
+            assert!(app.sidebar.as_ref().unwrap().visible);
+            assert!(app.sidebar.as_ref().unwrap().focused);
 
-        // Background thread should send a ReloadResult
-        let result = reload_rx.recv_timeout(std::time::Duration::from_secs(5));
-        assert!(result.is_ok());
+            // Background thread should send a ReloadResult
+            let result = reload_rx.recv_timeout(std::time::Duration::from_secs(5));
+            assert!(result.is_ok());
+        });
     }
 
     #[test]
