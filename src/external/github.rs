@@ -419,13 +419,15 @@ fn parse_stack(value: &serde_json::Value) -> Option<GithubStack> {
         .to_string();
     let base_ref = value.pointer("/base/ref")?.as_str()?.to_string();
     let open = value.get("open").and_then(|v| v.as_bool()).unwrap_or(true);
-    let pull_requests = value
+    let mut pull_requests = value
         .get("pull_requests")
         .and_then(|v| v.as_array())?
         .iter()
         .map(parse_stack_pull_request)
         .collect::<Option<Vec<_>>>()?;
 
+    let mut seen = std::collections::HashSet::new();
+    pull_requests.retain(|pr| seen.insert(pr.number));
     Some(GithubStack {
         number,
         url,
@@ -581,53 +583,145 @@ pub fn fetch_user_prs(main_worktree: &Path) -> Result<Vec<PrStatus>, String> {
     Ok(parse_search_response(&stdout))
 }
 
-pub fn fetch_review_requested_prs(main_worktree: &Path) -> Result<Vec<PrStatus>, String> {
-    let repo = get_repo_identity(main_worktree)?;
-    let user = fetch_current_user(main_worktree).ok_or("Could not fetch GitHub user")?;
-
-    let graphql_query = format!(
-        r#"query($search: String!) {{
-            search(query: $search, type: ISSUE, first: 50) {{
-                nodes {{
-                    ... on PullRequest {{
-                        {PR_FIELDS}
-                    }}
-                }}
-            }}
-        }}"#
-    );
-
-    // involves:<user> covers review-requested, assigned, reviewed-by, and
-    // mentioned - matching GitHub's "Involved" filter exactly.
-    // Authored PRs are included but deduped by sync_prs_as_issues() since
-    // user_prs is processed first.
-    let search_query = format!(
-        "repo:{}/{} is:pr is:open involves:{}",
-        repo.owner, repo.name, user
-    );
-
-    fetch_search_query(main_worktree, &graphql_query, &search_query)
+#[derive(Default)]
+pub struct ReviewDiscovery {
+    pub prs: Vec<PrStatus>,
+    pub stacks: HashMap<u32, Option<u32>>,
 }
 
-fn fetch_search_query(
-    main_worktree: &Path,
-    graphql_query: &str,
-    search: &str,
-) -> Result<Vec<PrStatus>, String> {
-    let output = crate::external::gh_command()
-        .args([
-            "api",
-            "graphql",
-            "-f",
-            &format!("query={graphql_query}"),
-            "-f",
-            &format!("search={search}"),
-        ])
-        .current_dir(main_worktree)
-        .output();
+pub fn fetch_review_requested_prs(main_worktree: &Path) -> Result<ReviewDiscovery, String> {
+    let repo = get_repo_identity(main_worktree)?;
+    let user = fetch_current_user(main_worktree).ok_or("Could not fetch GitHub user")?;
+    let search = format!(
+        "repo:{}/{} is:pr is:open review-requested:{}",
+        repo.owner, repo.name, user
+    );
+    fetch_review_pages(|query| {
+        checked_gh_output(
+            crate::external::gh_command()
+                .args([
+                    "api",
+                    "graphql",
+                    "-f",
+                    &format!("query={query}"),
+                    "-f",
+                    &format!("search={search}"),
+                ])
+                .current_dir(main_worktree)
+                .output(),
+        )
+    })
+}
 
-    let stdout = checked_gh_output(output)?;
-    Ok(parse_search_response(&stdout))
+fn fetch_review_pages(
+    mut fetch: impl FnMut(&str) -> Result<String, String>,
+) -> Result<ReviewDiscovery, String> {
+    let mut result = ReviewDiscovery::default();
+    let mut prs = HashMap::new();
+    let mut cursor = None::<String>;
+    let mut with_stacks = true;
+    loop {
+        let after = cursor
+            .as_ref()
+            .map(|cursor| {
+                format!(
+                    ",after:{}",
+                    serde_json::to_string(cursor).unwrap_or_default()
+                )
+            })
+            .unwrap_or_default();
+        let stack_field = if with_stacks { "stack { number }" } else { "" };
+        let query = format!("query($search:String!){{ search(query:$search,type:ISSUE,first:50{after}){{ nodes{{ ... on PullRequest{{ {PR_FIELDS} {stack_field} }} }} issueCount pageInfo{{hasNextPage endCursor}} }} }}");
+        let stdout = match fetch(&query) {
+            Ok(stdout) => stdout,
+            Err(error)
+                if with_stacks
+                    && error.contains("stack")
+                    && (error.contains("doesn't exist")
+                        || error.contains("Cannot query field")) =>
+            {
+                with_stacks = false;
+                cursor = None;
+                prs.clear();
+                result.stacks.clear();
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&stdout).map_err(|_| "Invalid GitHub review response")?;
+        if value
+            .get("errors")
+            .and_then(|v| v.as_array())
+            .is_some_and(|errors| !errors.is_empty())
+        {
+            return Err("GitHub review query returned incomplete data".into());
+        }
+        let search = value
+            .pointer("/data/search")
+            .ok_or("Missing GitHub review results")?;
+        if search
+            .get("issueCount")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|count| count > 1000)
+        {
+            return Err(
+                "GitHub review search exceeds its 1,000-result limit; keeping existing reviews"
+                    .into(),
+            );
+        }
+        let nodes = search
+            .get("nodes")
+            .and_then(|v| v.as_array())
+            .ok_or("Missing GitHub review nodes")?;
+        for node in nodes {
+            let pr = parse_pr_node(node).ok_or("Invalid GitHub review PR")?;
+            let stack = if with_stacks {
+                match node.get("stack") {
+                    Some(serde_json::Value::Null) => None,
+                    Some(stack) => Some(
+                        stack
+                            .get("number")
+                            .and_then(|v| v.as_u64())
+                            .and_then(|n| u32::try_from(n).ok())
+                            .ok_or("Invalid GitHub review stack")?,
+                    ),
+                    None => return Err("Missing GitHub review stack membership".into()),
+                }
+            } else {
+                None
+            };
+            if result
+                .stacks
+                .get(&pr.number)
+                .is_some_and(|old| old != &stack)
+            {
+                return Err("GitHub stack membership changed during discovery; retrying".into());
+            }
+            result.stacks.insert(pr.number, stack);
+            prs.insert(pr.number, pr);
+        }
+        let has_next = search
+            .pointer("/pageInfo/hasNextPage")
+            .and_then(|v| v.as_bool())
+            .ok_or("Missing GitHub review pagination")?;
+        if !has_next {
+            break;
+        }
+        let next = search
+            .pointer("/pageInfo/endCursor")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing GitHub review cursor")?;
+        if cursor.as_deref() == Some(next) {
+            return Err("GitHub review cursor did not advance".into());
+        }
+        cursor = Some(next.to_string());
+    }
+    result.prs = prs.into_values().collect();
+    result
+        .prs
+        .sort_unstable_by_key(|pr| std::cmp::Reverse(pr.number));
+    Ok(result)
 }
 
 fn parse_search_response(json_str: &str) -> Vec<PrStatus> {
@@ -792,6 +886,67 @@ mod tests {
     }
 
     // --- parse_pr_node ---
+
+    #[test]
+    fn review_pages_dedupe_prs_and_resolve_stack_before_returning() {
+        let mut pages = 0;
+        let result = fetch_review_pages(|query| {
+            assert!(query.contains("stack { number }"));
+            pages += 1;
+            let nodes = if pages == 1 {
+                vec![make_pr_node(r#"{"number":1,"stack":{"number":10}}"#), make_pr_node(r#"{"number":2,"stack":{"number":10}}"#)]
+            } else {
+                assert!(query.contains("after:\"next\""));
+                vec![make_pr_node(r#"{"number":2,"stack":{"number":10}}"#), make_pr_node(r#"{"number":3,"stack":null}"#)]
+            };
+            Ok(serde_json::json!({"data":{"search":{"nodes":nodes,"pageInfo":{"hasNextPage":pages == 1,"endCursor":"next"}}}}).to_string())
+        }).unwrap();
+        assert_eq!(pages, 2);
+        assert_eq!(
+            result.prs.iter().map(|pr| pr.number).collect::<Vec<_>>(),
+            vec![3, 2, 1]
+        );
+        assert_eq!(
+            result.stacks,
+            [(1, Some(10)), (2, Some(10)), (3, None)].into()
+        );
+    }
+
+    #[test]
+    fn incomplete_review_discovery_is_an_error_not_an_empty_success() {
+        for response in [
+            r#"{}"#,
+            r#"{"data":{"search":{"nodes":[]}},"errors":[{"message":"denied"}]}"#,
+            r#"{"data":{"search":{"nodes":[null],"pageInfo":{"hasNextPage":false}}}}"#,
+        ] {
+            assert!(fetch_review_pages(|_| Ok(response.into())).is_err());
+        }
+        let mut calls = 0;
+        assert!(fetch_review_pages(|_| {
+            calls += 1;
+            if calls == 2 { return Err("offline".into()); }
+            Ok(serde_json::json!({"data":{"search":{"nodes":[make_pr_node(r#"{"stack":null}"#)],"pageInfo":{"hasNextPage":true,"endCursor":"next"}}}}).to_string())
+        }).is_err());
+    }
+
+    #[test]
+    fn review_discovery_falls_back_only_for_missing_stack_schema() {
+        let mut calls = 0;
+        let result = fetch_review_pages(|query| {
+            calls += 1;
+            if calls == 1 { return Err("Field 'stack' doesn't exist on type 'PullRequest'".into()); }
+            assert!(!query.contains("stack { number }"));
+            Ok(serde_json::json!({"data":{"search":{"nodes":[make_pr_node("")],"pageInfo":{"hasNextPage":false}}}}).to_string())
+        }).unwrap();
+        assert_eq!(result.stacks[&42], None);
+        let mut calls = 0;
+        assert!(fetch_review_pages(|_| {
+            calls += 1;
+            Err("HTTP 403".into())
+        })
+        .is_err());
+        assert_eq!(calls, 1);
+    }
 
     #[test]
     fn branch_lookup_skips_forks_and_finds_open_pr_on_later_page() {

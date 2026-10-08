@@ -360,6 +360,7 @@ mod tests {
             agent_mode: crate::types::AgentMode::Plan,
             default_prompt: None,
             review_prompt: None,
+            stack_review_prompt: None,
             orchestrator_prompt: None,
             setup_script: None,
             teardown_script: None,

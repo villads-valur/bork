@@ -1166,6 +1166,7 @@ mod tests {
             agent_mode: AgentMode::Plan,
             default_prompt: Some("The source code is in main/.".to_string()),
             review_prompt: None,
+            stack_review_prompt: None,
             orchestrator_prompt: None,
             setup_script: None,
             teardown_script: None,

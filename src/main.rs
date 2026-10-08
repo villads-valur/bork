@@ -12,6 +12,7 @@ mod input;
 mod lock;
 mod ops;
 mod prune;
+mod review_import;
 mod stack;
 mod toml_lite;
 mod types;
@@ -75,6 +76,7 @@ struct PrPollResult {
     refreshed_stacks: Vec<u32>,
     user_prs: Vec<PrStatus>,
     review_requested_prs: Vec<PrStatus>,
+    review_stacks: Option<HashMap<u32, Option<u32>>>,
     github_user: Option<String>,
     loading_more: bool,
     error: Option<String>,
@@ -1169,6 +1171,7 @@ const CONFIG_KEYS: &[(&str, ConfigKeyKind)] = &[
     ("agent_mode", ConfigKeyKind::Mode),
     ("default_prompt", ConfigKeyKind::Str),
     ("review_prompt", ConfigKeyKind::Str),
+    ("stack_review_prompt", ConfigKeyKind::Str),
     ("orchestrator_prompt", ConfigKeyKind::Str),
 ];
 
@@ -1226,6 +1229,7 @@ fn resolved_config_value(config: &config::AppConfig, key: &str) -> Option<String
         "agent_mode" => Some(config.agent_mode.to_string()),
         "default_prompt" => Some(config.default_prompt.clone().unwrap_or_default()),
         "review_prompt" => Some(config.review_prompt.clone().unwrap_or_default()),
+        "stack_review_prompt" => Some(config.stack_review_prompt.clone().unwrap_or_default()),
         "orchestrator_prompt" => Some(config.orchestrator_prompt.clone().unwrap_or_default()),
         _ => None,
     }
@@ -1855,7 +1859,8 @@ fn drain_project_workers(
                 .as_ref()
                 .is_some_and(|stacks| live.github_stacks != *stacks)
             || live.user_prs != pr_result.user_prs
-            || live.review_requested_prs != pr_result.review_requested_prs;
+            || live.review_requested_prs != pr_result.review_requested_prs
+            || live.review_stacks != pr_result.review_stacks;
         if pr_result.github_user.is_some() && live.github_user != pr_result.github_user {
             live.github_user = pr_result.github_user;
             needs_redraw = true;
@@ -1881,6 +1886,7 @@ fn drain_project_workers(
         }
         live.user_prs = pr_result.user_prs;
         live.review_requested_prs = pr_result.review_requested_prs;
+        live.review_stacks = pr_result.review_stacks;
         live.pr_poll_done = true;
 
         // Rewrite imported issue titles from the fresh PR titles.
@@ -1904,6 +1910,7 @@ fn drain_project_workers(
 
     // --- Auto-import open PRs as issues (only when new PR data arrived) ---
     if pr_data_changed {
+        let stack_changed = project.sync_stack_reviews(protected_imports);
         let reconciled = project.reconcile_stack_imports(&refreshed_stacks, protected_imports);
         let (changed, msg) = project.sync_prs_as_issues();
         message = msg;
@@ -1912,7 +1919,7 @@ fn drain_project_workers(
             message =
                 Some(message.map_or_else(|| cleanup.clone(), |msg| format!("{msg}, {cleanup}")));
         }
-        if changed || reconciled > 0 {
+        if changed || stack_changed || reconciled > 0 {
             project.mark_dirty();
         }
     }

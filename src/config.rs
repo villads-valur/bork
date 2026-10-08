@@ -21,6 +21,7 @@ pub struct AppConfig {
     pub agent_mode: AgentMode,
     pub default_prompt: Option<String>,
     pub review_prompt: Option<String>,
+    pub stack_review_prompt: Option<String>,
     pub orchestrator_prompt: Option<String>,
     /// Shell command run inside a fresh issue worktree before the agent
     /// starts (e.g. dependency install). Prepended to the agent launch
@@ -96,6 +97,8 @@ pub const DEFAULT_AGENT_MODE: AgentMode = AgentMode::Plan;
 
 pub const DEFAULT_PROMPT_FALLBACK: &str = "The source code is in main/. Use `bork issue start \"Title\" --project <name-or-path> --prompt \"Details...\"` to spin off new issues with their own worktrees and agents.";
 
+pub const DEFAULT_STACK_REVIEW_PROMPT: &str = "Review this PR stack in dependency order. Read all members for context, focusing your review on the PRs where your review is requested. Check each PR against its own base, and check for bugs introduced by interactions between stack members. Report actionable findings against the relevant PR, with severity and file/line references. Do not submit reviews or modify code unless explicitly asked.";
+
 pub const DEFAULT_REVIEW_PROMPT: &str = "Read the diff, check for correctness, regressions, missing tests, and edge cases. Summarize your findings. Use any code review skills that might be installed. Categorize call outs in High, Medium, Low importance. Add file name, linenumber to each call out.";
 
 pub const DEFAULT_ORCHESTRATOR_PROMPT: &str = "You are an orchestrator agent: you coordinate work across multiple bork issues instead of writing code yourself. \
@@ -117,6 +120,7 @@ impl Default for AppConfig {
             agent_mode: DEFAULT_AGENT_MODE,
             default_prompt: None,
             review_prompt: None,
+            stack_review_prompt: None,
             orchestrator_prompt: None,
             setup_script: None,
             teardown_script: None,
@@ -202,6 +206,7 @@ pub struct PartialConfig {
     pub agent_mode: Option<AgentMode>,
     pub default_prompt: Option<String>,
     pub review_prompt: Option<String>,
+    pub stack_review_prompt: Option<String>,
     pub orchestrator_prompt: Option<String>,
     pub setup_script: Option<String>,
     pub teardown_script: Option<String>,
@@ -262,6 +267,7 @@ impl PartialConfig {
             agent_mode: other.agent_mode.or(self.agent_mode),
             default_prompt: other.default_prompt.or(self.default_prompt),
             review_prompt: other.review_prompt.or(self.review_prompt),
+            stack_review_prompt: other.stack_review_prompt.or(self.stack_review_prompt),
             orchestrator_prompt: other.orchestrator_prompt.or(self.orchestrator_prompt),
             setup_script: other.setup_script.or(self.setup_script),
             teardown_script: other.teardown_script.or(self.teardown_script),
@@ -315,6 +321,7 @@ fn materialize(merged: PartialConfig, project_root: &Path) -> AppConfig {
         agent_mode: merged.agent_mode.unwrap_or(DEFAULT_AGENT_MODE),
         default_prompt: merged.default_prompt,
         review_prompt: merged.review_prompt,
+        stack_review_prompt: merged.stack_review_prompt,
         orchestrator_prompt: merged.orchestrator_prompt,
         setup_script: merged.setup_script,
         teardown_script: merged.teardown_script,
@@ -392,6 +399,11 @@ fn partial_from_table(table: &Table) -> PartialConfig {
         .and_then(|v| v.as_str())
         .map(str::to_string);
 
+    let stack_review_prompt = table
+        .get("stack_review_prompt")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
     let review_prompt = table
         .get("review_prompt")
         .and_then(|v| v.as_str())
@@ -438,6 +450,7 @@ fn partial_from_table(table: &Table) -> PartialConfig {
         agent_mode,
         default_prompt,
         review_prompt,
+        stack_review_prompt,
         orchestrator_prompt,
         setup_script,
         teardown_script,
@@ -772,6 +785,20 @@ review_prompt = "Review the thing"
         assert_eq!(p.agent_kind, Some(AgentKind::Claude));
         assert_eq!(p.default_prompt.as_deref(), Some("Do the thing"));
         assert_eq!(p.review_prompt.as_deref(), Some("Review the thing"));
+    }
+
+    #[test]
+    fn stack_review_prompt_has_independent_global_and_project_precedence() {
+        let global = r#"review_prompt = "single"
+stack_review_prompt = "global stack""#;
+        assert_eq!(
+            merge_to_app(global, "").stack_review_prompt.as_deref(),
+            Some("global stack")
+        );
+        let config = merge_to_app(global, r#"stack_review_prompt = "project stack""#);
+        assert_eq!(config.stack_review_prompt.as_deref(), Some("project stack"));
+        assert_eq!(config.review_prompt.as_deref(), Some("single"));
+        assert!(merge_to_app("", "").stack_review_prompt.is_none());
     }
 
     #[test]

@@ -76,6 +76,7 @@ pub struct LiveState {
     pub linear_issues: Vec<LinearIssue>,
     pub user_prs: Vec<PrStatus>,
     pub review_requested_prs: Vec<PrStatus>,
+    pub review_stacks: Option<HashMap<u32, Option<u32>>>,
     pub github_user: Option<String>,
     pub git_poll_done: bool,
     pub pr_poll_done: bool,
@@ -1127,6 +1128,14 @@ impl Project {
         for pr in review_prs {
             if self
                 .live
+                .review_stacks
+                .as_ref()
+                .is_some_and(|map| !matches!(map.get(&pr.number), Some(None)))
+            {
+                continue;
+            }
+            if self
+                .live
                 .github_user
                 .as_deref()
                 .is_some_and(|user| pr.author.eq_ignore_ascii_case(user))
@@ -1649,6 +1658,7 @@ fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
         github_pr_links: _,
         github_stack: _,
         pr_import_baseline: _,
+        stack_review_import: _,
         linked_issues: _,
         // Merged entry-wise, interleaved with the kind/orchestrator logic below.
         sessions: _,
@@ -1688,6 +1698,7 @@ fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
     merge_field!(github_pr_links);
     merge_field!(github_stack);
     merge_field!(pr_import_baseline);
+    merge_field!(stack_review_import);
     merge_field!(linked_issues);
 
     // `sessions` merges entry-wise: per-agent entries are independent, so a
@@ -2459,6 +2470,7 @@ mod tests {
             agent_mode: crate::types::AgentMode::Plan,
             default_prompt: None,
             review_prompt: None,
+            stack_review_prompt: None,
             orchestrator_prompt: None,
             setup_script: None,
             teardown_script: None,
@@ -5790,6 +5802,7 @@ mod tests {
             agent_mode: crate::types::AgentMode::Plan,
             default_prompt: None,
             review_prompt: None,
+            stack_review_prompt: None,
             orchestrator_prompt: None,
             setup_script: None,
             teardown_script: None,
@@ -6413,6 +6426,11 @@ mod tests {
             number: 42,
             source: PrImportSource::Authored,
         });
+        issue.stack_review_import = Some(crate::types::StackReviewImport {
+            stack_number: 10,
+            requested_prs: vec![42],
+            generated_prompt: "review stack".into(),
+        });
         let value = serde_json::to_value(&issue).expect("issue serializes");
         let object = value.as_object().expect("issue is a JSON object");
         let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
@@ -6434,6 +6452,7 @@ mod tests {
             "linear_links",
             "github_pr_links",
             "pr_import_baseline",
+            "stack_review_import",
             "linked_issues",
         ];
         expected.sort_unstable();

@@ -272,6 +272,13 @@ pub struct LinkedGithubPr {
     pub import_source: Option<PrImportSource>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StackReviewImport {
+    pub stack_number: u32,
+    pub requested_prs: Vec<u32>,
+    pub generated_prompt: String,
+}
+
 /// Original auto-import values used to identify cards safe to reconcile into a stack.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PrImportBaseline {
@@ -320,6 +327,8 @@ pub struct Issue {
     pub github_stack: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_import_baseline: Option<PrImportBaseline>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack_review_import: Option<StackReviewImport>,
 
     /// IDs of other issues in the same project this one is tied to.
     /// Links are symmetric: each side stores the other's id.
@@ -386,6 +395,7 @@ impl Issue {
             github_pr_links: Vec::new(),
             github_stack: None,
             pr_import_baseline: None,
+            stack_review_import: None,
             linked_issues: Vec::new(),
             session_id: None,
             linear_id: None,
@@ -566,6 +576,7 @@ impl Issue {
             self.worktree = None;
             self.github_pr_links.clear();
             self.github_stack = None;
+            self.stack_review_import = None;
         }
         true
     }
@@ -615,9 +626,20 @@ impl Issue {
 
     pub fn is_any_pr_imported(&self) -> bool {
         self.github_pr_links.iter().any(|l| l.imported)
+            || self
+                .stack_review_import
+                .as_ref()
+                .is_some_and(|import| self.github_stack == Some(import.stack_number))
     }
 
     pub fn primary_pr_import_source(&self) -> Option<PrImportSource> {
+        if self
+            .stack_review_import
+            .as_ref()
+            .is_some_and(|import| self.github_stack == Some(import.stack_number))
+        {
+            return Some(PrImportSource::ReviewRequested);
+        }
         self.github_pr_links.first().and_then(|l| l.import_source)
     }
 
