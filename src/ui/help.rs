@@ -17,7 +17,7 @@ struct Section {
 
 const TUICR_SECTION: Section = Section {
     title: "Review",
-    bindings: &[("r", "Review changes"), ("R", "Review PR (--pr)")],
+    bindings: &[("r", "Review changes"), ("R", "Review PR / stack")],
 };
 
 const DEBUG_SECTION: Section = Section {
@@ -83,7 +83,8 @@ const SECTIONS: &[Section] = &[
             ("/", "Search"),
             ("P", "Sync PRs"),
             ("W", "Prune worktrees"),
-            ("o", "Open PR in browser"),
+            ("o", "Open PR / stack"),
+            ("s", "Expand stack"),
             ("O", "Open in Linear"),
             ("I", "Import from Linear"),
             ("w", "Assign worktree"),

@@ -4,6 +4,7 @@ mod config;
 mod dialog_state;
 mod error;
 mod external;
+mod github_poll;
 mod global_config;
 mod handler;
 mod init;
@@ -11,6 +12,7 @@ mod input;
 mod lock;
 mod ops;
 mod prune;
+mod stack;
 mod toml_lite;
 mod types;
 mod ui;
@@ -57,13 +59,25 @@ use external::linear::LinearPollResult;
 use external::ports::PortPollResult;
 use types::{GithubStack, PrStatus};
 
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 struct PrPollResult {
+    started: bool,
+    authored_ready: bool,
+    reviews_ready: bool,
+    stack_errors: HashMap<u32, String>,
+    gh_missing: bool,
+    stacks_unsupported: bool,
     prs: HashMap<String, PrStatus>,
     prs_by_number: HashMap<u32, PrStatus>,
     stacks: Option<Vec<GithubStack>>,
+    #[serde(skip)]
+    refreshed_stacks: Vec<u32>,
     user_prs: Vec<PrStatus>,
     review_requested_prs: Vec<PrStatus>,
     github_user: Option<String>,
+    loading_more: bool,
+    error: Option<String>,
 }
 
 /// Kitty keyboard protocol flags we negotiate so Ghostty/kitty/foot/WezTerm/recent
@@ -357,42 +371,98 @@ fn spawn_linear_worker(
 
 fn spawn_pr_poll_worker(
     main_worktree: PathBuf,
+    targets: Arc<Mutex<github_poll::Targets>>,
     suspended: Arc<AtomicBool>,
-    wake_rx: mpsc::Receiver<()>,
+    wake_rx: mpsc::Receiver<github_poll::Wake>,
 ) -> mpsc::Receiver<PrPollResult> {
     let (tx, rx) = mpsc::channel();
-
-    thread::spawn(move || loop {
-        wait_while_suspended(&suspended);
-        // Run the independent GitHub calls in parallel.
-        let result = thread::scope(|s| {
-            let prs_handle = s.spawn(|| external::github::fetch_prs(&main_worktree));
-            let user_prs_handle = s.spawn(|| external::github::fetch_user_prs(&main_worktree));
-            let review_handle =
-                s.spawn(|| external::github::fetch_review_requested_prs(&main_worktree));
-            let user_handle = s.spawn(|| external::github::fetch_current_user(&main_worktree));
-            let stacks_handle = s.spawn(|| external::github::fetch_stacks(&main_worktree));
-
-            let prs = prs_handle.join().unwrap_or_default();
-            let prs_by_number = prs.iter().map(|pr| (pr.number, pr.clone())).collect();
-
-            PrPollResult {
-                prs: external::github::index_by_branch(prs),
-                prs_by_number,
-                stacks: stacks_handle.join().unwrap_or(None),
-                user_prs: user_prs_handle.join().unwrap_or_default(),
-                review_requested_prs: review_handle.join().unwrap_or_default(),
-                github_user: user_handle.join().ok().flatten(),
-            }
-        });
-        if tx.send(result).is_err() {
-            break;
+    thread::spawn(move || {
+        let remote = StdCommand::new("git")
+            .args(["config", "--get", "remote.origin.url"])
+            .current_dir(&main_worktree)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .unwrap_or_default();
+        let cache_path = main_worktree
+            .parent()
+            .unwrap_or(&main_worktree)
+            .join(".bork/github-cache.json");
+        let mut cache = github_poll::Cache::load(&cache_path, &remote);
+        cache.result.gh_missing = !agent_config::command_exists("gh");
+        if tx.send(cache.result.clone()).is_err() {
+            return;
         }
-        if !sleep_with_wake(&wake_rx, PR_POLL_INTERVAL) {
-            break;
+        let mut force = false;
+        loop {
+            wait_while_suspended(&suspended);
+            let cycle_started = std::time::Instant::now();
+            if agent_config::command_exists("gh") {
+                cache.result.gh_missing = false;
+                let snapshot = targets
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone();
+                let disconnected = std::cell::Cell::new(false);
+                github_poll::poll(
+                    &mut cache,
+                    &snapshot,
+                    app::unix_now(),
+                    force,
+                    |request| {
+                        if disconnected.get() {
+                            let mut response = github_poll::Response::default();
+                            response.cancelled = true;
+                            response
+                        } else {
+                            github_poll::fetch(&main_worktree, request)
+                        }
+                    },
+                    |cache, started| {
+                        if disconnected.get() {
+                            return;
+                        }
+                        let result = if started {
+                            PrPollResult {
+                                started: true,
+                                ..Default::default()
+                            }
+                        } else {
+                            cache.snapshot(&snapshot)
+                        };
+                        if tx.send(result).is_err() {
+                            disconnected.set(true);
+                            return;
+                        }
+                        if !started {
+                            cache.save(&cache_path);
+                        }
+                    },
+                );
+                if disconnected.get() {
+                    return;
+                }
+            } else {
+                cache.result.gh_missing = true;
+                let _ = tx.send(cache.result.clone());
+            }
+            force = false;
+            let wait = PR_POLL_INTERVAL
+                .saturating_sub(cycle_started.elapsed())
+                .max(Duration::from_secs(1));
+            match wake_rx.recv_timeout(wait) {
+                Ok(wake) => {
+                    force = matches!(wake, github_poll::Wake::Refresh);
+                    while let Ok(wake) = wake_rx.try_recv() {
+                        force |= matches!(wake, github_poll::Wake::Refresh);
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
         }
     });
-
     rx
 }
 
@@ -1591,7 +1661,8 @@ struct ProjectWorkers {
     git_wake_tx: mpsc::Sender<()>,
     git_classes: Arc<Mutex<HashMap<String, PollClass>>>,
     pr_rx: mpsc::Receiver<PrPollResult>,
-    pr_wake_tx: mpsc::Sender<()>,
+    pr_wake_tx: mpsc::Sender<github_poll::Wake>,
+    linked_prs: Arc<Mutex<github_poll::Targets>>,
 }
 
 fn spawn_shared_workers() -> SharedWorkers {
@@ -1644,9 +1715,15 @@ fn spawn_project_workers(
         git_wake_rx,
     );
 
-    let (pr_wake_tx, pr_wake_rx) = mpsc::channel::<()>();
+    let (pr_wake_tx, pr_wake_rx) = mpsc::channel::<github_poll::Wake>();
     let main_worktree = project_root.join("main");
-    let pr_rx = spawn_pr_poll_worker(main_worktree, suspended.clone(), pr_wake_rx);
+    let linked_prs = Arc::new(Mutex::new(github_poll::Targets::for_project(project)));
+    let pr_rx = spawn_pr_poll_worker(
+        main_worktree,
+        linked_prs.clone(),
+        suspended.clone(),
+        pr_wake_rx,
+    );
 
     ProjectWorkers {
         session_rx,
@@ -1656,6 +1733,7 @@ fn spawn_project_workers(
         git_classes,
         pr_rx,
         pr_wake_tx,
+        linked_prs,
     }
 }
 
@@ -1684,9 +1762,22 @@ fn drain_project_workers(
     workers: &ProjectWorkers,
     action_tx: &mpsc::Sender<ActionResult>,
     now: u64,
+    picker: bool,
+    protected_imports: &HashSet<String>,
 ) -> DrainOutcome {
     let mut needs_redraw = false;
     let mut message = None;
+    let mut requested = github_poll::Targets::for_project(project);
+    requested.picker = picker;
+    let mut linked_prs = workers
+        .linked_prs
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if *linked_prs != requested {
+        *linked_prs = requested;
+        let _ = workers.pr_wake_tx.send(github_poll::Wake::TargetsChanged);
+    }
+    drop(linked_prs);
 
     // --- Auto-kill Done sessions past TTL ---
     // Runs for every worker-owning project (focused + swimlanes). Attempts are
@@ -1735,9 +1826,28 @@ fn drain_project_workers(
 
     // --- PR status ---
     let mut pr_data_changed = false;
+    let mut refreshed_stacks = HashSet::new();
     while let Ok(pr_result) = workers.pr_rx.try_recv() {
+        project.github_available = !pr_result.gh_missing;
         let live = &mut project.live;
-        let changed = !live.pr_poll_done
+        if pr_result.started {
+            live.gh_missing = false;
+            live.pr_refreshing = true;
+            needs_redraw = true;
+            continue;
+        }
+        refreshed_stacks.extend(&pr_result.refreshed_stacks);
+        let changed = !pr_result.refreshed_stacks.is_empty()
+            || live.gh_missing != pr_result.gh_missing
+            || live.stacks_unsupported != pr_result.stacks_unsupported
+            || live.pr_refreshing
+            || live.authored_prs_ready != Some(pr_result.authored_ready)
+            || live.review_prs_ready != Some(pr_result.reviews_ready)
+            || live.stack_errors != pr_result.stack_errors
+            || !live.pr_poll_done
+            || live.pr_loading_more != pr_result.loading_more
+            || live.github_error != pr_result.error
+            || live.stacks_available != pr_result.stacks.is_some()
             || live.pr_statuses != pr_result.prs
             || live.pr_statuses_by_number != pr_result.prs_by_number
             || pr_result
@@ -1755,8 +1865,17 @@ fn drain_project_workers(
         }
         needs_redraw = true;
         pr_data_changed = true;
+        live.pr_refreshing = false;
+        live.authored_prs_ready = Some(pr_result.authored_ready);
+        live.review_prs_ready = Some(pr_result.reviews_ready);
+        live.stack_errors = pr_result.stack_errors;
+        live.gh_missing = pr_result.gh_missing;
+        live.stacks_unsupported = pr_result.stacks_unsupported;
+        live.github_error = pr_result.error;
+        live.pr_loading_more = pr_result.loading_more;
         live.pr_statuses = pr_result.prs;
         live.pr_statuses_by_number = pr_result.prs_by_number;
+        live.stacks_available = pr_result.stacks.is_some();
         if let Some(stacks) = pr_result.stacks {
             live.github_stacks = stacks;
         }
@@ -1785,9 +1904,15 @@ fn drain_project_workers(
 
     // --- Auto-import open PRs as issues (only when new PR data arrived) ---
     if pr_data_changed {
+        let reconciled = project.reconcile_stack_imports(&refreshed_stacks, protected_imports);
         let (changed, msg) = project.sync_prs_as_issues();
         message = msg;
-        if changed {
+        if reconciled > 0 {
+            let cleanup = format!("Removed {reconciled} duplicate stack imports");
+            message =
+                Some(message.map_or_else(|| cleanup.clone(), |msg| format!("{msg}, {cleanup}")));
+        }
+        if changed || reconciled > 0 {
             project.mark_dirty();
         }
     }
@@ -2147,6 +2272,7 @@ fn run_tui() -> anyhow::Result<()> {
                                 if app.find_project(&id).is_some() && id != app.focused_project {
                                     app.dialog = None;
                                     app.linear_picker = None;
+                                    app.stack_details = None;
                                     app.confirm_message = None;
                                     app.pending_confirm = None;
                                     app.debug_inspector_json = None;
@@ -2370,7 +2496,26 @@ fn run_tui() -> anyhow::Result<()> {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let outcome = drain_project_workers(app.project_mut(), &workers, &action_tx, now);
+        let picker_project = (app.input_mode == InputMode::LinearPicker
+            && app.picker_tab == app::ImportSource::GitHub)
+            .then(|| app.active_project_id());
+        let picker = picker_project.as_ref() == Some(&app.focused_project);
+        let mut protected_imports = app.launches_in_flight.clone();
+        if let Some(id) = app
+            .dialog
+            .as_ref()
+            .and_then(|dialog| dialog.editing_issue_id.as_ref())
+        {
+            protected_imports.insert(id.clone());
+        }
+        let outcome = drain_project_workers(
+            app.project_mut(),
+            &workers,
+            &action_tx,
+            now,
+            picker,
+            &protected_imports,
+        );
         needs_redraw |= apply_drain_outcome(&mut app, outcome);
 
         // --- Update check (periodic worker results) ---
@@ -2451,7 +2596,14 @@ fn run_tui() -> anyhow::Result<()> {
             let Some(proj_pos) = app.projects.iter().position(|p| p.id() == *proj_id) else {
                 continue;
             };
-            let outcome = drain_project_workers(&mut app.projects[proj_pos], sw, &action_tx, now);
+            let outcome = drain_project_workers(
+                &mut app.projects[proj_pos],
+                sw,
+                &action_tx,
+                now,
+                picker_project.as_ref() == Some(proj_id),
+                &protected_imports,
+            );
             needs_redraw |= apply_drain_outcome(&mut app, outcome);
         }
 
@@ -2486,7 +2638,7 @@ fn run_tui() -> anyhow::Result<()> {
             }
         }
 
-        if app.is_busy_visible() {
+        if app.is_busy_visible() || app.github_loading_visible() {
             app.spinner_tick = app.spinner_tick.wrapping_add(1);
             // The spinner advances one frame every 2 ticks; redraw only when
             // the visible frame actually changes.
@@ -2731,6 +2883,47 @@ fn resolve_editor() -> Option<(String, Vec<String>)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires an authenticated GitHub repository; set BORK_GITHUB_SMOKE_WORKTREE and BORK_GITHUB_SMOKE_PRS"]
+    fn github_poll_smoke() {
+        let worktree = std::env::var("BORK_GITHUB_SMOKE_WORKTREE").expect("set the worktree path");
+        let numbers: Vec<u32> = std::env::var("BORK_GITHUB_SMOKE_PRS")
+            .expect("set comma-separated PR numbers")
+            .split(',')
+            .map(|number| number.parse().unwrap())
+            .collect();
+        let (wake_tx, wake_rx) = mpsc::channel();
+        let rx = spawn_pr_poll_worker(
+            PathBuf::from(worktree),
+            Arc::new(Mutex::new(github_poll::Targets {
+                prs: numbers.iter().map(|n| (*n, 0)).collect(),
+                ..Default::default()
+            })),
+            Arc::new(AtomicBool::new(false)),
+            wake_rx,
+        );
+        let start = std::time::Instant::now();
+        let mut updates = 0;
+        loop {
+            let result = rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("PR poll timed out");
+            if result.started {
+                continue;
+            }
+            updates += 1;
+            eprintln!("GitHub update {updates}: {} PRs, {} stacks, loading={}, elapsed={:.1}s, error={:?}", result.prs_by_number.len(), result.stacks.as_ref().map_or(0, Vec::len), result.loading_more, start.elapsed().as_secs_f32(), result.error);
+            assert!(result.error.is_none());
+            if numbers
+                .iter()
+                .all(|number| result.prs_by_number.contains_key(number))
+            {
+                break;
+            }
+        }
+        drop(wake_tx);
+    }
+
     use super::*;
 
     #[test]

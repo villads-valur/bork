@@ -272,6 +272,16 @@ pub struct LinkedGithubPr {
     pub import_source: Option<PrImportSource>,
 }
 
+/// Original auto-import values used to identify cards safe to reconcile into a stack.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PrImportBaseline {
+    pub title: String,
+    pub prompt: Option<String>,
+    pub agent_kind: AgentKind,
+    pub number: u32,
+    pub source: PrImportSource,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Issue {
     pub id: String,
@@ -306,6 +316,10 @@ pub struct Issue {
     pub linear_links: Vec<LinkedLinear>,
     #[serde(default)]
     pub github_pr_links: Vec<LinkedGithubPr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_stack: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_import_baseline: Option<PrImportBaseline>,
 
     /// IDs of other issues in the same project this one is tied to.
     /// Links are symmetric: each side stores the other's id.
@@ -370,6 +384,8 @@ impl Issue {
             setup_ran: false,
             linear_links: Vec::new(),
             github_pr_links: Vec::new(),
+            github_stack: None,
+            pr_import_baseline: None,
             linked_issues: Vec::new(),
             session_id: None,
             linear_id: None,
@@ -380,6 +396,28 @@ impl Issue {
             pr_imported: false,
             pr_import_source: None,
         }
+    }
+
+    pub fn is_untouched_pr_import(&self) -> bool {
+        let Some(baseline) = &self.pr_import_baseline else {
+            return false;
+        };
+        let expected = Self {
+            prompt: baseline.prompt.clone(),
+            github_pr_links: vec![LinkedGithubPr {
+                number: baseline.number,
+                imported: true,
+                import_source: Some(baseline.source),
+            }],
+            pr_import_baseline: Some(baseline.clone()),
+            ..Self::new(
+                &self.id,
+                &baseline.title,
+                Column::CodeReview,
+                baseline.agent_kind,
+            )
+        };
+        self == &expected
     }
 
     /// Build a fresh issue from a `draft`, stamping `done_at` with `now` when
@@ -527,6 +565,7 @@ impl Issue {
         if kind == IssueKind::Orchestrator {
             self.worktree = None;
             self.github_pr_links.clear();
+            self.github_stack = None;
         }
         true
     }
@@ -556,7 +595,7 @@ impl Issue {
 
     #[allow(dead_code)] // Symmetric with has_linear(); natural API for issue state checks
     pub fn has_pr(&self) -> bool {
-        !self.github_pr_links.is_empty()
+        !self.github_pr_links.is_empty() || self.github_stack.is_some()
     }
 
     pub fn pr_numbers(&self) -> Vec<u32> {
@@ -576,10 +615,6 @@ impl Issue {
 
     pub fn is_any_pr_imported(&self) -> bool {
         self.github_pr_links.iter().any(|l| l.imported)
-    }
-
-    pub fn primary_pr_number(&self) -> Option<u32> {
-        self.github_pr_links.first().map(|l| l.number)
     }
 
     pub fn primary_pr_import_source(&self) -> Option<PrImportSource> {
@@ -606,9 +641,9 @@ impl Issue {
     }
 }
 
-// --- PR types (ephemeral, not persisted) ---
+// --- GitHub status and cache types ---
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PrState {
     Open,
     Closed,
@@ -625,7 +660,7 @@ impl fmt::Display for PrState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChecksStatus {
     Success,
     Failure,
@@ -633,14 +668,14 @@ pub enum ChecksStatus {
     Error,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReviewDecision {
     Approved,
     ChangesRequested,
     ReviewRequired,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrStatus {
     pub number: u32,
     pub title: String,
@@ -658,7 +693,7 @@ pub struct PrStatus {
     pub is_cross_repository: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GithubStack {
     pub number: u32,
     pub url: String,
@@ -667,7 +702,7 @@ pub struct GithubStack {
     pub pull_requests: Vec<GithubStackPullRequest>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GithubStackPullRequest {
     pub number: u32,
     pub state: PrState,

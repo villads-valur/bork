@@ -378,6 +378,9 @@ pub fn show_issue(project_root: &Path, issue_id: &str, json: bool) -> anyhow::Re
             .collect();
         let _ = writeln!(out, "PR:       {}", nums.join(", "));
     }
+    if let Some(number) = issue.github_stack {
+        let _ = writeln!(out, "Stack:    #{number}");
+    }
     if !issue.linked_issues.is_empty() {
         let _ = writeln!(out, "Linked:   {}", issue.linked_issues.join(", "));
     }

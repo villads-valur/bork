@@ -16,7 +16,7 @@ use crate::types::{
 
 pub struct ActionChannels<'a> {
     pub action_tx: &'a mpsc::Sender<ActionResult>,
-    pub pr_wake_tx: &'a mpsc::Sender<()>,
+    pub pr_wake_tx: &'a mpsc::Sender<crate::github_poll::Wake>,
     pub linear_wake_tx: &'a mpsc::Sender<()>,
     pub git_wake_tx: &'a mpsc::Sender<()>,
     pub reload_tx: &'a mpsc::Sender<ReloadResult>,
@@ -96,6 +96,7 @@ pub fn handle_action(
             handle_linear_picker(app, action, ctx, ch.linear_wake_tx, ch.pr_wake_tx);
             PostAction::None
         }
+        InputMode::StackDetails => handle_stack_details(app, action, ch),
         InputMode::LinkPicker => {
             handle_link_picker(app, action, ctx);
             PostAction::None
@@ -281,7 +282,36 @@ fn handle_normal(
     ch: &ActionChannels<'_>,
 ) -> PostAction {
     let q = app.search_query.clone();
+    if matches!(action, Action::OpenPR | Action::OpenReviewPR) {
+        if let Some(issue) = app.context_project(ctx).selected_issue(&q).cloned() {
+            if issue.github_stack.is_some() {
+                return open_stack(app, action, ctx, &issue, ch);
+            }
+        }
+    }
     match action {
+        Action::ExpandStack => {
+            let live = &app.context_project(ctx).live;
+            if live.gh_missing || live.stacks_unsupported {
+                return PostAction::None;
+            }
+            if let Some(issue) = app.context_project(ctx).selected_issue(&q) {
+                if issue.github_stack.is_some() {
+                    app.stack_details = Some(crate::app::StackDetailsState {
+                        project_id: ctx.project_id.clone(),
+                        issue_id: issue.id.clone(),
+                        selected: 0,
+                    });
+                    app.message = None;
+                    app.input_mode = InputMode::StackDetails;
+                } else if issue.has_pr() {
+                    app.set_message("Individual PRs attached; edit GitHub links and use Ctrl+s to attach a stack");
+                } else {
+                    app.set_message("Attach a stack with Ctrl+s in the GitHub picker");
+                }
+            }
+            PostAction::None
+        }
         Action::Quit => {
             app.should_quit = true;
             PostAction::None
@@ -642,7 +672,7 @@ fn handle_normal(
         }
 
         Action::SyncPRs => {
-            let _ = ch.pr_wake_tx.send(());
+            let _ = ch.pr_wake_tx.send(crate::github_poll::Wake::Refresh);
             app.set_message("Syncing PRs...");
             PostAction::None
         }
@@ -862,6 +892,9 @@ fn handle_dialog(app: &mut App, action: Action, ctx: &ActionContext) -> PostActi
             }
             Action::DialogBackspace | Action::DialogDelete => {
                 if let Some(dialog) = app.dialog.as_mut() {
+                    if dialog.github_stack.take().is_some() {
+                        return PostAction::None;
+                    }
                     if dialog.github_prs.is_empty() {
                         dialog.github_pr_cleared = true;
                     } else {
@@ -1105,19 +1138,16 @@ fn apply_linear_fields(issue: &mut Issue, dialog: &crate::app::DialogState) {
 }
 
 fn apply_pr_fields(issue: &mut Issue, dialog: &crate::app::DialogState) {
+    issue.github_stack = if dialog.kind == IssueKind::Orchestrator {
+        None
+    } else {
+        dialog.github_stack
+    };
     // Orchestrators have no PR field; drop any links left from a kind change.
     if dialog.kind == IssueKind::Orchestrator || dialog.github_pr_cleared {
         issue.github_pr_links.clear();
     } else if !dialog.github_prs.is_empty() {
-        issue.github_pr_links = dialog
-            .github_prs
-            .iter()
-            .map(|pr| LinkedGithubPr {
-                number: pr.number,
-                imported: false,
-                import_source: None,
-            })
-            .collect();
+        issue.github_pr_links = dialog.github_prs.clone();
     }
 }
 
@@ -1126,7 +1156,7 @@ fn handle_linear_picker(
     action: Action,
     ctx: &ActionContext,
     linear_wake_tx: &mpsc::Sender<()>,
-    pr_wake_tx: &mpsc::Sender<()>,
+    pr_wake_tx: &mpsc::Sender<crate::github_poll::Wake>,
 ) {
     match action {
         Action::LinearPickerClose => {
@@ -1134,7 +1164,7 @@ fn handle_linear_picker(
         }
         Action::PickerSwitchTab => {
             let has_linear = !app.context_project(ctx).live.linear_issues.is_empty();
-            let has_github = app.context_project(ctx).has_github_prs();
+            let has_github = app.context_project(ctx).can_browse_github();
             if has_linear && has_github {
                 app.picker_tab = match app.picker_tab {
                     ImportSource::Linear => ImportSource::GitHub,
@@ -1175,6 +1205,7 @@ fn handle_linear_picker(
                 picker.selected = 0;
             }
         }
+        Action::AttachStack => attach_selected_stack(app, ctx),
         Action::LinearPickerSelect => match (app.linear_picker_context, app.picker_tab) {
             (LinearPickerContext::Attach, ImportSource::Linear) => {
                 attach_linear_to_dialog(app, ctx)
@@ -1191,7 +1222,7 @@ fn handle_linear_picker(
                 app.set_message("Refreshing Linear issues...");
             }
             ImportSource::GitHub => {
-                let _ = pr_wake_tx.send(());
+                let _ = pr_wake_tx.send(crate::github_poll::Wake::Refresh);
                 app.set_message("Refreshing GitHub PRs...");
             }
         },
@@ -1334,7 +1365,13 @@ fn import_github_pr(app: &mut App, ctx: &ActionContext) {
     let selected_idx = app.linear_picker.as_ref().map(|p| p.selected).unwrap_or(0);
 
     let pr = match filtered.get(selected_idx) {
-        Some(pr) => (*pr).clone(),
+        Some(entry) => match entry.status {
+            Some(pr) => pr.clone(),
+            None => {
+                app.set_warning("PR status unavailable; Ctrl+r to refresh");
+                return;
+            }
+        },
         None => return,
     };
 
@@ -1380,23 +1417,208 @@ fn import_github_pr(app: &mut App, ctx: &ActionContext) {
     app.close_linear_picker();
 }
 
+fn handle_stack_details(app: &mut App, action: Action, ch: &ActionChannels<'_>) -> PostAction {
+    let Some(details) = &app.stack_details else {
+        return PostAction::None;
+    };
+    let ctx = ActionContext {
+        project_id: details.project_id.clone(),
+    };
+    let issue = app
+        .find_project(&ctx.project_id)
+        .and_then(|project| {
+            project
+                .issues
+                .iter()
+                .find(|issue| issue.id == details.issue_id)
+        })
+        .cloned();
+    if action == Action::CloseStack
+        || issue
+            .as_ref()
+            .is_none_or(|issue| issue.github_stack.is_none())
+    {
+        app.stack_details = None;
+        app.input_mode = InputMode::Normal;
+        return PostAction::None;
+    }
+    let Some(issue) = issue else {
+        return PostAction::None;
+    };
+    match action {
+        Action::StackDown | Action::StackUp => {
+            let count = app
+                .context_project(&ctx)
+                .attached_stack(&issue)
+                .map(|stack| stack.pull_requests.len())
+                .unwrap_or(0);
+            if let Some(details) = &mut app.stack_details {
+                if action == Action::StackDown {
+                    details.selected = (details.selected + 1).min(count.saturating_sub(1));
+                } else {
+                    details.selected = details.selected.saturating_sub(1);
+                }
+            }
+        }
+        Action::SyncPRs => {
+            let _ = ch.pr_wake_tx.send(crate::github_poll::Wake::Refresh);
+        }
+        Action::OpenPR | Action::OpenReviewPR => return open_stack(app, action, &ctx, &issue, ch),
+        _ => {}
+    }
+    PostAction::None
+}
+
+fn open_stack(
+    app: &mut App,
+    action: Action,
+    ctx: &ActionContext,
+    issue: &Issue,
+    ch: &ActionChannels<'_>,
+) -> PostAction {
+    let project = app.context_project(ctx);
+    let numbers = match project.stack_open_numbers(issue) {
+        Ok(numbers) => numbers,
+        Err(message) => {
+            app.set_warning(message);
+            return PostAction::None;
+        }
+    };
+    let review = action == Action::OpenReviewPR;
+    if review && !project.tuicr_available {
+        app.set_warning("tuicr is not installed");
+        return PostAction::None;
+    }
+    let session = issue.session_name(&project.config.project_name);
+    let alive = project.is_session_alive(&session);
+    let cwd = project.config.project_root.join("main");
+    let popup_title = issue.popup_title();
+    let tx = ch.action_tx.clone();
+    app.begin_busy();
+    app.set_message(if review {
+        "Opening stack review..."
+    } else {
+        "Opening stack PRs..."
+    });
+    thread::spawn(move || {
+        let result = if review {
+            match tuicr::open_stack(&session, &cwd, &numbers, alive) {
+                Ok(()) => ActionResult {
+                    message: format!("Reviewing {} PRs in stack order", numbers.len()),
+                    session_to_open: Some(session),
+                    popup_title: Some(popup_title),
+                    ..Default::default()
+                },
+                Err(error) => ActionResult {
+                    message: format!("Failed to open stack review: {error}"),
+                    message_kind: MessageKind::Error,
+                    ..Default::default()
+                },
+            }
+        } else {
+            let mut failures = Vec::new();
+            for number in &numbers {
+                let result = github::pr_url(&cwd, *number)
+                    .ok_or_else(|| "Could not resolve GitHub repository".to_string())
+                    .and_then(|url| browser::open_url(&url));
+                if let Err(error) = result {
+                    failures.push(format!("#{number}: {error}"));
+                }
+            }
+            summarize_open_links("PR", numbers.len(), &format!("#{}", numbers[0]), failures)
+        };
+        let _ = tx.send(result);
+    });
+    PostAction::None
+}
+
+fn attach_selected_stack(app: &mut App, ctx: &ActionContext) {
+    if app.picker_tab != ImportSource::GitHub {
+        return;
+    }
+    let selected = app.linear_picker.as_ref().map(|p| p.selected).unwrap_or(0);
+    let prs = app.filtered_github_prs();
+    let Some(pr) = prs.get(selected) else { return };
+    let project = app.context_project(ctx);
+    if project.live.gh_missing || project.live.stacks_unsupported {
+        return;
+    }
+    if !project.live.stacks_available {
+        let message = format!(
+            "Stack data {}; Ctrl+r to refresh",
+            project.live.missing_github_status()
+        );
+        app.set_warning(&message);
+        return;
+    }
+    let Some(stack) = project.stack_for_pr(pr.number) else {
+        app.set_warning("This PR does not belong to a known stack");
+        return;
+    };
+    let number = stack.number;
+    let selected_number = pr.number;
+    if app.linear_picker_context == LinearPickerContext::Attach {
+        if let Some(dialog) = &mut app.dialog {
+            if dialog.github_stack == Some(number) {
+                dialog.github_stack = None;
+            } else {
+                dialog.github_stack = Some(number);
+            }
+        }
+        app.focus_github_picker_pr(selected_number);
+        return;
+    }
+    if project
+        .issues
+        .iter()
+        .any(|issue| issue.github_stack == Some(number))
+    {
+        app.set_warning(format!("Stack #{number} is already on the board"));
+        return;
+    }
+    let issue = Issue {
+        github_stack: Some(number),
+        ..Issue::new(
+            project.next_issue_id(),
+            pr.title().to_string(),
+            Column::CodeReview,
+            project.config.agent_kind,
+        )
+    };
+    let project = app.context_project_mut(ctx);
+    project.issues.push(issue);
+    project.selected_column = Column::CodeReview.index();
+    project.selected_row[Column::CodeReview.index()] = project
+        .issues_in_column(Column::CodeReview, "")
+        .len()
+        .saturating_sub(1);
+    project.mark_dirty();
+    app.close_linear_picker();
+    app.set_message(format!("Imported stack #{number}"));
+}
+
 fn attach_github_to_dialog(app: &mut App, _ctx: &ActionContext) {
     let filtered = app.filtered_github_prs();
     let selected_idx = app.linear_picker.as_ref().map(|p| p.selected).unwrap_or(0);
 
-    let pr = match filtered.get(selected_idx) {
-        Some(pr) => (*pr).clone(),
+    let number = match filtered.get(selected_idx) {
+        Some(pr) => pr.number,
         None => return,
     };
 
     if let Some(ref mut dialog) = app.dialog {
-        if let Some(pos) = dialog.github_prs.iter().position(|p| p.number == pr.number) {
+        if let Some(pos) = dialog.github_prs.iter().position(|p| p.number == number) {
             dialog.github_prs.remove(pos);
         } else {
-            dialog.github_prs.push(pr);
+            dialog.github_prs.push(LinkedGithubPr {
+                number,
+                imported: false,
+                import_source: None,
+            });
             dialog.github_pr_cleared = false;
         }
     }
+    app.focus_github_picker_pr(number);
 }
 
 fn handle_prune_dialog(
@@ -1882,6 +2104,858 @@ mod tests {
 
     fn test_issue_titled(id: &str, title: &str, column: Column) -> crate::types::Issue {
         crate::types::Issue::new(id, title, column, crate::types::AgentKind::OpenCode)
+    }
+
+    fn stack_test_app(count: u32) -> App {
+        use crate::types::{ChecksStatus, GithubStack, GithubStackPullRequest, PrState, PrStatus};
+        let mut app = test_app();
+        let project = app.project_mut();
+        let mut members = Vec::new();
+        for number in 1..=count {
+            let pr = PrStatus {
+                number,
+                title: format!("Change {number}"),
+                url: String::new(),
+                author: "author".into(),
+                state: PrState::Open,
+                is_draft: false,
+                checks: Some(ChecksStatus::Success),
+                review: None,
+                additions: 100,
+                deletions: 20,
+                head_branch: format!("branch-{number}"),
+                is_cross_repository: false,
+            };
+            members.push(GithubStackPullRequest {
+                number,
+                state: pr.state,
+                is_draft: false,
+                head_branch: pr.head_branch.clone(),
+            });
+            project
+                .live
+                .pr_statuses
+                .insert(pr.head_branch.clone(), pr.clone());
+            project.live.pr_statuses_by_number.insert(number, pr);
+        }
+        project.live.github_stacks.push(GithubStack {
+            number: 42,
+            url: String::new(),
+            base_ref: "main".into(),
+            open: true,
+            pull_requests: members,
+        });
+        project.live.stacks_available = true;
+        project.live.pr_poll_done = true;
+        app.picker_tab = ImportSource::GitHub;
+        app
+    }
+
+    #[test]
+    fn github_picker_pins_attached_prs_and_keeps_focus_when_toggled() {
+        let mut app = stack_test_app(4);
+        app.project_mut()
+            .live
+            .pr_statuses_by_number
+            .get_mut(&4)
+            .unwrap()
+            .state = crate::types::PrState::Merged;
+        let ctx = app.action_context();
+        app.open_import_picker(&ctx);
+        assert_eq!(
+            app.filtered_github_prs()
+                .iter()
+                .map(|pr| pr.number)
+                .collect::<Vec<_>>(),
+            vec![4, 3, 2, 1]
+        );
+        app.close_linear_picker();
+        let mut issue = test_issue("bork-1", Column::Todo);
+        issue.github_pr_links.push(LinkedGithubPr {
+            number: 1,
+            imported: false,
+            import_source: None,
+        });
+        app.project_mut().issues.push(issue.clone());
+        app.open_edit_dialog(&issue, 0, &ctx);
+        app.open_import_picker_with_context(LinearPickerContext::Attach, &ctx);
+        assert_eq!(
+            app.filtered_github_prs()
+                .iter()
+                .map(|pr| pr.number)
+                .collect::<Vec<_>>(),
+            vec![1, 4, 3, 2]
+        );
+        app.linear_picker.as_mut().unwrap().selected = 3;
+        act(&mut app, Action::LinearPickerSelect);
+        assert_eq!(
+            app.filtered_github_prs()
+                .iter()
+                .map(|pr| pr.number)
+                .collect::<Vec<_>>(),
+            vec![2, 1, 4, 3]
+        );
+        assert_eq!(app.linear_picker.as_ref().unwrap().selected, 0);
+        act(&mut app, Action::LinearPickerSelect);
+        assert_eq!(
+            app.filtered_github_prs()
+                .iter()
+                .map(|pr| pr.number)
+                .collect::<Vec<_>>(),
+            vec![1, 4, 3, 2]
+        );
+        assert_eq!(app.linear_picker.as_ref().unwrap().selected, 3);
+    }
+
+    #[test]
+    fn saved_prs_remain_editable_without_live_github_data() {
+        let mut app = test_app();
+        let mut issue = test_issue("bork-1", Column::Todo);
+        issue.github_pr_links = vec![
+            LinkedGithubPr {
+                number: 52617,
+                imported: true,
+                import_source: Some(PrImportSource::Authored),
+            },
+            LinkedGithubPr {
+                number: 52618,
+                imported: false,
+                import_source: None,
+            },
+        ];
+        app.project_mut().issues.push(issue.clone());
+        let ctx = app.action_context();
+        app.open_edit_dialog(&issue, 0, &ctx);
+        assert_eq!(
+            app.dialog.as_ref().unwrap().github_prs,
+            issue.github_pr_links
+        );
+        assert!(app.dialog.as_ref().unwrap().github_available);
+        app.picker_tab = ImportSource::GitHub;
+        app.open_import_picker_with_context(LinearPickerContext::Attach, &ctx);
+        assert_eq!(app.input_mode, InputMode::LinearPicker);
+        let entries = app.filtered_github_prs();
+        assert_eq!(
+            entries.iter().map(|entry| entry.number).collect::<Vec<_>>(),
+            vec![52618, 52617]
+        );
+        assert!(entries.iter().all(|entry| entry.status.is_none()));
+        app.close_linear_picker();
+        act(&mut app, Action::DialogSubmit);
+        assert_eq!(
+            app.project().issues[0].github_pr_links,
+            issue.github_pr_links
+        );
+        app.open_edit_dialog(&issue, 0, &ctx);
+        app.open_import_picker_with_context(LinearPickerContext::Attach, &ctx);
+        act(&mut app, Action::LinearPickerSelect);
+        app.close_linear_picker();
+        act(&mut app, Action::DialogSubmit);
+        assert_eq!(
+            app.project().issues[0].github_pr_links,
+            issue.github_pr_links[..1]
+        );
+        assert_eq!(app.project().linked_pr_numbers(), vec![52617]);
+    }
+
+    #[test]
+    fn editing_with_partial_pr_data_preserves_all_links_and_metadata() {
+        let mut app = stack_test_app(1);
+        let mut issue = test_issue("bork-1", Column::Todo);
+        issue.github_pr_links = vec![
+            LinkedGithubPr {
+                number: 1,
+                imported: true,
+                import_source: Some(PrImportSource::ReviewRequested),
+            },
+            LinkedGithubPr {
+                number: 2,
+                imported: false,
+                import_source: None,
+            },
+        ];
+        app.project_mut().issues.push(issue.clone());
+        let ctx = app.action_context();
+        app.open_edit_dialog(&issue, 0, &ctx);
+        act(&mut app, Action::DialogSubmit);
+        assert_eq!(
+            app.project().issues[0].github_pr_links,
+            issue.github_pr_links
+        );
+        app.picker_tab = ImportSource::GitHub;
+        app.open_import_picker(&ctx);
+        assert_eq!(app.filtered_github_prs().len(), 2);
+    }
+
+    #[test]
+    fn pr_icons_preserve_checks_review_and_draft_without_labels() {
+        use crate::types::{ChecksStatus, ReviewDecision};
+        let mut app = stack_test_app(1);
+        let pr = app
+            .project_mut()
+            .live
+            .pr_statuses_by_number
+            .get_mut(&1)
+            .unwrap();
+        pr.checks = Some(ChecksStatus::Success);
+        pr.review = Some(ReviewDecision::ChangesRequested);
+        pr.is_draft = true;
+        let spans = crate::ui::card::pr_spans(pr);
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            " ✓ ● draft"
+        );
+        assert_eq!(spans[0].style.fg, Some(ratatui::style::Color::Green));
+        assert_eq!(spans[1].style.fg, Some(ratatui::style::Color::Red));
+    }
+
+    #[test]
+    fn stack_picker_enter_preserves_single_pr_and_ctrl_s_imports_stack_once() {
+        let mut app = stack_test_app(3);
+        let ctx = app.action_context();
+        app.open_import_picker(&ctx);
+        act(&mut app, Action::LinearPickerSelect);
+        assert_eq!(app.project().issues[0].pr_numbers(), vec![3]);
+        assert_eq!(app.project().issues[0].github_stack, None);
+        app.open_import_picker(&ctx);
+        act(&mut app, Action::AttachStack);
+        assert_eq!(app.project().issues[1].github_stack, Some(42));
+        assert!(app.project().issues[1].github_pr_links.is_empty());
+        app.open_import_picker(&ctx);
+        act(&mut app, Action::AttachStack);
+        assert_eq!(app.project().issues.len(), 2);
+    }
+
+    #[test]
+    fn stack_dialog_attachment_is_cancelable_and_preserves_individual_links() {
+        let mut app = stack_test_app(3);
+        let ctx = app.action_context();
+        let mut issue = test_issue("bork-1", Column::Todo);
+        issue.github_pr_links.push(LinkedGithubPr {
+            number: 3,
+            imported: false,
+            import_source: None,
+        });
+        app.project_mut().issues.push(issue.clone());
+        app.open_edit_dialog(&issue, 0, &ctx);
+        app.open_import_picker_with_context(LinearPickerContext::Attach, &ctx);
+        act(&mut app, Action::AttachStack);
+        assert_eq!(app.dialog.as_ref().unwrap().github_stack, Some(42));
+        assert_eq!(app.project().issues[0].github_stack, None);
+        app.close_linear_picker();
+        app.close_dialog();
+        assert_eq!(app.project().issues[0], issue);
+        app.open_edit_dialog(&issue, 0, &ctx);
+        app.open_import_picker_with_context(LinearPickerContext::Attach, &ctx);
+        act(&mut app, Action::AttachStack);
+        app.close_linear_picker();
+        act(&mut app, Action::DialogSubmit);
+        assert_eq!(app.project().issues[0].github_stack, Some(42));
+        assert_eq!(app.project().issues[0].pr_numbers(), vec![3]);
+    }
+
+    #[test]
+    fn stack_membership_updates_and_only_open_members_are_actionable() {
+        use crate::types::PrState;
+        let mut app = stack_test_app(4);
+        let issue = Issue {
+            github_stack: Some(42),
+            ..test_issue("bork-1", Column::CodeReview)
+        };
+        let project = app.project_mut();
+        project.live.github_stacks[0].pull_requests[0].state = PrState::Merged;
+        project.live.github_stacks[0].pull_requests[1].state = PrState::Closed;
+        assert_eq!(project.stack_open_numbers(&issue).unwrap(), vec![3, 4]);
+        project.live.github_stacks[0].pull_requests.remove(2);
+        assert_eq!(project.stack_open_numbers(&issue).unwrap(), vec![4]);
+        assert_eq!(project.issue_pr_numbers(&issue), vec![1, 2, 4]);
+        project.live.stacks_available = false;
+        assert!(project.stack_open_numbers(&issue).is_err());
+        project.live.stacks_available = true;
+        project.live.github_stacks.clear();
+        assert!(project.stack_open_numbers(&issue).is_err());
+    }
+
+    #[test]
+    fn stack_checks_include_unknown_and_ignore_merged_members() {
+        use crate::types::{ChecksStatus, PrState};
+        let mut app = stack_test_app(5);
+        let project = app.project_mut();
+        project
+            .live
+            .pr_statuses_by_number
+            .get_mut(&1)
+            .unwrap()
+            .checks = Some(ChecksStatus::Error);
+        project
+            .live
+            .pr_statuses_by_number
+            .get_mut(&2)
+            .unwrap()
+            .checks = Some(ChecksStatus::Pending);
+        project
+            .live
+            .pr_statuses_by_number
+            .get_mut(&3)
+            .unwrap()
+            .checks = None;
+        project.live.github_stacks[0].pull_requests[4].state = PrState::Merged;
+        assert_eq!(
+            project.stack_checks(&project.live.github_stacks[0]).label(),
+            "1 failed · 1 pending · 1 unknown · 1 passed"
+        );
+    }
+
+    #[test]
+    fn stack_attachment_suppresses_auto_import_of_members_and_survives_sync() {
+        let mut app = stack_test_app(3);
+        let issue = Issue {
+            github_stack: Some(42),
+            ..test_issue("bork-1", Column::CodeReview)
+        };
+        let project = app.project_mut();
+        project.live.user_prs = project
+            .live
+            .pr_statuses_by_number
+            .values()
+            .cloned()
+            .collect();
+        project.issues.push(issue);
+        project.sync_prs_as_issues();
+        assert_eq!(project.issues.len(), 1);
+        project.live.user_prs.clear();
+        project.sync_prs_as_issues();
+        assert_eq!(project.issues.len(), 1);
+    }
+
+    #[test]
+    fn stack_details_loading_only_tracks_its_own_missing_statuses() {
+        let mut app = stack_test_app(5);
+        app.project_mut().issues.push(Issue {
+            github_stack: Some(42),
+            ..test_issue("bork-1", Column::Todo)
+        });
+        app.project_mut().live.pr_loading_more = true;
+        act(&mut app, Action::ExpandStack);
+        for missing in [false, true] {
+            if missing {
+                app.project_mut().live.pr_statuses_by_number.remove(&1);
+                app.project_mut()
+                    .live
+                    .pr_statuses
+                    .retain(|_, pr| pr.number != 1);
+            }
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+            terminal
+                .draw(|frame| crate::ui::stack_details::render(frame, &app))
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            let spinner: String = app
+                .spinner_frame()
+                .iter()
+                .map(|filled| if *filled { '●' } else { '○' })
+                .collect();
+            assert_eq!(text.contains(&spinner), missing);
+            assert!(!text.contains("loading"));
+            if !missing {
+                assert!(text.contains("CI:"));
+            }
+        }
+    }
+
+    #[test]
+    fn github_spinner_uses_global_corner_and_stops_after_loading() {
+        let mut app = stack_test_app(1);
+        for (loading, missing_cli) in [(true, false), (false, false), (true, true)] {
+            app.project_mut().live.pr_loading_more = loading;
+            app.project_mut().live.gh_missing = missing_cli;
+            app.input_mode = InputMode::Normal;
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 1)).unwrap();
+            terminal
+                .draw(|frame| crate::ui::status_bar::render_footer(frame, &app, frame.area()))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let corner: String = (34..39).map(|x| buffer[(x, 0)].symbol()).collect();
+            let spinner: String = app
+                .spinner_frame()
+                .iter()
+                .map(|filled| if *filled { '●' } else { '○' })
+                .collect();
+            assert_eq!(corner == spinner, loading && !missing_cli);
+        }
+    }
+
+    #[test]
+    fn update_notice_cannot_overlap_global_loading_spinner() {
+        let mut app = stack_test_app(1);
+        app.project_mut().live.pr_loading_more = true;
+        app.update_available = true;
+        app.input_mode = InputMode::Normal;
+        for width in [40, 160] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 1)).unwrap();
+            terminal
+                .draw(|frame| crate::ui::status_bar::render_footer(frame, &app, frame.area()))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let corner: String = (width - 6..width - 1)
+                .map(|x| buffer[(x, 0)].symbol())
+                .collect();
+            let spinner: String = app
+                .spinner_frame()
+                .iter()
+                .map(|filled| if *filled { '●' } else { '○' })
+                .collect();
+            assert_eq!(corner, spinner);
+            assert_eq!(buffer[(width - 8, 0)].symbol(), " ");
+            assert_eq!(buffer[(width - 7, 0)].symbol(), " ");
+            if width == 160 {
+                let text: String = (0..width - 6).map(|x| buffer[(x, 0)].symbol()).collect();
+                assert!(text.contains("↑ Update Available"));
+            }
+        }
+    }
+
+    #[test]
+    fn global_spinner_clears_between_requests_on_the_same_screen() {
+        let mut app = stack_test_app(1);
+        app.input_mode = InputMode::Normal;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 1)).unwrap();
+        // Idle before first poll, initial fetch, batches, done, refresh, failure.
+        for (done, refreshing, more, error, visible) in [
+            (false, false, false, false, false),
+            (false, true, false, false, true),
+            (true, false, true, false, true),
+            (true, false, false, false, false),
+            (true, true, false, false, true),
+            (true, false, false, true, false),
+        ] {
+            let live = &mut app.project_mut().live;
+            live.pr_poll_done = done;
+            live.pr_refreshing = refreshing;
+            live.pr_loading_more = more;
+            live.github_error = error.then(|| "Request failed".into());
+            terminal
+                .draw(|frame| crate::ui::status_bar::render_footer(frame, &app, frame.area()))
+                .unwrap();
+            let corner: String = (94..99)
+                .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+                .collect();
+            let spinner: String = app
+                .spinner_frame()
+                .iter()
+                .map(|filled| if *filled { '●' } else { '○' })
+                .collect();
+            assert_eq!(corner == spinner, visible);
+        }
+    }
+
+    #[test]
+    fn github_picker_uses_spinner_without_hiding_errors() {
+        let mut app = stack_test_app(1);
+        let ctx = app.action_context();
+        app.open_import_picker(&ctx);
+        app.picker_tab = ImportSource::GitHub;
+        for loading in [true, false] {
+            app.project_mut().live.pr_loading_more = loading;
+            app.project_mut().live.github_error =
+                (!loading).then(|| "GitHub authentication failed".into());
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+            terminal
+                .draw(|frame| crate::ui::linear_picker::render_import_picker(frame, &app))
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            let spinner: String = app
+                .spinner_frame()
+                .iter()
+                .map(|filled| if *filled { '●' } else { '○' })
+                .collect();
+            assert_eq!(text.contains(&spinner), loading);
+            assert!(!text.contains("Loading"));
+            assert_eq!(text.contains("GitHub authentication failed"), !loading);
+        }
+    }
+
+    #[test]
+    fn stack_attachment_survives_edit_and_serialization() {
+        let mut app = stack_test_app(2);
+        let issue = Issue {
+            github_stack: Some(42),
+            ..test_issue("bork-1", Column::Todo)
+        };
+        app.project_mut().issues.push(issue.clone());
+        let ctx = app.action_context();
+        app.open_edit_dialog(&issue, 0, &ctx);
+        act(&mut app, Action::DialogSubmit);
+        let json = serde_json::to_string(&app.project().issues[0]).unwrap();
+        let saved: Issue = serde_json::from_str(&json).unwrap();
+        assert_eq!(saved.github_stack, Some(42));
+        app.project_mut().issues[0] = saved;
+        act(&mut app, Action::ExpandStack);
+        assert_eq!(app.input_mode, InputMode::StackDetails);
+        assert!(app.message.is_none());
+    }
+
+    #[test]
+    fn stack_details_scrolls_large_stacks_and_handles_removed_issue() {
+        let mut app = stack_test_app(120);
+        let issue = Issue {
+            github_stack: Some(42),
+            ..test_issue("bork-1", Column::Todo)
+        };
+        app.project_mut().issues.push(issue);
+        act(&mut app, Action::ExpandStack);
+        for _ in 0..150 {
+            act(&mut app, Action::StackDown);
+        }
+        assert_eq!(app.stack_details.as_ref().unwrap().selected, 119);
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::stack_details::render(frame, &app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("#120"));
+        assert!(text.contains("Esc close"));
+        assert!(!text.contains("#1 "));
+        app.project_mut().issues.clear();
+        act(&mut app, Action::StackUp);
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert!(app.stack_details.is_none());
+    }
+
+    fn card_rows(app: &App, issue: &Issue, width: u16, size: crate::app::CardSize) -> Vec<String> {
+        use crate::ui::card::{render_card, CardContext, CARD_HEIGHT, CARD_HEIGHT_MEDIUM};
+        let height = match size {
+            crate::app::CardSize::Full => CARD_HEIGHT,
+            crate::app::CardSize::Medium => CARD_HEIGHT_MEDIUM,
+        };
+        let context = CardContext {
+            issue,
+            selected: true,
+            marked: false,
+            session_alive: false,
+            agent_status: crate::types::AgentStatus::Idle,
+            activity: None,
+            git_status: None,
+            pr: None,
+            project: app.project(),
+            ports: None,
+            search_query: "",
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| render_card(frame, &context, frame.area(), size))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn card_footer_keeps_links_left_without_shortcut_hints_in_both_layouts() {
+        let app = stack_test_app(2);
+        for size in [crate::app::CardSize::Full, crate::app::CardSize::Medium] {
+            for kind in [
+                IssueKind::Agentic,
+                IssueKind::NonAgentic,
+                IssueKind::Orchestrator,
+            ] {
+                let issue = Issue {
+                    kind,
+                    github_stack: Some(42),
+                    linked_issues: vec!["bork-2".into()],
+                    linear_links: vec![LinkedLinear {
+                        id: "id".into(),
+                        identifier: "DOCS-3902".into(),
+                        url: String::new(),
+                        imported: false,
+                    }],
+                    ..test_issue("bork-1", Column::Todo)
+                };
+                for width in [28, 44, 70] {
+                    let rows = card_rows(&app, &issue, width, size);
+                    let footer = &rows[rows.len() - 2];
+                    assert!(footer.contains("∞1 ◈"), "{footer}");
+                    assert!(!footer.contains("s expand"), "{footer}");
+                    assert!(!rows[2].contains('∞'));
+                    let kind_label = match kind {
+                        IssueKind::Orchestrator => "orch",
+                        IssueKind::NonAgentic => "todo",
+                        IssueKind::Agentic => "",
+                    };
+                    if !kind_label.is_empty() {
+                        assert!(rows[0].contains(&format!("bork-1 · {kind_label}")));
+                        assert!(!rows[2].to_lowercase().contains(kind_label));
+                    }
+                    if width >= 44 {
+                        assert!(footer.contains("DOCS-3902"));
+                    }
+                    if size == crate::app::CardSize::Full {
+                        assert!(rows[3].contains("┌ #1"));
+                    } else {
+                        assert!(rows[3].contains("2 PRs"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn individual_pr_card_hides_diff_for_draft_and_merged_prs() {
+        let mut app = stack_test_app(1);
+        let issue = Issue {
+            github_pr_links: vec![LinkedGithubPr {
+                number: 1,
+                imported: false,
+                import_source: None,
+            }],
+            ..test_issue("bork-1", Column::Todo)
+        };
+        for (draft, state) in [
+            (false, crate::types::PrState::Open),
+            (true, crate::types::PrState::Open),
+            (false, crate::types::PrState::Merged),
+        ] {
+            let pr = app
+                .project_mut()
+                .live
+                .pr_statuses_by_number
+                .get_mut(&1)
+                .unwrap();
+            pr.is_draft = draft;
+            pr.state = state;
+            pr.additions = 182;
+            pr.deletions = 7;
+            let text = card_rows(&app, &issue, 70, crate::app::CardSize::Full).join("\n");
+            assert_eq!(
+                text.contains("+182/-7"),
+                !draft && state != crate::types::PrState::Merged
+            );
+            assert_eq!(
+                text.contains("merged"),
+                state == crate::types::PrState::Merged
+            );
+            assert_eq!(text.contains("draft"), draft);
+        }
+    }
+
+    #[test]
+    fn github_card_distinguishes_loading_errors_and_optional_capabilities() {
+        let mut app = stack_test_app(2);
+        let issue = Issue {
+            github_stack: Some(42),
+            ..test_issue("bork-1", Column::Todo)
+        };
+        app.project_mut().live.github_stacks.clear();
+        app.project_mut().live.stacks_available = false;
+        app.project_mut().live.github_error = Some("network failed".into());
+        for phase in 0..3 {
+            let live = &mut app.project_mut().live;
+            live.pr_poll_done = phase != 0;
+            live.pr_refreshing = phase == 1;
+            live.pr_loading_more = phase == 2;
+            let text = card_rows(&app, &issue, 70, crate::app::CardSize::Full).join("\n");
+            assert!(!text.contains("loading"));
+            assert!(text.contains("Stack #42"));
+            assert!(!text.contains("unavailable"));
+        }
+        app.project_mut().live.pr_loading_more = false;
+        let text = card_rows(&app, &issue, 70, crate::app::CardSize::Full).join("\n");
+        assert!(text.contains("unavailable"));
+        app.project_mut().live.github_error = None;
+        let text = card_rows(&app, &issue, 70, crate::app::CardSize::Full).join("\n");
+        assert!(text.contains("not found"));
+        for missing_cli in [false, true] {
+            app.project_mut().live.gh_missing = missing_cli;
+            app.project_mut().live.stacks_unsupported = !missing_cli;
+            let text = card_rows(&app, &issue, 70, crate::app::CardSize::Full).join("\n");
+            assert!(!text.contains("Stack"));
+            assert!(!text.contains("s expand"));
+            assert!(!text.contains("unavailable"));
+        }
+    }
+
+    #[test]
+    fn small_stack_card_shows_each_pr_without_hiding_draft_or_review() {
+        use crate::types::{AgentStatus, ChecksStatus, ReviewDecision};
+        let mut app = stack_test_app(2);
+        for old_number in [1, 2] {
+            let project = app.project_mut();
+            let mut pr = project
+                .live
+                .pr_statuses_by_number
+                .remove(&old_number)
+                .unwrap();
+            pr.number += 52616;
+            pr.is_draft = old_number == 1;
+            pr.checks = Some(ChecksStatus::Success);
+            pr.review = Some(ReviewDecision::ChangesRequested);
+            project.live.github_stacks[0].pull_requests[(old_number - 1) as usize].number =
+                pr.number;
+            project.live.pr_statuses_by_number.insert(pr.number, pr);
+        }
+        let issue = Issue {
+            github_stack: Some(42),
+            ..test_issue("bork-1", Column::Todo)
+        };
+        for width in [28, 44, 70] {
+            let context = crate::ui::card::CardContext {
+                issue: &issue,
+                selected: true,
+                marked: false,
+                session_alive: false,
+                agent_status: AgentStatus::Idle,
+                activity: None,
+                git_status: None,
+                pr: None,
+                project: app.project(),
+                ports: None,
+                search_query: "",
+            };
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 7)).unwrap();
+            terminal
+                .draw(|frame| {
+                    crate::ui::card::render_card(
+                        frame,
+                        &context,
+                        frame.area(),
+                        crate::app::CardSize::Full,
+                    )
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let text = buffer
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(text.contains("┌ #52617 ✓ ● draft"));
+            assert!(text.contains("└ #52618 ✓ ●"));
+            assert!(!text.contains('ø'));
+            assert!(!text.contains("CI:"));
+            assert!(!text.contains("Stack #"));
+            assert!(!text.contains("s expand"));
+            for row in 1..6 {
+                assert_eq!(buffer[(width - 1, row)].symbol(), "│");
+            }
+        }
+    }
+
+    #[test]
+    fn large_stack_summary_stays_on_one_readable_line() {
+        let mut app = stack_test_app(5);
+        let issue = Issue {
+            github_stack: Some(42),
+            ..test_issue("bork-1", Column::Todo)
+        };
+        for pr in app.project_mut().live.pr_statuses_by_number.values_mut() {
+            pr.checks = Some(crate::types::ChecksStatus::Pending);
+        }
+        for size in [crate::app::CardSize::Full, crate::app::CardSize::Medium] {
+            for width in [28, 44, 70] {
+                let rows = card_rows(&app, &issue, width, size);
+                assert!(rows[3].contains("5 PRs · ◌ 5 pending"), "{}", rows[3]);
+                assert!(!rows[3].contains('▸'));
+                assert!(!rows[rows.len() - 2].contains("s expand"));
+                if size == crate::app::CardSize::Full {
+                    assert!(rows[4].trim_matches('│').trim().is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stack_card_uses_summary_and_shows_refresh_failures() {
+        use crate::types::{AgentStatus, ChecksStatus};
+        let mut app = stack_test_app(12);
+        let issue = Issue {
+            github_stack: Some(42),
+            ..test_issue("bork-1", Column::Todo)
+        };
+        app.project_mut()
+            .live
+            .pr_statuses_by_number
+            .get_mut(&1)
+            .unwrap()
+            .checks = Some(ChecksStatus::Failure);
+        for width in [28, 44, 70] {
+            for available in [true, false] {
+                app.project_mut().live.stacks_available = available;
+                app.project_mut().live.github_error =
+                    (!available).then(|| "GitHub failed".to_string());
+                let project = app.project();
+                let context = crate::ui::card::CardContext {
+                    issue: &issue,
+                    selected: true,
+                    marked: false,
+                    session_alive: false,
+                    agent_status: AgentStatus::Idle,
+                    activity: None,
+                    git_status: None,
+                    pr: None,
+                    project,
+                    ports: None,
+                    search_query: "",
+                };
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 7)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        crate::ui::card::render_card(
+                            frame,
+                            &context,
+                            frame.area(),
+                            crate::app::CardSize::Full,
+                        )
+                    })
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let text = buffer
+                    .content
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>();
+                assert!(text.contains("12 PRs"));
+                if available {
+                    assert!(text.contains("failed") || text.contains("✗ 1"));
+                } else {
+                    assert!(text.contains("unavailable"));
+                }
+                assert!(!text.contains("+100"));
+                for row in 1..6 {
+                    assert_eq!(buffer[(width - 1, row)].symbol(), "│");
+                }
+            }
+        }
     }
 
     // ================================================================

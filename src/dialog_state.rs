@@ -5,7 +5,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 
 use crate::external::linear::LinearIssue;
-use crate::types::{AgentKind, AgentMode, Column, Issue, IssueKind, PrStatus};
+use crate::types::{AgentKind, AgentMode, Column, Issue, IssueKind, LinkedGithubPr};
 use crate::ui::styles;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,7 +42,8 @@ pub struct DialogState {
     pub linear_issues: Vec<LinearIssue>,
     pub linear_detached: bool,
     pub linear_available: bool,
-    pub github_prs: Vec<PrStatus>,
+    pub github_prs: Vec<LinkedGithubPr>,
+    pub github_stack: Option<u32>,
     pub github_pr_cleared: bool,
     pub github_available: bool,
 }
@@ -94,6 +95,7 @@ impl DialogState {
             linear_detached: false,
             linear_available,
             github_prs: Vec::new(),
+            github_stack: None,
             github_pr_cleared: false,
             github_available,
         }
@@ -105,7 +107,7 @@ impl DialogState {
         available_agents: Vec<AgentKind>,
         linear_available: bool,
         github_available: bool,
-        live: &crate::app::LiveState,
+        _live: &crate::app::LiveState,
     ) -> Self {
         let prompt_text = issue.prompt.as_deref().unwrap_or("");
 
@@ -124,20 +126,7 @@ impl DialogState {
             })
             .collect();
 
-        let github_prs: Vec<PrStatus> = issue
-            .github_pr_links
-            .iter()
-            .filter_map(|link| {
-                // Include review_requested_prs: fork PRs are absent from the
-                // by-branch map and would otherwise vanish on the next save.
-                live.pr_statuses
-                    .values()
-                    .chain(live.user_prs.iter())
-                    .chain(live.review_requested_prs.iter())
-                    .find(|pr| pr.number == link.number)
-                    .cloned()
-            })
-            .collect();
+        let github_prs = issue.github_pr_links.clone();
 
         let mut prompt = make_prompt_textarea(prompt_text);
         prompt.move_cursor(CursorMove::Bottom);
@@ -168,6 +157,7 @@ impl DialogState {
             linear_detached: false,
             linear_available,
             github_prs,
+            github_stack: issue.github_stack,
             github_pr_cleared: false,
             github_available,
         }
