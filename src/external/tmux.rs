@@ -352,6 +352,26 @@ pub fn create_window(session: &str, window_name: &str, cwd: &Path) -> Result<(),
     Ok(())
 }
 
+pub fn select_window(session: &str, window_name: &str) -> Result<(), AppError> {
+    let status = Command::new("tmux")
+        .args(["select-window", "-t", &format!("{session}:{window_name}")])
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| {
+            AppError::Tmux(format!(
+                "failed to select window '{window_name}' in '{session}': {e}"
+            ))
+        })?;
+
+    if !status.success() {
+        return Err(AppError::Tmux(format!(
+            "tmux select-window failed for '{session}:{window_name}'"
+        )));
+    }
+
+    Ok(())
+}
+
 /// Open a session as a tmux popup overlay (95% of the screen).
 /// This blocks until the user detaches or the popup closes.
 pub fn open_popup(session: &str, title: &str) -> Result<(), AppError> {

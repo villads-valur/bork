@@ -18,6 +18,7 @@ pub fn open_in_session(session: &str, cwd: &Path, pr_mode: bool) -> Result<(), A
 
     let target = format!("{session}:tuicr");
     tmux::send_keys(&target, &tuicr_cmd(pr_mode))?;
+    tmux::select_window(session, "tuicr")?;
 
     Ok(())
 }
