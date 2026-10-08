@@ -77,6 +77,8 @@ pub struct LiveState {
     pub user_prs: Vec<PrStatus>,
     pub review_requested_prs: Vec<PrStatus>,
     pub review_stacks: Option<HashMap<u32, Option<u32>>>,
+    /// Stack members whose stack card is blocked by an existing card; imported individually.
+    pub review_stack_fallback: HashSet<u32>,
     pub github_user: Option<String>,
     pub git_poll_done: bool,
     pub pr_poll_done: bool,
@@ -1131,6 +1133,7 @@ impl Project {
                 .review_stacks
                 .as_ref()
                 .is_some_and(|map| !matches!(map.get(&pr.number), Some(None)))
+                && !self.live.review_stack_fallback.contains(&pr.number)
             {
                 continue;
             }

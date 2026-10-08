@@ -11,6 +11,8 @@ Follow-up to merged PR #133. New branch/PR only.
 - Test transitions, pagination/duplicates/failures, config precedence; rebuild debug, commit/push new PR.
 
 Implemented and validated: 973 tests passed, 2 ignored; formatting and Clippy clean; debug binary rebuilt at target/debug/bork.
-GitHub access became unavailable during final validation (DNS failure for github.com; gh cannot connect to api.github.com). Final live smoke test and PR publication still pending.
+Live check done: GraphQL `PullRequest.stack` works, direct requests come back with stack numbers, and the Legora board stayed clean on restart (cards with agent work were left alone).
 
 Fixed the review queue flood: use user-review-requested instead of team-inclusive review-requested. Read-only inspection found 59 new cards in Legora. Regression test covers moving extra automatic cards to Done after successful discovery while preserving manual cards and retaining state on failed discovery. Legora state was not edited.
+
+Fixed hidden requests: a card with your work on it (or any Done card) used to block the stack card and also stop the individual import, so the request never showed. Done cards are now ignored, and blocked requests fall back to individual cards.

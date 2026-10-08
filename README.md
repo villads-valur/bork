@@ -690,4 +690,4 @@ The stack detail view marks members that need your review. Automatic stack cards
 
 `stack_review_prompt` is separate from `review_prompt`. Set it in `~/.config/bork/config.toml` or the project's `.bork/config.toml`; the project value wins. Bork appends the ordered PR list, URLs, and which members need your review. Custom prompts edited on individual cards are preserved.
 
-Untouched automatic PR cards can be consolidated into a stack card. Explicit PR-only attachments and edited cards are preserved, and Bork avoids creating a stack card over them.
+Untouched automatic PR cards can be consolidated into a stack card. Explicit PR-only attachments and edited cards are preserved, and Bork avoids creating a stack card over them. In that case, each other requested member gets its own card so no request goes missing. Cards in Done are left alone.

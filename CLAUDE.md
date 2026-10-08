@@ -202,6 +202,6 @@ Issues can be tied to other issues in the same project via a symmetric `linked_i
 ## Automatic stack review imports
 
 - Review discovery uses `user-review-requested` (direct personal requests), not `review-requested` (which includes team queues) or `involves`. Return PRs and their stack numbers atomically, after all pages succeed.
-- Resolve distinct stacks before importing cards. A known stack member must never fall back to an individual automatic card while metadata is pending. Preserve explicit PR-only attachments and edited cards.
+- Resolve distinct stacks before importing cards. A known stack member must never fall back to an individual automatic card while metadata is pending. Preserve explicit PR-only attachments and edited cards; when they block a stack card, import the remaining requests individually so every direct request reaches the board. Done cards neither block nor get absorbed.
 - Track automatic stack review lifecycle separately from manual stack attachments. Complete only from a successful discovery with no outstanding requests; reopen on a new member request.
 - `stack_review_prompt` has the same global/project precedence as `review_prompt`. Keep them independent and preserve per-card prompt edits.

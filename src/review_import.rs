@@ -51,6 +51,7 @@ impl Project {
 
     /// Resolve groups before the ordinary per-PR importer sees the discovery result.
     pub fn sync_stack_reviews(&mut self, protected: &HashSet<String>) -> bool {
+        self.live.review_stack_fallback.clear();
         if !self.config.auto_import_reviews || self.live.review_prs_ready != Some(true) {
             return false;
         }
@@ -158,10 +159,12 @@ impl Project {
                 .issues
                 .iter()
                 .filter(|issue| {
-                    issue
-                        .pr_numbers()
-                        .iter()
-                        .any(|number| members.contains(number))
+                    // Done cards are history: they neither block nor get absorbed.
+                    issue.column != Column::Done
+                        && issue
+                            .pr_numbers()
+                            .iter()
+                            .any(|number| members.contains(number))
                 })
                 .collect();
             // A manually attached or edited card owns its PRs. Do not create another
@@ -184,6 +187,8 @@ impl Project {
                             .any(|id| id.eq_ignore_ascii_case(&issue.id))
                     })
             }) {
+                // Existing cards win, but every request must still reach the board.
+                self.live.review_stack_fallback.extend(requested);
                 continue;
             }
             let reusable_id = existing.first().map(|issue| issue.id.clone());
@@ -356,12 +361,85 @@ mod tests {
         });
         project.issues.push(issue.clone());
         sync(&mut project);
-        assert_eq!(project.issues.len(), 2); // explicit PR card and standalone #5
         assert_eq!(project.issues[0], issue);
         assert!(!project
             .issues
             .iter()
             .any(|issue| issue.github_stack == Some(10)));
+        // The other requested members still reach the board, one card each.
+        for number in 1..=5 {
+            assert_eq!(
+                project
+                    .issues
+                    .iter()
+                    .filter(|issue| issue.has_pr_number(number))
+                    .count(),
+                1,
+                "PR #{number}"
+            );
+        }
+    }
+
+    fn reviewed_card(id: &str, number: u32, column: Column) -> Issue {
+        let mut issue = Issue::new(id, "Reviewed earlier", column, AgentKind::Codex);
+        issue.github_pr_links.push(LinkedGithubPr {
+            number,
+            imported: true,
+            import_source: Some(PrImportSource::ReviewRequested),
+        });
+        issue.prompt = Some("edited".into());
+        issue
+    }
+
+    #[test]
+    fn done_cards_neither_block_nor_get_absorbed_by_a_new_stack_card() {
+        let mut project = project();
+        let reviewed = reviewed_card("old", 1, Column::Done);
+        project.issues.push(reviewed.clone());
+        project.live.review_requested_prs = vec![pr(3)];
+        sync(&mut project);
+        let stack = project
+            .issues
+            .iter()
+            .find(|issue| issue.github_stack == Some(10))
+            .unwrap();
+        assert_eq!(stack.column, Column::CodeReview);
+        assert_eq!(
+            project.issues.iter().find(|issue| issue.id == "old"),
+            Some(&reviewed)
+        );
+    }
+
+    #[test]
+    fn blocked_stack_still_puts_every_requested_pr_on_the_board() {
+        let mut project = project();
+        let reviewed = reviewed_card("mine", 1, Column::CodeReview);
+        project.issues.push(reviewed.clone());
+        project.live.review_requested_prs = vec![pr(1), pr(3)];
+        for _ in 0..2 {
+            sync(&mut project);
+        }
+        assert!(!project
+            .issues
+            .iter()
+            .any(|issue| issue.github_stack == Some(10)));
+        assert_eq!(project.issues[0], reviewed);
+        assert_eq!(
+            project
+                .issues
+                .iter()
+                .filter(|issue| issue.has_pr_number(3))
+                .count(),
+            1
+        );
+        assert_eq!(
+            project
+                .issues
+                .iter()
+                .filter(|issue| issue.has_pr_number(1))
+                .count(),
+            1
+        );
     }
 
     #[test]
