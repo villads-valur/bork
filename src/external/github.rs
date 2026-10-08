@@ -593,7 +593,7 @@ pub fn fetch_review_requested_prs(main_worktree: &Path) -> Result<ReviewDiscover
     let repo = get_repo_identity(main_worktree)?;
     let user = fetch_current_user(main_worktree).ok_or("Could not fetch GitHub user")?;
     let search = format!(
-        "repo:{}/{} is:pr is:open review-requested:{}",
+        "repo:{}/{} is:pr is:open user-review-requested:{}",
         repo.owner, repo.name, user
     );
     fetch_review_pages(|query| {

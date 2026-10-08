@@ -684,7 +684,7 @@ browser and review shortcuts.
 
 ### Automatic stack reviews
 
-A review request on any member imports one card for the stack. Bork checks stack membership before importing individual PRs, deduplicates repeated results, and fetches only the stacks referenced by your review requests. Direct requests and requests to your teams qualify; mentions alone do not.
+A review request on any member imports one card for the stack. Bork checks stack membership before importing individual PRs, deduplicates repeated results, and fetches only the stacks referenced by your review requests. Only review requests addressed directly to you qualify. Team-only requests and mentions do not fill your personal review column.
 
 The stack detail view marks members that need your review. Automatic stack cards move to Done when no member has an outstanding request and return to Code Review when a new request arrives. Failed or incomplete discovery preserves the previous state. Manually attached stacks keep their existing lifecycle.
 

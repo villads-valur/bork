@@ -380,6 +380,76 @@ mod tests {
     }
 
     #[test]
+    fn narrowing_review_discovery_clears_team_queue_without_changing_manual_cards() {
+        let mut project = project();
+        // Simulate the team-inclusive discovery that filled the board.
+        for number in 100..160 {
+            project.live.review_requested_prs.push(pr(number));
+            project
+                .live
+                .review_stacks
+                .as_mut()
+                .unwrap()
+                .insert(number, None);
+        }
+        let mut manual = Issue::new(
+            "manual",
+            "Keep my work",
+            Column::CodeReview,
+            AgentKind::Codex,
+        );
+        manual.github_pr_links.push(LinkedGithubPr {
+            number: 200,
+            imported: false,
+            import_source: None,
+        });
+        project.issues.push(manual.clone());
+        sync(&mut project);
+        assert_eq!(
+            project
+                .issues
+                .iter()
+                .filter(|issue| issue.column == Column::CodeReview)
+                .count(),
+            63
+        );
+
+        // An unsuccessful refresh must leave the queue alone.
+        project.live.review_prs_ready = Some(false);
+        sync(&mut project);
+        assert_eq!(
+            project
+                .issues
+                .iter()
+                .filter(|issue| issue.column == Column::CodeReview)
+                .count(),
+            63
+        );
+
+        // Only #5 remains directly requested; the stack and team-only PRs finish.
+        project.live.review_prs_ready = Some(true);
+        project.live.review_requested_prs = vec![pr(5)];
+        project.live.review_stacks = Some([(5, None)].into());
+        sync(&mut project);
+        let remaining: Vec<_> = project
+            .issues
+            .iter()
+            .filter(|issue| issue.column == Column::CodeReview)
+            .collect();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.iter().any(|issue| issue.has_pr_number(5)));
+        assert_eq!(
+            project.issues.iter().find(|issue| issue.id == "manual"),
+            Some(&manual)
+        );
+        assert_eq!(
+            project.issues.len(),
+            63,
+            "keep completed cards and their history"
+        );
+    }
+
+    #[test]
     fn prompt_overrides_are_separate_and_user_edits_survive_refresh() {
         let mut project = project();
         project.config.review_prompt = Some("Single only".into());
