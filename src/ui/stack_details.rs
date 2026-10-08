@@ -113,7 +113,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         .enumerate()
     {
         let pr = project.pr_by_number(member.number);
-        let status_spans = if member.state != PrState::Open {
+        let mut status_spans = if member.state != PrState::Open {
             vec![Span::styled(
                 format!(" {}", member.state),
                 styles::dim_style(),
@@ -128,6 +128,12 @@ pub fn render(frame: &mut Frame, app: &App) {
                 )]
             })
         };
+        if project.review_requested_for(member.number) {
+            status_spans.push(Span::styled(
+                " · your review",
+                Style::default().fg(styles::ACCENT),
+            ));
+        }
         let pointer = if offset + row == details.selected {
             "▸"
         } else {

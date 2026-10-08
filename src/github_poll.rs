@@ -175,13 +175,33 @@ impl Cache {
                             .get(number)
                             .is_some_and(|stamp| stamp.failures >= MEMBERSHIP_FAILURE_LIMIT)
                 });
-        result.reviews_ready &= membership_ready;
+        if result.review_stacks.is_none() {
+            result.reviews_ready &= membership_ready;
+        }
         result.authored_ready &= membership_ready;
+        if targets.auto_reviews && result.error.is_none() {
+            result.error = result
+                .review_stacks
+                .iter()
+                .flat_map(|map| map.values().flatten())
+                .find_map(|number| {
+                    result
+                        .stack_errors
+                        .get(number)
+                        .map(|error| format!("Review stack #{number}: {error}"))
+                });
+        }
         result
     }
 
     fn prune(&mut self, targets: &Targets, now: u64) {
-        let stack_numbers: HashSet<_> = targets.stacks.iter().map(|(n, _)| *n).collect();
+        let mut stack_numbers: HashSet<_> = targets.stacks.iter().map(|(n, _)| *n).collect();
+        stack_numbers.extend(
+            self.result
+                .review_stacks
+                .iter()
+                .flat_map(|map| map.values().filter_map(|number| *number)),
+        );
         let branches: HashSet<_> = targets.branches.iter().map(|(b, _)| b.as_str()).collect();
         if now.saturating_sub(self.picker_prs.success) >= DISCOVERY_INTERVAL {
             self.picker_numbers.clear();
@@ -314,13 +334,17 @@ pub struct Response {
     stacks: Option<Vec<GithubStack>>,
     unsupported: bool,
     github_user: Option<String>,
+    review_stacks: Option<HashMap<u32, Option<u32>>>,
     error: Option<String>,
 }
 
 pub fn fetch(path: &Path, request: &Request) -> Response {
     let mut response = Response::default();
     let result = match request {
-        Request::Reviews => github::fetch_review_requested_prs(path).map(|prs| response.prs = prs),
+        Request::Reviews => github::fetch_review_requested_prs(path).map(|discovery| {
+            response.prs = discovery.prs;
+            response.review_stacks = Some(discovery.stacks);
+        }),
         Request::Authored => github::fetch_user_prs(path).map(|prs| response.prs = prs),
         Request::PickerPrs => github::fetch_prs(path).map(|prs| response.prs = prs),
         Request::PickerStacks => github::fetch_stacks(path).map(|stacks| {
@@ -385,6 +409,7 @@ pub fn poll(
                 if success {
                     cache.result.reviews_ready = true;
                     cache.result.review_requested_prs = response.prs.clone();
+                    cache.result.review_stacks = response.review_stacks;
                 }
             }
             Request::Authored => {
@@ -487,6 +512,28 @@ pub fn poll(
 
     if reviews_due {
         run(cache, Request::Reviews);
+    }
+    let mut review_stacks: Vec<_> = if targets.auto_reviews {
+        cache
+            .result
+            .review_stacks
+            .iter()
+            .flat_map(|map| map.values().filter_map(|number| *number))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    review_stacks.sort_unstable();
+    review_stacks.dedup();
+    for number in review_stacks {
+        if cache
+            .stacks
+            .get(&number)
+            .unwrap_or(&Stamp::default())
+            .due(now, REVIEW_INTERVAL, force)
+        {
+            run(cache, Request::Stack(number));
+        }
     }
     if authored_due {
         run(cache, Request::Authored);
@@ -640,6 +687,66 @@ mod tests {
             |_, _| {},
         );
         requests
+    }
+
+    #[test]
+    fn review_discovery_fetches_each_stack_once_and_keeps_it_before_board_attachment() {
+        let targets = Targets {
+            auto_reviews: true,
+            ..Default::default()
+        };
+        let mut cache = Cache::default();
+        let mut requests = Vec::new();
+        poll(
+            &mut cache,
+            &targets,
+            1000,
+            false,
+            |request| {
+                requests.push(request.clone());
+                match request {
+                    Request::Reviews => Response {
+                        prs: vec![pr(1), pr(2), pr(2), pr(3)],
+                        review_stacks: Some([(1, Some(42)), (2, Some(42)), (3, None)].into()),
+                        ..Default::default()
+                    },
+                    Request::Stack(42) => Response {
+                        stacks: Some(vec![stack(42, 1)]),
+                        ..Default::default()
+                    },
+                    _ => Response::default(),
+                }
+            },
+            |_, _| {},
+        );
+        assert_eq!(requests, vec![Request::Reviews, Request::Stack(42)]);
+        assert_eq!(cache.result.stacks.as_ref().unwrap()[0].number, 42);
+        assert!(cycle(&mut cache, &targets, 1010, false).is_empty());
+    }
+
+    #[test]
+    fn failed_review_discovery_preserves_membership_and_requests() {
+        let targets = Targets {
+            auto_reviews: true,
+            ..Default::default()
+        };
+        let mut cache = Cache::default();
+        cache.result.review_requested_prs = vec![pr(1)];
+        cache.result.review_stacks = Some([(1, Some(42))].into());
+        poll(
+            &mut cache,
+            &targets,
+            1000,
+            false,
+            |_| Response {
+                error: Some("offline".into()),
+                ..Default::default()
+            },
+            |_, _| {},
+        );
+        assert_eq!(cache.result.review_requested_prs.len(), 1);
+        assert_eq!(cache.result.review_stacks.as_ref().unwrap()[&1], Some(42));
+        assert!(!cache.result.reviews_ready);
     }
 
     #[test]

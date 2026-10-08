@@ -1143,6 +1143,13 @@ fn apply_pr_fields(issue: &mut Issue, dialog: &crate::app::DialogState) {
     } else {
         dialog.github_stack
     };
+    if issue
+        .stack_review_import
+        .as_ref()
+        .is_some_and(|import| issue.github_stack != Some(import.stack_number))
+    {
+        issue.stack_review_import = None;
+    }
     // Orchestrators have no PR field; drop any links left from a kind change.
     if dialog.kind == IssueKind::Orchestrator || dialog.github_pr_cleared {
         issue.github_pr_links.clear();
@@ -2072,6 +2079,7 @@ mod tests {
             agent_mode: crate::types::AgentMode::Plan,
             default_prompt: Some("Check AGENTS.md for context.".to_string()),
             review_prompt: None,
+            stack_review_prompt: None,
             orchestrator_prompt: None,
             setup_script: None,
             teardown_script: None,
@@ -3913,6 +3921,7 @@ mod tests {
             agent_mode: crate::types::AgentMode::Plan,
             default_prompt: None,
             review_prompt: None,
+            stack_review_prompt: None,
             orchestrator_prompt: None,
             setup_script: None,
             teardown_script: None,
