@@ -1,12 +1,12 @@
 # Bork
 
-Terminal kanban board for orchestrating OpenCode/Claude coding sessions across git worktrees and tmux.
+Terminal kanban board for orchestrating OpenCode/Claude Code/Codex/Pi/Cursor coding sessions across git worktrees and tmux.
 
 ## Architecture
 
 - **Language**: Rust (no async runtime, pure `std::thread` + `mpsc`)
 - **TUI**: ratatui + crossterm
-- **External tools**: tmux, git, gh, linear (optional), and the coding agents (all via `std::process::Command`)
+- **External tools**: tmux, git, gh, linear (optional), and the coding agents: `opencode`, `claude`, `codex`, `pi`, `cursor-agent` (all via `std::process::Command`)
 
 ### Threading Model
 
@@ -73,7 +73,9 @@ src/
 │   │   ├── opencode.rs # OpenCode provider (mode flags, launch/resume, session detection, hooks)
 │   │   ├── claude.rs   # Claude provider
 │   │   ├── codex.rs    # Codex provider
-│   │   └── pi.rs       # Pi provider
+│   │   ├── pi.rs       # Pi provider
+│   │   ├── cursor.rs   # Cursor provider (`cursor-agent`; chat id via `create-chat`; no status hooks)
+│   │   └── setup.rs    # Worktree setup-script runner
 │   ├── git.rs        # Git worktree status polling
 │   ├── github.rs     # GitHub PR polling via gh api graphql (per-repo identity cache)
 │   ├── linear.rs     # Linear CLI integration (assigned issues via graphql)

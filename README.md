@@ -68,7 +68,7 @@ Press `n` to create an issue, `Enter` to launch an agent session. You're up and 
 - **Dev server detection** &mdash; Automatically detects listening TCP ports per session and shows a 🔌 indicator on the card
 - **Git worktree tracking** &mdash; Live staged/unstaged change counts and branch names
 - **Tmux integration** &mdash; Auto-wraps in tmux, sessions open as 90% screen popups
-- **Plan, Build, and Yolo modes** &mdash; Toggle between modes per issue; Claude and Codex support Yolo (skips all permission prompts)
+- **Plan, Build, and Yolo modes** &mdash; Toggle between modes per issue; Claude, Codex, and Cursor support Yolo (skips all permission prompts)
 - **Vim-style navigation** &mdash; h/j/k/l, g/G, and familiar modal keybindings
 - **ANSI 16 colors** &mdash; Adapts to any terminal theme, no hardcoded RGB
 - **Linear integration** &mdash; Import and attach multiple Linear issues per card, refresh their state and title on each poll, open in Linear with a keypress
@@ -86,8 +86,10 @@ Press `n` to create an issue, `Enter` to launch an agent session. You're up and 
 | [git](https://git-scm.com/) | Worktree status and branch detection |
 | [gh](https://cli.github.com/) | GitHub PR status polling (optional) |
 | [Linear](https://linear.app) | Issue import, via `LINEAR_API_KEY` or a `linear` command (optional) |
-| [OpenCode](https://opencode.ai), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://developers.openai.com/codex), or [Pi](https://pi.dev) | AI coding agent (at least one) |
+| [OpenCode](https://opencode.ai), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://developers.openai.com/codex), [Pi](https://pi.dev), or [Cursor](https://cursor.com/cli) (`cursor-agent` >= 2026.09.02) | AI coding agent (at least one) |
 | [Rust toolchain](https://rustup.rs/) | Building from source |
+
+Cursor needs `cursor-agent` 2026.09.02 or newer. Older builds don't have `--mode`, `--plan`, or `--trust`, and `cursor-agent` exits on any flag it doesn't know, so an old build fails at launch without a useful error. Run `cursor-agent update` to upgrade.
 
 ## Installation
 
@@ -183,6 +185,7 @@ Bork ships with hooks that report agent status (Idle, Busy, Waiting, Error) back
 - **Claude Code**: Adds hooks to `settings.json`
 - **Codex**: Adds hooks to `~/.codex/hooks.json` and enables `features.codex_hooks = true` in `~/.codex/config.toml`
 - **Pi**: Installs a status extension to `~/.pi/agent/extensions/bork-status.ts`
+- **Cursor**: Installs nothing, on purpose. `cursor-agent` never fires a `stop` event, so there is no Idle signal, and hooks that only ever write Busy would leave every Cursor card stuck on Busy (bork never expires an old status). With no status file, bork shows a live Cursor session as Idle instead.
 
 `bork install` also deploys the `worktree` and `bork-cli` skills into the project at `.claude/skills/` (Claude Code) and `.agents/skills/` (the cross-agent standard read by Pi and others).
 
@@ -451,6 +454,14 @@ Both keys accept a single shell command line and can live in either config layer
 
 The new/edit issue dialog hides the Agent field when only one agent is available. Pi has a single mode and no built-in mode flags; its general launch args still apply, and mode overrides can supply additional flags.
 
+Cursor notes:
+
+- Requires `cursor-agent` >= 2026.09.02 (`cursor-agent update`). Older builds fail at launch on the flags below.
+- `--trust` is passed in every mode. Each issue gets a fresh worktree, and the first run in an untrusted directory otherwise blocks on Cursor's Workspace Trust prompt.
+- Plan runs with `--mode plan`, so it is enforced by Cursor, not just a prompt instruction. Build passes only `--trust`.
+- `-f` is passed only in Yolo. It auto-approves every command, so bork doesn't use it to get past the trust prompt, which would make Build behave like Yolo.
+- Don't put `-c` or `--cloud` in `agent.cursor.args`. Cloud agents run on Cursor's machines, not in the tmux pane, so bork can't see or track the session.
+
 `~/.config/bork/agents.toml` from earlier versions is no longer read. Move its `agents` and `default_agent` keys into `~/.config/bork/config.toml`.
 
 ### State
@@ -476,6 +487,8 @@ Each issue card shows the current agent status:
 | `✗` | Error |
 | `🌿` | Worktree branch detected |
 | `🔌` | Dev server listening on a TCP port |
+
+Cursor sessions only ever show Stopped or Idle. Bork installs no Cursor hooks (see [`bork install`](#bork-install--bork-uninstall)), so both states come from whether the tmux session is alive, and Busy and Waiting never appear.
 
 ## GitHub PR Integration
 
