@@ -285,30 +285,31 @@ fn handle_normal(
     if matches!(action, Action::OpenPR | Action::OpenReviewPR) {
         if let Some(issue) = app.context_project(ctx).selected_issue(&q).cloned() {
             if issue.github_stack.is_some() {
-                return open_stack(app, action, ctx, &issue, ch);
+                return open_pr_group(app, action, ctx, &issue, ch);
             }
         }
     }
     match action {
         Action::ExpandStack => {
-            let live = &app.context_project(ctx).live;
-            if live.gh_missing || live.stacks_unsupported {
+            let project = app.context_project(ctx);
+            let Some(issue) = project.selected_issue(&q) else {
+                return PostAction::None;
+            };
+            if issue.github_stack.is_some()
+                && (project.live.gh_missing || project.live.stacks_unsupported)
+            {
                 return PostAction::None;
             }
-            if let Some(issue) = app.context_project(ctx).selected_issue(&q) {
-                if issue.github_stack.is_some() {
-                    app.stack_details = Some(crate::app::StackDetailsState {
-                        project_id: ctx.project_id.clone(),
-                        issue_id: issue.id.clone(),
-                        selected: 0,
-                    });
-                    app.message = None;
-                    app.input_mode = InputMode::StackDetails;
-                } else if issue.has_pr() {
-                    app.set_message("Individual PRs attached; edit GitHub links and use Ctrl+s to attach a stack");
-                } else {
-                    app.set_message("Attach a stack with Ctrl+s in the GitHub picker");
-                }
+            if issue.has_pr() {
+                app.stack_details = Some(crate::app::StackDetailsState {
+                    project_id: ctx.project_id.clone(),
+                    issue_id: issue.id.clone(),
+                    selected: 0,
+                });
+                app.message = None;
+                app.input_mode = InputMode::StackDetails;
+            } else {
+                app.set_message("Attach a stack with Ctrl+s in the GitHub picker");
             }
             PostAction::None
         }
@@ -1440,11 +1441,7 @@ fn handle_stack_details(app: &mut App, action: Action, ch: &ActionChannels<'_>) 
                 .find(|issue| issue.id == details.issue_id)
         })
         .cloned();
-    if action == Action::CloseStack
-        || issue
-            .as_ref()
-            .is_none_or(|issue| issue.github_stack.is_none())
-    {
+    if action == Action::CloseStack || issue.as_ref().is_none_or(|issue| !issue.has_pr()) {
         app.stack_details = None;
         app.input_mode = InputMode::Normal;
         return PostAction::None;
@@ -1454,11 +1451,7 @@ fn handle_stack_details(app: &mut App, action: Action, ch: &ActionChannels<'_>) 
     };
     match action {
         Action::StackDown | Action::StackUp => {
-            let count = app
-                .context_project(&ctx)
-                .attached_stack(&issue)
-                .map(|stack| stack.pull_requests.len())
-                .unwrap_or(0);
+            let count = app.context_project(&ctx).detail_member_count(&issue);
             if let Some(details) = &mut app.stack_details {
                 if action == Action::StackDown {
                     details.selected = (details.selected + 1).min(count.saturating_sub(1));
@@ -1470,13 +1463,15 @@ fn handle_stack_details(app: &mut App, action: Action, ch: &ActionChannels<'_>) 
         Action::SyncPRs => {
             let _ = ch.pr_wake_tx.send(crate::github_poll::Wake::Refresh);
         }
-        Action::OpenPR | Action::OpenReviewPR => return open_stack(app, action, &ctx, &issue, ch),
+        Action::OpenPR | Action::OpenReviewPR => {
+            return open_pr_group(app, action, &ctx, &issue, ch)
+        }
         _ => {}
     }
     PostAction::None
 }
 
-fn open_stack(
+fn open_pr_group(
     app: &mut App,
     action: Action,
     ctx: &ActionContext,
@@ -1484,7 +1479,8 @@ fn open_stack(
     ch: &ActionChannels<'_>,
 ) -> PostAction {
     let project = app.context_project(ctx);
-    let numbers = match project.stack_open_numbers(issue) {
+    let is_stack = issue.github_stack.is_some();
+    let numbers = match project.detail_open_numbers(issue) {
         Ok(numbers) => numbers,
         Err(message) => {
             app.set_warning(message);
@@ -1502,22 +1498,27 @@ fn open_stack(
     let popup_title = issue.popup_title();
     let tx = ch.action_tx.clone();
     app.begin_busy();
-    app.set_message(if review {
-        "Opening stack review..."
-    } else {
-        "Opening stack PRs..."
+    app.set_message(match (review, is_stack) {
+        (true, true) => "Opening stack review...",
+        (true, false) => "Opening PR review...",
+        (false, true) => "Opening stack PRs...",
+        (false, false) => "Opening PRs...",
     });
     thread::spawn(move || {
         let result = if review {
             match tuicr::open_stack(&session, &cwd, &numbers, alive) {
                 Ok(()) => ActionResult {
-                    message: format!("Reviewing {} PRs in stack order", numbers.len()),
+                    message: if is_stack {
+                        format!("Reviewing {} PRs in stack order", numbers.len())
+                    } else {
+                        format!("Reviewing {} PRs", numbers.len())
+                    },
                     session_to_open: Some(session),
                     popup_title: Some(popup_title),
                     ..Default::default()
                 },
                 Err(error) => ActionResult {
-                    message: format!("Failed to open stack review: {error}"),
+                    message: format!("Failed to open review: {error}"),
                     message_kind: MessageKind::Error,
                     ..Default::default()
                 },
@@ -2621,6 +2622,50 @@ mod tests {
         act(&mut app, Action::ExpandStack);
         assert_eq!(app.input_mode, InputMode::StackDetails);
         assert!(app.message.is_none());
+    }
+
+    #[test]
+    fn expand_lists_linked_prs_without_a_stack() {
+        let mut app = stack_test_app(3);
+        app.project_mut().live.github_stacks.clear();
+        app.project_mut().live.stacks_unsupported = true;
+        if let Some(pr) = app.project_mut().live.pr_statuses_by_number.get_mut(&2) {
+            pr.state = crate::types::PrState::Merged;
+        }
+        app.project_mut().issues.push(Issue {
+            github_pr_links: (1..=3)
+                .map(|number| LinkedGithubPr {
+                    number,
+                    imported: false,
+                    import_source: None,
+                })
+                .collect(),
+            ..test_issue("bork-1", Column::CodeReview)
+        });
+        app.project_mut().selected_column = Column::CodeReview.index();
+        act(&mut app, Action::ExpandStack);
+        assert_eq!(app.input_mode, InputMode::StackDetails);
+        for _ in 0..5 {
+            act(&mut app, Action::StackDown);
+        }
+        assert_eq!(app.stack_details.as_ref().unwrap().selected, 2);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::stack_details::render(frame, &app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("PRs · bork-1"), "{text}");
+        assert!(text.contains("Change 3"), "{text}");
+        assert!(text.contains("merged"), "{text}");
+        let issue = app.project().issues[0].clone();
+        assert_eq!(app.project().detail_open_numbers(&issue), Ok(vec![1, 3]));
     }
 
     #[test]

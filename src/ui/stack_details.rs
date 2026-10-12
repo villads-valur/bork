@@ -4,8 +4,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::app::App;
-use crate::types::PrState;
+use crate::app::{App, Project};
+use crate::types::{GithubStackPullRequest, PrState};
 use crate::ui::{card, styles};
 
 pub fn render(frame: &mut Frame, app: &App) {
@@ -22,7 +22,8 @@ pub fn render(frame: &mut Frame, app: &App) {
     else {
         return;
     };
-    if project.live.gh_missing || project.live.stacks_unsupported {
+    let is_stack = issue.github_stack.is_some();
+    if is_stack && (project.live.gh_missing || project.live.stacks_unsupported) {
         return;
     }
     let size = frame.area();
@@ -38,11 +39,10 @@ pub fn render(frame: &mut Frame, app: &App) {
         height,
     );
     frame.render_widget(Clear, area);
-    let title = format!(
-        " Stack #{} · {} ",
-        issue.github_stack.unwrap_or_default(),
-        issue.id
-    );
+    let title = match issue.github_stack {
+        Some(number) => format!(" Stack #{number} · {} ", issue.id),
+        None => format!(" PRs · {} ", issue.id),
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
@@ -50,6 +50,31 @@ pub fn render(frame: &mut Frame, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    let refresh_error = project
+        .live
+        .github_error
+        .as_ref()
+        .map(|error| format!("Refresh failed: {error} · showing last known data"));
+    if !is_stack {
+        let members = project.linked_pr_members(issue);
+        let summary = refresh_error.unwrap_or_else(|| {
+            format!(
+                "{} PRs · CI: {}",
+                members.len(),
+                project.member_checks(&members).label()
+            )
+        });
+        render_members(
+            frame,
+            app,
+            project,
+            details.selected,
+            inner,
+            &summary,
+            &members,
+        );
+        return;
+    }
     let Some(stack) = project.attached_stack(issue) else {
         if project.live.github_loading() {
             if project.live.github_fetching() {
@@ -76,15 +101,8 @@ pub fn render(frame: &mut Frame, app: &App) {
         );
         return;
     };
-    let missing_statuses = stack
-        .pull_requests
-        .iter()
-        .filter(|pr| pr.state == PrState::Open && project.pr_by_number(pr.number).is_none())
-        .count();
-    let loading =
-        project.live.github_fetching() && (missing_statuses > 0 || project.live.pr_refreshing);
-    let summary = if let Some(error) = &project.live.github_error {
-        format!("Refresh failed: {error} · showing last known data")
+    let summary = if let Some(error) = refresh_error {
+        error
     } else if project.live.stacks_available {
         format!(
             "{} PRs · base {} · CI: {}",
@@ -95,23 +113,42 @@ pub fn render(frame: &mut Frame, app: &App) {
     } else {
         "Showing last known members · P refresh".to_string()
     };
+    render_members(
+        frame,
+        app,
+        project,
+        details.selected,
+        inner,
+        &summary,
+        &stack.pull_requests,
+    );
+}
+
+fn render_members(
+    frame: &mut Frame,
+    app: &App,
+    project: &Project,
+    selected: usize,
+    inner: Rect,
+    summary: &str,
+    members: &[GithubStackPullRequest],
+) {
+    let missing_statuses = members
+        .iter()
+        .filter(|pr| pr.state == PrState::Open && project.pr_by_number(pr.number).is_none())
+        .count();
+    let loading =
+        project.live.github_fetching() && (missing_statuses > 0 || project.live.pr_refreshing);
     frame.render_widget(
-        Paragraph::new(styles::truncate(&summary, inner.width as usize)),
+        Paragraph::new(styles::truncate(summary, inner.width as usize)),
         Rect::new(inner.x, inner.y, inner.width, 1),
     );
 
     let visible = inner.height.saturating_sub(3) as usize;
-    let offset = details
-        .selected
-        .min(stack.pull_requests.len().saturating_sub(1))
+    let offset = selected
+        .min(members.len().saturating_sub(1))
         .saturating_sub(visible.saturating_sub(1));
-    for (row, member) in stack
-        .pull_requests
-        .iter()
-        .skip(offset)
-        .take(visible)
-        .enumerate()
-    {
+    for (row, member) in members.iter().skip(offset).take(visible).enumerate() {
         let pr = project.pr_by_number(member.number);
         let mut status_spans = if member.state != PrState::Open {
             vec![Span::styled(
@@ -134,11 +171,7 @@ pub fn render(frame: &mut Frame, app: &App) {
                 Style::default().fg(styles::ACCENT),
             ));
         }
-        let pointer = if offset + row == details.selected {
-            "▸"
-        } else {
-            " "
-        };
+        let pointer = if offset + row == selected { "▸" } else { " " };
         let prefix = format!("{pointer}{:>2} #{} ", offset + row + 1, member.number);
         let title = pr
             .map(|pr| pr.title.as_str())
@@ -162,8 +195,8 @@ pub fn render(frame: &mut Frame, app: &App) {
     } else {
         format!(
             "j/k move  o open all  R review all  P refresh  Esc close  {}/{}",
-            (offset + visible).min(stack.pull_requests.len()),
-            stack.pull_requests.len()
+            (offset + visible).min(members.len()),
+            members.len()
         )
     };
     let footer_area = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);

@@ -84,7 +84,7 @@ const SECTIONS: &[Section] = &[
             ("P", "Sync PRs"),
             ("W", "Prune worktrees"),
             ("o", "Open PR / stack"),
-            ("s", "Expand stack"),
+            ("s", "Expand stack or PRs"),
             ("O", "Open in Linear"),
             ("I", "Import from Linear"),
             ("w", "Assign worktree"),

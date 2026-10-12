@@ -1,5 +1,5 @@
 use crate::app::Project;
-use crate::types::{ChecksStatus, GithubStack, Issue, PrState, PrStatus};
+use crate::types::{ChecksStatus, GithubStack, GithubStackPullRequest, Issue, PrState, PrStatus};
 
 impl Project {
     pub fn linked_pr_numbers(&self) -> Vec<u32> {
@@ -63,21 +63,60 @@ impl Project {
         let stack = self
             .attached_stack(issue)
             .ok_or("Attached stack not found; refresh or change its attachment")?;
-        let numbers: Vec<_> = stack
-            .pull_requests
-            .iter()
-            .filter(|pr| pr.state == PrState::Open)
-            .map(|pr| pr.number)
-            .collect();
-        if numbers.is_empty() {
-            return Err("No open PRs in this stack");
+        open_member_numbers(&stack.pull_requests, "No open PRs in this stack")
+    }
+
+    /// PRs linked directly to an issue (no stack), shaped like stack members so
+    /// the details popup can list them. Unknown PRs are treated as open.
+    pub fn linked_pr_members(&self, issue: &Issue) -> Vec<GithubStackPullRequest> {
+        issue
+            .pr_numbers()
+            .into_iter()
+            .map(|number| match self.pr_by_number(number) {
+                Some(pr) => GithubStackPullRequest {
+                    number,
+                    state: pr.state,
+                    is_draft: pr.is_draft,
+                    head_branch: pr.head_branch.clone(),
+                },
+                None => GithubStackPullRequest {
+                    number,
+                    state: PrState::Open,
+                    is_draft: false,
+                    head_branch: String::new(),
+                },
+            })
+            .collect()
+    }
+
+    /// Rows in the details popup: the attached stack's members, or the issue's
+    /// linked PRs when it has no stack.
+    pub fn detail_member_count(&self, issue: &Issue) -> usize {
+        if issue.github_stack.is_some() {
+            return self
+                .attached_stack(issue)
+                .map_or(0, |stack| stack.pull_requests.len());
         }
-        Ok(numbers)
+        issue.github_pr_links.len()
+    }
+
+    pub fn detail_open_numbers(&self, issue: &Issue) -> Result<Vec<u32>, &'static str> {
+        if issue.github_stack.is_some() {
+            return self.stack_open_numbers(issue);
+        }
+        open_member_numbers(
+            &self.linked_pr_members(issue),
+            "No open PRs linked to this issue",
+        )
     }
 
     pub fn stack_checks(&self, stack: &GithubStack) -> StackChecks {
+        self.member_checks(&stack.pull_requests)
+    }
+
+    pub fn member_checks(&self, members: &[GithubStackPullRequest]) -> StackChecks {
         let mut summary = StackChecks::default();
-        for member in &stack.pull_requests {
+        for member in members {
             if member.state != PrState::Open {
                 continue;
             }
@@ -91,6 +130,21 @@ impl Project {
         }
         summary
     }
+}
+
+fn open_member_numbers(
+    members: &[GithubStackPullRequest],
+    empty_message: &'static str,
+) -> Result<Vec<u32>, &'static str> {
+    let numbers: Vec<_> = members
+        .iter()
+        .filter(|pr| pr.state == PrState::Open)
+        .map(|pr| pr.number)
+        .collect();
+    if numbers.is_empty() {
+        return Err(empty_message);
+    }
+    Ok(numbers)
 }
 
 #[derive(Default)]
