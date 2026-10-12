@@ -48,12 +48,13 @@ pub struct ActionResult {
     pub launched_issue_id: Option<String>,
     /// If set, apply this prune outcome to the issues of `project_id`.
     pub prune_outcome: Option<(crate::app::ProjectId, crate::prune::PruneOutcome)>,
-    /// Remove this issue only after its asynchronous session teardown succeeds.
-    pub issue_to_delete: Option<(ProjectId, String)>,
-    /// Move this issue to Done and drop its worktree only after its
+    /// Remove these issues only after their asynchronous session teardown
+    /// succeeds.
+    pub issues_to_delete: Vec<(ProjectId, String)>,
+    /// Move these issues to Done and drop their worktrees only after their
     /// asynchronous teardown (session kill + teardown script + worktree
     /// removal) succeeds.
-    pub issue_to_archive: Option<(ProjectId, String)>,
+    pub issues_to_archive: Vec<(ProjectId, String)>,
 }
 
 pub enum PostAction {
@@ -222,6 +223,163 @@ fn start_marked_sessions(
     }
 }
 
+/// Append " (N marked issues had no X)" when some marked issues were skipped.
+fn skipped_note(skipped: usize, missing: &str) -> String {
+    if skipped == 0 {
+        return String::new();
+    }
+    format!(" ({} had no {missing})", count_of(skipped, "marked issue"))
+}
+
+/// "1 session", "3 sessions".
+fn count_of(count: usize, noun: &str) -> String {
+    if count == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
+}
+
+/// Open `pr_numbers` in the browser off the main thread. `note` is appended
+/// to the summary message.
+fn spawn_open_prs(
+    app: &mut App,
+    ch: &ActionChannels<'_>,
+    main_worktree: std::path::PathBuf,
+    pr_numbers: Vec<u32>,
+    note: String,
+) {
+    app.begin_busy();
+    if pr_numbers.len() == 1 {
+        app.set_message("Opening PR...");
+    } else {
+        app.set_message(format!("Opening {} PRs...", pr_numbers.len()));
+    }
+    let tx = ch.action_tx.clone();
+
+    thread::spawn(move || {
+        // pr_url resolves the repo identity via gh (cached after the
+        // first call), so it must run off the main thread.
+        let mut failures = Vec::new();
+        for num in &pr_numbers {
+            let outcome = github::pr_url(&main_worktree, *num)
+                .ok_or_else(|| {
+                    "could not determine GitHub repo (is gh installed and authenticated?)"
+                        .to_string()
+                })
+                .and_then(|url| browser::open_url(&url));
+            if let Err(e) = outcome {
+                failures.push(format!("#{num}: {e}"));
+            }
+        }
+        let first_label = format!("#{}", pr_numbers[0]);
+        let mut result = summarize_open_links("PR", pr_numbers.len(), &first_label, failures);
+        result.message.push_str(&note);
+        let _ = tx.send(result);
+    });
+}
+
+/// Open `(identifier, url)` Linear links in the browser off the main thread.
+/// `note` is appended to the summary message.
+fn spawn_open_linear(
+    app: &mut App,
+    ch: &ActionChannels<'_>,
+    links: Vec<(String, String)>,
+    note: String,
+) {
+    app.begin_busy();
+    app.set_message("Opening Linear...");
+    let tx = ch.action_tx.clone();
+
+    thread::spawn(move || {
+        let mut failures = Vec::new();
+        for (identifier, url) in &links {
+            if let Err(e) = browser::open_url(url) {
+                failures.push(format!("{identifier}: {e}"));
+            }
+        }
+        let mut result = summarize_open_links("Linear issue", links.len(), &links[0].0, failures);
+        result.message.push_str(&note);
+        let _ = tx.send(result);
+    });
+}
+
+/// Merge the per-issue results of a confirmed action into one. A single
+/// result passes through untouched so one-issue actions keep their detailed
+/// message; several are reported as `summary`, or as the failure count plus
+/// the first failure.
+fn combine_results(results: Vec<ActionResult>, summary: String) -> ActionResult {
+    if results.len() == 1 {
+        return results.into_iter().next().unwrap_or_default();
+    }
+    let total = results.len();
+    let mut combined = ActionResult::default();
+    let mut failures = Vec::new();
+    for result in results {
+        if result.message_kind == MessageKind::Error {
+            failures.push(result.message);
+        }
+        combined.issues_to_delete.extend(result.issues_to_delete);
+        combined.issues_to_archive.extend(result.issues_to_archive);
+    }
+    match failures.first() {
+        None => combined.message = summary,
+        Some(first) => {
+            combined.message = format!("{} of {} failed; {}", failures.len(), total, first);
+            combined.message_kind = MessageKind::Error;
+        }
+    }
+    combined
+}
+
+/// Run `per_issue` for each confirmed issue, one after another on a
+/// background thread (teardown scripts and worktree removals for one repo
+/// shouldn't race), and report the combined result as e.g. "Deleted 3
+/// issues". Issues are looked up by ID now, since the board can change while
+/// the prompt is open. Clears the project's marks.
+fn run_confirmed(
+    app: &mut App,
+    action_tx: &mpsc::Sender<ActionResult>,
+    project_id: ProjectId,
+    issue_ids: &[String],
+    done: &'static str,
+    noun: &'static str,
+    per_issue: fn(&AppConfig, &ProjectId, &Issue) -> ActionResult,
+) {
+    let Some(project) = app.find_project_mut(&project_id) else {
+        app.set_warning("Project no longer available");
+        return;
+    };
+    project.clear_marks();
+    let issues: Vec<Issue> = issue_ids
+        .iter()
+        .filter_map(|id| project.issues.iter().find(|issue| issue.id == *id))
+        .cloned()
+        .collect();
+    let config = project.config.clone();
+    if issues.is_empty() {
+        if let [id] = issue_ids {
+            app.set_warning(format!("{} is no longer on the board", id));
+        } else {
+            app.set_warning("The marked issues are no longer on the board");
+        }
+        return;
+    }
+    for issue in &issues {
+        app.invalidate_inflight_launch(&issue.id);
+    }
+    app.begin_busy();
+    let tx = action_tx.clone();
+    thread::spawn(move || {
+        let results = issues
+            .iter()
+            .map(|issue| per_issue(&config, &project_id, issue))
+            .collect();
+        let summary = format!("{done} {}", count_of(issues.len(), noun));
+        let _ = tx.send(combine_results(results, summary));
+    });
+}
+
 /// Launch sessions for `issues` on one background thread, one after another,
 /// sending a result per issue. Running them in sequence matters: agents that
 /// detect their session id by diffing a global session list would otherwise
@@ -282,7 +440,7 @@ fn handle_normal(
     ch: &ActionChannels<'_>,
 ) -> PostAction {
     let q = app.search_query.clone();
-    if matches!(action, Action::OpenPR | Action::OpenReviewPR) {
+    if action == Action::OpenReviewPR {
         if let Some(issue) = app.context_project(ctx).selected_issue(&q).cloned() {
             if issue.github_stack.is_some() {
                 return open_stack(app, action, ctx, &issue, ch);
@@ -392,21 +550,39 @@ fn handle_normal(
         }
 
         Action::KillSession => {
-            let Some(issue) = app.context_project(ctx).selected_issue(&q) else {
-                return PostAction::None;
+            let project = app.context_project(ctx);
+            let targets = project.target_issues(&q);
+            let alive: Vec<&Issue> = targets
+                .iter()
+                .copied()
+                .filter(|issue| {
+                    project.is_session_alive(&issue.session_name(&project.config.project_name))
+                })
+                .collect();
+            let message = match alive.as_slice() {
+                [] if targets.len() > 1 => {
+                    app.set_warning("No marked issues have an active session");
+                    return PostAction::None;
+                }
+                [] => {
+                    app.set_warning("No active session to kill");
+                    return PostAction::None;
+                }
+                [issue] if targets.len() == 1 => format!(
+                    "Kill session '{}'? (y/n)",
+                    issue.session_name(&project.config.project_name)
+                ),
+                _ => format!(
+                    "Kill {}?{} (y/n)",
+                    count_of(alive.len(), "session"),
+                    skipped_note(targets.len() - alive.len(), "active session")
+                ),
             };
-
-            let session_name = issue.session_name(&app.context_project(ctx).config.project_name);
-            if !app.context_project(ctx).is_session_alive(&session_name) {
-                app.set_warning("No active session to kill");
-                return PostAction::None;
-            }
-
+            let issue_ids = alive.iter().map(|issue| issue.id.clone()).collect();
             app.start_confirm(
-                format!("Kill session '{}'? (y/n)", session_name),
+                message,
                 ConfirmAction::KillSession {
-                    session_name,
-                    issue_id: issue.id.clone(),
+                    issue_ids,
                     project_id: ctx.project_id.clone(),
                 },
             );
@@ -435,14 +611,18 @@ fn handle_normal(
         }
 
         Action::DeleteIssue => {
-            let Some(issue) = app.context_project(ctx).selected_issue(&q) else {
-                return PostAction::None;
+            let project = app.context_project(ctx);
+            let issues = project.target_issues(&q);
+            let message = match issues.as_slice() {
+                [] => return PostAction::None,
+                [issue] => format!("Delete {}: {}? (y/n)", issue.id, issue.title),
+                _ => format!("Delete {}? (y/n)", count_of(issues.len(), "issue")),
             };
-
+            let issue_ids = issues.iter().map(|issue| issue.id.clone()).collect();
             app.start_confirm(
-                format!("Delete {}: {}? (y/n)", issue.id, issue.title),
+                message,
                 ConfirmAction::DeleteIssue {
-                    issue_id: issue.id.clone(),
+                    issue_ids,
                     project_id: ctx.project_id.clone(),
                 },
             );
@@ -450,20 +630,28 @@ fn handle_normal(
         }
 
         Action::ArchiveIssue => {
-            let Some(issue) = app.context_project(ctx).selected_issue(&q) else {
-                return PostAction::None;
+            let project = app.context_project(ctx);
+            let issues = project.target_issues(&q);
+            let message = match issues.as_slice() {
+                [] => return PostAction::None,
+                [issue] => {
+                    let detail = if issue.worktree.is_some() {
+                        "kill session, run teardown, remove worktree"
+                    } else {
+                        "kill session, move to Done"
+                    };
+                    format!("Archive {}: {}? ({}) (y/n)", issue.id, issue.title, detail)
+                }
+                _ => format!(
+                    "Archive {}? (kill sessions, run teardown, remove worktrees) (y/n)",
+                    count_of(issues.len(), "issue")
+                ),
             };
-
-            let has_worktree = issue.worktree.is_some();
-            let detail = if has_worktree {
-                "kill session, run teardown, remove worktree"
-            } else {
-                "kill session, move to Done"
-            };
+            let issue_ids = issues.iter().map(|issue| issue.id.clone()).collect();
             app.start_confirm(
-                format!("Archive {}: {}? ({}) (y/n)", issue.id, issue.title, detail),
+                message,
                 ConfirmAction::ArchiveIssue {
-                    issue_id: issue.id.clone(),
+                    issue_ids,
                     project_id: ctx.project_id.clone(),
                 },
             );
@@ -571,7 +759,6 @@ fn handle_normal(
         Action::StartSession if !app.context_project(ctx).marked_issues.is_empty() => {
             start_marked_sessions(app, ctx, ch)
         }
-
         Action::OpenSession | Action::StartSession => {
             let open_popup = action == Action::OpenSession;
 
@@ -678,82 +865,60 @@ fn handle_normal(
         }
 
         Action::OpenPR => {
-            let Some(issue) = app.context_project(ctx).selected_issue(&q) else {
-                return PostAction::None;
-            };
-            let pr_numbers: Vec<u32> = if issue.github_pr_links.is_empty() {
-                let Some(pr) = app.context_project(ctx).pr_for(issue) else {
-                    app.set_warning("No PR found for this issue");
-                    return PostAction::None;
-                };
-                vec![pr.number]
-            } else {
-                issue.pr_numbers()
-            };
-            let main_worktree = app.context_project(ctx).config.project_root.join("main");
-
-            app.begin_busy();
-            app.set_message("Opening PR...");
-            let tx = ch.action_tx.clone();
-
-            thread::spawn(move || {
-                // pr_url resolves the repo identity via gh (cached after the
-                // first call), so it must run off the main thread.
-                let mut failures = Vec::new();
-                for num in &pr_numbers {
-                    let outcome = github::pr_url(&main_worktree, *num)
-                        .ok_or_else(|| {
-                            "could not determine GitHub repo (is gh installed and authenticated?)"
-                                .to_string()
-                        })
-                        .and_then(|url| browser::open_url(&url));
-                    if let Err(e) = outcome {
-                        failures.push(format!("#{num}: {e}"));
+            let project = app.context_project(ctx);
+            let issues = project.target_issues(&q);
+            let mut numbers: Vec<u32> = Vec::new();
+            let mut failures = Vec::new();
+            for issue in &issues {
+                match project.open_pr_numbers(issue) {
+                    Ok(found) => {
+                        for number in found {
+                            if !numbers.contains(&number) {
+                                numbers.push(number);
+                            }
+                        }
                     }
+                    Err(message) => failures.push(message),
                 }
-                let first_label = format!("#{}", pr_numbers[0]);
-                let _ = tx.send(summarize_open_links(
-                    "PR",
-                    pr_numbers.len(),
-                    &first_label,
-                    failures,
-                ));
-            });
+            }
+            if numbers.is_empty() {
+                match failures.as_slice() {
+                    [] => {}
+                    [message] => app.set_warning(*message),
+                    _ => app.set_warning("No PRs found for the marked issues"),
+                }
+                return PostAction::None;
+            }
+            let main_worktree = project.config.project_root.join("main");
+            let note = skipped_note(failures.len(), "PR");
+            spawn_open_prs(app, ch, main_worktree, numbers, note);
             PostAction::None
         }
 
         Action::OpenLinear => {
-            let Some(issue) = app.context_project(ctx).selected_issue(&q) else {
-                return PostAction::None;
-            };
-            if issue.linear_links.is_empty() {
-                app.set_warning("No Linear issue linked");
-                return PostAction::None;
-            }
-            let links: Vec<(String, String)> = issue
-                .linear_links
-                .iter()
-                .map(|link| (link.identifier.clone(), link.url.clone()))
-                .collect();
-
-            app.begin_busy();
-            app.set_message("Opening Linear...");
-            let tx = ch.action_tx.clone();
-
-            thread::spawn(move || {
-                let mut failures = Vec::new();
-                for (identifier, url) in &links {
-                    if let Err(e) = browser::open_url(url) {
-                        failures.push(format!("{identifier}: {e}"));
+            let project = app.context_project(ctx);
+            let issues = project.target_issues(&q);
+            let mut links: Vec<(String, String)> = Vec::new();
+            let mut skipped = 0;
+            for issue in &issues {
+                if issue.linear_links.is_empty() {
+                    skipped += 1;
+                }
+                for link in &issue.linear_links {
+                    if !links.iter().any(|(_, url)| *url == link.url) {
+                        links.push((link.identifier.clone(), link.url.clone()));
                     }
                 }
-                let _ = tx.send(summarize_open_links(
-                    "Linear issue",
-                    links.len(),
-                    &links[0].0,
-                    failures,
-                ));
-            });
+            }
+            if links.is_empty() {
+                match issues.len() {
+                    0 => {}
+                    1 => app.set_warning("No Linear issue linked"),
+                    _ => app.set_warning("No Linear issues linked to the marked issues"),
+                }
+                return PostAction::None;
+            }
+            spawn_open_linear(app, ch, links, skipped_note(skipped, "Linear link"));
             PostAction::None
         }
 
@@ -1491,48 +1656,34 @@ fn open_stack(
             return PostAction::None;
         }
     };
-    let review = action == Action::OpenReviewPR;
-    if review && !project.tuicr_available {
+    let cwd = project.config.project_root.join("main");
+    if action != Action::OpenReviewPR {
+        spawn_open_prs(app, ch, cwd, numbers, String::new());
+        return PostAction::None;
+    }
+    if !project.tuicr_available {
         app.set_warning("tuicr is not installed");
         return PostAction::None;
     }
     let session = issue.session_name(&project.config.project_name);
     let alive = project.is_session_alive(&session);
-    let cwd = project.config.project_root.join("main");
     let popup_title = issue.popup_title();
     let tx = ch.action_tx.clone();
     app.begin_busy();
-    app.set_message(if review {
-        "Opening stack review..."
-    } else {
-        "Opening stack PRs..."
-    });
+    app.set_message("Opening stack review...");
     thread::spawn(move || {
-        let result = if review {
-            match tuicr::open_stack(&session, &cwd, &numbers, alive) {
-                Ok(()) => ActionResult {
-                    message: format!("Reviewing {} PRs in stack order", numbers.len()),
-                    session_to_open: Some(session),
-                    popup_title: Some(popup_title),
-                    ..Default::default()
-                },
-                Err(error) => ActionResult {
-                    message: format!("Failed to open stack review: {error}"),
-                    message_kind: MessageKind::Error,
-                    ..Default::default()
-                },
-            }
-        } else {
-            let mut failures = Vec::new();
-            for number in &numbers {
-                let result = github::pr_url(&cwd, *number)
-                    .ok_or_else(|| "Could not resolve GitHub repository".to_string())
-                    .and_then(|url| browser::open_url(&url));
-                if let Err(error) = result {
-                    failures.push(format!("#{number}: {error}"));
-                }
-            }
-            summarize_open_links("PR", numbers.len(), &format!("#{}", numbers[0]), failures)
+        let result = match tuicr::open_stack(&session, &cwd, &numbers, alive) {
+            Ok(()) => ActionResult {
+                message: format!("Reviewing {} PRs in stack order", numbers.len()),
+                session_to_open: Some(session),
+                popup_title: Some(popup_title),
+                ..Default::default()
+            },
+            Err(error) => ActionResult {
+                message: format!("Failed to open stack review: {error}"),
+                message_kind: MessageKind::Error,
+                ..Default::default()
+            },
         };
         let _ = tx.send(result);
     });
@@ -1815,97 +1966,70 @@ fn handle_confirm(
             if let Some(confirm_action) = app.take_confirm_action() {
                 match confirm_action {
                     ConfirmAction::KillSession {
-                        session_name,
-                        issue_id,
+                        issue_ids,
                         project_id,
-                    } => {
-                        let Some(project) = app.find_project(&project_id) else {
-                            app.set_warning("Project no longer available");
-                            return;
-                        };
-                        let project_root = project.config.project_root.clone();
-                        app.invalidate_inflight_launch(&issue_id);
-                        app.begin_busy();
-                        let tx = action_tx.clone();
-
-                        thread::spawn(move || {
-                            let _ = tx.send(terminate_to_result(
-                                &project_root,
+                    } => run_confirmed(
+                        app,
+                        action_tx,
+                        project_id,
+                        &issue_ids,
+                        "Killed",
+                        "session",
+                        |config, _, issue| {
+                            let session_name = issue.session_name(&config.project_name);
+                            terminate_to_result(
+                                &config.project_root,
                                 &session_name,
                                 format!("Session '{}' killed", session_name),
                                 format!("Session '{}' was already stopped", session_name),
-                            ));
-                        });
-                    }
+                            )
+                        },
+                    ),
                     ConfirmAction::DeleteIssue {
-                        issue_id,
+                        issue_ids,
                         project_id,
-                    } => {
-                        let Some(p) = app.find_project(&project_id) else {
-                            app.set_warning("Project no longer available");
-                            return;
-                        };
-                        // Resolve by ID at confirm time: indices can shift while
-                        // the prompt is open (PR sync, external state merges).
-                        let Some(issue_index) = p.issues.iter().position(|i| i.id == issue_id)
-                        else {
-                            app.set_warning(format!("{} is no longer on the board", issue_id));
-                            return;
-                        };
-                        let issue = &p.issues[issue_index];
-                        let session_name = issue.session_name(&p.config.project_name);
-                        let id = issue.id.clone();
-                        let project_root = p.config.project_root.clone();
-
-                        app.invalidate_inflight_launch(&issue_id);
-                        app.begin_busy();
-                        let tx = action_tx.clone();
-                        thread::spawn(move || {
+                    } => run_confirmed(
+                        app,
+                        action_tx,
+                        project_id,
+                        &issue_ids,
+                        "Deleted",
+                        "issue",
+                        |config, project_id, issue| {
                             let mut result = terminate_to_result(
-                                &project_root,
-                                &session_name,
-                                format!("Deleted {} and killed session", id),
-                                format!("Deleted {}", id),
+                                &config.project_root,
+                                &issue.session_name(&config.project_name),
+                                format!("Deleted {} and killed session", issue.id),
+                                format!("Deleted {}", issue.id),
                             );
                             if result.message_kind != MessageKind::Error {
-                                result.issue_to_delete = Some((project_id, id));
+                                result
+                                    .issues_to_delete
+                                    .push((project_id.clone(), issue.id.clone()));
                             }
-                            let _ = tx.send(result);
-                        });
-                    }
+                            result
+                        },
+                    ),
                     ConfirmAction::ArchiveIssue {
-                        issue_id,
+                        issue_ids,
                         project_id,
-                    } => {
-                        let Some(p) = app.find_project(&project_id) else {
-                            app.set_warning("Project no longer available");
-                            return;
-                        };
-                        // Resolve by ID at confirm time: indices can shift while
-                        // the prompt is open (PR sync, external state merges).
-                        let Some(idx) = p.issues.iter().position(|i| i.id == issue_id) else {
-                            app.set_warning(format!("{} is no longer on the board", issue_id));
-                            return;
-                        };
-                        let issue = &p.issues[idx];
-                        let id = issue.id.clone();
-                        let session_name = issue.session_name(&p.config.project_name);
-                        let worktree = issue.worktree.clone();
-                        let config = p.config.clone();
-
-                        app.invalidate_inflight_launch(&issue_id);
-                        app.begin_busy();
-                        let tx = action_tx.clone();
-                        thread::spawn(move || {
-                            let _ = tx.send(archive_to_result(
-                                &config,
-                                project_id,
-                                id,
-                                &session_name,
-                                worktree.as_deref(),
-                            ));
-                        });
-                    }
+                    } => run_confirmed(
+                        app,
+                        action_tx,
+                        project_id,
+                        &issue_ids,
+                        "Archived",
+                        "issue",
+                        |config, project_id, issue| {
+                            archive_to_result(
+                                config,
+                                project_id.clone(),
+                                issue.id.clone(),
+                                &issue.session_name(&config.project_name),
+                                issue.worktree.as_deref(),
+                            )
+                        },
+                    ),
                 }
             }
         }
@@ -1919,7 +2043,7 @@ fn handle_confirm(
 /// Run the off-thread half of a TUI archive: kill the agent session, run the
 /// teardown script, and remove the worktree (never forced, matching the CLI's
 /// default — a failing teardown or dirty worktree aborts and reports an
-/// error). On success it sets `issue_to_archive` so the main thread applies
+/// error). On success it sets `issues_to_archive` so the main thread applies
 /// the move-to-Done and worktree drop against the live in-memory board,
 /// instead of writing state.json directly and racing concurrent merges.
 fn archive_to_result(
@@ -1958,7 +2082,7 @@ fn archive_to_result(
     };
     ActionResult {
         message,
-        issue_to_archive: Some((project_id, issue_id)),
+        issues_to_archive: vec![(project_id, issue_id)],
         ..Default::default()
     }
 }
@@ -3650,7 +3774,7 @@ mod tests {
         act(&mut app, Action::ArchiveIssue);
         assert_eq!(app.input_mode, InputMode::Confirm);
         match app.pending_confirm.as_ref().unwrap() {
-            ConfirmAction::ArchiveIssue { issue_id, .. } => assert_eq!(issue_id, "bork-1"),
+            ConfirmAction::ArchiveIssue { issue_ids, .. } => assert_eq!(issue_ids, &["bork-1"]),
             _ => panic!("expected ArchiveIssue"),
         }
     }

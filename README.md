@@ -255,12 +255,12 @@ bork update --check   # force a fresh check without pulling
 | `Enter` | Open session (resume or launch if none, attach if running) |
 | `Ctrl+P` | Toggle project sidebar |
 | `P` | Force-sync PR statuses from GitHub |
-| `o` | Open PR in browser (if issue has a matching PR) |
+| `o` | Open PR in browser (if issue has a matching PR, or all marked issues' PRs) |
 | `t` | Open project-root terminal in tmux |
 | `/` | Search / filter board |
 | `?` | Show keybinding help overlay |
 | `I` | Import issue from Linear |
-| `O` | Open linked Linear issue in browser |
+| `O` | Open linked Linear issue in browser (or all marked issues' Linear issues) |
 | `q` / `Ctrl+c` | Quit |
 
 ### Issue Management
@@ -270,6 +270,7 @@ bork update --check   # force a fresh check without pulling
 | `n` | Create new issue |
 | `e` | Edit selected issue |
 | `d` | Delete issue (with confirmation) |
+| `A` | Archive issue: kill session, run teardown, remove worktree, move to Done (with confirmation) |
 | `x` | Kill session (with confirmation) |
 | `a` | Add issue in current column |
 | `H` | Move issue to previous column |
@@ -277,6 +278,10 @@ bork update --check   # force a fresh check without pulling
 | `D` | Move issue directly to Done |
 | `T` | Move issue directly to To Do |
 | `W` | Reassign worktree |
+| `Space` | Mark / unmark issue |
+| `m` | Mark linked group |
+
+With issues marked, `H`, `L`, `D`, `T`, `Shift+Enter`, `o`, `O`, `x`, `d` and `A` act on all marked issues instead of the one under the cursor. `x`, `d` and `A` ask once for the whole batch. `Esc` clears the marks.
 
 ### Dialog Mode
 

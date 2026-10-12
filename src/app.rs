@@ -592,6 +592,18 @@ impl Project {
             .collect()
     }
 
+    /// Issues an action applies to: every marked issue, or else the one under
+    /// the cursor.
+    pub(crate) fn target_issues(&self, query: &str) -> Vec<&Issue> {
+        if self.marked_issues.is_empty() {
+            return self.selected_issue(query).into_iter().collect();
+        }
+        self.marked_issue_indices()
+            .into_iter()
+            .map(|idx| &self.issues[idx])
+            .collect()
+    }
+
     pub fn move_issue_right(&mut self, query: &str) -> usize {
         if !self.marked_issues.is_empty() {
             return self.move_marked(query, |column| column.next());
@@ -889,6 +901,20 @@ impl Project {
         }
 
         None
+    }
+
+    /// PR numbers `o` opens for `issue`: the open PRs of its stack, its linked
+    /// PRs, or the PR detected for its branch.
+    pub fn open_pr_numbers(&self, issue: &Issue) -> Result<Vec<u32>, &'static str> {
+        if issue.github_stack.is_some() {
+            return self.stack_open_numbers(issue);
+        }
+        if !issue.github_pr_links.is_empty() {
+            return Ok(issue.pr_numbers());
+        }
+        self.pr_for(issue)
+            .map(|pr| vec![pr.number])
+            .ok_or("No PR found for this issue")
     }
 
     pub fn pr_for(&self, issue: &Issue) -> Option<&PrStatus> {
@@ -1598,21 +1624,22 @@ impl PruneDialogState {
 
 #[derive(Debug, Clone)]
 pub enum ConfirmAction {
+    /// Each action holds every issue it applies to: the one under the cursor,
+    /// or all marked issues.
     KillSession {
-        session_name: String,
-        issue_id: String,
+        issue_ids: Vec<String>,
         project_id: ProjectId,
     },
     DeleteIssue {
         /// Stored by ID, not index: background workers can reorder/remove
         /// issues while the confirm prompt is open.
-        issue_id: String,
+        issue_ids: Vec<String>,
         project_id: ProjectId,
     },
     /// Kill the session, run teardown, remove the worktree, then move the
     /// issue to Done. Stored by ID for the same reason as `DeleteIssue`.
     ArchiveIssue {
-        issue_id: String,
+        issue_ids: Vec<String>,
         project_id: ProjectId,
     },
 }
