@@ -67,6 +67,7 @@ const SECTIONS: &[Section] = &[
         bindings: &[
             ("Space", "Mark / unmark issue"),
             ("m", "Mark linked group"),
+            ("x d A o O", "Run on all marked"),
             ("H / L", "Move left / right"),
             ("K / J", "Move up / down"),
             ("D", "Move to Done"),

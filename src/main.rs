@@ -2358,11 +2358,11 @@ fn run_tui() -> anyhow::Result<()> {
                 }
             }
 
-            if let Some((project_id, issue_id)) = result.issue_to_delete {
+            for (project_id, issue_id) in result.issues_to_delete {
                 handler::delete_issue_from_app(&mut app, &project_id, &issue_id);
             }
 
-            if let Some((project_id, issue_id)) = result.issue_to_archive {
+            for (project_id, issue_id) in result.issues_to_archive {
                 handler::archive_issue_in_app(&mut app, &project_id, &issue_id);
             }
 
