@@ -13,6 +13,7 @@ use crate::input::Action;
 use crate::types::{
     AgentKind, Column, Issue, IssueDraft, IssueKind, LinkedGithubPr, LinkedLinear, PrImportSource,
 };
+use crate::undo::{self, Change, ColumnSnapshot, UndoEntry, UNDO_WINDOW};
 
 pub struct ActionChannels<'a> {
     pub action_tx: &'a mpsc::Sender<ActionResult>,
@@ -165,8 +166,8 @@ fn report_mark(app: &mut App, count: Option<usize>) {
     }
 }
 
-/// Run a column-move on the active project and, when issues were marked, report
-/// how many moved. `suffix` is appended to the bulk message (e.g. " to done").
+/// Run a column-move on the active project, record it for undo and report what
+/// moved. `suffix` is appended to the bulk message (e.g. " to done").
 fn bulk_move(
     app: &mut App,
     ctx: &ActionContext,
@@ -176,11 +177,59 @@ fn bulk_move(
 ) {
     let p = app.context_project_mut(ctx);
     let was_bulk = !p.marked_issues.is_empty();
+    let before = ColumnSnapshot::take(&p.issues);
     let moved = move_fn(p, query);
     p.mark_dirty();
-    if was_bulk {
-        app.set_message(format!("Moved {} marked issues{}", moved, suffix));
+    let changes = before.changes_since(&p.issues);
+    let project_id = p.id();
+
+    let label = if was_bulk {
+        format!("Moved {}{}", count_of(moved, "marked issue"), suffix)
+    } else if let [Change::Column { issue_id, to, .. }] = changes.as_slice() {
+        format!("Moved {} to {}", issue_id, to)
+    } else {
+        return;
+    };
+    let undo_message = format!("{} · u to undo", label);
+    if undo::record(
+        &mut app.undo,
+        UndoEntry::new(project_id, label.as_str(), changes),
+    ) {
+        app.show_message_for(undo_message, MessageKind::Info, UNDO_WINDOW);
+    } else {
+        app.set_message(label);
     }
+}
+
+/// Revert the last recorded action if it's still inside the undo window.
+fn undo_last(app: &mut App) {
+    let live = app
+        .undo
+        .take()
+        .filter(|entry| entry.is_live(std::time::Instant::now()));
+    let Some(entry) = live else {
+        app.set_warning("Nothing to undo");
+        return;
+    };
+    let query = app.search_query.clone();
+    let Some(project) = app.find_project_mut(&entry.project_id) else {
+        app.set_warning("Nothing to undo");
+        return;
+    };
+    let reverted = entry.revert(project);
+    if reverted == 0 {
+        app.set_warning("Couldn't undo, the issues changed since");
+        return;
+    }
+    project.clamp_all_rows(&query);
+    project.mark_dirty();
+
+    let mut message = format!("Undone: {}", entry.label);
+    let skipped = entry.changes.len() - reverted;
+    if skipped > 0 {
+        message.push_str(&format!(" ({} skipped, changed since)", skipped));
+    }
+    app.set_message(message);
 }
 
 /// Start a session for every marked agentic issue in the context project,
@@ -536,6 +585,11 @@ fn handle_normal(
         }
         Action::MoveToTodo => {
             bulk_move(app, ctx, &q, " to todo", Project::move_to_todo);
+            PostAction::None
+        }
+
+        Action::Undo => {
+            undo_last(app);
             PostAction::None
         }
 
@@ -3759,6 +3813,92 @@ mod tests {
         act(&mut app, Action::MoveToTodo);
         assert_eq!(app.project().issues[2].column, Column::Todo);
         assert!(app.project().state_dirty);
+    }
+
+    #[test]
+    fn undo_reverts_last_move() {
+        let mut app = app_with_issues();
+        act(&mut app, Action::MoveIssueRight);
+        assert_eq!(app.project().issues[0].column, Column::InProgress);
+        assert!(app.message.as_ref().unwrap().0.contains("u to undo"));
+
+        app.project_mut().state_dirty = false;
+        act(&mut app, Action::Undo);
+        assert_eq!(app.project().issues[0].column, Column::Todo);
+        assert!(app.project().state_dirty);
+        assert!(app.undo.is_none());
+    }
+
+    #[test]
+    fn undo_restores_original_done_at() {
+        let mut app = app_with_issues();
+        app.project_mut().issues[0].column = Column::Done;
+        app.project_mut().issues[0].done_at = Some(1700000000);
+        app.project_mut().selected_column = Column::Done.index();
+
+        act(&mut app, Action::MoveToTodo);
+        assert_eq!(app.project().issues[0].done_at, None);
+        act(&mut app, Action::Undo);
+        assert_eq!(app.project().issues[0].column, Column::Done);
+        assert_eq!(app.project().issues[0].done_at, Some(1700000000));
+    }
+
+    #[test]
+    fn undo_after_repeated_moves_returns_to_start() {
+        let mut app = app_with_issues();
+        act(&mut app, Action::MoveToDone);
+        app.project_mut().selected_column = Column::Done.index();
+        act(&mut app, Action::MoveIssueLeft);
+        assert_eq!(app.project().issues[0].column, Column::CodeReview);
+
+        act(&mut app, Action::Undo);
+        assert_eq!(app.project().issues[0].column, Column::Todo);
+    }
+
+    #[test]
+    fn undo_reverts_bulk_move_in_one_step() {
+        let mut app = app_with_issues();
+        app.project_mut().marked_issues.insert("bork-1".to_string());
+        app.project_mut().marked_issues.insert("bork-3".to_string());
+        act(&mut app, Action::MoveToDone);
+        assert_eq!(app.project().issues[0].column, Column::Done);
+        assert_eq!(app.project().issues[2].column, Column::Done);
+
+        act(&mut app, Action::Undo);
+        assert_eq!(app.project().issues[0].column, Column::Todo);
+        assert_eq!(app.project().issues[2].column, Column::InProgress);
+    }
+
+    #[test]
+    fn undo_skips_issues_changed_since() {
+        let mut app = app_with_issues();
+        app.project_mut().marked_issues.insert("bork-1".to_string());
+        app.project_mut().marked_issues.insert("bork-2".to_string());
+        act(&mut app, Action::MoveToDone);
+        app.project_mut().issues[1].column = Column::CodeReview;
+
+        act(&mut app, Action::Undo);
+        assert_eq!(app.project().issues[0].column, Column::Todo);
+        assert_eq!(app.project().issues[1].column, Column::CodeReview);
+        assert!(app.message.as_ref().unwrap().0.contains("1 skipped"));
+    }
+
+    #[test]
+    fn undo_does_nothing_after_window() {
+        let mut app = app_with_issues();
+        act(&mut app, Action::MoveIssueRight);
+        app.undo.as_mut().unwrap().created_at -= crate::undo::UNDO_WINDOW;
+
+        act(&mut app, Action::Undo);
+        assert_eq!(app.project().issues[0].column, Column::InProgress);
+        assert_eq!(app.message.as_ref().unwrap().1, MessageKind::Warning);
+    }
+
+    #[test]
+    fn undo_with_nothing_recorded_warns() {
+        let mut app = app_with_issues();
+        act(&mut app, Action::Undo);
+        assert_eq!(app.message.as_ref().unwrap().0, "Nothing to undo");
     }
 
     // ================================================================

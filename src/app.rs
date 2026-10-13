@@ -9,6 +9,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// actions don't appear as a single-frame flash.
 const BUSY_MIN_VISIBLE: Duration = Duration::from_millis(250);
 
+/// How long a status-bar message stays up by default.
+const MESSAGE_TTL: Duration = Duration::from_secs(3);
+
 /// Maximum Done-TTL auto-kill attempts per session before giving up. A tmux
 /// session that refuses to die is re-reported by the poller every ~2s; without
 /// this cap the cleanup loop would spawn a kill thread indefinitely.
@@ -22,6 +25,7 @@ use crate::types::{
     AgentKind, AgentStatus, AgentStatusInfo, Column, GithubStack, Issue, IssueKind, LinkedGithubPr,
     PrImportBaseline, PrImportSource, PrState, PrStatus, WorktreeStatus,
 };
+use crate::undo::UndoEntry;
 
 pub type ProjectId = PathBuf;
 
@@ -689,6 +693,31 @@ impl Project {
         let (a, b) = (items[row].0, items[target_row].0);
         self.issues.swap(a, b);
         self.selected_row[self.selected_column] = target_row;
+    }
+
+    /// Move an issue back to `from` and restore its `done_at`, but only if it
+    /// is still in `expected` (the column a previous move left it in).
+    /// Returns false when the issue is gone or has moved since.
+    pub(crate) fn restore_column(
+        &mut self,
+        issue_id: &str,
+        expected: Column,
+        from: Column,
+        done_at: Option<u64>,
+    ) -> bool {
+        let Some(idx) = self
+            .issues
+            .iter()
+            .position(|issue| issue.id.eq_ignore_ascii_case(issue_id))
+        else {
+            return false;
+        };
+        if self.issues[idx].column != expected {
+            return false;
+        }
+        self.move_issue_to_column(idx, from);
+        self.issues[idx].done_at = done_at;
+        true
     }
 
     fn move_issue_to_column(&mut self, idx: usize, target: Column) {
@@ -1787,6 +1816,9 @@ pub struct App {
     pub should_quit: bool,
     pub message: Option<(String, MessageKind)>,
     pub message_set_at: Option<Instant>,
+    pub message_ttl: Duration,
+    /// The last undoable action, cleared once undone.
+    pub undo: Option<UndoEntry>,
     pub busy_count: usize,
     /// When the spinner first became visible. Used to hold it on screen for
     /// at least `BUSY_MIN_VISIBLE` after `busy_count` drops back to zero so
@@ -1828,6 +1860,8 @@ impl App {
             should_quit: false,
             message: None,
             message_set_at: None,
+            message_ttl: MESSAGE_TTL,
+            undo: None,
             busy_count: 0,
             busy_visible_since: None,
             spinner_tick: 0,
@@ -2015,8 +2049,13 @@ impl App {
     }
 
     pub fn show_message(&mut self, msg: impl Into<String>, kind: MessageKind) {
+        self.show_message_for(msg, kind, MESSAGE_TTL);
+    }
+
+    pub fn show_message_for(&mut self, msg: impl Into<String>, kind: MessageKind, ttl: Duration) {
         self.message = Some((msg.into(), kind));
         self.message_set_at = Some(Instant::now());
+        self.message_ttl = ttl;
     }
 
     pub fn set_message(&mut self, msg: impl Into<String>) {
@@ -2033,7 +2072,7 @@ impl App {
 
     pub fn clear_expired_message(&mut self) -> bool {
         if let Some(set_at) = self.message_set_at {
-            if set_at.elapsed().as_secs() >= 3 {
+            if set_at.elapsed() >= self.message_ttl {
                 self.message = None;
                 self.message_set_at = None;
                 return true;

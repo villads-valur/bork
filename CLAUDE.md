@@ -54,6 +54,7 @@ src/
 ├── agent_config.rs   # Agent preferences from layered config + PATH detection
 ├── toml_lite.rs      # Shared minimal TOML reader for config files
 ├── handler.rs        # Action dispatch, state mutations, dialog submit/confirm
+├── undo.rs           # Single-slot undo (UndoEntry + per-field Change variants, 10s window)
 ├── config.rs         # Config/state persistence (atomic writes)
 ├── global_config.rs  # Global project registry (~/.config/bork/projects.json)
 ├── types.rs          # Domain types (Issue, Column, AgentKind, IssueKind, PrStatus, etc.)

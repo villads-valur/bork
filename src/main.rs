@@ -17,6 +17,7 @@ mod stack;
 mod toml_lite;
 mod types;
 mod ui;
+mod undo;
 mod update;
 mod worktree;
 

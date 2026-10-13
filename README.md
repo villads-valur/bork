@@ -277,6 +277,7 @@ bork update --check   # force a fresh check without pulling
 | `L` | Move issue to next column |
 | `D` | Move issue directly to Done |
 | `T` | Move issue directly to To Do |
+| `u` | Undo the last move (within 10 seconds) |
 | `W` | Reassign worktree |
 | `Space` | Mark / unmark issue |
 | `m` | Mark linked group |
