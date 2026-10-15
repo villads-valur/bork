@@ -25,7 +25,7 @@ pub fn ensure_bork_session(project_name: &str) -> Result<EnsureResult, AppError>
     }
 
     // Verify tmux is installed
-    Command::new("tmux")
+    tmux()
         .arg("-V")
         .output()
         .map_err(|_| AppError::Tmux("tmux is not installed".to_string()))?;
@@ -42,7 +42,7 @@ pub fn ensure_bork_session(project_name: &str) -> Result<EnsureResult, AppError>
         let exe = std::env::current_exe()
             .map_err(|e| AppError::Tmux(format!("could not determine executable path: {e}")))?;
 
-        let status = Command::new("tmux")
+        let status = tmux()
             .args([
                 "new-session",
                 "-d",
@@ -74,7 +74,7 @@ pub fn ensure_bork_session(project_name: &str) -> Result<EnsureResult, AppError>
         configure_extended_keys(session_name);
 
         // Bind Ctrl+q to detach (scoped to this tmux server, not the user's outer tmux)
-        let _ = Command::new("tmux")
+        let _ = tmux()
             .args(["bind-key", "-n", "C-q", "detach-client"])
             .stderr(Stdio::null())
             .status();
@@ -90,7 +90,7 @@ pub fn ensure_bork_session(project_name: &str) -> Result<EnsureResult, AppError>
     }
 
     // Attach to the session (blocks until user detaches)
-    let status = Command::new("tmux")
+    let status = tmux()
         .args(["attach", "-t", session_name])
         .status()
         .map_err(|e| {
@@ -103,7 +103,7 @@ pub fn ensure_bork_session(project_name: &str) -> Result<EnsureResult, AppError>
 }
 
 pub fn session_exists(name: &str) -> bool {
-    Command::new("tmux")
+    tmux()
         .args(["has-session", "-t", name])
         .output()
         .map(|o| o.status.success())
@@ -115,7 +115,7 @@ pub fn session_exists(name: &str) -> bool {
 /// process inside it (bork) is dead. tmux marks this with `pane_dead`.
 pub fn is_pane_alive(session: &str) -> bool {
     let target = format!("{session}:0.0");
-    let output = Command::new("tmux")
+    let output = tmux()
         .args(["display-message", "-t", &target, "-p", "#{pane_dead}"])
         .output();
 
@@ -131,7 +131,7 @@ pub fn is_pane_alive(session: &str) -> bool {
 
 /// List all tmux session names. Used by the background status worker.
 pub fn list_sessions() -> HashSet<String> {
-    let output = Command::new("tmux")
+    let output = tmux()
         .args(["list-sessions", "-F", "#{session_name}"])
         .output();
 
@@ -145,7 +145,7 @@ pub fn list_sessions() -> HashSet<String> {
 }
 
 pub fn create_session(name: &str, cwd: &Path) -> Result<(), AppError> {
-    let status = Command::new("tmux")
+    let status = tmux()
         .args([
             "new-session",
             "-d",
@@ -179,7 +179,7 @@ pub fn create_session(name: &str, cwd: &Path) -> Result<(), AppError> {
 /// Best-effort `tmux set-option`; failures are ignored (styling/key options are
 /// non-critical and unsupported values are silently ignored on older tmux).
 fn set_option(session_name: &str, option: &str, value: &str) {
-    let _ = Command::new("tmux")
+    let _ = tmux()
         .args(["set-option", "-t", session_name, option, value])
         .stderr(Stdio::null())
         .status();
@@ -200,10 +200,7 @@ fn configure_extended_keys(session_name: &str) {
 /// which also sweeps processes the agent leaked — calling this directly for
 /// an issue session reintroduces orphan leaks.
 pub fn kill_session(name: &str) -> Result<bool, AppError> {
-    let output = match Command::new("tmux")
-        .args(["kill-session", "-t", name])
-        .output()
-    {
+    let output = match tmux().args(["kill-session", "-t", name]).output() {
         Ok(output) => output,
         // No tmux binary means no session to kill; same outcome as a missing
         // session, and CLI subcommands must keep working without tmux.
@@ -234,7 +231,7 @@ pub fn kill_session(name: &str) -> Result<bool, AppError> {
 /// empty set so termination remains idempotent.
 #[cfg_attr(test, allow(dead_code))]
 pub fn pane_pids(name: &str) -> Result<Vec<i32>, AppError> {
-    let output = match Command::new("tmux")
+    let output = match tmux()
         .args(["list-panes", "-s", "-t", name, "-F", "#{pane_pid}"])
         .output()
     {
@@ -281,7 +278,7 @@ fn is_missing_session_error(stderr: &str) -> bool {
 }
 
 pub fn send_keys(session: &str, keys: &str) -> Result<(), AppError> {
-    let status = Command::new("tmux")
+    let status = tmux()
         .args(["send-keys", "-t", session, keys, "Enter"])
         .stderr(Stdio::null())
         .status()
@@ -301,7 +298,7 @@ pub fn create_command_window(
     cwd: &Path,
     command: &str,
 ) -> Result<(), AppError> {
-    let status = Command::new("tmux")
+    let status = tmux()
         .args([
             "new-window",
             "-t",
@@ -324,7 +321,7 @@ pub fn create_command_window(
 }
 
 pub fn create_window(session: &str, window_name: &str, cwd: &Path) -> Result<(), AppError> {
-    let status = Command::new("tmux")
+    let status = tmux()
         .args([
             "new-window",
             "-d",
@@ -353,7 +350,7 @@ pub fn create_window(session: &str, window_name: &str, cwd: &Path) -> Result<(),
 }
 
 pub fn select_window(session: &str, window_name: &str) -> Result<(), AppError> {
-    let status = Command::new("tmux")
+    let status = tmux()
         .args(["select-window", "-t", &format!("{session}:{window_name}")])
         .stderr(Stdio::null())
         .status()
@@ -377,7 +374,7 @@ pub fn select_window(session: &str, window_name: &str) -> Result<(), AppError> {
 pub fn open_popup(session: &str, title: &str) -> Result<(), AppError> {
     if !is_inside_tmux() {
         // Fallback: just attach directly
-        let _ = Command::new("tmux")
+        let _ = tmux()
             .args(["attach", "-t", session])
             .stderr(Stdio::null())
             .status();
@@ -387,7 +384,7 @@ pub fn open_popup(session: &str, title: &str) -> Result<(), AppError> {
     let attach_cmd = format!("tmux attach -t {}", shell_escape(session));
     let popup_title = format!(" {} ", title);
 
-    let status = Command::new("tmux")
+    let status = tmux()
         .args([
             "display-popup",
             "-E",
@@ -415,6 +412,39 @@ pub fn open_popup(session: &str, title: &str) -> Result<(), AppError> {
 fn shell_escape(s: &str) -> String {
     // Simple escaping: wrap in single quotes, escape any internal single quotes
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+#[cfg(not(test))]
+fn tmux() -> Command {
+    Command::new("tmux")
+}
+
+// Tests run against a private tmux server so they never touch the
+// developer's real sessions. An explicit -L also overrides $TMUX.
+#[cfg(test)]
+fn tmux() -> Command {
+    let mut command = Command::new("tmux");
+    command.args(["-L", "bork-test", "-f", "/dev/null"]);
+    command
+}
+
+#[cfg(test)]
+pub(super) fn tmux_available() -> bool {
+    tmux().arg("-V").output().is_ok_and(|o| o.status.success())
+}
+
+#[cfg(test)]
+pub(super) fn active_window_name(session: &str) -> Option<String> {
+    let output = tmux()
+        .args(["display-message", "-p", "-t", session, "#{window_name}"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 #[cfg(test)]

@@ -104,4 +104,24 @@ mod tests {
         assert_eq!(run_stack("q\n", false), "pr 18\n");
         assert_eq!(run_stack("\n\n", true), "pr 18\n");
     }
+
+    #[test]
+    fn opening_a_review_in_an_existing_session_focuses_tuicr() {
+        if !tmux::tmux_available() {
+            eprintln!("skipping: tmux is not installed");
+            return;
+        }
+
+        let session = format!("bork-tuicr-focus-{}", std::process::id());
+        let cwd = std::env::temp_dir();
+        tmux::create_session(&session, &cwd).unwrap();
+        tmux::create_window(&session, "terminal", &cwd).unwrap();
+
+        let opened = open_in_session(&session, &cwd, false);
+        let active = tmux::active_window_name(&session);
+        let _ = tmux::kill_session(&session);
+
+        opened.unwrap();
+        assert_eq!(active.as_deref(), Some("tuicr"));
+    }
 }
