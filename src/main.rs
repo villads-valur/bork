@@ -20,9 +20,10 @@ mod ui;
 mod update;
 mod worktree;
 
-/// Serializes tests that mutate or write through the process-global
+/// Serializes tests that point the process-global
+/// config dir somewhere, either through `with_test_config_home` or by setting
 /// `XDG_CONFIG_HOME`. One lock per module would not exclude the other
-/// module's tests, so the env races and the assertions flake.
+/// module's tests, so the assertions would flake.
 #[cfg(test)]
 pub(crate) static XDG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

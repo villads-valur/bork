@@ -22,25 +22,47 @@ pub fn global_config_dir() -> PathBuf {
     dirs_path().join("bork")
 }
 
+#[cfg(not(test))]
 fn dirs_path() -> PathBuf {
     if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
         return PathBuf::from(dir);
     }
-    // Tests toggle XDG_CONFIG_HOME process-wide (see XDG_ENV_LOCK), so a
-    // concurrent test thread can read the variable in the window where it is
-    // unset. Falling through to the real ~/.config there would let a test
-    // overwrite the developer's own project registry.
-    #[cfg(test)]
-    return std::env::temp_dir().join(format!("bork-test-config-{}", std::process::id()));
-    #[cfg(not(test))]
-    {
-        if let Some(home) = home_dir() {
-            return home.join(".config");
-        }
-        // Fallback: $HOME and $XDG_CONFIG_HOME both unset (broken environment).
-        // Creates config relative to cwd, which is non-ideal but avoids a hard error.
-        PathBuf::from(".config")
+    if let Some(home) = home_dir() {
+        return home.join(".config");
     }
+    // Fallback: $HOME and $XDG_CONFIG_HOME both unset (broken environment).
+    // Creates config relative to cwd, which is non-ideal but avoids a hard error.
+    PathBuf::from(".config")
+}
+
+// Tests never read XDG_CONFIG_HOME or HOME: a developer's exported value
+// would point tests at their real project registry. Tests that need a
+// specific directory set it through with_test_config_home.
+#[cfg(test)]
+fn dirs_path() -> PathBuf {
+    TEST_CONFIG_HOME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("bork-test-config-{}", std::process::id()))
+        })
+}
+
+#[cfg(test)]
+static TEST_CONFIG_HOME: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Runs `test` with the global config dir rooted at `dir`. Holds
+/// XDG_ENV_LOCK so tests that share the override never overlap.
+#[cfg(test)]
+pub(crate) fn with_test_config_home(dir: &Path, test: impl FnOnce()) {
+    let _guard = crate::XDG_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    *TEST_CONFIG_HOME.lock().unwrap_or_else(|e| e.into_inner()) = Some(dir.to_path_buf());
+    test();
+    *TEST_CONFIG_HOME.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 #[cfg(not(test))]
@@ -227,25 +249,13 @@ pub(crate) mod tests {
     use super::*;
 
     pub(crate) fn with_temp_config(name: &str, test: impl FnOnce()) {
-        let _guard = crate::XDG_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
         let dir =
             std::env::temp_dir().join(format!("bork-test-global-{}-{}", name, std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
-        let old = std::env::var("XDG_CONFIG_HOME").ok();
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+        with_test_config_home(&dir, test);
 
-        test();
-
-        if let Some(v) = old {
-            unsafe { std::env::set_var("XDG_CONFIG_HOME", v) };
-        } else {
-            unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
-        }
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -259,6 +269,29 @@ pub(crate) mod tests {
         fs::create_dir_all(dir.join(".bork")).unwrap();
         fs::write(dir.join(".bork/config.toml"), "project_name = \"t\"\n").unwrap();
         dir
+    }
+
+    #[test]
+    fn inherited_xdg_config_home_never_reaches_tests() {
+        let _guard = crate::XDG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let inherited =
+            std::env::temp_dir().join(format!("bork-test-inherited-xdg-{}", std::process::id()));
+        let old = std::env::var("XDG_CONFIG_HOME").ok();
+
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &inherited) };
+        let with_xdg = global_config_dir();
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        let without_xdg = global_config_dir();
+
+        if let Some(v) = old {
+            unsafe { std::env::set_var("XDG_CONFIG_HOME", v) };
+        }
+
+        assert!(!with_xdg.starts_with(&inherited), "{with_xdg:?}");
+        assert_eq!(with_xdg, without_xdg);
     }
 
     #[test]

@@ -194,19 +194,9 @@ mod tests {
     use super::*;
 
     fn with_isolated_config(tmp: &Path, test: impl FnOnce()) {
-        let _guard = crate::XDG_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let config_dir = tmp.join("xdg-config");
         let _ = fs::create_dir_all(&config_dir);
-        let old = std::env::var("XDG_CONFIG_HOME").ok();
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", &config_dir) };
-        test();
-        if let Some(v) = old {
-            unsafe { std::env::set_var("XDG_CONFIG_HOME", v) };
-        } else {
-            unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
-        }
+        crate::global_config::with_test_config_home(&config_dir, test);
     }
 
     // --- normalize_repo_url ---
