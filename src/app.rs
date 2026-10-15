@@ -1012,8 +1012,22 @@ impl Project {
             return (false, None);
         }
 
-        let live_authored_numbers: HashSet<u32> =
-            self.live.user_prs.iter().map(|pr| pr.number).collect();
+        // `involves:` behind review_requested_prs also matches your own PRs, so
+        // they count as live even on a poll where the authored fetch came back
+        // empty; otherwise the removal pass below would delete the card.
+        let me = self.live.github_user.as_deref();
+        let live_authored_numbers: HashSet<u32> = self
+            .live
+            .user_prs
+            .iter()
+            .chain(
+                self.live
+                    .review_requested_prs
+                    .iter()
+                    .filter(|pr| Some(pr.author.as_str()) == me),
+            )
+            .map(|pr| pr.number)
+            .collect();
         let live_review_numbers: HashSet<u32> = self
             .live
             .review_requested_prs
@@ -1049,6 +1063,7 @@ impl Project {
         // fetch still matched it via `involves:`, a card for your own PR gets
         // stuck tagged as someone else's review forever, sorting behind your
         // real work. Reconcile it here whenever the PR's known author is you.
+        let mut retagged = 0usize;
         if let Some(me) = self.live.github_user.clone() {
             let authors_by_number: HashMap<u32, &str> = self
                 .live
@@ -1064,6 +1079,9 @@ impl Project {
                     if authors_by_number.get(&link.number) == Some(&me.as_str()) {
                         link.import_source = Some(PrImportSource::Authored);
                     }
+                }
+                if issue.primary_pr_import_source() == Some(PrImportSource::Authored) {
+                    retagged += 1;
                 }
             }
         }
@@ -1224,7 +1242,7 @@ impl Project {
         let added = new_issues.len();
         self.issues.append(&mut new_issues);
 
-        if added == 0 && removed == 0 && completed == 0 {
+        if added == 0 && removed == 0 && completed == 0 && retagged == 0 {
             return (false, None);
         }
 
@@ -1249,6 +1267,9 @@ impl Project {
                 completed,
                 if completed == 1 { "" } else { "s" }
             ));
+        }
+        if parts.is_empty() {
+            return (true, None);
         }
         (true, Some(parts.join(", ")))
     }
@@ -3576,12 +3597,31 @@ mod tests {
             .insert(7, test_pr(7, "feature"));
         app.project_mut().live.pr_poll_done = true;
 
-        app.project_mut().sync_prs_as_issues();
+        let (changed, _) = app.project_mut().sync_prs_as_issues();
 
+        assert!(changed, "a retag must be persisted");
         assert_eq!(
             app.project().issues[0].primary_pr_import_source(),
             Some(PrImportSource::Authored)
         );
+    }
+
+    #[test]
+    fn sync_prs_keeps_own_pr_card_while_authored_fetch_stays_empty() {
+        let mut app = test_app(vec![]);
+        app.project_mut().live.github_user = Some("testuser".into());
+        app.project_mut().live.review_requested_prs = vec![test_pr(7, "feature")];
+        app.project_mut().live.pr_poll_done = true;
+
+        app.project_mut().sync_prs_as_issues();
+        let id = app.project().issues[0].id.clone();
+        app.project_mut().issues[0].prompt = Some("keep me".into());
+
+        app.project_mut().sync_prs_as_issues();
+
+        assert_eq!(app.project().issues.len(), 1);
+        assert_eq!(app.project().issues[0].id, id);
+        assert_eq!(app.project().issues[0].prompt.as_deref(), Some("keep me"));
     }
 
     #[test]
