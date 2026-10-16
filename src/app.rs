@@ -17,13 +17,15 @@ const MESSAGE_TTL: Duration = Duration::from_secs(3);
 /// this cap the cleanup loop would spawn a kill thread indefinitely.
 const MAX_CLEANUP_ATTEMPTS: u32 = 5;
 
+use crate::attention::Attention;
 use crate::config::{AppConfig, AppState, DEFAULT_REVIEW_PROMPT};
 use crate::external::git::PollClass;
 use crate::external::linear::LinearIssue;
 use crate::prune::{PruneAction, PruneCandidate};
 use crate::types::{
-    AgentKind, AgentStatus, AgentStatusInfo, Column, GithubStack, Issue, IssueKind, LinkedGithubPr,
-    PrImportBaseline, PrImportSource, PrState, PrStatus, WorktreeStatus,
+    AgentKind, AgentStatus, AgentStatusInfo, ChecksStatus, Column, GithubStack, Issue, IssueKind,
+    LinkedGithubPr, MergeBlocker, PrImportBaseline, PrImportSource, PrState, PrStatus,
+    ReviewDecision, WorktreeStatus,
 };
 use crate::undo::UndoEntry;
 
@@ -155,6 +157,8 @@ pub struct Project {
     /// contains this issue id (the anchor itself plus everything reachable
     /// through `linked_issues`). Cleared with the same key or Esc.
     pub link_filter: Option<String>,
+    /// Show only cards that need their owner (see `attention_for`).
+    pub attention_filter: bool,
     pub linear_available: bool,
     pub tuicr_available: bool,
     pub github_available: bool,
@@ -217,6 +221,7 @@ impl Project {
             selected_row: [0; 4],
             marked_issues: HashSet::new(),
             link_filter: None,
+            attention_filter: false,
             linear_available: false,
             tuicr_available: false,
             github_available: false,
@@ -382,6 +387,7 @@ impl Project {
             .filter(|(_, issue)| {
                 issue.column == column && (query.is_empty() || self.issue_matches(issue, &query))
             })
+            .filter(|(_, issue)| !self.attention_filter || self.needs_you(issue))
             .collect();
         let Some(anchor) = self.link_filter.as_deref() else {
             return matches;
@@ -944,6 +950,73 @@ impl Project {
         self.pr_for(issue)
             .map(|pr| vec![pr.number])
             .ok_or("No PR found for this issue")
+    }
+
+    /// Why a card needs its owner right now, or `None` when it can wait. A
+    /// blocked agent outranks its PR: the agent has stopped until you answer.
+    /// Derived on every read from data the pollers already carry, so there is
+    /// nothing to persist or invalidate.
+    pub fn attention_for(&self, issue: &Issue) -> Option<Attention> {
+        self.agent_attention(issue)
+            .or_else(|| self.pr_attention(issue))
+    }
+
+    pub fn needs_you(&self, issue: &Issue) -> bool {
+        self.attention_for(issue)
+            .is_some_and(|attention| attention.needs_you())
+    }
+
+    pub fn attention_count(&self) -> usize {
+        self.issues
+            .iter()
+            .filter(|issue| self.needs_you(issue))
+            .count()
+    }
+
+    fn agent_attention(&self, issue: &Issue) -> Option<Attention> {
+        match self.resolved_agent_status(issue) {
+            AgentStatus::WaitingPermission | AgentStatus::WaitingApproval => {
+                Some(Attention::AgentBlocked)
+            }
+            AgentStatus::Error => Some(Attention::AgentError),
+            _ => None,
+        }
+    }
+
+    /// Only the owner's own open, non-draft PRs. A review-requested card
+    /// waiting for its first review is the board's ordinary workload.
+    fn pr_attention(&self, issue: &Issue) -> Option<Attention> {
+        let pr = self.pr_for(issue)?;
+        let mine = self.live.user_prs.iter().any(|own| own.number == pr.number);
+        if pr.state != PrState::Open || pr.is_draft || !mine {
+            return None;
+        }
+
+        // While the queue holds the PR, its checks and merge-state describe
+        // the queue's work, not the owner's.
+        if pr.in_merge_queue {
+            return Some(Attention::Queued);
+        }
+
+        if pr.review == Some(ReviewDecision::ChangesRequested)
+            || matches!(pr.checks, Some(ChecksStatus::Failure | ChecksStatus::Error))
+        {
+            return Some(Attention::NeedsFixes);
+        }
+
+        // A null review decision means the repo requires no review.
+        // REVIEW_REQUIRED stays quiet: that PR waits on reviewers.
+        let approved = matches!(pr.review, Some(ReviewDecision::Approved) | None);
+        let green = matches!(pr.checks, Some(ChecksStatus::Success) | None);
+        if !approved || !green {
+            return None;
+        }
+
+        match pr.merge_blocker {
+            Some(MergeBlocker::Conflicts) => Some(Attention::NeedsRebase),
+            Some(MergeBlocker::Blocked) => Some(Attention::Blocked),
+            None => Some(Attention::ReadyToMerge),
+        }
     }
 
     pub fn pr_for(&self, issue: &Issue) -> Option<&PrStatus> {
@@ -2436,6 +2509,10 @@ impl App {
             self.clear_link_filter(ctx);
             return;
         }
+        if self.active_project().attention_filter {
+            self.set_attention_filter(ctx, false);
+            return;
+        }
         if !self.search_query.is_empty() {
             self.search_query.clear();
             for project in &mut self.projects {
@@ -2466,6 +2543,27 @@ impl App {
         };
         let project = self.context_project_mut(ctx);
         project.link_filter = Some(anchor);
+        project.clamp_all_rows(&query);
+    }
+
+    /// Toggle the board filter to cards that need you. Refuses to switch on
+    /// over a board where nothing does: an empty board reads as data loss.
+    pub fn toggle_attention_filter(&mut self, ctx: &ActionContext) {
+        if self.context_project(ctx).attention_filter {
+            self.set_attention_filter(ctx, false);
+            return;
+        }
+        if self.context_project(ctx).attention_count() == 0 {
+            self.set_message("Nothing needs you right now");
+            return;
+        }
+        self.set_attention_filter(ctx, true);
+    }
+
+    fn set_attention_filter(&mut self, ctx: &ActionContext, on: bool) {
+        let query = self.search_query.clone();
+        let project = self.context_project_mut(ctx);
+        project.attention_filter = on;
         project.clamp_all_rows(&query);
     }
 
@@ -2683,7 +2781,288 @@ mod tests {
             deletions: 5,
             head_branch: branch.into(),
             is_cross_repository: false,
+            merge_blocker: None,
+            in_merge_queue: false,
         }
+    }
+
+    fn issue_linked_to_pr(id: &str, number: u32, source: Option<PrImportSource>) -> Issue {
+        let mut issue = test_issue(id, Column::CodeReview);
+        issue.github_pr_links.push(LinkedGithubPr {
+            number,
+            imported: source.is_some(),
+            import_source: source,
+        });
+        issue
+    }
+
+    fn attention_of(app: &App) -> Option<Attention> {
+        app.project().attention_for(&app.project().issues[0])
+    }
+
+    #[test]
+    fn own_approved_green_pr_is_ready_to_merge() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        app.project_mut().live.user_prs = vec![test_pr(7, "feature")];
+
+        assert_eq!(attention_of(&app), Some(Attention::ReadyToMerge));
+    }
+
+    #[test]
+    fn queued_pr_shows_queued_but_needs_nothing() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let mut pr = test_pr(7, "feature");
+        pr.in_merge_queue = true;
+        // Queue-side state must not surface as owner work while queued.
+        pr.merge_blocker = Some(MergeBlocker::Blocked);
+        app.project_mut().live.user_prs = vec![pr];
+
+        assert_eq!(attention_of(&app), Some(Attention::Queued));
+        assert_eq!(app.project().attention_count(), 0);
+    }
+
+    #[test]
+    fn approval_with_pending_checks_is_not_actionable_yet() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let mut pr = test_pr(7, "feature");
+        pr.checks = Some(ChecksStatus::Pending);
+        app.project_mut().live.user_prs = vec![pr];
+
+        assert_eq!(attention_of(&app), None);
+    }
+
+    #[test]
+    fn red_checks_need_fixes_even_when_approved() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let mut pr = test_pr(7, "feature");
+        pr.checks = Some(ChecksStatus::Failure);
+        app.project_mut().live.user_prs = vec![pr];
+
+        assert_eq!(attention_of(&app), Some(Attention::NeedsFixes));
+    }
+
+    #[test]
+    fn changes_requested_need_fixes() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let mut pr = test_pr(7, "feature");
+        pr.review = Some(ReviewDecision::ChangesRequested);
+        app.project_mut().live.user_prs = vec![pr];
+
+        assert_eq!(attention_of(&app), Some(Attention::NeedsFixes));
+    }
+
+    #[test]
+    fn a_draft_never_demands_attention() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let mut pr = test_pr(7, "feature");
+        pr.is_draft = true;
+        app.project_mut().live.user_prs = vec![pr];
+
+        assert_eq!(attention_of(&app), None);
+    }
+
+    #[test]
+    fn someone_elses_pr_is_not_my_merge_button() {
+        // Linked but not in user_prs: watching a colleague's PR must not nag.
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        app.project_mut()
+            .live
+            .pr_statuses_by_number
+            .insert(7, test_pr(7, "feature"));
+
+        assert_eq!(attention_of(&app), None);
+    }
+
+    #[test]
+    fn a_review_card_awaiting_first_review_is_ordinary_workload() {
+        let mut app = test_app(vec![issue_linked_to_pr(
+            "bork-1",
+            7,
+            Some(PrImportSource::ReviewRequested),
+        )]);
+        app.project_mut().live.review_requested_prs = vec![test_pr(7, "feature")];
+
+        assert_eq!(attention_of(&app), None);
+    }
+
+    #[test]
+    fn a_blocked_pr_without_a_review_decision_still_surfaces() {
+        // reviewDecision is null when no review is required, so the blocker
+        // (an unresolved conversation, say) is the owner's alone.
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let mut pr = test_pr(7, "feature");
+        pr.review = None;
+        pr.merge_blocker = Some(MergeBlocker::Blocked);
+        app.project_mut().live.user_prs = vec![pr];
+
+        assert_eq!(attention_of(&app), Some(Attention::Blocked));
+    }
+
+    #[test]
+    fn a_pr_awaiting_required_review_stays_quiet() {
+        // REVIEW_REQUIRED waits on reviewers, not on the owner.
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let mut pr = test_pr(7, "feature");
+        pr.review = Some(ReviewDecision::ReviewRequired);
+        pr.merge_blocker = Some(MergeBlocker::Blocked);
+        app.project_mut().live.user_prs = vec![pr];
+
+        assert_eq!(attention_of(&app), None);
+    }
+
+    #[test]
+    fn a_blocked_merge_is_not_ready() {
+        // Approved and green, yet the merge button is dead — an unresolved
+        // conversation, say. Calling that "ready" sends the user to a wall.
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let mut pr = test_pr(7, "feature");
+        pr.merge_blocker = Some(MergeBlocker::Blocked);
+        app.project_mut().live.user_prs = vec![pr];
+
+        assert_eq!(attention_of(&app), Some(Attention::Blocked));
+    }
+
+    #[test]
+    fn a_conflicting_branch_asks_for_a_rebase() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let mut pr = test_pr(7, "feature");
+        pr.merge_blocker = Some(MergeBlocker::Conflicts);
+        app.project_mut().live.user_prs = vec![pr];
+
+        assert_eq!(attention_of(&app), Some(Attention::NeedsRebase));
+    }
+
+    #[test]
+    fn attention_filter_hides_quiet_cards() {
+        let mut app = test_app(vec![
+            issue_linked_to_pr("bork-1", 7, None),
+            issue_linked_to_pr("bork-2", 8, None),
+        ]);
+        app.project_mut().live.user_prs = vec![test_pr(7, "feature")];
+        app.project_mut().attention_filter = true;
+
+        let visible = app.project().issues_in_column(Column::CodeReview, "");
+
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].1.id, "bork-1");
+    }
+
+    #[test]
+    fn attention_filter_refuses_an_all_quiet_board() {
+        // Turning it on with nothing actionable would blank the board, which
+        // reads as data loss rather than good news.
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let ctx = app.action_context();
+
+        app.toggle_attention_filter(&ctx);
+
+        assert!(!app.project().attention_filter);
+    }
+
+    #[test]
+    fn esc_peels_the_attention_filter() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        app.project_mut().live.user_prs = vec![test_pr(7, "feature")];
+        let ctx = app.action_context();
+        app.toggle_attention_filter(&ctx);
+        assert!(app.project().attention_filter);
+
+        app.clear_search(&ctx);
+
+        assert!(!app.project().attention_filter);
+    }
+
+    #[test]
+    fn attention_count_sums_only_actionable_cards() {
+        let mut app = test_app(vec![
+            issue_linked_to_pr("bork-1", 7, None),
+            issue_linked_to_pr("bork-2", 8, None),
+        ]);
+        let mut pending = test_pr(8, "other");
+        pending.checks = Some(ChecksStatus::Pending);
+        app.project_mut().live.user_prs = vec![test_pr(7, "feature"), pending];
+
+        assert_eq!(app.project().attention_count(), 1);
+    }
+
+    fn set_agent_status(app: &mut App, session: &str, status: AgentStatus) {
+        let live = &mut app.project_mut().live;
+        live.active_sessions.insert(session.to_string());
+        live.agent_statuses.insert(
+            session.to_string(),
+            AgentStatusInfo {
+                status,
+                activity: None,
+                updated_at: 0,
+            },
+        );
+    }
+
+    #[test]
+    fn an_agent_blocked_on_you_needs_you_and_passes_the_filter() {
+        for status in [AgentStatus::WaitingPermission, AgentStatus::WaitingApproval] {
+            let mut app = test_app(vec![
+                test_issue("bork-1", Column::InProgress),
+                test_issue("bork-2", Column::InProgress),
+            ]);
+            set_agent_status(&mut app, "bork-bork-1", status);
+            set_agent_status(&mut app, "bork-bork-2", AgentStatus::Busy);
+            app.project_mut().attention_filter = true;
+
+            let visible = app.project().issues_in_column(Column::InProgress, "");
+
+            assert_eq!(
+                attention_of(&app),
+                Some(Attention::AgentBlocked),
+                "{status}"
+            );
+            assert_eq!(app.project().attention_count(), 1, "{status}");
+            assert_eq!(visible.len(), 1, "{status}");
+            assert_eq!(visible[0].1.id, "bork-1", "{status}");
+        }
+    }
+
+    #[test]
+    fn an_agent_that_errored_needs_you() {
+        let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
+        set_agent_status(&mut app, "bork-bork-1", AgentStatus::Error);
+
+        assert_eq!(attention_of(&app), Some(Attention::AgentError));
+        assert_eq!(app.project().attention_count(), 1);
+    }
+
+    #[test]
+    fn a_working_or_finished_agent_is_quiet() {
+        // Claude's idle Notification also reports WaitingInput, so it means
+        // "finished and idle" as often as "asked you something".
+        for status in [
+            AgentStatus::Busy,
+            AgentStatus::Idle,
+            AgentStatus::WaitingInput,
+        ] {
+            let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
+            set_agent_status(&mut app, "bork-bork-1", status);
+
+            assert_eq!(attention_of(&app), None, "{status}");
+        }
+    }
+
+    #[test]
+    fn a_blocked_status_left_by_a_dead_session_is_quiet() {
+        let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
+        set_agent_status(&mut app, "bork-bork-1", AgentStatus::WaitingPermission);
+        app.project_mut().live.active_sessions.clear();
+
+        assert_eq!(attention_of(&app), None);
+    }
+
+    #[test]
+    fn a_blocked_agent_outranks_its_pr() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        app.project_mut().live.user_prs = vec![test_pr(7, "feature")];
+        set_agent_status(&mut app, "bork-bork-1", AgentStatus::WaitingPermission);
+
+        assert_eq!(attention_of(&app), Some(Attention::AgentBlocked));
     }
 
     // ================================================================
@@ -5507,6 +5886,8 @@ mod tests {
             deletions: 0,
             head_branch: "bork-1/task".into(),
             is_cross_repository: false,
+            merge_blocker: None,
+            in_merge_queue: false,
         };
         app.project_mut()
             .live

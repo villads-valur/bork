@@ -121,6 +121,7 @@ fn map_normal_key(key: KeyEvent, swimlane_count: usize) -> Action {
         KeyCode::Char('I') => Action::OpenLinearPicker,
 
         KeyCode::Char('f') => Action::ToggleLinkFilter,
+        KeyCode::Char('!') => Action::ToggleAttentionFilter,
         KeyCode::Char('c') => Action::OpenLinkPicker,
 
         _ => Action::Noop,
@@ -482,6 +483,14 @@ mod tests {
         assert_eq!(
             map_normal_key(key(KeyCode::Char('c')), 1),
             Action::OpenLinkPicker
+        );
+    }
+
+    #[test]
+    fn normal_attention_filter() {
+        assert_eq!(
+            map_normal_key(key(KeyCode::Char('!')), 1),
+            Action::ToggleAttentionFilter
         );
     }
 

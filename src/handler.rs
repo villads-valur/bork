@@ -726,6 +726,10 @@ fn handle_normal(
             app.toggle_link_filter(ctx);
             PostAction::None
         }
+        Action::ToggleAttentionFilter => {
+            app.toggle_attention_filter(ctx);
+            PostAction::None
+        }
         Action::OpenLinkPicker => {
             app.open_link_picker(ctx);
             PostAction::None
@@ -2315,6 +2319,8 @@ mod tests {
                 deletions: 20,
                 head_branch: format!("branch-{number}"),
                 is_cross_repository: false,
+                merge_blocker: None,
+                in_merge_queue: false,
             };
             members.push(GithubStackPullRequest {
                 number,
@@ -4577,6 +4583,8 @@ mod tests {
             deletions: 5,
             head_branch: "feature".to_string(),
             is_cross_repository: false,
+            merge_blocker: None,
+            in_merge_queue: false,
         };
         app.projects[0]
             .live

@@ -1,5 +1,6 @@
 use ratatui::style::{Color, Modifier, Style};
 
+use crate::attention::Attention;
 use crate::types::{AgentStatus, ChecksStatus, PrState, ReviewDecision};
 
 pub fn truncate(s: &str, max: usize) -> String {
@@ -66,6 +67,19 @@ pub fn card_title_style(selected: bool) -> Style {
 
 pub fn search_highlight_style() -> Style {
     Style::default().fg(Color::Yellow)
+}
+
+/// Badge for a card that needs its owner: glyph and label, colour.
+pub fn attention_badge(attention: Attention) -> (&'static str, Color) {
+    match attention {
+        Attention::ReadyToMerge => ("\u{2713} merge", Color::Green),
+        Attention::NeedsFixes => ("\u{2717} fix", Color::Red),
+        Attention::NeedsRebase => ("\u{21a5} rebase", Color::Yellow),
+        Attention::Blocked => ("\u{2298} blocked", Color::Magenta),
+        Attention::Queued => ("\u{29d6} queued", DIM),
+        Attention::AgentBlocked => ("\u{2691} agent blocked", Color::Yellow),
+        Attention::AgentError => ("\u{2691} agent error", Color::Red),
+    }
 }
 
 pub fn agent_status_color(status: &AgentStatus) -> Color {

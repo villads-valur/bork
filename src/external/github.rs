@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex};
 
 use crate::types::{
-    ChecksStatus, GithubStack, GithubStackPullRequest, PrState, PrStatus, ReviewDecision,
+    ChecksStatus, GithubStack, GithubStackPullRequest, MergeBlocker, PrState, PrStatus,
+    ReviewDecision,
 };
 
 #[derive(Clone)]
@@ -30,6 +31,8 @@ const PR_FIELDS: &str = r#"
     isCrossRepository
     author { login }
     reviewDecision
+    mergeStateStatus
+    isInMergeQueue
     additions deletions
     commits(last: 1) {
         nodes {
@@ -530,6 +533,19 @@ fn parse_pr_node(node: &serde_json::Value) -> Option<PrStatus> {
     let additions = node.get("additions").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
     let deletions = node.get("deletions").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
+    let merge_blocker = node
+        .get("mergeStateStatus")
+        .and_then(|v| v.as_str())
+        .and_then(|s| match s {
+            "DIRTY" => Some(MergeBlocker::Conflicts),
+            "BLOCKED" => Some(MergeBlocker::Blocked),
+            _ => None,
+        });
+    let in_merge_queue = node
+        .get("isInMergeQueue")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     Some(PrStatus {
         number,
         title,
@@ -543,6 +559,8 @@ fn parse_pr_node(node: &serde_json::Value) -> Option<PrStatus> {
         deletions,
         head_branch,
         is_cross_repository,
+        merge_blocker,
+        in_merge_queue,
     })
 }
 
@@ -1146,6 +1164,28 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_merge_blocker() {
+        for (status, expected) in [
+            ("DIRTY", Some(MergeBlocker::Conflicts)),
+            ("BLOCKED", Some(MergeBlocker::Blocked)),
+            ("BEHIND", None),
+            ("CLEAN", None),
+            ("UNKNOWN", None),
+        ] {
+            let node = make_pr_node(&format!(r#"{{"mergeStateStatus": "{status}"}}"#));
+            let pr = parse_pr_node(&node).unwrap();
+            assert_eq!(pr.merge_blocker, expected, "{status}");
+        }
+    }
+
+    #[test]
+    fn test_parse_in_merge_queue() {
+        let node = make_pr_node(r#"{"isInMergeQueue": true}"#);
+        assert!(parse_pr_node(&node).unwrap().in_merge_queue);
+        assert!(!parse_pr_node(&make_pr_node("")).unwrap().in_merge_queue);
+    }
+
+    #[test]
     fn test_parse_missing_number_returns_none() {
         let mut node = make_pr_node("");
         node.as_object_mut().unwrap().remove("number");
@@ -1435,6 +1475,8 @@ mod tests {
             deletions: 0,
             head_branch: branch.into(),
             is_cross_repository: false,
+            merge_blocker: None,
+            in_merge_queue: false,
         }
     }
 

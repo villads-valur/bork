@@ -1,5 +1,5 @@
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
@@ -176,7 +176,7 @@ fn link_badge(issue: &Issue) -> Option<Span<'static>> {
 
 fn format_status_line(ctx: &CardContext) -> Line<'static> {
     if ctx.issue.kind == IssueKind::NonAgentic {
-        return Line::default();
+        return Line::from(attention_spans(ctx));
     }
 
     let status_color = styles::agent_status_color(&ctx.agent_status);
@@ -206,6 +206,8 @@ fn format_status_line(ctx: &CardContext) -> Line<'static> {
         spans.push(Span::styled("review", Style::default().fg(Color::Yellow)));
     }
 
+    spans.extend(attention_spans(ctx));
+
     let git_spans = format_git_status(ctx.git_status);
     if !git_spans.is_empty() {
         spans.push(Span::raw(" "));
@@ -213,6 +215,20 @@ fn format_status_line(ctx: &CardContext) -> Line<'static> {
     }
 
     Line::from(spans)
+}
+
+fn attention_spans(ctx: &CardContext) -> Vec<Span<'static>> {
+    let Some(attention) = ctx.project.attention_for(ctx.issue) else {
+        return Vec::new();
+    };
+    let (badge, color) = styles::attention_badge(attention);
+    vec![
+        Span::raw(" "),
+        Span::styled(
+            badge,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+    ]
 }
 
 fn format_bottom_line(issue: &Issue, ports: Option<&Vec<u16>>, max_width: usize) -> Line<'static> {

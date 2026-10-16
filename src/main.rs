@@ -1,5 +1,6 @@
 mod agent_config;
 mod app;
+mod attention;
 mod config;
 mod dialog_state;
 mod error;

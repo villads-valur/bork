@@ -241,6 +241,8 @@ mod tests {
             deletions: 0,
             head_branch: format!("branch-{number}"),
             is_cross_repository: false,
+            merge_blocker: None,
+            in_merge_queue: false,
         }
     }
 

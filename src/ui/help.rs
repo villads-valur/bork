@@ -83,6 +83,7 @@ const SECTIONS: &[Section] = &[
         title: "Other",
         bindings: &[
             ("/", "Search"),
+            ("!", "Only cards that need you"),
             ("P", "Sync PRs"),
             ("W", "Prune worktrees"),
             ("o", "Open PR / stack"),

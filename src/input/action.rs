@@ -77,6 +77,7 @@ pub enum Action {
     StackDown,
     StackUp,
     ToggleLinkFilter,
+    ToggleAttentionFilter,
     OpenLinkPicker,
     LinkPickerDown,
     LinkPickerUp,

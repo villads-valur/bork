@@ -37,6 +37,13 @@ pub fn render_header(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(styles::TEXT),
         ));
     }
+    let needs_you: usize = app.projects.iter().map(|p| p.attention_count()).sum();
+    if needs_you > 0 {
+        title_spans.push(Span::styled(
+            format!(" \u{25cf} {needs_you} need you "),
+            Style::default().fg(ratatui::style::Color::Yellow),
+        ));
+    }
     if app.active_project().config.debug {
         title_spans.push(Span::styled(
             " [DEBUG]",
@@ -163,6 +170,21 @@ fn render_footer_content(frame: &mut Frame, app: &App, area: Rect) {
             ),
             Span::raw("  "),
             Span::styled("f/Esc", styles::statusbar_key_style()),
+            Span::styled(":clear", styles::statusbar_desc_style()),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+        render_right_indicators(frame, app, area);
+        return;
+    }
+
+    if app.active_project().attention_filter {
+        let line = Line::from(vec![
+            Span::styled(
+                " \u{25cf} needs you",
+                Style::default().fg(ratatui::style::Color::Yellow),
+            ),
+            Span::raw("  "),
+            Span::styled("!/Esc", styles::statusbar_key_style()),
             Span::styled(":clear", styles::statusbar_desc_style()),
         ]);
         frame.render_widget(Paragraph::new(line), area);

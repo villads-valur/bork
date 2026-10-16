@@ -690,6 +690,17 @@ pub enum ChecksStatus {
     Error,
 }
 
+/// Why GitHub's `mergeStateStatus` refuses a merge that review and checks
+/// alone would allow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MergeBlocker {
+    /// `DIRTY`: the branch conflicts with its base.
+    Conflicts,
+    /// `BLOCKED`: a branch rule still objects, typically an unresolved
+    /// conversation.
+    Blocked,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReviewDecision {
     Approved,
@@ -713,6 +724,8 @@ pub struct PrStatus {
     /// True when the head branch lives in a fork. Fork PRs are excluded from
     /// branch-keyed indexing since their branch names can collide with upstream.
     pub is_cross_repository: bool,
+    pub merge_blocker: Option<MergeBlocker>,
+    pub in_merge_queue: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -789,6 +802,8 @@ mod tests {
             deletions: 5,
             head_branch: "main".into(),
             is_cross_repository: false,
+            merge_blocker: None,
+            in_merge_queue: false,
         };
         let cloned = pr.clone();
         assert_eq!(cloned.number, 1);
