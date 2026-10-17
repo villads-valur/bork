@@ -349,6 +349,65 @@ pub fn create_window(session: &str, window_name: &str, cwd: &Path) -> Result<(),
     Ok(())
 }
 
+/// Names of `session`'s windows, in index order. Empty when the session is
+/// missing.
+pub fn window_names(session: &str) -> Vec<String> {
+    let output = tmux()
+        .args(["list-windows", "-t", session, "-F", "#{window_name}"])
+        .output();
+
+    match output {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The foreground command of `target`'s active pane, e.g. `zsh` or `tuicr`.
+pub fn pane_current_command(target: &str) -> Option<String> {
+    let output = tmux()
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            target,
+            "#{pane_current_command}",
+        ])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Rename `session`'s current window. An explicit name also switches off
+/// tmux's `automatic-rename` for that window, so the name survives the
+/// command inside it exiting.
+pub fn rename_window(session: &str, window_name: &str) -> Result<(), AppError> {
+    let status = tmux()
+        .args(["rename-window", "-t", session, window_name])
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| {
+            AppError::Tmux(format!(
+                "failed to rename window to '{window_name}' in '{session}': {e}"
+            ))
+        })?;
+
+    if !status.success() {
+        return Err(AppError::Tmux(format!(
+            "tmux rename-window failed for '{session}' -> '{window_name}'"
+        )));
+    }
+
+    Ok(())
+}
+
 pub fn select_window(session: &str, window_name: &str) -> Result<(), AppError> {
     let status = tmux()
         .args(["select-window", "-t", &format!("{session}:{window_name}")])

@@ -13,20 +13,33 @@ pub fn check_available() -> bool {
         .is_ok_and(|s| s.success())
 }
 
+const TUICR_WINDOW: &str = "tuicr";
+
+/// Show tuicr in `session`, reusing its tuicr window when there is one: tmux
+/// cannot resolve `session:tuicr` once two windows share the name. tuicr is
+/// started again only when it is no longer running there.
 pub fn open_in_session(session: &str, cwd: &Path, pr_mode: bool) -> Result<(), AppError> {
-    tmux::create_window(session, "tuicr", cwd)?;
+    let target = format!("{session}:{TUICR_WINDOW}");
 
-    let target = format!("{session}:tuicr");
-    tmux::send_keys(&target, &tuicr_cmd(pr_mode))?;
-    tmux::select_window(session, "tuicr")?;
+    if !tmux::window_names(session)
+        .iter()
+        .any(|name| name == TUICR_WINDOW)
+    {
+        tmux::create_window(session, TUICR_WINDOW, cwd)?;
+    }
 
-    Ok(())
+    if tmux::pane_current_command(&target).as_deref() != Some("tuicr") {
+        tmux::send_keys(&target, &tuicr_cmd(pr_mode))?;
+    }
+
+    tmux::select_window(session, TUICR_WINDOW)
 }
 
 /// Create a fresh tmux session whose first window runs tuicr.
 /// Used when there is no agent session for the issue but the user wants to review.
 pub fn launch_review_session(session: &str, cwd: &Path, pr_mode: bool) -> Result<(), AppError> {
     tmux::create_session(session, cwd)?;
+    tmux::rename_window(session, TUICR_WINDOW)?;
     tmux::send_keys(session, &tuicr_cmd(pr_mode))?;
     tmux::create_window(session, "terminal", cwd)?;
     Ok(())
@@ -103,6 +116,54 @@ mod tests {
     fn stack_review_can_stop_and_does_not_skip_failed_reviews() {
         assert_eq!(run_stack("q\n", false), "pr 18\n");
         assert_eq!(run_stack("\n\n", true), "pr 18\n");
+    }
+
+    fn tuicr_windows(session: &str) -> usize {
+        tmux::window_names(session)
+            .iter()
+            .filter(|name| *name == "tuicr")
+            .count()
+    }
+
+    #[test]
+    fn reopening_a_review_reuses_the_tuicr_window() {
+        if !tmux::tmux_available() {
+            eprintln!("skipping: tmux is not installed");
+            return;
+        }
+
+        let session = format!("bork-tuicr-reopen-{}", std::process::id());
+        let cwd = std::env::temp_dir();
+        tmux::create_session(&session, &cwd).unwrap();
+
+        let first = open_in_session(&session, &cwd, false);
+        let second = open_in_session(&session, &cwd, false);
+        let windows = tuicr_windows(&session);
+        let _ = tmux::kill_session(&session);
+
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(windows, 1);
+    }
+
+    #[test]
+    fn opening_a_review_in_a_review_session_reuses_its_tuicr_window() {
+        if !tmux::tmux_available() {
+            eprintln!("skipping: tmux is not installed");
+            return;
+        }
+
+        let session = format!("bork-tuicr-review-session-{}", std::process::id());
+        let cwd = std::env::temp_dir();
+
+        let launched = launch_review_session(&session, &cwd, false);
+        let opened = open_in_session(&session, &cwd, false);
+        let windows = tmux::window_names(&session);
+        let _ = tmux::kill_session(&session);
+
+        launched.unwrap();
+        opened.unwrap();
+        assert_eq!(windows, ["tuicr", "terminal"]);
     }
 
     #[test]
