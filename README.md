@@ -668,6 +668,8 @@ Want to contribute? Open an issue or PR &mdash; contributions of all sizes are w
 
 This project is licensed under the [MIT License](LICENSE).
 
+Made by [Villads Valur](https://valur.xyz/bork).
+
 ### Attached PR stacks
 
 The GitHub picker marks PRs that belong to a stack. **Enter** still imports or
