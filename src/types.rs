@@ -726,6 +726,9 @@ pub struct PrStatus {
     pub is_cross_repository: bool,
     pub merge_blocker: Option<MergeBlocker>,
     pub in_merge_queue: bool,
+    /// Unresolved review threads (inline comments that can be resolved).
+    #[serde(default)]
+    pub unresolved_threads: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -804,6 +807,7 @@ mod tests {
             is_cross_repository: false,
             merge_blocker: None,
             in_merge_queue: false,
+            unresolved_threads: 0,
         };
         let cloned = pr.clone();
         assert_eq!(cloned.number, 1);

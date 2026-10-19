@@ -88,7 +88,7 @@ fn render_full(
     let title_line = Line::from(highlight_spans(&title_text, ctx.search_query, title_style));
     let status_line = format_status_line(ctx);
     let pr_lines = format_pr_rows(ctx, max_width, false);
-    let bottom_line = format_bottom_line(ctx.issue, ctx.ports, max_width);
+    let bottom_line = format_bottom_line(ctx, max_width);
 
     let mut lines = vec![title_line];
     if inner.height > 1 {
@@ -130,7 +130,7 @@ fn render_medium(
 
     frame.render_widget(Paragraph::new(lines), inner);
     if inner.height > 3 {
-        let footer = format_bottom_line(ctx.issue, ctx.ports, max_width);
+        let footer = format_bottom_line(ctx, max_width);
         let bottom = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
         frame.render_widget(Paragraph::new(footer), bottom);
     }
@@ -231,7 +231,19 @@ fn attention_spans(ctx: &CardContext) -> Vec<Span<'static>> {
     ]
 }
 
-fn format_bottom_line(issue: &Issue, ports: Option<&Vec<u16>>, max_width: usize) -> Line<'static> {
+fn comments_badge(count: u32) -> Option<Span<'static>> {
+    if count == 0 {
+        return None;
+    }
+    Some(Span::styled(
+        format!("\u{270e}{count}"),
+        Style::default().fg(Color::Yellow),
+    ))
+}
+
+fn format_bottom_line(ctx: &CardContext, max_width: usize) -> Line<'static> {
+    let issue = ctx.issue;
+    let ports = ctx.ports;
     let mut right = Vec::new();
     if let Some(text) = pruned_indicator_text(issue) {
         right.push(text);
@@ -247,6 +259,10 @@ fn format_bottom_line(issue: &Issue, ports: Option<&Vec<u16>>, max_width: usize)
     let left_budget = max_width.saturating_sub(right.width() + 2);
     let mut left = vec![Span::raw("  ")];
     if let Some(badge) = link_badge(issue) {
+        left.push(badge);
+        left.push(Span::raw(" "));
+    }
+    if let Some(badge) = comments_badge(ctx.project.unresolved_comments(issue)) {
         left.push(badge);
         left.push(Span::raw(" "));
     }

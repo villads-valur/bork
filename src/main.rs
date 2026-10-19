@@ -105,6 +105,7 @@ const GIT_STATUS_CONCURRENCY: usize = 4;
 // port poll runs at a slower cadence than the other pollers.
 const PORT_POLL_INTERVAL: Duration = Duration::from_secs(10);
 const LINEAR_POLL_INTERVAL: Duration = Duration::from_secs(45);
+const TUICR_POLL_INTERVAL: Duration = Duration::from_secs(10);
 const PR_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const STATE_POLL_TICKS: usize = 40; // 40 * 50ms = 2s
 /// Minimum interval between auto-prune checks (and thus toasts) for the same
@@ -198,6 +199,31 @@ fn spawn_port_poll_worker(
             break;
         }
         thread::sleep(PORT_POLL_INTERVAL);
+    });
+
+    rx
+}
+
+fn spawn_tuicr_draft_worker(
+    suspended: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
+) -> mpsc::Receiver<external::tuicr::DraftComments> {
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let mut poller = external::tuicr::DraftPoller::default();
+        loop {
+            if shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            wait_while_suspended(&suspended);
+            if let Some(drafts) = poller.poll() {
+                if tx.send(drafts).is_err() {
+                    break;
+                }
+            }
+            thread::sleep(TUICR_POLL_INTERVAL);
+        }
     });
 
     rx
@@ -1655,6 +1681,7 @@ struct SharedWorkers {
     linear_rx: Option<mpsc::Receiver<LinearPollResult>>,
     linear_wake_tx: mpsc::Sender<()>,
     linear_wake_rx: Option<mpsc::Receiver<()>>,
+    tuicr_rx: Option<mpsc::Receiver<external::tuicr::DraftComments>>,
     shutdown: Arc<AtomicBool>,
     /// While set, all pollers idle instead of spawning subprocesses. Used when
     /// the terminal is handed over to a tmux popup or external editor.
@@ -1696,6 +1723,7 @@ fn spawn_shared_workers() -> SharedWorkers {
         linear_rx: None,
         linear_wake_tx,
         linear_wake_rx: Some(linear_wake_rx),
+        tuicr_rx: None,
         shutdown,
         poll_suspended,
     }
@@ -2546,6 +2574,20 @@ fn run_tui() -> anyhow::Result<()> {
         if let Ok(true) = tuicr_check_rx.try_recv() {
             for p in &mut app.projects {
                 p.tuicr_available = true;
+            }
+            shared.tuicr_rx = Some(spawn_tuicr_draft_worker(
+                shared.poll_suspended.clone(),
+                shared.shutdown.clone(),
+            ));
+        }
+        if let Some(rx) = &shared.tuicr_rx {
+            while let Ok(drafts) = rx.try_recv() {
+                for project in &mut app.projects {
+                    if project.live.tuicr_drafts != drafts {
+                        project.live.tuicr_drafts = drafts.clone();
+                        needs_redraw = true;
+                    }
+                }
             }
         }
 

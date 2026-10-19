@@ -34,6 +34,7 @@ const PR_FIELDS: &str = r#"
     mergeStateStatus
     isInMergeQueue
     additions deletions
+    reviewThreads(first: 100) { nodes { isResolved } }
     commits(last: 1) {
         nodes {
             commit {
@@ -545,6 +546,15 @@ fn parse_pr_node(node: &serde_json::Value) -> Option<PrStatus> {
         .get("isInMergeQueue")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let unresolved_threads = node
+        .pointer("/reviewThreads/nodes")
+        .and_then(|v| v.as_array())
+        .map_or(0, |threads| {
+            threads
+                .iter()
+                .filter(|thread| thread.get("isResolved").and_then(|v| v.as_bool()) == Some(false))
+                .count()
+        }) as u32;
 
     Some(PrStatus {
         number,
@@ -561,6 +571,7 @@ fn parse_pr_node(node: &serde_json::Value) -> Option<PrStatus> {
         is_cross_repository,
         merge_blocker,
         in_merge_queue,
+        unresolved_threads,
     })
 }
 
@@ -1477,6 +1488,7 @@ mod tests {
             is_cross_repository: false,
             merge_blocker: None,
             in_merge_queue: false,
+            unresolved_threads: 0,
         }
     }
 

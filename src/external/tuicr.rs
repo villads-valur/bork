@@ -1,5 +1,8 @@
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+use serde_json::Value;
 
 use crate::error::AppError;
 use crate::external::tmux;
@@ -57,6 +60,148 @@ fn stack_command(numbers: &[u32]) -> String {
         "set -- {numbers}; while [ \"$#\" -gt 0 ]; do tuicr pr \"$1\" || {{ printf 'Review failed. Enter to return to the terminal: '; read -r answer; break; }}; shift; [ \"$#\" -gt 0 ] || break; printf 'Next: PR #%s. Enter to continue, q to stop: ' \"$1\"; read -r answer || break; [ \"$answer\" != q ] || break; done"
     );
     format!("sh -c '{}'", script.replace('\'', "'\\''"))
+}
+
+/// Unposted tuicr comments, keyed by what they review.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DraftComments {
+    /// Local reviews, keyed by the reviewed checkout path.
+    pub by_worktree: HashMap<PathBuf, u32>,
+    /// PR reviews, keyed by the PR's GitHub URL.
+    pub by_pr_url: HashMap<String, u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReviewTarget {
+    Worktree(PathBuf),
+    PrUrl(String),
+}
+
+/// Counts drafts across every persisted tuicr session. Session files are only
+/// re-read when tuicr reports a new `updated_at` for them.
+#[derive(Default)]
+pub struct DraftPoller {
+    cache: HashMap<String, (String, Option<(ReviewTarget, u32)>)>,
+}
+
+impl DraftPoller {
+    pub fn poll(&mut self) -> Option<DraftComments> {
+        let output = Command::new("tuicr")
+            .args(["review", "list", "--all"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let sessions: Vec<Value> = serde_json::from_slice(&output.stdout).ok()?;
+
+        let mut seen = HashMap::new();
+        for session in &sessions {
+            let Some(path) = session.get("path").and_then(Value::as_str) else {
+                continue;
+            };
+            let updated_at = session
+                .get("updated_at")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let has_comments = session
+                .get("comment_count")
+                .and_then(Value::as_u64)
+                .is_some_and(|count| count > 0);
+            let entry = match self.cache.remove(path) {
+                Some((cached_at, drafts)) if cached_at == updated_at => drafts,
+                _ if !has_comments => None,
+                _ => std::fs::read(path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                    .and_then(|value| session_drafts(&value)),
+            };
+            seen.insert(path.to_string(), (updated_at, entry));
+        }
+        self.cache = seen;
+
+        let mut drafts = DraftComments::default();
+        for (target, count) in self.cache.values().filter_map(|(_, entry)| entry.as_ref()) {
+            match target {
+                ReviewTarget::Worktree(path) => {
+                    *drafts.by_worktree.entry(path.clone()).or_default() += count;
+                }
+                ReviewTarget::PrUrl(url) => {
+                    *drafts.by_pr_url.entry(url.clone()).or_default() += count;
+                }
+            }
+        }
+        Some(drafts)
+    }
+}
+
+/// What a session file reviews and how many of its comments are still drafts.
+fn session_drafts(session: &Value) -> Option<(ReviewTarget, u32)> {
+    let count = draft_count(session);
+    if count == 0 {
+        return None;
+    }
+    if let Some(key) = session.get("pr_session_key").filter(|key| !key.is_null()) {
+        let repository = key.get("repository")?;
+        if repository.get("kind").and_then(Value::as_str) != Some("git_hub") {
+            return None;
+        }
+        let field = |name: &str| repository.get(name).and_then(Value::as_str);
+        let url = format!(
+            "https://{}/{}/{}/pull/{}",
+            field("host")?,
+            field("owner")?,
+            field("name")?,
+            key.get("number")?.as_u64()?
+        );
+        return Some((ReviewTarget::PrUrl(url), count));
+    }
+    let repo_path = session.get("repo_path")?.as_str()?.trim_end_matches('/');
+    Some((ReviewTarget::Worktree(PathBuf::from(repo_path)), count))
+}
+
+fn draft_count(session: &Value) -> u32 {
+    let files = session
+        .get("files")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|files| files.values());
+    let file_comments = files.clone().flat_map(|file| {
+        file.get("file_comments")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+    });
+    let line_comments = files.flat_map(|file| {
+        file.get("line_comments")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|lines| lines.values())
+            .filter_map(Value::as_array)
+            .flatten()
+    });
+    let review_comments = session
+        .get("review_comments")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten();
+    file_comments
+        .chain(line_comments)
+        .chain(review_comments)
+        .filter(|comment| is_draft(comment))
+        .count() as u32
+}
+
+/// Comments written but not yet posted. Older sessions have no lifecycle field,
+/// and everything in them is local.
+fn is_draft(comment: &Value) -> bool {
+    comment
+        .get("lifecycle_state")
+        .and_then(Value::as_str)
+        .is_none_or(|state| state == "local_draft")
 }
 
 #[cfg(test)]

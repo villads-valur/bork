@@ -243,6 +243,7 @@ mod tests {
             is_cross_repository: false,
             merge_blocker: None,
             in_merge_queue: false,
+            unresolved_threads: 0,
         }
     }
 

@@ -86,6 +86,7 @@ pub struct LiveState {
     /// Stack members whose stack card is blocked by an existing card; imported individually.
     pub review_stack_fallback: HashSet<u32>,
     pub github_user: Option<String>,
+    pub tuicr_drafts: crate::external::tuicr::DraftComments,
     pub git_poll_done: bool,
     pub pr_poll_done: bool,
     pub pr_loading_more: bool,
@@ -961,9 +962,12 @@ impl Project {
             .or_else(|| self.pr_attention(issue))
     }
 
+    /// Unresolved comments are an extra reason on top of `attention_for`, so
+    /// they count even when the card has another attention state.
     pub fn needs_you(&self, issue: &Issue) -> bool {
         self.attention_for(issue)
             .is_some_and(|attention| attention.needs_you())
+            || self.unresolved_comments(issue) > 0
     }
 
     pub fn attention_count(&self) -> usize {
@@ -1022,17 +1026,8 @@ impl Project {
     pub fn pr_for(&self, issue: &Issue) -> Option<&PrStatus> {
         let live = &self.live;
         for link in &issue.github_pr_links {
-            if let Some(pr) = live.pr_statuses_by_number.get(&link.number) {
+            if let Some(pr) = self.pr_by_number(link.number) {
                 return Some(pr);
-            }
-            let found = live
-                .pr_statuses
-                .values()
-                .chain(live.user_prs.iter())
-                .chain(live.review_requested_prs.iter())
-                .find(|p| p.number == link.number);
-            if found.is_some() {
-                return found;
             }
         }
         if let Some(branch) = self.branch_for(issue) {
@@ -1041,6 +1036,31 @@ impl Project {
             }
         }
         None
+    }
+
+    /// Comments waiting on the owner: unresolved review threads on the issue's
+    /// open PRs, plus unposted tuicr drafts for its worktree or those PRs.
+    /// Done cards never count.
+    pub fn unresolved_comments(&self, issue: &Issue) -> u32 {
+        if issue.column == Column::Done {
+            return 0;
+        }
+        let drafts = &self.live.tuicr_drafts;
+        let mut total = self
+            .worktree_for(issue)
+            .and_then(|wt| drafts.by_worktree.get(&self.id.join(wt)))
+            .copied()
+            .unwrap_or(0);
+        for number in self.open_pr_numbers(issue).unwrap_or_default() {
+            let Some(pr) = self.pr_by_number(number) else {
+                continue;
+            };
+            if pr.state != PrState::Open {
+                continue;
+            }
+            total += pr.unresolved_threads + drafts.by_pr_url.get(&pr.url).copied().unwrap_or(0);
+        }
+        total
     }
 
     pub fn stack_for_pr(&self, number: u32) -> Option<&GithubStack> {
@@ -2783,6 +2803,7 @@ mod tests {
             is_cross_repository: false,
             merge_blocker: None,
             in_merge_queue: false,
+            unresolved_threads: 0,
         }
     }
 
@@ -5888,6 +5909,7 @@ mod tests {
             is_cross_repository: false,
             merge_blocker: None,
             in_merge_queue: false,
+            unresolved_threads: 0,
         };
         app.project_mut()
             .live
