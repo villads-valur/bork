@@ -210,20 +210,17 @@ fn spawn_tuicr_draft_worker(
 ) -> mpsc::Receiver<external::tuicr::DraftComments> {
     let (tx, rx) = mpsc::channel();
 
-    thread::spawn(move || {
-        let mut poller = external::tuicr::DraftPoller::default();
-        loop {
-            if shutdown.load(Ordering::Relaxed) {
+    thread::spawn(move || loop {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+        wait_while_suspended(&suspended);
+        if let Some(drafts) = external::tuicr::poll_drafts() {
+            if tx.send(drafts).is_err() {
                 break;
             }
-            wait_while_suspended(&suspended);
-            if let Some(drafts) = poller.poll() {
-                if tx.send(drafts).is_err() {
-                    break;
-                }
-            }
-            thread::sleep(TUICR_POLL_INTERVAL);
         }
+        thread::sleep(TUICR_POLL_INTERVAL);
     });
 
     rx

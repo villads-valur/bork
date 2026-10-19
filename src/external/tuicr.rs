@@ -71,128 +71,99 @@ pub struct DraftComments {
     pub by_pr_url: HashMap<String, u32>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ReviewTarget {
-    Worktree(PathBuf),
-    PrUrl(String),
-}
-
-/// Counts drafts across every persisted tuicr session. Session files are only
-/// re-read when tuicr reports a new `updated_at` for them.
-#[derive(Default)]
-pub struct DraftPoller {
-    cache: HashMap<String, (String, Option<(ReviewTarget, u32)>)>,
-}
-
-impl DraftPoller {
-    pub fn poll(&mut self) -> Option<DraftComments> {
-        let output = Command::new("tuicr")
-            .args(["review", "list", "--all"])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let sessions: Vec<Value> = serde_json::from_slice(&output.stdout).ok()?;
-
-        let mut seen = HashMap::new();
-        for session in &sessions {
-            let Some(path) = session.get("path").and_then(Value::as_str) else {
-                continue;
-            };
-            let updated_at = session
-                .get("updated_at")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let has_comments = session
-                .get("comment_count")
-                .and_then(Value::as_u64)
-                .is_some_and(|count| count > 0);
-            let entry = match self.cache.remove(path) {
-                Some((cached_at, drafts)) if cached_at == updated_at => drafts,
-                _ if !has_comments => None,
-                _ => std::fs::read(path)
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-                    .and_then(|value| session_drafts(&value)),
-            };
-            seen.insert(path.to_string(), (updated_at, entry));
-        }
-        self.cache = seen;
-
-        let mut drafts = DraftComments::default();
-        for (target, count) in self.cache.values().filter_map(|(_, entry)| entry.as_ref()) {
-            match target {
-                ReviewTarget::Worktree(path) => {
-                    *drafts.by_worktree.entry(path.clone()).or_default() += count;
-                }
-                ReviewTarget::PrUrl(url) => {
-                    *drafts.by_pr_url.entry(url.clone()).or_default() += count;
-                }
-            }
-        }
-        Some(drafts)
-    }
-}
-
-/// What a session file reviews and how many of its comments are still drafts.
-fn session_drafts(session: &Value) -> Option<(ReviewTarget, u32)> {
-    let count = draft_count(session);
-    if count == 0 {
+/// Counts drafts across every persisted tuicr session. Only sessions tuicr
+/// reports as having comments are read.
+pub fn poll_drafts() -> Option<DraftComments> {
+    let mut command = Command::new("tuicr");
+    crate::external::harden_command(&mut command);
+    let output = command
+        .args(["review", "list", "--all"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
         return None;
     }
-    if let Some(key) = session.get("pr_session_key").filter(|key| !key.is_null()) {
-        let repository = key.get("repository")?;
-        if repository.get("kind").and_then(Value::as_str) != Some("git_hub") {
-            return None;
+    let sessions: Vec<Value> = serde_json::from_slice(&output.stdout).ok()?;
+
+    let mut drafts = DraftComments::default();
+    for session in &sessions {
+        if session.get("comment_count").and_then(Value::as_u64) == Some(0) {
+            continue;
         }
-        let field = |name: &str| repository.get(name).and_then(Value::as_str);
-        let url = format!(
-            "https://{}/{}/{}/pull/{}",
-            field("host")?,
-            field("owner")?,
-            field("name")?,
-            key.get("number")?.as_u64()?
-        );
-        return Some((ReviewTarget::PrUrl(url), count));
+        let Some(path) = session.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(session) = std::fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        else {
+            continue;
+        };
+        let count = draft_count(&session);
+        if count == 0 {
+            continue;
+        }
+        match review_target(&session) {
+            Some(ReviewTarget::PrUrl(url)) => *drafts.by_pr_url.entry(url).or_default() += count,
+            Some(ReviewTarget::Worktree(path)) => {
+                *drafts.by_worktree.entry(path).or_default() += count
+            }
+            None => {}
+        }
     }
-    let repo_path = session.get("repo_path")?.as_str()?.trim_end_matches('/');
-    Some((ReviewTarget::Worktree(PathBuf::from(repo_path)), count))
+    Some(drafts)
+}
+
+enum ReviewTarget {
+    PrUrl(String),
+    Worktree(PathBuf),
+}
+
+/// The GitHub PR or local checkout a session reviews.
+fn review_target(session: &Value) -> Option<ReviewTarget> {
+    let Some(key) = session.get("pr_session_key").filter(|key| !key.is_null()) else {
+        let repo_path = session.get("repo_path")?.as_str()?.trim_end_matches('/');
+        return Some(ReviewTarget::Worktree(PathBuf::from(repo_path)));
+    };
+    let repository = key.get("repository")?;
+    if repository.get("kind").and_then(Value::as_str) != Some("git_hub") {
+        return None;
+    }
+    let field = |name: &str| repository.get(name).and_then(Value::as_str);
+    Some(ReviewTarget::PrUrl(format!(
+        "https://{}/{}/{}/pull/{}",
+        field("host")?,
+        field("owner")?,
+        field("name")?,
+        key.get("number")?.as_u64()?
+    )))
 }
 
 fn draft_count(session: &Value) -> u32 {
-    let files = session
+    let count = |comments: &Vec<Value>| comments.iter().filter(|comment| is_draft(comment)).count();
+    let mut total = 0;
+    for file in session
         .get("files")
         .and_then(Value::as_object)
         .into_iter()
-        .flat_map(|files| files.values());
-    let file_comments = files.clone().flat_map(|file| {
-        file.get("file_comments")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-    });
-    let line_comments = files.flat_map(|file| {
-        file.get("line_comments")
-            .and_then(Value::as_object)
-            .into_iter()
-            .flat_map(|lines| lines.values())
-            .filter_map(Value::as_array)
-            .flatten()
-    });
-    let review_comments = session
-        .get("review_comments")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten();
-    file_comments
-        .chain(line_comments)
-        .chain(review_comments)
-        .filter(|comment| is_draft(comment))
-        .count() as u32
+        .flat_map(|files| files.values())
+    {
+        if let Some(file_comments) = file.get("file_comments").and_then(Value::as_array) {
+            total += count(file_comments);
+        }
+        if let Some(lines) = file.get("line_comments").and_then(Value::as_object) {
+            total += lines
+                .values()
+                .filter_map(Value::as_array)
+                .map(count)
+                .sum::<usize>();
+        }
+    }
+    if let Some(review_comments) = session.get("review_comments").and_then(Value::as_array) {
+        total += count(review_comments);
+    }
+    total as u32
 }
 
 /// Comments written but not yet posted. Older sessions have no lifecycle field,
@@ -237,6 +208,56 @@ mod tests {
             .unwrap();
         assert!(child.wait().unwrap().success());
         std::fs::read_to_string(log).unwrap()
+    }
+
+    fn session(extra: serde_json::Value) -> Value {
+        let mut session = serde_json::json!({
+            "repo_path": "/work/bork-1/",
+            "pr_session_key": null,
+            "files": {
+                "src/a.rs": {
+                    "file_comments": [{"lifecycle_state": "local_draft"}],
+                    "line_comments": {
+                        "3": [{"lifecycle_state": "local_draft"}],
+                        "9": [{"lifecycle_state": "posted"}, {}]
+                    }
+                }
+            },
+            "review_comments": [{"lifecycle_state": "local_draft"}]
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            session[key] = value.clone();
+        }
+        session
+    }
+
+    #[test]
+    fn draft_count_skips_posted_comments_and_keeps_old_unmarked_ones() {
+        assert_eq!(draft_count(&session(serde_json::json!({}))), 4);
+    }
+
+    #[test]
+    fn local_sessions_target_their_checkout() {
+        let Some(ReviewTarget::Worktree(path)) = review_target(&session(serde_json::json!({})))
+        else {
+            panic!("expected a worktree target");
+        };
+        assert_eq!(path, PathBuf::from("/work/bork-1"));
+    }
+
+    #[test]
+    fn pr_sessions_target_the_github_pr_url() {
+        let key = |kind: &str| {
+            serde_json::json!({"pr_session_key": {
+                "repository": {"kind": kind, "host": "github.com", "owner": "acme", "name": "bork"},
+                "number": 12
+            }})
+        };
+        let Some(ReviewTarget::PrUrl(url)) = review_target(&session(key("git_hub"))) else {
+            panic!("expected a PR target");
+        };
+        assert_eq!(url, "https://github.com/acme/bork/pull/12");
+        assert!(review_target(&session(key("git_lab"))).is_none());
     }
 
     #[test]

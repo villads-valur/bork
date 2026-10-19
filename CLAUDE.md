@@ -6,7 +6,7 @@ Terminal kanban board for orchestrating OpenCode/Claude Code/Codex/Pi/Cursor cod
 
 - **Language**: Rust (no async runtime, pure `std::thread` + `mpsc`)
 - **TUI**: ratatui + crossterm
-- **External tools**: tmux, git, gh, linear (optional), and the coding agents: `opencode`, `claude`, `codex`, `pi`, `cursor-agent` (all via `std::process::Command`)
+- **External tools**: tmux, git, gh, linear (optional), tuicr (optional), and the coding agents: `opencode`, `claude`, `codex`, `pi`, `cursor-agent` (all via `std::process::Command`)
 
 ### Threading Model
 

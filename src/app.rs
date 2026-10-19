@@ -1051,13 +1051,16 @@ impl Project {
             .and_then(|wt| drafts.by_worktree.get(&self.id.join(wt)))
             .copied()
             .unwrap_or(0);
-        for number in self.open_pr_numbers(issue).unwrap_or_default() {
-            let Some(pr) = self.pr_by_number(number) else {
-                continue;
-            };
-            if pr.state != PrState::Open {
-                continue;
-            }
+        // Cached stack members, so a failed or loading stack refresh keeps the count.
+        let mut numbers = self.issue_pr_numbers(issue);
+        if numbers.is_empty() {
+            numbers.extend(self.pr_for(issue).map(|pr| pr.number));
+        }
+        let open_prs = numbers
+            .into_iter()
+            .filter_map(|number| self.pr_by_number(number))
+            .filter(|pr| pr.state == PrState::Open);
+        for pr in open_prs {
             total += pr.unresolved_threads + drafts.by_pr_url.get(&pr.url).copied().unwrap_or(0);
         }
         total
@@ -3003,6 +3006,94 @@ mod tests {
         pending.checks = Some(ChecksStatus::Pending);
         app.project_mut().live.user_prs = vec![test_pr(7, "feature"), pending];
 
+        assert_eq!(app.project().attention_count(), 1);
+    }
+
+    fn comments_of(app: &App) -> u32 {
+        app.project().unresolved_comments(&app.project().issues[0])
+    }
+
+    #[test]
+    fn unresolved_comments_add_threads_and_tuicr_drafts() {
+        let mut issue = issue_linked_to_pr("bork-1", 7, None);
+        issue.worktree = Some("bork-1".into());
+        let mut app = test_app(vec![issue]);
+        let mut pr = test_pr(7, "feature");
+        pr.unresolved_threads = 2;
+        let worktree = app.project().id().join("bork-1");
+        let live = &mut app.project_mut().live;
+        live.pr_statuses_by_number.insert(7, pr.clone());
+        live.tuicr_drafts.by_pr_url.insert(pr.url.clone(), 3);
+        live.tuicr_drafts.by_worktree.insert(worktree, 1);
+
+        assert_eq!(comments_of(&app), 6);
+    }
+
+    #[test]
+    fn unresolved_comments_skip_closed_prs_and_done_cards() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let mut pr = test_pr(7, "feature");
+        pr.unresolved_threads = 2;
+        pr.state = PrState::Merged;
+        app.project_mut().live.pr_statuses_by_number.insert(7, pr);
+        assert_eq!(comments_of(&app), 0);
+
+        app.project_mut()
+            .live
+            .pr_statuses_by_number
+            .get_mut(&7)
+            .unwrap()
+            .state = PrState::Open;
+        assert_eq!(comments_of(&app), 2);
+        app.project_mut().issues[0].column = Column::Done;
+        assert_eq!(comments_of(&app), 0);
+    }
+
+    #[test]
+    fn stack_cards_keep_their_count_when_the_stack_refresh_fails() {
+        let mut issue = test_issue("bork-1", Column::CodeReview);
+        issue.github_stack = Some(42);
+        let mut app = test_app(vec![issue]);
+        let member = |number| crate::types::GithubStackPullRequest {
+            number,
+            state: PrState::Open,
+            is_draft: false,
+            head_branch: format!("member-{number}"),
+        };
+        let live = &mut app.project_mut().live;
+        live.stacks_available = true;
+        live.github_stacks = vec![GithubStack {
+            number: 42,
+            url: String::new(),
+            base_ref: "main".into(),
+            open: true,
+            pull_requests: vec![member(44), member(45)],
+        }];
+        for (number, threads) in [(44, 1), (45, 2)] {
+            let mut pr = test_pr(number, &format!("member-{number}"));
+            pr.unresolved_threads = threads;
+            live.pr_statuses_by_number.insert(number, pr);
+        }
+        live.stack_errors.insert(42, "offline".into());
+
+        assert_eq!(comments_of(&app), 3);
+    }
+
+    #[test]
+    fn unresolved_comments_need_you_on_top_of_attention() {
+        let mut app = test_app(vec![issue_linked_to_pr(
+            "bork-1",
+            7,
+            Some(PrImportSource::ReviewRequested),
+        )]);
+        let mut pr = test_pr(7, "feature");
+        pr.review = Some(crate::types::ReviewDecision::ReviewRequired);
+        app.project_mut().live.review_requested_prs = vec![pr];
+        assert_eq!(attention_of(&app), None);
+        assert_eq!(app.project().attention_count(), 0);
+
+        app.project_mut().live.review_requested_prs[0].unresolved_threads = 1;
+        assert_eq!(attention_of(&app), None);
         assert_eq!(app.project().attention_count(), 1);
     }
 

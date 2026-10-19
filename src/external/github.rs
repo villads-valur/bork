@@ -1190,6 +1190,20 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_unresolved_threads() {
+        let node = make_pr_node(
+            r#"{"reviewThreads": {"nodes": [
+                {"isResolved": false}, {"isResolved": true}, {"isResolved": false}
+            ]}}"#,
+        );
+        assert_eq!(parse_pr_node(&node).unwrap().unresolved_threads, 2);
+        assert_eq!(
+            parse_pr_node(&make_pr_node("")).unwrap().unresolved_threads,
+            0
+        );
+    }
+
+    #[test]
     fn test_parse_in_merge_queue() {
         let node = make_pr_node(r#"{"isInMergeQueue": true}"#);
         assert!(parse_pr_node(&node).unwrap().in_merge_queue);

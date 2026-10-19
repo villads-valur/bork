@@ -518,6 +518,9 @@ Each card shows PR status when a matching PR is found:
 | `●` (red) | Changes requested |
 | `○` (yellow) | Review required |
 | `+12/-3` | Lines added/removed |
+| `✎3` (yellow, bottom line) | Unresolved comments: open review threads on the card's open PRs plus unposted tuicr drafts |
+
+Cards with unresolved comments also count as needing you. Review threads from bots count too; plain PR conversation comments don't. With tuicr installed, its drafts count until you post them with `:submit` or clear them with `:clearc`. Done cards never count.
 
 The `gh` CLI must be installed and authenticated. If `gh` is not available or the repo is not on GitHub, PR polling is silently skipped.
 

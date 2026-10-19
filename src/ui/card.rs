@@ -243,12 +243,11 @@ fn comments_badge(count: u32) -> Option<Span<'static>> {
 
 fn format_bottom_line(ctx: &CardContext, max_width: usize) -> Line<'static> {
     let issue = ctx.issue;
-    let ports = ctx.ports;
     let mut right = Vec::new();
     if let Some(text) = pruned_indicator_text(issue) {
         right.push(text);
     }
-    if ports.is_some_and(|ports| !ports.is_empty()) {
+    if ctx.ports.is_some_and(|ports| !ports.is_empty()) {
         right.push("🔌".to_string());
     }
     // Drop secondary indicators first when the footer gets narrow.
