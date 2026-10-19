@@ -521,6 +521,49 @@ Each card shows PR status when a matching PR is found:
 
 The `gh` CLI must be installed and authenticated. If `gh` is not available or the repo is not on GitHub, PR polling is silently skipped.
 
+### Attached PR stacks
+
+The GitHub picker marks PRs that belong to a stack. **Enter** still imports or
+attaches only the selected PR. **Ctrl+S** imports the whole stack, or toggles its
+attachment when editing an issue. Typing continues to search, including `s`.
+An issue can follow one stack alongside its existing individual PR links.
+
+An attached stack follows GitHub's current membership. Its card summarizes CI
+across open PRs, with failures, pending checks, and unknown checks shown separately.
+Small stacks show connected PR rows; larger stacks show a count and check summary.
+Merged and closed PRs remain visible in the expanded list. Stack cards omit diff
+counts. Individual PRs show additions/deletions, or `draft` while still in draft.
+Linked issues and Linear IDs sit at bottom-left. Selecting a stack issue shows
+`s view stack` in the app shortcut bar.
+Orchestrator and todo cards show their type beside the issue ID in the border.
+
+Stack controls appear only when the repository supports GitHub's stack API;
+no CLI extension is required. Without `gh`, live GitHub details are hidden and
+saved links remain editable. Loading is separate from errors. Failed refreshes
+keep cached status and show the error in the picker or stack details.
+
+- **s** expands the stack into a scrollable panel; **j/k** navigates and **Esc** closes.
+- **o** opens all open PRs in the attached stack, in stack order.
+- **R** reviews each open PR separately with `tuicr pr <number>`. After exiting a
+  review, press Enter for the next PR or `q` to stop. This needs a tuicr version
+  with the `pr` subcommand; an issue worktree is not required.
+- **P** refreshes GitHub data. When stack data is unavailable, stack-wide actions
+  wait for a successful refresh rather than opening a partial list.
+
+To detach a stack, edit the issue, focus GitHub, and press Backspace. Existing
+individual PR links remain attached. Issues without a stack keep their existing
+browser and review shortcuts.
+
+### Automatic stack reviews
+
+A review request on any member imports one card for the stack. Bork checks stack membership before importing individual PRs, deduplicates repeated results, and fetches only the stacks referenced by your review requests. Only review requests addressed directly to you qualify. Team-only requests and mentions do not fill your personal review column.
+
+The stack detail view marks members that need your review. Automatic stack cards move to Done when no member has an outstanding request and return to Code Review when a new request arrives. Failed or incomplete discovery preserves the previous state. Manually attached stacks keep their existing lifecycle.
+
+`stack_review_prompt` is separate from `review_prompt`. Set it in `~/.config/bork/config.toml` or the project's `.bork/config.toml`; the project value wins. Bork appends the ordered PR list, URLs, and which members need your review. Custom prompts edited on individual cards are preserved.
+
+Untouched automatic PR cards can be consolidated into a stack card. Explicit PR-only attachments and edited cards are preserved, and Bork avoids creating a stack card over them. In that case, each other requested member gets its own card so no request goes missing. Cards in Done are left alone.
+
 ## Linear Integration
 
 Set `LINEAR_API_KEY` to a [Linear personal API key](https://linear.app/settings/api):
@@ -669,46 +712,3 @@ Want to contribute? Open an issue or PR &mdash; contributions of all sizes are w
 This project is licensed under the [MIT License](LICENSE).
 
 Made by [Villads Valur](https://valur.xyz/projects/bork).
-
-### Attached PR stacks
-
-The GitHub picker marks PRs that belong to a stack. **Enter** still imports or
-attaches only the selected PR. **Ctrl+S** imports the whole stack, or toggles its
-attachment when editing an issue. Typing continues to search, including `s`.
-An issue can follow one stack alongside its existing individual PR links.
-
-An attached stack follows GitHub's current membership. Its card summarizes CI
-across open PRs, with failures, pending checks, and unknown checks shown separately.
-Small stacks show connected PR rows; larger stacks show a count and check summary.
-Merged and closed PRs remain visible in the expanded list. Stack cards omit diff
-counts. Individual PRs show additions/deletions, or `draft` while still in draft.
-Linked issues and Linear IDs sit at bottom-left. Selecting a stack issue shows
-`s view stack` in the app shortcut bar.
-Orchestrator and todo cards show their type beside the issue ID in the border.
-
-Stack controls appear only when the repository supports GitHub's stack API;
-no CLI extension is required. Without `gh`, live GitHub details are hidden and
-saved links remain editable. Loading is separate from errors. Failed refreshes
-keep cached status and show the error in the picker or stack details.
-
-- **s** expands the stack into a scrollable panel; **j/k** navigates and **Esc** closes.
-- **o** opens all open PRs in the attached stack, in stack order.
-- **R** reviews each open PR separately with `tuicr pr <number>`. After exiting a
-  review, press Enter for the next PR or `q` to stop. This needs a tuicr version
-  with the `pr` subcommand; an issue worktree is not required.
-- **P** refreshes GitHub data. When stack data is unavailable, stack-wide actions
-  wait for a successful refresh rather than opening a partial list.
-
-To detach a stack, edit the issue, focus GitHub, and press Backspace. Existing
-individual PR links remain attached. Issues without a stack keep their existing
-browser and review shortcuts.
-
-### Automatic stack reviews
-
-A review request on any member imports one card for the stack. Bork checks stack membership before importing individual PRs, deduplicates repeated results, and fetches only the stacks referenced by your review requests. Only review requests addressed directly to you qualify. Team-only requests and mentions do not fill your personal review column.
-
-The stack detail view marks members that need your review. Automatic stack cards move to Done when no member has an outstanding request and return to Code Review when a new request arrives. Failed or incomplete discovery preserves the previous state. Manually attached stacks keep their existing lifecycle.
-
-`stack_review_prompt` is separate from `review_prompt`. Set it in `~/.config/bork/config.toml` or the project's `.bork/config.toml`; the project value wins. Bork appends the ordered PR list, URLs, and which members need your review. Custom prompts edited on individual cards are preserved.
-
-Untouched automatic PR cards can be consolidated into a stack card. Explicit PR-only attachments and edited cards are preserved, and Bork avoids creating a stack card over them. In that case, each other requested member gets its own card so no request goes missing. Cards in Done are left alone.
