@@ -261,17 +261,21 @@ fn format_bottom_line(ctx: &CardContext, max_width: usize) -> Line<'static> {
         left.push(badge);
         left.push(Span::raw(" "));
     }
-    if let Some(badge) = comments_badge(ctx.project.unresolved_comments(issue)) {
-        left.push(badge);
-        left.push(Span::raw(" "));
-    }
-    let used = left.iter().map(Span::width).sum::<usize>();
+    // Comments arrive after the first poll, so they go after the Linear IDs to
+    // avoid shifting them. Their width is reserved so the IDs truncate first.
+    let comments = comments_badge(ctx.project.unresolved_comments(issue));
+    let comments_width = comments.as_ref().map_or(0, |badge| badge.width() + 1);
+    let used = left.iter().map(Span::width).sum::<usize>() + comments_width;
     if issue.has_linear() && left_budget > used + 2 {
         let identifiers = issue.linear_identifiers().join(", ");
         left.push(Span::styled(
             styles::truncate(&format!("◈ {identifiers}"), left_budget - used),
             Style::default().fg(Color::Blue),
         ));
+        left.push(Span::raw(" "));
+    }
+    if let Some(badge) = comments {
+        left.push(badge);
     }
     let used = left.iter().map(Span::width).sum::<usize>();
     if right.width() > 0 && used + right.width() < max_width {

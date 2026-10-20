@@ -1024,18 +1024,14 @@ impl Project {
     }
 
     pub fn pr_for(&self, issue: &Issue) -> Option<&PrStatus> {
-        let live = &self.live;
-        for link in &issue.github_pr_links {
-            if let Some(pr) = self.pr_by_number(link.number) {
-                return Some(pr);
-            }
-        }
-        if let Some(branch) = self.branch_for(issue) {
-            if let Some(pr) = live.pr_statuses.get(branch) {
-                return Some(pr);
-            }
-        }
-        None
+        issue
+            .github_pr_links
+            .iter()
+            .find_map(|link| self.pr_by_number(link.number))
+            .or_else(|| {
+                self.branch_for(issue)
+                    .and_then(|branch| self.live.pr_statuses.get(branch))
+            })
     }
 
     /// Comments waiting on the owner: unresolved review threads on the issue's

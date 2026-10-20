@@ -115,6 +115,7 @@ pub fn poll_drafts() -> Option<DraftComments> {
     Some(drafts)
 }
 
+#[derive(Debug, PartialEq)]
 enum ReviewTarget {
     PrUrl(String),
     Worktree(PathBuf),
@@ -140,30 +141,31 @@ fn review_target(session: &Value) -> Option<ReviewTarget> {
     )))
 }
 
+/// Drafts across the three places tuicr stores comments: per file, per line,
+/// and for the whole review.
 fn draft_count(session: &Value) -> u32 {
-    let count = |comments: &Vec<Value>| comments.iter().filter(|comment| is_draft(comment)).count();
-    let mut total = 0;
-    for file in session
+    let files = session
         .get("files")
         .and_then(Value::as_object)
         .into_iter()
-        .flat_map(|files| files.values())
-    {
-        if let Some(file_comments) = file.get("file_comments").and_then(Value::as_array) {
-            total += count(file_comments);
-        }
-        if let Some(lines) = file.get("line_comments").and_then(Value::as_object) {
-            total += lines
-                .values()
-                .filter_map(Value::as_array)
-                .map(count)
-                .sum::<usize>();
-        }
+        .flat_map(|files| files.values());
+    let mut lists: Vec<&Value> = Vec::new();
+    for file in files {
+        lists.extend(file.get("file_comments"));
+        lists.extend(
+            file.get("line_comments")
+                .and_then(Value::as_object)
+                .into_iter()
+                .flat_map(|lines| lines.values()),
+        );
     }
-    if let Some(review_comments) = session.get("review_comments").and_then(Value::as_array) {
-        total += count(review_comments);
-    }
-    total as u32
+    lists.extend(session.get("review_comments"));
+    lists
+        .into_iter()
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter(|comment| is_draft(comment))
+        .count() as u32
 }
 
 /// Comments written but not yet posted. Older sessions have no lifecycle field,
@@ -210,10 +212,10 @@ mod tests {
         std::fs::read_to_string(log).unwrap()
     }
 
-    fn session(extra: serde_json::Value) -> Value {
-        let mut session = serde_json::json!({
+    fn session(pr_session_key: Value) -> Value {
+        serde_json::json!({
             "repo_path": "/work/bork-1/",
-            "pr_session_key": null,
+            "pr_session_key": pr_session_key,
             "files": {
                 "src/a.rs": {
                     "file_comments": [{"lifecycle_state": "local_draft"}],
@@ -224,40 +226,38 @@ mod tests {
                 }
             },
             "review_comments": [{"lifecycle_state": "local_draft"}]
-        });
-        for (key, value) in extra.as_object().unwrap() {
-            session[key] = value.clone();
-        }
-        session
+        })
+    }
+
+    fn pr_key(kind: &str) -> Value {
+        serde_json::json!({
+            "repository": {"kind": kind, "host": "github.com", "owner": "acme", "name": "bork"},
+            "number": 12
+        })
     }
 
     #[test]
     fn draft_count_skips_posted_comments_and_keeps_old_unmarked_ones() {
-        assert_eq!(draft_count(&session(serde_json::json!({}))), 4);
+        assert_eq!(draft_count(&session(Value::Null)), 4);
     }
 
     #[test]
     fn local_sessions_target_their_checkout() {
-        let Some(ReviewTarget::Worktree(path)) = review_target(&session(serde_json::json!({})))
-        else {
-            panic!("expected a worktree target");
-        };
-        assert_eq!(path, PathBuf::from("/work/bork-1"));
+        assert_eq!(
+            review_target(&session(Value::Null)),
+            Some(ReviewTarget::Worktree(PathBuf::from("/work/bork-1")))
+        );
     }
 
     #[test]
     fn pr_sessions_target_the_github_pr_url() {
-        let key = |kind: &str| {
-            serde_json::json!({"pr_session_key": {
-                "repository": {"kind": kind, "host": "github.com", "owner": "acme", "name": "bork"},
-                "number": 12
-            }})
-        };
-        let Some(ReviewTarget::PrUrl(url)) = review_target(&session(key("git_hub"))) else {
-            panic!("expected a PR target");
-        };
-        assert_eq!(url, "https://github.com/acme/bork/pull/12");
-        assert!(review_target(&session(key("git_lab"))).is_none());
+        assert_eq!(
+            review_target(&session(pr_key("git_hub"))),
+            Some(ReviewTarget::PrUrl(
+                "https://github.com/acme/bork/pull/12".into()
+            ))
+        );
+        assert_eq!(review_target(&session(pr_key("git_lab"))), None);
     }
 
     #[test]
