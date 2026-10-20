@@ -30,6 +30,7 @@ pub enum Action {
     ScrollToBottom,
     SyncPRs,
     OpenPR,
+    OpenAllPRs,
     OpenLinear,
     AssignWorktree,
     OpenReview,

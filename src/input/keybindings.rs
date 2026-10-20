@@ -26,6 +26,7 @@ pub fn map_key_to_action(
             KeyCode::Down | KeyCode::Char('j') => Action::StackDown,
             KeyCode::Up | KeyCode::Char('k') => Action::StackUp,
             KeyCode::Char('o') => Action::OpenPR,
+            KeyCode::Char('O') => Action::OpenAllPRs,
             KeyCode::Char('R') => Action::OpenReviewPR,
             KeyCode::Char('P') => Action::SyncPRs,
             _ => Action::Noop,

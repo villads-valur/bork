@@ -91,13 +91,13 @@ impl Project {
 
     /// Rows in the details popup: the attached stack's members, or the issue's
     /// linked PRs when it has no stack.
-    pub fn detail_member_count(&self, issue: &Issue) -> usize {
+    pub fn detail_members(&self, issue: &Issue) -> Vec<GithubStackPullRequest> {
         if issue.github_stack.is_some() {
             return self
                 .attached_stack(issue)
-                .map_or(0, |stack| stack.pull_requests.len());
+                .map_or_else(Vec::new, |stack| stack.pull_requests.clone());
         }
-        issue.github_pr_links.len()
+        self.linked_pr_members(issue)
     }
 
     pub fn detail_open_numbers(&self, issue: &Issue) -> Result<Vec<u32>, &'static str> {

@@ -546,7 +546,7 @@ saved links remain editable. Loading is separate from errors. Failed refreshes
 keep cached status and show the error in the picker or stack details.
 
 - **s** expands the stack into a scrollable panel; **j/k** navigates and **Esc** closes.
-- **o** opens all open PRs in the attached stack, in stack order.
+- **o** opens the selected PR; **O** opens all open PRs in the attached stack, in stack order.
 - **R** reviews each open PR separately with `tuicr pr <number>`. After exiting a
   review, press Enter for the next PR or `q` to stop. This needs a tuicr version
   with the `pr` subcommand; an issue worktree is not required.

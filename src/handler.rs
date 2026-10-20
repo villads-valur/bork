@@ -1655,6 +1655,7 @@ fn handle_stack_details(app: &mut App, action: Action, ch: &ActionChannels<'_>) 
     let ctx = ActionContext {
         project_id: details.project_id.clone(),
     };
+    let selected = details.selected;
     let issue = app
         .find_project(&ctx.project_id)
         .and_then(|project| {
@@ -1674,7 +1675,7 @@ fn handle_stack_details(app: &mut App, action: Action, ch: &ActionChannels<'_>) 
     };
     match action {
         Action::StackDown | Action::StackUp => {
-            let count = app.context_project(&ctx).detail_member_count(&issue);
+            let count = app.context_project(&ctx).detail_members(&issue).len();
             if let Some(details) = &mut app.stack_details {
                 if action == Action::StackDown {
                     details.selected = (details.selected + 1).min(count.saturating_sub(1));
@@ -1686,7 +1687,20 @@ fn handle_stack_details(app: &mut App, action: Action, ch: &ActionChannels<'_>) 
         Action::SyncPRs => {
             let _ = ch.pr_wake_tx.send(crate::github_poll::Wake::Refresh);
         }
-        Action::OpenPR | Action::OpenReviewPR => {
+        Action::OpenPR => {
+            let project = app.context_project(&ctx);
+            let Some(number) = project
+                .detail_members(&issue)
+                .get(selected)
+                .map(|member| member.number)
+            else {
+                app.set_warning("No PR selected");
+                return PostAction::None;
+            };
+            let cwd = project.config.project_root.join("main");
+            spawn_open_prs(app, ch, cwd, vec![number], String::new());
+        }
+        Action::OpenAllPRs | Action::OpenReviewPR => {
             return open_pr_group(app, action, &ctx, &issue, ch)
         }
         _ => {}

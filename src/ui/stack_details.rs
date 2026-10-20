@@ -194,7 +194,7 @@ fn render_members(
         message.clone()
     } else {
         format!(
-            "j/k move  o open all  R review all  P refresh  Esc close  {}/{}",
+            "j/k move  o open  O open all  R review all  P refresh  Esc close  {}/{}",
             (offset + visible).min(members.len()),
             members.len()
         )
