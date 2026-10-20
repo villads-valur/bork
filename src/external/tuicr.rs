@@ -277,7 +277,9 @@ fn main() {
         let session = FakeTuicrSession::start("running");
 
         open_in_session(&session.name, session.cwd(), false).unwrap();
+        // The pane reports tuicr before it has logged its launch.
         wait_until(|| tuicr_is_running(&session.name));
+        session.wait_for_launches(1);
         open_in_session(&session.name, session.cwd(), false).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(300));
 
@@ -293,7 +295,9 @@ fn main() {
         let session = FakeTuicrSession::start("mode");
 
         open_in_session(&session.name, session.cwd(), false).unwrap();
+        // The pane reports tuicr before it has logged its launch.
         wait_until(|| tuicr_is_running(&session.name));
+        session.wait_for_launches(1);
         open_in_session(&session.name, session.cwd(), true).unwrap();
         session.wait_for_launches(2);
 
