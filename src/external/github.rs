@@ -633,70 +633,24 @@ fn run_graphql_search(main_worktree: &Path, query: &str, search: &str) -> Result
 
 fn fetch_changes_requested_pages(
     user: &str,
-    mut fetch: impl FnMut(&str) -> Result<String, String>,
+    fetch: impl FnMut(&str) -> Result<String, String>,
 ) -> Result<Vec<u32>, String> {
     let mut numbers = Vec::new();
-    let mut cursor = None::<String>;
-    loop {
-        let after = cursor
-            .as_ref()
-            .map(|cursor| {
-                format!(
-                    ",after:{}",
-                    serde_json::to_string(cursor).unwrap_or_default()
-                )
-            })
-            .unwrap_or_default();
-        let query = format!("query($search:String!){{ search(query:$search,type:ISSUE,first:100{after}){{ nodes{{ ... on PullRequest{{ number latestOpinionatedReviews(first:100){{ nodes{{ author{{ login }} state }} }} }} }} issueCount pageInfo{{hasNextPage endCursor}} }} }}");
-        let value: serde_json::Value = serde_json::from_str(&fetch(&query)?)
-            .map_err(|_| "Invalid GitHub reviewed-by response")?;
-        if value
-            .get("errors")
-            .and_then(|v| v.as_array())
-            .is_some_and(|errors| !errors.is_empty())
-        {
-            return Err("GitHub reviewed-by query returned incomplete data".into());
-        }
-        let search = value
-            .pointer("/data/search")
-            .ok_or("Missing GitHub reviewed-by results")?;
-        if search
-            .get("issueCount")
-            .and_then(|v| v.as_u64())
-            .is_some_and(|count| count > 1000)
-        {
-            return Err(
-                "GitHub reviewed-by search exceeds its 1,000-result limit; keeping existing reviews"
-                    .into(),
-            );
-        }
-        let nodes = search
-            .get("nodes")
-            .and_then(|v| v.as_array())
-            .ok_or("Missing GitHub reviewed-by nodes")?;
-        numbers.extend(
-            nodes
-                .iter()
-                .filter(|node| has_changes_requested_from(node, user))
-                .filter_map(|node| node.get("number").and_then(|v| v.as_u64()))
-                .filter_map(|n| u32::try_from(n).ok()),
-        );
-        let has_next = search
-            .pointer("/pageInfo/hasNextPage")
-            .and_then(|v| v.as_bool())
-            .ok_or("Missing GitHub reviewed-by pagination")?;
-        if !has_next {
-            break;
-        }
-        let next = search
-            .pointer("/pageInfo/endCursor")
-            .and_then(|v| v.as_str())
-            .ok_or("Missing GitHub reviewed-by cursor")?;
-        if cursor.as_deref() == Some(next) {
-            return Err("GitHub reviewed-by cursor did not advance".into());
-        }
-        cursor = Some(next.to_string());
-    }
+    search_pages(
+        "reviewed-by",
+        "number latestOpinionatedReviews(first:100){ nodes{ author{ login } state } }",
+        fetch,
+        |node| {
+            if has_changes_requested_from(node, user) {
+                numbers.extend(
+                    node.get("number")
+                        .and_then(|v| v.as_u64())
+                        .and_then(|n| u32::try_from(n).ok()),
+                );
+            }
+            Ok(())
+        },
+    )?;
     numbers.sort_unstable();
     numbers.dedup();
     Ok(numbers)
@@ -722,13 +676,14 @@ fn has_changes_requested_from(node: &serde_json::Value, user: &str) -> bool {
     })
 }
 
-fn fetch_review_pages(
+/// Page through a GitHub PR search, handing each node to `on_node`.
+fn search_pages(
+    label: &str,
+    fields: &str,
     mut fetch: impl FnMut(&str) -> Result<String, String>,
-) -> Result<ReviewDiscovery, String> {
-    let mut result = ReviewDiscovery::default();
-    let mut prs = HashMap::new();
+    mut on_node: impl FnMut(&serde_json::Value) -> Result<(), String>,
+) -> Result<(), String> {
     let mut cursor = None::<String>;
-    let mut with_stacks = true;
     loop {
         let after = cursor
             .as_ref()
@@ -739,51 +694,79 @@ fn fetch_review_pages(
                 )
             })
             .unwrap_or_default();
-        let stack_field = if with_stacks { "stack { number }" } else { "" };
-        let query = format!("query($search:String!){{ search(query:$search,type:ISSUE,first:50{after}){{ nodes{{ ... on PullRequest{{ {PR_FIELDS} {stack_field} }} }} issueCount pageInfo{{hasNextPage endCursor}} }} }}");
-        let stdout = match fetch(&query) {
-            Ok(stdout) => stdout,
-            Err(error)
-                if with_stacks
-                    && error.contains("stack")
-                    && (error.contains("doesn't exist")
-                        || error.contains("Cannot query field")) =>
-            {
-                with_stacks = false;
-                cursor = None;
-                prs.clear();
-                result.stacks.clear();
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
-        let value: serde_json::Value =
-            serde_json::from_str(&stdout).map_err(|_| "Invalid GitHub review response")?;
+        let query = format!("query($search:String!){{ search(query:$search,type:ISSUE,first:50{after}){{ nodes{{ ... on PullRequest{{ {fields} }} }} issueCount pageInfo{{hasNextPage endCursor}} }} }}");
+        let value: serde_json::Value = serde_json::from_str(&fetch(&query)?)
+            .map_err(|_| format!("Invalid GitHub {label} response"))?;
         if value
             .get("errors")
             .and_then(|v| v.as_array())
             .is_some_and(|errors| !errors.is_empty())
         {
-            return Err("GitHub review query returned incomplete data".into());
+            return Err(format!("GitHub {label} query returned incomplete data"));
         }
         let search = value
             .pointer("/data/search")
-            .ok_or("Missing GitHub review results")?;
+            .ok_or_else(|| format!("Missing GitHub {label} results"))?;
         if search
             .get("issueCount")
             .and_then(|v| v.as_u64())
             .is_some_and(|count| count > 1000)
         {
-            return Err(
-                "GitHub review search exceeds its 1,000-result limit; keeping existing reviews"
-                    .into(),
-            );
+            return Err(format!(
+                "GitHub {label} search exceeds its 1,000-result limit; keeping existing reviews"
+            ));
         }
         let nodes = search
             .get("nodes")
             .and_then(|v| v.as_array())
-            .ok_or("Missing GitHub review nodes")?;
+            .ok_or_else(|| format!("Missing GitHub {label} nodes"))?;
         for node in nodes {
+            on_node(node)?;
+        }
+        let has_next = search
+            .pointer("/pageInfo/hasNextPage")
+            .and_then(|v| v.as_bool())
+            .ok_or_else(|| format!("Missing GitHub {label} pagination"))?;
+        if !has_next {
+            return Ok(());
+        }
+        let next = search
+            .pointer("/pageInfo/endCursor")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("Missing GitHub {label} cursor"))?;
+        if cursor.as_deref() == Some(next) {
+            return Err(format!("GitHub {label} cursor did not advance"));
+        }
+        cursor = Some(next.to_string());
+    }
+}
+
+fn fetch_review_pages(
+    mut fetch: impl FnMut(&str) -> Result<String, String>,
+) -> Result<ReviewDiscovery, String> {
+    match review_pages(true, &mut fetch) {
+        Err(error)
+            if error.contains("stack")
+                && (error.contains("doesn't exist") || error.contains("Cannot query field")) =>
+        {
+            review_pages(false, &mut fetch)
+        }
+        result => result,
+    }
+}
+
+fn review_pages(
+    with_stacks: bool,
+    fetch: impl FnMut(&str) -> Result<String, String>,
+) -> Result<ReviewDiscovery, String> {
+    let mut result = ReviewDiscovery::default();
+    let mut prs = HashMap::new();
+    let stack_field = if with_stacks { "stack { number }" } else { "" };
+    search_pages(
+        "review",
+        &format!("{PR_FIELDS} {stack_field}"),
+        fetch,
+        |node| {
             let pr = parse_pr_node(node).ok_or("Invalid GitHub review PR")?;
             let stack = if with_stacks {
                 match node.get("stack") {
@@ -809,23 +792,9 @@ fn fetch_review_pages(
             }
             result.stacks.insert(pr.number, stack);
             prs.insert(pr.number, pr);
-        }
-        let has_next = search
-            .pointer("/pageInfo/hasNextPage")
-            .and_then(|v| v.as_bool())
-            .ok_or("Missing GitHub review pagination")?;
-        if !has_next {
-            break;
-        }
-        let next = search
-            .pointer("/pageInfo/endCursor")
-            .and_then(|v| v.as_str())
-            .ok_or("Missing GitHub review cursor")?;
-        if cursor.as_deref() == Some(next) {
-            return Err("GitHub review cursor did not advance".into());
-        }
-        cursor = Some(next.to_string());
-    }
+            Ok(())
+        },
+    )?;
     result.prs = prs.into_values().collect();
     result
         .prs

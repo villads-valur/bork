@@ -16,7 +16,11 @@ impl Project {
     }
 
     pub fn review_pending_for(&self, number: u32) -> bool {
-        self.pending_review_numbers().contains(&number)
+        self.live
+            .review_requested_prs
+            .iter()
+            .any(|pr| pr.number == number)
+            || self.live.changes_requested_prs.contains(&number)
     }
 
     fn stack_review_prompt(&self, stack: &GithubStack, requested: &[u32]) -> String {
