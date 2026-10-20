@@ -335,6 +335,7 @@ pub struct Response {
     unsupported: bool,
     github_user: Option<String>,
     review_stacks: Option<HashMap<u32, Option<u32>>>,
+    changes_requested: Vec<u32>,
     error: Option<String>,
 }
 
@@ -344,6 +345,7 @@ pub fn fetch(path: &Path, request: &Request) -> Response {
         Request::Reviews => github::fetch_review_requested_prs(path).map(|discovery| {
             response.prs = discovery.prs;
             response.review_stacks = Some(discovery.stacks);
+            response.changes_requested = discovery.changes_requested;
         }),
         Request::Authored => github::fetch_user_prs(path).map(|prs| response.prs = prs),
         Request::PickerPrs => github::fetch_prs(path).map(|prs| response.prs = prs),
@@ -410,6 +412,7 @@ pub fn poll(
                     cache.result.reviews_ready = true;
                     cache.result.review_requested_prs = response.prs.clone();
                     cache.result.review_stacks = response.review_stacks;
+                    cache.result.changes_requested_prs = response.changes_requested;
                 }
             }
             Request::Authored => {
@@ -722,6 +725,31 @@ mod tests {
         assert_eq!(requests, vec![Request::Reviews, Request::Stack(42)]);
         assert_eq!(cache.result.stacks.as_ref().unwrap()[0].number, 42);
         assert!(cycle(&mut cache, &targets, 1010, false).is_empty());
+    }
+
+    #[test]
+    fn review_discovery_stores_changes_requested() {
+        let targets = Targets {
+            auto_reviews: true,
+            ..Default::default()
+        };
+        let mut cache = Cache::default();
+        poll(
+            &mut cache,
+            &targets,
+            1000,
+            false,
+            |request| match request {
+                Request::Reviews => Response {
+                    changes_requested: vec![7],
+                    review_stacks: Some(HashMap::new()),
+                    ..Default::default()
+                },
+                _ => Response::default(),
+            },
+            |_, _| {},
+        );
+        assert_eq!(cache.result.changes_requested_prs, vec![7]);
     }
 
     #[test]

@@ -165,7 +165,7 @@ fn render_members(
                 )]
             })
         };
-        if project.review_requested_for(member.number) {
+        if project.review_pending_for(member.number) {
             status_spans.push(Span::styled(
                 " · your review",
                 Style::default().fg(styles::ACCENT),

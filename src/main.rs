@@ -79,6 +79,7 @@ struct PrPollResult {
     user_prs: Vec<PrStatus>,
     review_requested_prs: Vec<PrStatus>,
     review_stacks: Option<HashMap<u32, Option<u32>>>,
+    changes_requested_prs: Vec<u32>,
     github_user: Option<String>,
     loading_more: bool,
     error: Option<String>,
@@ -1862,7 +1863,8 @@ fn drain_project_workers(
                 .is_some_and(|stacks| live.github_stacks != *stacks)
             || live.user_prs != pr_result.user_prs
             || live.review_requested_prs != pr_result.review_requested_prs
-            || live.review_stacks != pr_result.review_stacks;
+            || live.review_stacks != pr_result.review_stacks
+            || live.changes_requested_prs != pr_result.changes_requested_prs;
         if pr_result.github_user.is_some() && live.github_user != pr_result.github_user {
             live.github_user = pr_result.github_user;
             needs_redraw = true;
@@ -1889,6 +1891,7 @@ fn drain_project_workers(
         live.user_prs = pr_result.user_prs;
         live.review_requested_prs = pr_result.review_requested_prs;
         live.review_stacks = pr_result.review_stacks;
+        live.changes_requested_prs = pr_result.changes_requested_prs;
         live.pr_poll_done = true;
 
         // Rewrite imported issue titles from the fresh PR titles.

@@ -81,6 +81,8 @@ pub struct LiveState {
     pub user_prs: Vec<PrStatus>,
     pub review_requested_prs: Vec<PrStatus>,
     pub review_stacks: Option<HashMap<u32, Option<u32>>>,
+    /// Open PRs where your latest review requests changes.
+    pub changes_requested_prs: Vec<u32>,
     /// Stack members whose stack card is blocked by an existing card; imported individually.
     pub review_stack_fallback: HashSet<u32>,
     pub github_user: Option<String>,
@@ -1043,12 +1045,7 @@ impl Project {
 
         let live_authored_numbers: HashSet<u32> =
             self.live.user_prs.iter().map(|pr| pr.number).collect();
-        let live_review_numbers: HashSet<u32> = self
-            .live
-            .review_requested_prs
-            .iter()
-            .map(|pr| pr.number)
-            .collect();
+        let live_review_numbers = self.pending_review_numbers();
 
         // Remove authored pr_imported issues whose PR is no longer in the live set
         // (closed, merged, or from a stale/wrong repo identity).
@@ -3671,6 +3668,23 @@ mod tests {
         let (changed, _) = app.project_mut().sync_prs_as_issues();
         assert!(changed);
         assert_eq!(app.project().issues[0].column, Column::Done);
+    }
+
+    #[test]
+    fn sync_prs_keeps_review_open_while_changes_requested() {
+        let mut existing = test_issue("bork-1", Column::CodeReview);
+        existing.github_pr_links = vec![LinkedGithubPr {
+            number: 7,
+            imported: true,
+            import_source: Some(PrImportSource::ReviewRequested),
+        }];
+        let mut app = test_app(vec![existing]);
+        app.project_mut().live.review_requested_prs = vec![];
+        app.project_mut().live.changes_requested_prs = vec![7];
+        app.project_mut().live.pr_poll_done = true;
+
+        app.project_mut().sync_prs_as_issues();
+        assert_eq!(app.project().issues[0].column, Column::CodeReview);
     }
 
     #[test]

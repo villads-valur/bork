@@ -520,12 +520,7 @@ fn parse_pr_node(node: &serde_json::Value) -> Option<PrStatus> {
     let review = node
         .get("reviewDecision")
         .and_then(|v| v.as_str())
-        .and_then(|s| match s {
-            "APPROVED" => Some(ReviewDecision::Approved),
-            "CHANGES_REQUESTED" => Some(ReviewDecision::ChangesRequested),
-            "REVIEW_REQUIRED" => Some(ReviewDecision::ReviewRequired),
-            _ => None,
-        });
+        .and_then(parse_review_decision);
 
     let additions = node.get("additions").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
     let deletions = node.get("deletions").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
@@ -544,6 +539,15 @@ fn parse_pr_node(node: &serde_json::Value) -> Option<PrStatus> {
         head_branch,
         is_cross_repository,
     })
+}
+
+fn parse_review_decision(value: &str) -> Option<ReviewDecision> {
+    match value {
+        "APPROVED" => Some(ReviewDecision::Approved),
+        "CHANGES_REQUESTED" => Some(ReviewDecision::ChangesRequested),
+        "REVIEW_REQUIRED" => Some(ReviewDecision::ReviewRequired),
+        _ => None,
+    }
 }
 
 pub fn fetch_user_prs(main_worktree: &Path) -> Result<Vec<PrStatus>, String> {
@@ -587,6 +591,9 @@ pub fn fetch_user_prs(main_worktree: &Path) -> Result<Vec<PrStatus>, String> {
 pub struct ReviewDiscovery {
     pub prs: Vec<PrStatus>,
     pub stacks: HashMap<u32, Option<u32>>,
+    /// Open PRs where your latest review requests changes. GitHub clears your
+    /// review request when you submit, but the review isn't finished yet.
+    pub changes_requested: Vec<u32>,
 }
 
 pub fn fetch_review_requested_prs(main_worktree: &Path) -> Result<ReviewDiscovery, String> {
@@ -596,20 +603,122 @@ pub fn fetch_review_requested_prs(main_worktree: &Path) -> Result<ReviewDiscover
         "repo:{}/{} is:pr is:open user-review-requested:{}",
         repo.owner, repo.name, user
     );
-    fetch_review_pages(|query| {
-        checked_gh_output(
-            crate::external::gh_command()
-                .args([
-                    "api",
-                    "graphql",
-                    "-f",
-                    &format!("query={query}"),
-                    "-f",
-                    &format!("search={search}"),
-                ])
-                .current_dir(main_worktree)
-                .output(),
-        )
+    let mut discovery =
+        fetch_review_pages(|query| run_graphql_search(main_worktree, query, &search))?;
+    let reviewed = format!(
+        "repo:{}/{} is:pr is:open reviewed-by:{} -author:{}",
+        repo.owner, repo.name, user, user
+    );
+    discovery.changes_requested = fetch_changes_requested_pages(&user, |query| {
+        run_graphql_search(main_worktree, query, &reviewed)
+    })?;
+    Ok(discovery)
+}
+
+fn run_graphql_search(main_worktree: &Path, query: &str, search: &str) -> Result<String, String> {
+    checked_gh_output(
+        crate::external::gh_command()
+            .args([
+                "api",
+                "graphql",
+                "-f",
+                &format!("query={query}"),
+                "-f",
+                &format!("search={search}"),
+            ])
+            .current_dir(main_worktree)
+            .output(),
+    )
+}
+
+fn fetch_changes_requested_pages(
+    user: &str,
+    mut fetch: impl FnMut(&str) -> Result<String, String>,
+) -> Result<Vec<u32>, String> {
+    let mut numbers = Vec::new();
+    let mut cursor = None::<String>;
+    loop {
+        let after = cursor
+            .as_ref()
+            .map(|cursor| {
+                format!(
+                    ",after:{}",
+                    serde_json::to_string(cursor).unwrap_or_default()
+                )
+            })
+            .unwrap_or_default();
+        let query = format!("query($search:String!){{ search(query:$search,type:ISSUE,first:100{after}){{ nodes{{ ... on PullRequest{{ number latestOpinionatedReviews(first:100){{ nodes{{ author{{ login }} state }} }} }} }} issueCount pageInfo{{hasNextPage endCursor}} }} }}");
+        let value: serde_json::Value = serde_json::from_str(&fetch(&query)?)
+            .map_err(|_| "Invalid GitHub reviewed-by response")?;
+        if value
+            .get("errors")
+            .and_then(|v| v.as_array())
+            .is_some_and(|errors| !errors.is_empty())
+        {
+            return Err("GitHub reviewed-by query returned incomplete data".into());
+        }
+        let search = value
+            .pointer("/data/search")
+            .ok_or("Missing GitHub reviewed-by results")?;
+        if search
+            .get("issueCount")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|count| count > 1000)
+        {
+            return Err(
+                "GitHub reviewed-by search exceeds its 1,000-result limit; keeping existing reviews"
+                    .into(),
+            );
+        }
+        let nodes = search
+            .get("nodes")
+            .and_then(|v| v.as_array())
+            .ok_or("Missing GitHub reviewed-by nodes")?;
+        numbers.extend(
+            nodes
+                .iter()
+                .filter(|node| has_changes_requested_from(node, user))
+                .filter_map(|node| node.get("number").and_then(|v| v.as_u64()))
+                .filter_map(|n| u32::try_from(n).ok()),
+        );
+        let has_next = search
+            .pointer("/pageInfo/hasNextPage")
+            .and_then(|v| v.as_bool())
+            .ok_or("Missing GitHub reviewed-by pagination")?;
+        if !has_next {
+            break;
+        }
+        let next = search
+            .pointer("/pageInfo/endCursor")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing GitHub reviewed-by cursor")?;
+        if cursor.as_deref() == Some(next) {
+            return Err("GitHub reviewed-by cursor did not advance".into());
+        }
+        cursor = Some(next.to_string());
+    }
+    numbers.sort_unstable();
+    numbers.dedup();
+    Ok(numbers)
+}
+
+fn has_changes_requested_from(node: &serde_json::Value, user: &str) -> bool {
+    let Some(reviews) = node
+        .pointer("/latestOpinionatedReviews/nodes")
+        .and_then(|v| v.as_array())
+    else {
+        return false;
+    };
+    reviews.iter().any(|review| {
+        let by_user = review
+            .pointer("/author/login")
+            .and_then(|v| v.as_str())
+            .is_some_and(|login| login.eq_ignore_ascii_case(user));
+        let state = review
+            .get("state")
+            .and_then(|v| v.as_str())
+            .and_then(parse_review_decision);
+        by_user && state == Some(ReviewDecision::ChangesRequested)
     })
 }
 
@@ -838,6 +947,38 @@ fn state_priority(state: &PrState) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changes_requested_pages_keep_only_your_open_request() {
+        let pages = [
+            r#"{"data":{"search":{"issueCount":3,"nodes":[
+                {"number":1,"latestOpinionatedReviews":{"nodes":[{"author":{"login":"Me"},"state":"CHANGES_REQUESTED"}]}},
+                {"number":2,"latestOpinionatedReviews":{"nodes":[{"author":{"login":"me"},"state":"APPROVED"}]}}
+            ],"pageInfo":{"hasNextPage":true,"endCursor":"next"}}}}"#,
+            r#"{"data":{"search":{"issueCount":3,"nodes":[
+                {"number":3,"latestOpinionatedReviews":{"nodes":[{"author":{"login":"other"},"state":"CHANGES_REQUESTED"}]}},
+                {"number":4,"latestOpinionatedReviews":{"nodes":[{"author":{"login":"me"},"state":"CHANGES_REQUESTED"}]}}
+            ],"pageInfo":{"hasNextPage":false}}}}"#,
+        ];
+        let mut queries = Vec::new();
+        let numbers = fetch_changes_requested_pages("me", |query| {
+            queries.push(query.to_string());
+            Ok(pages[queries.len() - 1].to_string())
+        })
+        .unwrap();
+        assert_eq!(numbers, vec![1, 4]);
+        assert!(queries[1].contains(r#"after:"next""#));
+    }
+
+    #[test]
+    fn changes_requested_pages_fail_on_errors_or_oversized_search() {
+        for body in [
+            r#"{"errors":[{"message":"x"}]}"#,
+            r#"{"data":{"search":{"issueCount":1001,"nodes":[],"pageInfo":{"hasNextPage":false}}}}"#,
+        ] {
+            assert!(fetch_changes_requested_pages("me", |_| Ok(body.to_string())).is_err());
+        }
+    }
 
     fn make_pr_node(overrides: &str) -> serde_json::Value {
         let base = r#"{

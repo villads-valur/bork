@@ -5,11 +5,18 @@ use crate::config::DEFAULT_STACK_REVIEW_PROMPT;
 use crate::types::{Column, GithubStack, Issue, PrImportSource, PrState, StackReviewImport};
 
 impl Project {
-    pub fn review_requested_for(&self, number: u32) -> bool {
+    /// PRs still waiting on your review: requested, or where you requested changes.
+    pub fn pending_review_numbers(&self) -> HashSet<u32> {
         self.live
             .review_requested_prs
             .iter()
-            .any(|pr| pr.number == number)
+            .map(|pr| pr.number)
+            .chain(self.live.changes_requested_prs.iter().copied())
+            .collect()
+    }
+
+    pub fn review_pending_for(&self, number: u32) -> bool {
+        self.pending_review_numbers().contains(&number)
     }
 
     fn stack_review_prompt(&self, stack: &GithubStack, requested: &[u32]) -> String {
@@ -34,6 +41,8 @@ impl Project {
                 .unwrap_or_default();
             let scope = if requested.contains(&member.number) {
                 "your review requested"
+            } else if self.live.changes_requested_prs.contains(&member.number) {
+                "you requested changes"
             } else {
                 "context only"
             };
@@ -87,10 +96,19 @@ impl Project {
             if issue.github_stack != Some(import.stack_number) {
                 continue;
             }
-            let requested = groups
+            // Your changes request keeps a member pending after GitHub clears the request.
+            let mut requested = groups
                 .get(&import.stack_number)
                 .cloned()
                 .unwrap_or_default();
+            requested.extend(
+                import
+                    .requested_prs
+                    .iter()
+                    .filter(|number| self.live.changes_requested_prs.contains(number)),
+            );
+            requested.sort_unstable();
+            requested.dedup();
             if requested.is_empty()
                 && !import.requested_prs.is_empty()
                 && issue.column == Column::CodeReview
@@ -348,6 +366,26 @@ mod tests {
         assert_eq!(project.issues[0].column, Column::CodeReview);
         assert_eq!(project.issues[0].id, id);
         assert!(project.issues[0].done_at.is_none());
+    }
+
+    #[test]
+    fn your_changes_request_keeps_stack_card_open() {
+        let mut project = project();
+        project.live.review_requested_prs = vec![pr(4)];
+        sync(&mut project);
+        project.live.review_requested_prs = vec![pr(2)];
+        project.live.changes_requested_prs = vec![4];
+        sync(&mut project);
+        let prompt = project.issues[0].prompt.as_ref().unwrap();
+        assert!(prompt
+            .contains("#4 https://github.com/owner/repo/pull/4 (open, you requested changes)"));
+        project.live.review_requested_prs.clear();
+        sync(&mut project);
+        assert_eq!(project.issues[0].column, Column::CodeReview);
+        assert!(project.review_pending_for(4));
+        project.live.changes_requested_prs.clear();
+        sync(&mut project);
+        assert_eq!(project.issues[0].column, Column::Done);
     }
 
     #[test]
