@@ -131,7 +131,7 @@ bork/                           # container (the agent's cwd)
 └── {issue-id}/                 # issue worktrees (created by agent)
 ```
 
-State lives in `.bork/` at the container root. Config is detected by walking up from cwd looking for a `.bork/` directory.
+State lives in `.bork/` at the container root. Config is detected by walking up from cwd looking for a `.bork/` directory. Failures that would otherwise only flash in the status bar (currently worktree prune) are appended to `.bork/errors.log`.
 
 ## Global State
 

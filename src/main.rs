@@ -1074,10 +1074,9 @@ fn run_prune_command(
     let (to_remove, dirty_names) = partition_selection(&candidates);
     if !dirty_names.is_empty() {
         eprintln!(
-            "Refusing: dirty worktrees can't be pruned: {}",
+            "Skipping dirty worktrees (commit or stash first): {}",
             dirty_names.join(", ")
         );
-        anyhow::bail!("aborting; clean or stash these worktrees first");
     }
 
     if dry_run {
@@ -1108,7 +1107,7 @@ fn run_prune_command(
         }
     }
 
-    let outcome = execute_removals(&config.project_root, &to_remove);
+    let outcome = execute_removals(&config.project_root, &to_remove, &dirty_names);
 
     for result in &outcome.results {
         match &result.outcome {
@@ -1123,6 +1122,12 @@ fn run_prune_command(
     config::save_state(&state, &config.project_root)?;
 
     println!("\nDone. Pruned {} worktree(s).", outcome.removed_count());
+    if outcome.failed_count() > 0 {
+        anyhow::bail!(
+            "{} worktree(s) failed, see .bork/errors.log",
+            outcome.failed_count()
+        );
+    }
     Ok(())
 }
 

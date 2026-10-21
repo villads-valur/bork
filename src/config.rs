@@ -183,6 +183,30 @@ fn state_path(project_root: &Path) -> PathBuf {
     config_dir(project_root).join("state.json")
 }
 
+fn error_log_path(project_root: &Path) -> PathBuf {
+    config_dir(project_root).join("errors.log")
+}
+
+/// Append timestamped lines to `.bork/errors.log` so failures that only
+/// flash by in the status bar can be looked at later. Best effort: a failed
+/// write is ignored rather than turning one error into two.
+pub fn append_error_log(project_root: &Path, lines: &[String]) {
+    if lines.is_empty() {
+        return;
+    }
+    let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(error_log_path(project_root))
+    else {
+        return;
+    };
+    let now = crate::app::unix_now();
+    for line in lines {
+        let _ = writeln!(file, "[{now}] {line}");
+    }
+}
+
 fn config_path(project_root: &Path) -> PathBuf {
     config_dir(project_root).join("config.toml")
 }

@@ -1886,7 +1886,7 @@ fn submit_prune_dialog(app: &mut App, action_tx: &mpsc::Sender<ActionResult>) {
     };
 
     let (to_remove, dirty) = crate::prune::partition_selection(&dialog.candidates);
-    if !dirty.is_empty() {
+    if to_remove.is_empty() && !dirty.is_empty() {
         dialog.error = Some(format!(
             "Refusing: dirty worktrees can't be pruned ({}). Commit/stash first.",
             dirty.join(", ")
@@ -1913,7 +1913,7 @@ fn submit_prune_dialog(app: &mut App, action_tx: &mpsc::Sender<ActionResult>) {
 
     let tx = action_tx.clone();
     thread::spawn(move || {
-        let outcome = crate::prune::execute_removals(&project_root, &to_remove);
+        let outcome = crate::prune::execute_removals(&project_root, &to_remove, &dirty);
         let (message, message_kind) = format_prune_result(&outcome);
         let _ = tx.send(ActionResult {
             message,
@@ -1940,7 +1940,7 @@ fn format_prune_result(outcome: &crate::prune::PruneOutcome) -> (String, Message
         .collect();
     (
         format!(
-            "Pruned {} worktree(s), {} failed ({})",
+            "Pruned {} worktree(s), {} failed ({}), see .bork/errors.log",
             removed,
             failed,
             failure_summary.join("; ")
@@ -4754,6 +4754,33 @@ mod tests {
         assert!(app.prune_dialog.is_some());
         let err = app.prune_dialog.as_ref().unwrap().error.clone();
         assert!(err.is_some_and(|s| s.contains("dirty")));
+    }
+
+    #[test]
+    fn prune_confirm_skips_dirty_and_prunes_the_rest() {
+        let (_dir, mut app) = test_app_with_worktrees(&["wt-clean", "wt-dirty"]);
+        app.project_mut().live.worktree_statuses.insert(
+            "wt-clean".into(),
+            crate::types::WorktreeStatus {
+                staged: 0,
+                unstaged: 0,
+            },
+        );
+        app.project_mut().live.worktree_statuses.insert(
+            "wt-dirty".into(),
+            crate::types::WorktreeStatus {
+                staged: 1,
+                unstaged: 0,
+            },
+        );
+        act(&mut app, Action::OpenPruneDialog);
+        act(&mut app, Action::PruneSelectAllRemove);
+        act(&mut app, Action::PruneConfirm);
+        assert!(app.prune_dialog.is_none());
+        assert!(app
+            .message
+            .as_ref()
+            .is_some_and(|(m, _)| m.contains("Pruning 1 worktree(s)")));
     }
 
     #[test]
