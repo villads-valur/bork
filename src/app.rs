@@ -2525,8 +2525,8 @@ impl App {
             self.clear_link_filter(ctx);
             return;
         }
-        if self.active_project().attention_filter {
-            self.set_attention_filter(ctx, false);
+        if self.attention_filter_active() {
+            self.set_attention_filter(false);
             return;
         }
         if !self.search_query.is_empty() {
@@ -2562,25 +2562,45 @@ impl App {
         project.clamp_all_rows(&query);
     }
 
-    /// Toggle the board filter to cards that need you. Refuses to switch on
-    /// over a board where nothing does: an empty board reads as data loss.
-    pub fn toggle_attention_filter(&mut self, ctx: &ActionContext) {
-        if self.context_project(ctx).attention_filter {
-            self.set_attention_filter(ctx, false);
+    /// Cards that need you across the visible swimlanes only.
+    pub fn visible_attention_count(&self) -> usize {
+        self.visible_swimlanes()
+            .iter()
+            .filter_map(|id| self.find_project(id))
+            .map(|project| project.attention_count())
+            .sum()
+    }
+
+    pub fn attention_filter_active(&self) -> bool {
+        self.visible_swimlanes().iter().any(|id| {
+            self.find_project(id)
+                .is_some_and(|project| project.attention_filter)
+        })
+    }
+
+    /// Toggle the board filter to cards that need you on every visible
+    /// swimlane. Refuses to switch on when nothing visible needs you: an
+    /// empty board reads as data loss.
+    pub fn toggle_attention_filter(&mut self, _ctx: &ActionContext) {
+        if self.attention_filter_active() {
+            self.set_attention_filter(false);
             return;
         }
-        if self.context_project(ctx).attention_count() == 0 {
+        if self.visible_attention_count() == 0 {
             self.set_message("Nothing needs you right now");
             return;
         }
-        self.set_attention_filter(ctx, true);
+        self.set_attention_filter(true);
     }
 
-    fn set_attention_filter(&mut self, ctx: &ActionContext, on: bool) {
+    fn set_attention_filter(&mut self, on: bool) {
         let query = self.search_query.clone();
-        let project = self.context_project_mut(ctx);
-        project.attention_filter = on;
-        project.clamp_all_rows(&query);
+        for id in self.visible_swimlanes() {
+            if let Some(project) = self.find_project_mut(&id) {
+                project.attention_filter = on;
+                project.clamp_all_rows(&query);
+            }
+        }
     }
 
     pub fn clear_link_filter(&mut self, ctx: &ActionContext) {
@@ -2987,6 +3007,53 @@ mod tests {
         app.clear_search(&ctx);
 
         assert!(!app.project().attention_filter);
+    }
+
+    fn attention_app(names: &[&str]) -> (App, Vec<ProjectId>) {
+        let state = |name: &str| AppState {
+            last_prune_at: None,
+            issues: vec![issue_linked_to_pr(&format!("{name}-1"), 7, None)],
+        };
+        let mut app = App::new(test_config_named(names[0]), state(names[0]));
+        for name in &names[1..] {
+            app.add_background_project(test_config_named(name), state(name));
+        }
+        app.enable_sidebar();
+        let ids: Vec<ProjectId> = app.projects.iter().map(|project| project.id()).collect();
+        (app, ids)
+    }
+
+    #[test]
+    fn attention_count_and_filter_cover_only_visible_swimlanes() {
+        let (mut app, ids) = attention_app(&["alpha", "beta", "gamma"]);
+        for project in &mut app.projects {
+            project.live.user_prs = vec![test_pr(7, "feature")];
+        }
+        app.sidebar.as_mut().unwrap().swimlanes = vec![ids[0].clone(), ids[1].clone()];
+
+        assert_eq!(app.visible_attention_count(), 2);
+
+        let ctx = app.action_context();
+        app.toggle_attention_filter(&ctx);
+
+        assert!(app.find_project(&ids[0]).unwrap().attention_filter);
+        assert!(app.find_project(&ids[1]).unwrap().attention_filter);
+        assert!(!app.find_project(&ids[2]).unwrap().attention_filter);
+    }
+
+    #[test]
+    fn attention_filter_ignores_hidden_projects_that_need_you() {
+        let (mut app, ids) = attention_app(&["alpha", "beta"]);
+        app.find_project_mut(&ids[1]).unwrap().live.user_prs = vec![test_pr(7, "feature")];
+        app.sidebar.as_mut().unwrap().swimlanes = vec![ids[0].clone()];
+
+        assert_eq!(app.visible_attention_count(), 0);
+
+        let ctx = app.action_context();
+        app.toggle_attention_filter(&ctx);
+
+        assert!(!app.attention_filter_active());
+        assert!(!app.find_project(&ids[1]).unwrap().attention_filter);
     }
 
     #[test]

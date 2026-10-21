@@ -37,7 +37,7 @@ pub fn render_header(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(styles::TEXT),
         ));
     }
-    let needs_you: usize = app.projects.iter().map(|p| p.attention_count()).sum();
+    let needs_you = app.visible_attention_count();
     if needs_you > 0 {
         title_spans.push(Span::styled(
             format!(" \u{25cf} {needs_you} need you "),
@@ -177,7 +177,7 @@ fn render_footer_content(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    if app.active_project().attention_filter {
+    if app.attention_filter_active() {
         let line = Line::from(vec![
             Span::styled(
                 " \u{25cf} needs you",
