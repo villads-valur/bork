@@ -18,7 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config;
 use crate::external::agent;
-use crate::types::{AgentKind, AgentMode, Column, Issue, IssueDraft, IssueKind};
+use crate::types::{AgentKind, AgentMode, Column, Issue, IssueDraft, IssueKind, CLOUD_KIND_LOCKED};
 use crate::ui::styles::truncate;
 use crate::worktree;
 
@@ -223,6 +223,12 @@ pub fn update_issue(
         .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", issue_id))?;
 
     let issue = &mut state.issues[idx];
+
+    if let Some(kind) = opts.kind {
+        if !issue.kind_change_allowed(kind) {
+            anyhow::bail!("{}: {}", issue.id, CLOUD_KIND_LOCKED);
+        }
+    }
 
     if let Some(title) = opts.title {
         issue.title = title;
@@ -1541,5 +1547,31 @@ mod tests {
         assert!(output.contains("test-1"));
         assert!(output.contains("test-2"));
         assert!(!output.contains("test-3"));
+    }
+
+    #[test]
+    fn update_issue_refuses_to_change_cloud_kind() {
+        let dir = setup_project();
+        let mut state = config::load_state(dir.path());
+        state.issues.push(Issue {
+            kind: IssueKind::Cloud,
+            ..Issue::new("test-1", "Cloud", Column::Todo, AgentKind::Cursor)
+        });
+        config::save_state(&state, dir.path()).unwrap();
+        let before = fs::read_to_string(dir.path().join(".bork/state.json")).unwrap();
+
+        let err = update_issue(
+            dir.path(),
+            "test-1",
+            UpdateOptions {
+                title: Some("renamed".to_string()),
+                kind: Some(IssueKind::Agentic),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("can't change kind"), "{err}");
+        let after = fs::read_to_string(dir.path().join(".bork/state.json")).unwrap();
+        assert_eq!(before, after);
     }
 }

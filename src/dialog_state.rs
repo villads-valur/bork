@@ -306,6 +306,8 @@ impl DialogState {
 
     pub fn push_char(&mut self, c: char) {
         match self.current_field() {
+            // Cloud cards keep their kind; the selector never offers Cloud.
+            DialogField::Kind if self.kind == IssueKind::Cloud => {}
             DialogField::Kind => {
                 const KIND_ORDER: [IssueKind; 3] = [
                     IssueKind::Agentic,

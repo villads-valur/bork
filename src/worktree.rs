@@ -380,6 +380,7 @@ mod tests {
             agents_allowlist: None,
             prune_threshold: crate::config::DEFAULT_PRUNE_THRESHOLD,
             auto_prune_check_interval: crate::config::DEFAULT_AUTO_PRUNE_CHECK_INTERVAL,
+            cloud_agents: false,
             agent_launch: std::collections::HashMap::new(),
         }
     }
