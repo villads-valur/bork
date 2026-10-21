@@ -1004,10 +1004,13 @@ impl Project {
             return Some(Attention::Queued);
         }
 
-        if pr.review == Some(ReviewDecision::ChangesRequested)
-            || matches!(pr.checks, Some(ChecksStatus::Failure | ChecksStatus::Error))
-        {
-            return Some(Attention::NeedsFixes);
+        let changes_requested = pr.review == Some(ReviewDecision::ChangesRequested);
+        let checks_failing = matches!(pr.checks, Some(ChecksStatus::Failure | ChecksStatus::Error));
+        match (checks_failing, changes_requested) {
+            (true, true) => return Some(Attention::ChecksAndChanges),
+            (true, false) => return Some(Attention::ChecksFailing),
+            (false, true) => return Some(Attention::ChangesRequested),
+            (false, false) => {}
         }
 
         // A null review decision means the repo requires no review.
@@ -2849,23 +2852,35 @@ mod tests {
     }
 
     #[test]
-    fn red_checks_need_fixes_even_when_approved() {
+    fn red_checks_need_fixing_even_when_approved() {
         let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
         let mut pr = test_pr(7, "feature");
         pr.checks = Some(ChecksStatus::Failure);
         app.project_mut().live.user_prs = vec![pr];
 
-        assert_eq!(attention_of(&app), Some(Attention::NeedsFixes));
+        assert_eq!(attention_of(&app), Some(Attention::ChecksFailing));
     }
 
     #[test]
-    fn changes_requested_need_fixes() {
+    fn changes_requested_need_changes() {
         let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
         let mut pr = test_pr(7, "feature");
         pr.review = Some(ReviewDecision::ChangesRequested);
         app.project_mut().live.user_prs = vec![pr];
 
-        assert_eq!(attention_of(&app), Some(Attention::NeedsFixes));
+        assert_eq!(attention_of(&app), Some(Attention::ChangesRequested));
+    }
+
+    #[test]
+    fn changes_requested_with_erroring_checks_names_both() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let mut pr = test_pr(7, "feature");
+        pr.review = Some(ReviewDecision::ChangesRequested);
+        pr.checks = Some(ChecksStatus::Error);
+        app.project_mut().live.user_prs = vec![pr];
+
+        assert_eq!(attention_of(&app), Some(Attention::ChecksAndChanges));
+        assert_eq!(app.project().attention_count(), 1);
     }
 
     #[test]

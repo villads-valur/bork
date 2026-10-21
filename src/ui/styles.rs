@@ -73,7 +73,9 @@ pub fn search_highlight_style() -> Style {
 pub fn attention_badge(attention: Attention) -> (&'static str, Color) {
     match attention {
         Attention::ReadyToMerge => ("\u{2713} merge", Color::Green),
-        Attention::NeedsFixes => ("\u{2717} fix", Color::Red),
+        Attention::ChecksFailing => ("\u{2717} CI", Color::Red),
+        Attention::ChangesRequested => ("\u{21a9} review", Color::Red),
+        Attention::ChecksAndChanges => ("\u{2717} CI \u{21a9} review", Color::Red),
         Attention::NeedsRebase => ("\u{21a5} rebase", Color::Yellow),
         Attention::Blocked => ("\u{2298} blocked", Color::Magenta),
         Attention::Queued => ("\u{29d6} queued", DIM),

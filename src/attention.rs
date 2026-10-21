@@ -5,8 +5,12 @@ pub enum Attention {
     /// Own PR: approved (or no review required), checks green (or none), and
     /// GitHub's merge-state raises no objection.
     ReadyToMerge,
-    /// Own PR: changes requested, or checks red.
-    NeedsFixes,
+    /// Own PR: checks failing or erroring.
+    ChecksFailing,
+    /// Own PR: a reviewer requested changes.
+    ChangesRequested,
+    /// Own PR: changes requested and checks failing or erroring.
+    ChecksAndChanges,
     /// Own PR: approved and green, but in conflict with its base. Merely
     /// being behind is not this: a merge queue rebases on enqueue.
     NeedsRebase,
