@@ -420,6 +420,15 @@ fn render_kind_field(
         format!("{:<width$}", "Kind:", width = label_width),
         label_style,
     )];
+    if kind == IssueKind::Cloud {
+        spans.push(Span::styled(
+            format!("[{} Cloud]", indicator(true)),
+            selected_style,
+        ));
+        spans.push(Span::styled("  locked", unselected_style));
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
     for (i, (option, label)) in options.iter().enumerate() {
         if i > 0 {
             spans.push(Span::raw("  "));

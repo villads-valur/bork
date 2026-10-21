@@ -353,6 +353,21 @@ fn spawn_open_linear(
     });
 }
 
+/// Open a cloud agent's Cursor web page off the main thread.
+fn spawn_open_cloud_page(app: &mut App, ch: &ActionChannels<'_>, issue_id: String, url: String) {
+    app.begin_busy();
+    app.set_message("Opening cloud agent...");
+    let tx = ch.action_tx.clone();
+
+    thread::spawn(move || {
+        let failures = match browser::open_url(&url) {
+            Ok(()) => Vec::new(),
+            Err(e) => vec![format!("{issue_id}: {e}")],
+        };
+        let _ = tx.send(summarize_open_links("cloud agent", 1, &issue_id, failures));
+    });
+}
+
 /// Merge the per-issue results of a confirmed action into one. A single
 /// result passes through untouched so one-issue actions keep their detailed
 /// message; several are reported as `summary`, or as the failure count plus
@@ -607,6 +622,16 @@ fn handle_normal(
         Action::KillSession => {
             let project = app.context_project(ctx);
             let targets = project.target_issues(&q);
+            if let [issue] = targets.as_slice() {
+                if issue.kind == IssueKind::Cloud {
+                    let message = format!(
+                        "Cloud agents are stopped from the CLI: use `bork issue cancel {}`",
+                        issue.id
+                    );
+                    app.set_warning(message);
+                    return PostAction::None;
+                }
+            }
             let alive: Vec<&Issue> = targets
                 .iter()
                 .copied()
@@ -825,6 +850,16 @@ fn handle_normal(
                 return PostAction::None;
             };
             let issue = app.context_project(ctx).issues[idx].clone();
+
+            // Cloud agents have no tmux session; their Cursor web page is
+            // the equivalent of attaching.
+            if issue.kind == IssueKind::Cloud {
+                match issue.cloud.and_then(|agent| agent.url) {
+                    Some(url) => spawn_open_cloud_page(app, ch, issue.id, url),
+                    None => app.set_warning("cloud agent is still being created"),
+                }
+                return PostAction::None;
+            }
 
             if !issue.kind.is_agentic() {
                 app.open_edit_dialog(&issue, idx, ctx);
@@ -2290,6 +2325,7 @@ mod tests {
             agents_allowlist: None,
             prune_threshold: crate::config::DEFAULT_PRUNE_THRESHOLD,
             auto_prune_check_interval: crate::config::DEFAULT_AUTO_PRUNE_CHECK_INTERVAL,
+            cloud_agents: false,
             agent_launch: std::collections::HashMap::new(),
         }
     }
@@ -2965,6 +3001,7 @@ mod tests {
                         IssueKind::Orchestrator => "orch",
                         IssueKind::NonAgentic => "todo",
                         IssueKind::Agentic => "",
+                        IssueKind::Cloud => "cloud",
                     };
                     if !kind_label.is_empty() {
                         assert!(rows[0].contains(&format!("bork-1 · {kind_label}")));
@@ -4265,6 +4302,7 @@ mod tests {
             agents_allowlist: None,
             prune_threshold: crate::config::DEFAULT_PRUNE_THRESHOLD,
             auto_prune_check_interval: crate::config::DEFAULT_AUTO_PRUNE_CHECK_INTERVAL,
+            cloud_agents: false,
             agent_launch: std::collections::HashMap::new(),
         }
     }
@@ -4791,5 +4829,85 @@ mod tests {
         act(&mut app, Action::PruneConfirm);
         assert!(app.prune_dialog.is_none());
         assert_eq!(app.input_mode, InputMode::Normal);
+    }
+
+    // ================================================================
+    // Cursor cloud agents (bork-214)
+    // ================================================================
+
+    fn cloud_issue(id: &str, url: Option<&str>) -> crate::types::Issue {
+        crate::types::Issue {
+            kind: IssueKind::Cloud,
+            cloud: Some(crate::types::CloudAgent {
+                agent_id: format!("bc-{id}"),
+                created: url.is_some(),
+                run_id: None,
+                url: url.map(str::to_string),
+                repo_url: "https://github.com/acme/scratch".to_string(),
+                starting_ref: None,
+                branch: None,
+                last_run_status: None,
+                archived: false,
+                gone: false,
+            }),
+            ..test_issue(id, Column::Todo)
+        }
+    }
+
+    #[test]
+    fn enter_on_cloud_without_url_warns_and_never_launches() {
+        for action in [Action::OpenSession, Action::StartSession] {
+            let mut app = test_app();
+            app.project_mut().issues.push(cloud_issue("bork-1", None));
+            let post = act(&mut app, action);
+            assert!(matches!(post, PostAction::None));
+            assert!(app.launches_in_flight.is_empty());
+            assert!(app.dialog.is_none());
+            let (msg, kind) = app.message.as_ref().unwrap();
+            assert_eq!(msg, "cloud agent is still being created");
+            assert_eq!(*kind, MessageKind::Warning);
+        }
+    }
+
+    #[test]
+    fn kill_session_on_cloud_points_at_cli_cancel() {
+        let mut app = test_app();
+        app.project_mut().issues.push(cloud_issue("bork-1", None));
+        act(&mut app, Action::KillSession);
+        assert_eq!(app.input_mode, InputMode::Normal);
+        let (msg, kind) = app.message.as_ref().unwrap();
+        assert!(msg.contains("bork issue cancel bork-1"), "{msg}");
+        assert_eq!(*kind, MessageKind::Warning);
+    }
+
+    #[test]
+    fn bulk_start_skips_marked_cloud_issues() {
+        let mut app = test_app();
+        app.project_mut().issues.push(cloud_issue("bork-1", None));
+        app.project_mut().marked_issues.insert("bork-1".to_string());
+        let post = act(&mut app, Action::StartSession);
+        assert!(matches!(post, PostAction::None));
+        assert!(app.launches_in_flight.is_empty());
+        let (msg, _) = app.message.as_ref().unwrap();
+        assert_eq!(msg, "No marked issues could be started");
+    }
+
+    #[test]
+    fn edit_dialog_keeps_cloud_kind_locked() {
+        let issue = cloud_issue("bork-1", None);
+        let mut dialog = crate::dialog_state::DialogState::from_issue(
+            &issue,
+            0,
+            AgentKind::ALL.to_vec(),
+            false,
+            false,
+            &crate::app::LiveState::default(),
+        );
+        dialog.focused_field = 0;
+        assert_eq!(dialog.current_field(), crate::app::DialogField::Kind);
+        for c in [' ', 'h', 'l'] {
+            dialog.push_char(c);
+            assert_eq!(dialog.kind, IssueKind::Cloud);
+        }
     }
 }
