@@ -33,6 +33,7 @@ const PR_FIELDS: &str = r#"
     reviewDecision
     mergeStateStatus
     isInMergeQueue
+    isMergeQueueEnabled
     additions deletions
     reviewThreads(first: 100) { nodes { isResolved } }
     commits(last: 1) {
@@ -529,12 +530,19 @@ fn parse_pr_node(node: &serde_json::Value) -> Option<PrStatus> {
     let additions = node.get("additions").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
     let deletions = node.get("deletions").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
+    let merge_queue_enabled = node
+        .get("isMergeQueueEnabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    // A merge queue brings a BEHIND branch up to date on enqueue.
     let merge_blocker = node
         .get("mergeStateStatus")
         .and_then(|v| v.as_str())
         .and_then(|s| match s {
             "DIRTY" => Some(MergeBlocker::Conflicts),
             "BLOCKED" => Some(MergeBlocker::Blocked),
+            "BEHIND" if !merge_queue_enabled => Some(MergeBlocker::Behind),
+            "UNKNOWN" => Some(MergeBlocker::Computing),
             _ => None,
         });
     let in_merge_queue = node
@@ -1286,16 +1294,19 @@ mod tests {
 
     #[test]
     fn test_parse_merge_blocker() {
-        for (status, expected) in [
-            ("DIRTY", Some(MergeBlocker::Conflicts)),
-            ("BLOCKED", Some(MergeBlocker::Blocked)),
-            ("BEHIND", None),
-            ("CLEAN", None),
-            ("UNKNOWN", None),
+        for (status, queue, expected) in [
+            ("DIRTY", false, Some(MergeBlocker::Conflicts)),
+            ("BLOCKED", false, Some(MergeBlocker::Blocked)),
+            ("BEHIND", false, Some(MergeBlocker::Behind)),
+            ("BEHIND", true, None),
+            ("UNKNOWN", false, Some(MergeBlocker::Computing)),
+            ("CLEAN", false, None),
         ] {
-            let node = make_pr_node(&format!(r#"{{"mergeStateStatus": "{status}"}}"#));
+            let node = make_pr_node(&format!(
+                r#"{{"mergeStateStatus": "{status}", "isMergeQueueEnabled": {queue}}}"#
+            ));
             let pr = parse_pr_node(&node).unwrap();
-            assert_eq!(pr.merge_blocker, expected, "{status}");
+            assert_eq!(pr.merge_blocker, expected, "{status} queue={queue}");
         }
     }
 

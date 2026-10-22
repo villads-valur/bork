@@ -1013,6 +1013,12 @@ impl Project {
             (false, false) => {}
         }
 
+        // Actions does not run pull_request workflows on a conflicting PR, so
+        // its checks can stay pending until the rebase.
+        if pr.merge_blocker == Some(MergeBlocker::Conflicts) {
+            return Some(Attention::NeedsRebase);
+        }
+
         // A null review decision means the repo requires no review.
         // REVIEW_REQUIRED stays quiet: that PR waits on reviewers.
         let approved = matches!(pr.review, Some(ReviewDecision::Approved) | None);
@@ -1024,6 +1030,8 @@ impl Project {
         match pr.merge_blocker {
             Some(MergeBlocker::Conflicts) => Some(Attention::NeedsRebase),
             Some(MergeBlocker::Blocked) => Some(Attention::Blocked),
+            Some(MergeBlocker::Behind) => Some(Attention::NeedsUpdate),
+            Some(MergeBlocker::Computing) => None,
             None => Some(Attention::ReadyToMerge),
         }
     }
@@ -1610,6 +1618,30 @@ impl Project {
 
     fn next_issue_id_after(&self, offset: u32) -> String {
         crate::ops::next_issue_id_after(&self.issues, &self.config.project_name, offset)
+    }
+
+    /// Apply a background refresh without moving the cursor off its card.
+    /// With the needs-you filter on, cards drop in and out on every poll, so
+    /// the selected card is found again by id; the filter turns itself off
+    /// once nothing needs you, rather than leave an empty board.
+    pub fn keep_selection<T>(&mut self, query: &str, refresh: impl FnOnce(&mut Self) -> T) -> T {
+        let selected = self.selected_issue(query).map(|issue| issue.id.clone());
+        let result = refresh(self);
+
+        if self.attention_filter && self.attention_count() == 0 {
+            self.attention_filter = false;
+        }
+
+        let row = Column::from_index(self.selected_column).and_then(|column| {
+            self.issues_in_column(column, query)
+                .iter()
+                .position(|(_, issue)| Some(&issue.id) == selected.as_ref())
+        });
+        if let Some(row) = row {
+            self.selected_row[self.selected_column] = row;
+        }
+        self.clamp_all_rows(query);
+        result
     }
 
     pub fn clamp_all_rows(&mut self, query: &str) {
@@ -2985,6 +3017,51 @@ mod tests {
     }
 
     #[test]
+    fn a_conflict_surfaces_before_review_or_checks_settle() {
+        // Actions does not run pull_request workflows while a PR conflicts,
+        // so its checks can sit pending until the rebase.
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let mut pr = test_pr(7, "feature");
+        pr.review = Some(ReviewDecision::ReviewRequired);
+        pr.checks = Some(ChecksStatus::Pending);
+        pr.merge_blocker = Some(MergeBlocker::Conflicts);
+        app.project_mut().live.user_prs = vec![pr];
+
+        assert_eq!(attention_of(&app), Some(Attention::NeedsRebase));
+    }
+
+    #[test]
+    fn red_checks_outrank_a_conflict() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let mut pr = test_pr(7, "feature");
+        pr.checks = Some(ChecksStatus::Failure);
+        pr.merge_blocker = Some(MergeBlocker::Conflicts);
+        app.project_mut().live.user_prs = vec![pr];
+
+        assert_eq!(attention_of(&app), Some(Attention::ChecksFailing));
+    }
+
+    #[test]
+    fn a_branch_behind_its_base_without_a_merge_queue_needs_an_update() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let mut pr = test_pr(7, "feature");
+        pr.merge_blocker = Some(MergeBlocker::Behind);
+        app.project_mut().live.user_prs = vec![pr];
+
+        assert_eq!(attention_of(&app), Some(Attention::NeedsUpdate));
+    }
+
+    #[test]
+    fn a_merge_state_github_is_still_computing_stays_quiet() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let mut pr = test_pr(7, "feature");
+        pr.merge_blocker = Some(MergeBlocker::Computing);
+        app.project_mut().live.user_prs = vec![pr];
+
+        assert_eq!(attention_of(&app), None);
+    }
+
+    #[test]
     fn attention_filter_hides_quiet_cards() {
         let mut app = test_app(vec![
             issue_linked_to_pr("bork-1", 7, None),
@@ -3069,6 +3146,81 @@ mod tests {
 
         assert!(!app.attention_filter_active());
         assert!(!app.find_project(&ids[1]).unwrap().attention_filter);
+    }
+
+    fn footer_text(app: &App) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 1)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::status_bar::render_footer(frame, app, frame.area()))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn esc_peels_the_link_filter_before_the_attention_filter() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        app.project_mut().live.user_prs = vec![test_pr(7, "feature")];
+        app.project_mut().link_filter = Some("bork-1".into());
+        app.project_mut().attention_filter = true;
+        app.input_mode = InputMode::Normal;
+        let ctx = app.action_context();
+        assert!(footer_text(&app).contains("linked: bork-1"));
+
+        app.clear_search(&ctx);
+
+        assert_eq!(app.project().link_filter, None);
+        assert!(app.project().attention_filter);
+        assert!(footer_text(&app).contains("needs you"));
+
+        app.clear_search(&ctx);
+
+        assert!(!app.project().attention_filter);
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_cursor_on_its_card_when_another_drops_out() {
+        let mut app = test_app(vec![
+            issue_linked_to_pr("bork-1", 7, None),
+            issue_linked_to_pr("bork-2", 8, None),
+            issue_linked_to_pr("bork-3", 9, None),
+        ]);
+        app.project_mut().live.user_prs = vec![
+            test_pr(7, "first"),
+            test_pr(8, "second"),
+            test_pr(9, "third"),
+        ];
+        app.project_mut().attention_filter = true;
+        app.project_mut().selected_column = Column::CodeReview.index();
+        app.project_mut().selected_row[Column::CodeReview.index()] = 1;
+        assert_eq!(app.project().selected_issue("").unwrap().id, "bork-2");
+
+        app.project_mut().keep_selection("", |project| {
+            project.live.user_prs[0].checks = Some(ChecksStatus::Pending);
+        });
+
+        assert_eq!(app.project().selected_issue("").unwrap().id, "bork-2");
+    }
+
+    #[test]
+    fn a_refresh_that_leaves_nothing_needing_you_turns_the_filter_off() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        app.project_mut().live.user_prs = vec![test_pr(7, "feature")];
+        app.project_mut().attention_filter = true;
+        app.project_mut().selected_column = Column::CodeReview.index();
+
+        app.project_mut().keep_selection("", |project| {
+            project.live.user_prs[0].checks = Some(ChecksStatus::Pending);
+        });
+
+        assert!(!app.project().attention_filter);
+        assert_eq!(app.project().selected_issue("").unwrap().id, "bork-1");
     }
 
     #[test]
