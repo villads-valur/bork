@@ -18,8 +18,8 @@ const REDACTED: &str = "***";
 
 /// A Cursor API key.
 ///
-/// Deliberately has no `Clone`, `Serialize`, `Deserialize`, `Deref` or
-/// `AsRef<str>`, and `Debug`/`Display` print `ApiKey(***)`.
+/// Deliberately has no `Clone`, `Serialize`, `Deserialize`, `Deref`,
+/// `AsRef<str>` or `Display`, and `Debug` prints `ApiKey(***)`.
 pub struct ApiKey(String);
 
 impl ApiKey {
@@ -32,8 +32,9 @@ impl ApiKey {
                 "the stored Cursor API key is empty".to_string(),
             ));
         }
-        // Whitespace, quotes or control characters would break the curl
-        // config line the key is written into.
+        // Redaction relies on this: a key with no quotes, backslashes,
+        // whitespace or control characters shows up in JSON and stderr
+        // exactly as stored, so a plain `replace` finds every echo of it.
         if key
             .chars()
             .any(|c| c.is_whitespace() || c.is_control() || c == '"' || c == '\\')
@@ -68,21 +69,9 @@ impl fmt::Debug for ApiKey {
     }
 }
 
-impl fmt::Display for ApiKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("ApiKey(***)")
-    }
-}
-
 /// Read the key from the keychain. `Ok(None)` means none is stored.
 pub fn read_key() -> Result<Option<ApiKey>, CloudError> {
-    ensure_macos()?;
-    let output = Command::new("security")
-        .args(find_args())
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| CloudError::Keychain(format!("failed to run security: {e}")))?;
-    parse_find_output(output)
+    parse_find_output(run_security(&find_args(&account()))?)
 }
 
 /// Store a key with `security`'s own prompt. `-w` goes last with no value, so
@@ -96,7 +85,7 @@ pub fn store_key_interactively() -> Result<(), CloudError> {
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
-        .map_err(|e| CloudError::Keychain(format!("failed to run security: {e}")))?;
+        .map_err(spawn_error)?;
     if status.success() {
         return Ok(());
     }
@@ -107,22 +96,8 @@ pub fn store_key_interactively() -> Result<(), CloudError> {
 
 /// Delete the keychain item. `Ok(false)` means there was nothing to delete.
 pub fn delete_key() -> Result<bool, CloudError> {
-    ensure_macos()?;
-    let output = Command::new("security")
-        .args(delete_args())
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| CloudError::Keychain(format!("failed to run security: {e}")))?;
-    if output.status.success() {
-        return Ok(true);
-    }
-    if output.status.code() == Some(SECURITY_NOT_FOUND) {
-        return Ok(false);
-    }
-    Err(CloudError::Keychain(format!(
-        "security could not delete the key: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    )))
+    let output = run_security(&delete_args(&account()))?;
+    Ok(check_security(output, "delete")?.is_some())
 }
 
 fn ensure_macos() -> Result<(), CloudError> {
@@ -132,6 +107,37 @@ fn ensure_macos() -> Result<(), CloudError> {
     Err(CloudError::Unsupported)
 }
 
+fn run_security(args: &[&str]) -> Result<Output, CloudError> {
+    ensure_macos()?;
+    Command::new("security")
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(spawn_error)
+}
+
+fn spawn_error(err: std::io::Error) -> CloudError {
+    CloudError::Keychain(format!("failed to run security: {err}"))
+}
+
+/// `Ok(None)` when `security` says the item doesn't exist. Failures report
+/// stderr only: on success stdout can be the key itself.
+fn check_security(output: Output, verb: &str) -> Result<Option<Output>, CloudError> {
+    if output.status.success() {
+        return Ok(Some(output));
+    }
+    if output.status.code() == Some(SECURITY_NOT_FOUND) {
+        return Ok(None);
+    }
+    Err(CloudError::Keychain(format!(
+        "security could not {verb} the key: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    )))
+}
+
+/// Every command names both the service and the account, so they all mean the
+/// same item: with only `-s`, a second item stored under another account
+/// could be read or deleted instead.
 fn account() -> String {
     std::env::var("USER")
         .ok()
@@ -139,11 +145,18 @@ fn account() -> String {
         .unwrap_or_else(|| "bork".to_string())
 }
 
-fn find_args() -> [&'static str; 4] {
-    ["find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"]
+fn find_args(account: &str) -> [&str; 6] {
+    [
+        "find-generic-password",
+        "-s",
+        KEYCHAIN_SERVICE,
+        "-a",
+        account,
+        "-w",
+    ]
 }
 
-fn add_args(account: &str) -> Vec<String> {
+fn add_args(account: &str) -> [&str; 7] {
     [
         "add-generic-password",
         "-U",
@@ -153,31 +166,28 @@ fn add_args(account: &str) -> Vec<String> {
         account,
         "-w",
     ]
-    .iter()
-    .map(|arg| arg.to_string())
-    .collect()
 }
 
-fn delete_args() -> [&'static str; 3] {
-    ["delete-generic-password", "-s", KEYCHAIN_SERVICE]
+fn delete_args(account: &str) -> [&str; 5] {
+    [
+        "delete-generic-password",
+        "-s",
+        KEYCHAIN_SERVICE,
+        "-a",
+        account,
+    ]
 }
 
 /// stdout of `find-generic-password -w` is the key itself, so it is only ever
 /// handed to [`ApiKey::parse`], never put in an error.
 fn parse_find_output(output: Output) -> Result<Option<ApiKey>, CloudError> {
-    if output.status.success() {
-        let stdout = String::from_utf8(output.stdout).map_err(|_| {
-            CloudError::Keychain("the stored Cursor API key is not valid UTF-8".to_string())
-        })?;
-        return ApiKey::parse(&stdout).map(Some);
-    }
-    if output.status.code() == Some(SECURITY_NOT_FOUND) {
+    let Some(output) = check_security(output, "read")? else {
         return Ok(None);
-    }
-    Err(CloudError::Keychain(format!(
-        "security could not read the key: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    )))
+    };
+    let stdout = String::from_utf8(output.stdout).map_err(|_| {
+        CloudError::Keychain("the stored Cursor API key is not valid UTF-8".to_string())
+    })?;
+    ApiKey::parse(&stdout).map(Some)
 }
 
 /// Standard base64 with padding. Only used to recognise the key in a Basic
@@ -235,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn api_key_cannot_be_serialized_or_borrowed_as_str() {
+    fn api_key_has_no_traits_that_could_leak_it() {
         // Compile-time check: each line stops compiling if `ApiKey` gains
         // the trait, because the `_` becomes ambiguous.
         trait AmbiguousIfImpl<A> {
@@ -247,23 +257,20 @@ mod tests {
         struct Borrowable;
         struct Derefs;
         struct Clones;
+        struct Displays;
         impl<T: serde::Serialize> AmbiguousIfImpl<Serializable> for T {}
         impl<T: serde::de::DeserializeOwned> AmbiguousIfImpl<Deserializable> for T {}
         impl<T: AsRef<str>> AmbiguousIfImpl<Borrowable> for T {}
         impl<T: std::ops::Deref> AmbiguousIfImpl<Derefs> for T {}
         impl<T: Clone> AmbiguousIfImpl<Clones> for T {}
+        impl<T: fmt::Display> AmbiguousIfImpl<Displays> for T {}
         <ApiKey as AmbiguousIfImpl<_>>::check();
     }
 
     #[test]
-    fn debug_and_display_hide_the_key() {
+    fn debug_hides_the_key() {
         let key = test_key(SENTINEL);
-        for text in [
-            format!("{key:?}"),
-            format!("{key:#?}"),
-            format!("{key}"),
-            key.to_string(),
-        ] {
+        for text in [format!("{key:?}"), format!("{key:#?}")] {
             assert!(!text.contains(SENTINEL), "leaked: {text}");
             assert_eq!(text, "ApiKey(***)");
         }
@@ -272,7 +279,7 @@ mod tests {
     #[test]
     fn redact_hides_the_key_and_its_basic_auth_forms() {
         let key = test_key(SENTINEL);
-        let basic = base64(format!("{SENTINEL}:").as_bytes());
+        let basic = basic_form_for_test(SENTINEL);
         let text = format!(
             "bad key {SENTINEL}, header Authorization: Basic {basic}, bare {}",
             base64(SENTINEL.as_bytes())
@@ -343,14 +350,16 @@ mod tests {
         // `-w` with a value would put the key in argv; as the last argument
         // with nothing after it, `security` prompts on the terminal instead.
         let args = add_args("someone");
-        assert_eq!(args.last().map(String::as_str), Some("-w"));
-        assert!(args.iter().any(|arg| arg == "-U"));
+        assert_eq!(args.last(), Some(&"-w"));
+        assert!(args.contains(&"-U"));
         assert!(args.windows(2).any(|pair| pair == ["-s", KEYCHAIN_SERVICE]));
     }
 
     #[test]
     fn find_and_delete_name_the_same_item() {
-        assert!(find_args().contains(&KEYCHAIN_SERVICE));
-        assert!(delete_args().contains(&KEYCHAIN_SERVICE));
+        let item = ["-s", KEYCHAIN_SERVICE, "-a", "someone"];
+        assert_eq!(&add_args("someone")[2..6], item);
+        assert_eq!(&find_args("someone")[1..5], item);
+        assert_eq!(&delete_args("someone")[1..5], item);
     }
 }

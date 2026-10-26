@@ -11,8 +11,8 @@ use anyhow::bail;
 
 use http::{Client, Me};
 
-/// Every error message here is built from text that has already been through
-/// [`auth::ApiKey::redact`], or from text that never saw the key.
+/// Errors from [`Client`] are redacted before they're returned, so their text
+/// can go anywhere (stderr, the status bar).
 #[derive(Debug, thiserror::Error)]
 pub enum CloudError {
     #[error("Cursor cloud agents need the macOS keychain, so they only work on macOS for now")]
@@ -38,6 +38,38 @@ pub enum CloudError {
     Parse(String),
 }
 
+impl CloudError {
+    /// Cursor said the key itself is bad, as opposed to a network or server
+    /// problem.
+    pub fn is_key_rejected(&self) -> bool {
+        matches!(
+            self,
+            CloudError::Api {
+                status: 401 | 403,
+                ..
+            }
+        )
+    }
+
+    fn redacted(self, key: &auth::ApiKey) -> Self {
+        match self {
+            CloudError::Keychain(text) => CloudError::Keychain(key.redact(&text)),
+            CloudError::Transport(text) => CloudError::Transport(key.redact(&text)),
+            CloudError::Parse(text) => CloudError::Parse(key.redact(&text)),
+            CloudError::Api {
+                status,
+                code,
+                message,
+            } => CloudError::Api {
+                status,
+                code: code.map(|code| key.redact(&code)),
+                message: key.redact(&message),
+            },
+            CloudError::Unsupported | CloudError::NoKey => self,
+        }
+    }
+}
+
 /// `bork cloud login`: store a key at `security`'s prompt, then check it.
 pub fn login() -> anyhow::Result<()> {
     // Agent panes export BORK_ISSUE_ID. The key shouldn't be typed into a
@@ -59,15 +91,14 @@ pub fn login() -> anyhow::Result<()> {
             println!("{}", describe(&client, &me));
             Ok(())
         }
-        Verified::Rejected(err) => {
-            let removed = auth::delete_key();
-            if matches!(removed, Ok(true)) {
-                bail!("Cursor rejected the key, so it was removed from the keychain: {err}");
-            }
-            bail!(
-                "Cursor rejected the key, and removing it failed (run `bork cloud logout`): {err}"
-            );
-        }
+        // `Ok(false)` means the item is already gone, which is the outcome
+        // we wanted.
+        Verified::Rejected(err) => match auth::delete_key() {
+            Ok(_) => bail!("Cursor rejected the key, so it was removed from the keychain: {err}"),
+            Err(delete_err) => bail!(
+                "Cursor rejected the key ({err}), and removing it failed: {delete_err}. Run `bork cloud logout`."
+            ),
+        },
         Verified::Unchecked(err) => {
             bail!("the key is stored, but checking it with Cursor failed: {err}. Run `bork cloud login` again to retry.")
         }
@@ -95,11 +126,7 @@ enum Verified {
 fn verify(client: &Client) -> Verified {
     match client.me() {
         Ok(me) => Verified::Ok(me),
-        Err(
-            err @ CloudError::Api {
-                status: 401 | 403, ..
-            },
-        ) => Verified::Rejected(err),
+        Err(err) if err.is_key_rejected() => Verified::Rejected(err),
         Err(err) => Verified::Unchecked(err),
     }
 }
@@ -115,16 +142,7 @@ fn describe(client: &Client, me: &Me) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cloud::auth::test_key;
-    use crate::cloud::http::tests::{fake, SENTINEL};
-
-    fn fake_client(
-        status: u16,
-        body: &str,
-    ) -> (Client, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
-        let (transport, seen) = fake(status, body);
-        (Client::with_transport(test_key(SENTINEL), transport), seen)
-    }
+    use crate::cloud::http::tests::{client as fake_client, SENTINEL};
 
     #[test]
     fn login_check_only_ever_calls_get_v1_me() {

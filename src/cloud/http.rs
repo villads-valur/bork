@@ -100,32 +100,41 @@ impl Client {
 
     /// Check the key and see who owns it. Free to call.
     pub fn me(&self) -> Result<Me, CloudError> {
-        let body = self.request("GET", "/v1/me", None)?;
-        self.parse_json(&body)
+        self.call("GET", "/v1/me", None)
     }
 
     pub fn redact(&self, text: &str) -> String {
         self.key.redact(text)
     }
 
+    /// Every request goes through here, so every error is redacted in one
+    /// place, whichever step produced it.
+    fn call<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+    ) -> Result<T, CloudError> {
+        self.request(method, path, body)
+            .and_then(|body| self.parse_json(&body))
+            .map_err(|err| err.redacted(&self.key))
+    }
+
     fn request(&self, method: &str, path: &str, body: Option<&str>) -> Result<String, CloudError> {
         let config = curl_config(&self.key, method, &format!("{BASE_URL}{path}"), body);
         let output = (self.transport)(&config)
-            .map_err(|e| CloudError::Transport(self.redact(&format!("failed to run curl: {e}"))))?;
+            .map_err(|e| CloudError::Transport(format!("failed to run curl: {e}")))?;
 
         if !output.success {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(CloudError::Transport(self.redact(stderr.trim())));
+            return Err(CloudError::Transport(stderr.trim().to_string()));
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let Some((body, status)) = stdout.rsplit_once('\n') else {
-            return Err(CloudError::Parse("curl printed no HTTP status".to_string()));
-        };
-        let status: u16 = status
-            .trim()
-            .parse()
-            .map_err(|_| CloudError::Parse("curl printed no HTTP status".to_string()))?;
+        let (body, status) = stdout
+            .rsplit_once('\n')
+            .and_then(|(body, status)| Some((body, status.trim().parse::<u16>().ok()?)))
+            .ok_or_else(|| CloudError::Parse("curl printed no HTTP status".to_string()))?;
 
         if (200..300).contains(&status) {
             return Ok(body.to_string());
@@ -146,23 +155,19 @@ impl Client {
         };
         CloudError::Api {
             status,
-            code: code.map(|code| self.redact(&code)),
-            message: self.redact(&message),
+            code,
+            message,
         }
     }
 
     fn parse_json<T: DeserializeOwned>(&self, body: &str) -> Result<T, CloudError> {
-        serde_json::from_str(body).map_err(|e| {
-            CloudError::Parse(format!(
-                "{} (body: {})",
-                self.redact(&e.to_string()),
-                self.excerpt(body)
-            ))
-        })
+        serde_json::from_str(body)
+            .map_err(|e| CloudError::Parse(format!("{e} (body: {})", self.excerpt(body))))
     }
 
-    /// Redact before cutting, so a key that straddles the cut can't leave a
-    /// recognisable prefix behind.
+    /// Redacts before cutting, even though [`Self::call`] redacts again: a key
+    /// that straddles the cut would otherwise leave a prefix no later pass
+    /// can recognise.
     fn excerpt(&self, body: &str) -> String {
         self.redact(body.trim())
             .chars()
@@ -184,12 +189,7 @@ struct ErrorDetail {
 
 /// Spawn curl with the fixed argv and write the config to its stdin.
 fn run_curl(program: &str, config: &CurlConfig) -> io::Result<CurlOutput> {
-    let mut child = Command::new(program)
-        .args(CURL_ARGS)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    let mut child = curl_command(program).spawn()?;
 
     // Dropping stdin after the write closes it, which is how curl knows the
     // config has ended. Wait for the child even if the write failed, so it
@@ -206,6 +206,20 @@ fn run_curl(program: &str, config: &CurlConfig) -> io::Result<CurlOutput> {
         stdout: output.stdout,
         stderr: output.stderr,
     })
+}
+
+/// `SSLKEYLOGFILE` makes some curl builds write TLS session secrets to a file,
+/// and with those anyone holding a packet capture can read the
+/// `Authorization` header. `--disable` doesn't cover environment variables.
+fn curl_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    command
+        .args(CURL_ARGS)
+        .env_remove("SSLKEYLOGFILE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
 }
 
 /// One request as a curl config. `user = "<key>:"` makes curl send HTTP Basic
@@ -259,9 +273,12 @@ pub(super) mod tests {
 
     pub const SENTINEL: &str = "key_SENTINEL_5e81d0";
 
+    /// Every curl config a fake transport was handed.
+    pub type Seen = Arc<Mutex<Vec<String>>>;
+
     /// A transport that records every config it is handed and replies with a
     /// canned status and body.
-    pub fn fake(status: u16, body: &str) -> (Transport, Arc<Mutex<Vec<String>>>) {
+    pub fn fake(status: u16, body: &str) -> (Transport, Seen) {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let recorder = Arc::clone(&seen);
         let stdout = format!("{body}\n{status}").into_bytes();
@@ -279,9 +296,14 @@ pub(super) mod tests {
         (transport, seen)
     }
 
-    fn client(status: u16, body: &str) -> (Client, Arc<Mutex<Vec<String>>>) {
+    pub fn client(status: u16, body: &str) -> (Client, Seen) {
         let (transport, seen) = fake(status, body);
         (Client::with_transport(test_key(SENTINEL), transport), seen)
+    }
+
+    /// A client whose transport always returns `output`.
+    fn client_with(output: fn() -> io::Result<CurlOutput>) -> Client {
+        Client::with_transport(test_key(SENTINEL), Box::new(move |_| output()))
     }
 
     fn failing_client(stderr: &str) -> Client {
@@ -393,6 +415,17 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn curl_never_inherits_a_tls_key_log_file() {
+        let command = curl_command("curl");
+        let removed: Vec<_> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.to_os_string())
+            .collect();
+        assert_eq!(removed, ["SSLKEYLOGFILE"]);
+    }
+
+    #[test]
     fn error_envelope_is_parsed() {
         let (client, _) = client(
             404,
@@ -433,16 +466,13 @@ pub(super) mod tests {
 
     #[test]
     fn missing_status_line_is_a_parse_error() {
-        let client = Client::with_transport(
-            test_key(SENTINEL),
-            Box::new(|_| {
-                Ok(CurlOutput {
-                    success: true,
-                    stdout: b"garbage".to_vec(),
-                    stderr: Vec::new(),
-                })
-            }),
-        );
+        let client = client_with(|| {
+            Ok(CurlOutput {
+                success: true,
+                stdout: b"garbage".to_vec(),
+                stderr: Vec::new(),
+            })
+        });
         assert!(matches!(client.me().unwrap_err(), CloudError::Parse(_)));
     }
 
@@ -457,10 +487,7 @@ pub(super) mod tests {
 
     #[test]
     fn missing_curl_is_a_transport_error() {
-        let client = Client::with_transport(
-            test_key(SENTINEL),
-            Box::new(|_| Err(io::Error::new(io::ErrorKind::NotFound, "No such file"))),
-        );
+        let client = client_with(|| Err(io::Error::new(io::ErrorKind::NotFound, "No such file")));
         assert!(matches!(client.me().unwrap_err(), CloudError::Transport(_)));
     }
 
@@ -514,7 +541,6 @@ pub(super) mod tests {
 
         let shown = [
             format!("{key:?}"),
-            format!("{key}"),
             format!("{config:?}"),
             format!("{client:?}"),
             format!("{client:#?}"),
