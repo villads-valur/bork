@@ -328,43 +328,31 @@ fn spawn_open_prs(
     });
 }
 
-/// Open `(identifier, url)` Linear links in the browser off the main thread.
-/// `note` is appended to the summary message.
-fn spawn_open_linear(
+/// Open `(label, url)` links in the browser off the main thread. `noun`
+/// names what is opened ("Linear issue"), `loading` is the status shown
+/// meanwhile, and `note` is appended to the summary message.
+fn spawn_open_links(
     app: &mut App,
     ch: &ActionChannels<'_>,
+    noun: &'static str,
+    loading: &'static str,
     links: Vec<(String, String)>,
     note: String,
 ) {
     app.begin_busy();
-    app.set_message("Opening Linear...");
+    app.set_message(loading);
     let tx = ch.action_tx.clone();
 
     thread::spawn(move || {
         let mut failures = Vec::new();
-        for (identifier, url) in &links {
+        for (label, url) in &links {
             if let Err(e) = browser::open_url(url) {
-                failures.push(format!("{identifier}: {e}"));
+                failures.push(format!("{label}: {e}"));
             }
         }
-        let mut result = summarize_open_links("Linear issue", links.len(), &links[0].0, failures);
+        let mut result = summarize_open_links(noun, links.len(), &links[0].0, failures);
         result.message.push_str(&note);
         let _ = tx.send(result);
-    });
-}
-
-/// Open a cloud agent's Cursor web page off the main thread.
-fn spawn_open_cloud_page(app: &mut App, ch: &ActionChannels<'_>, issue_id: String, url: String) {
-    app.begin_busy();
-    app.set_message("Opening cloud agent...");
-    let tx = ch.action_tx.clone();
-
-    thread::spawn(move || {
-        let failures = match browser::open_url(&url) {
-            Ok(()) => Vec::new(),
-            Err(e) => vec![format!("{issue_id}: {e}")],
-        };
-        let _ = tx.send(summarize_open_links("cloud agent", 1, &issue_id, failures));
     });
 }
 
@@ -855,7 +843,14 @@ fn handle_normal(
             // the equivalent of attaching.
             if issue.kind == IssueKind::Cloud {
                 match issue.cloud.and_then(|agent| agent.url) {
-                    Some(url) => spawn_open_cloud_page(app, ch, issue.id, url),
+                    Some(url) => spawn_open_links(
+                        app,
+                        ch,
+                        "cloud agent",
+                        "Opening cloud agent...",
+                        vec![(issue.id, url)],
+                        String::new(),
+                    ),
                     None => app.set_warning("cloud agent is still being created"),
                 }
                 return PostAction::None;
@@ -1012,7 +1007,14 @@ fn handle_normal(
                 }
                 return PostAction::None;
             }
-            spawn_open_linear(app, ch, links, skipped_note(skipped, "Linear link"));
+            spawn_open_links(
+                app,
+                ch,
+                "Linear issue",
+                "Opening Linear...",
+                links,
+                skipped_note(skipped, "Linear link"),
+            );
             PostAction::None
         }
 
@@ -4841,14 +4843,8 @@ mod tests {
             cloud: Some(crate::types::CloudAgent {
                 agent_id: format!("bc-{id}"),
                 created: url.is_some(),
-                run_id: None,
                 url: url.map(str::to_string),
-                repo_url: "https://github.com/acme/scratch".to_string(),
-                starting_ref: None,
-                branch: None,
-                last_run_status: None,
-                archived: false,
-                gone: false,
+                ..Default::default()
             }),
             ..test_issue(id, Column::Todo)
         }

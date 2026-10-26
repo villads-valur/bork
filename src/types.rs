@@ -268,7 +268,7 @@ impl From<CloudRunStatus> for String {
 
 /// Durable facts about a Cursor cloud agent, persisted on `Issue.cloud`.
 /// In-flight run state lives in `LiveState.cloud_runs` instead.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloudAgent {
     /// `bc-<uuid>`, minted by bork before the create request.
     pub agent_id: String,
@@ -1575,14 +1575,8 @@ mod tests {
         CloudAgent {
             agent_id: "bc-1".to_string(),
             created,
-            run_id: None,
-            url: None,
             repo_url: "https://github.com/acme/scratch".to_string(),
-            starting_ref: None,
-            branch: None,
-            last_run_status: None,
-            archived: false,
-            gone: false,
+            ..Default::default()
         }
     }
 
@@ -1649,49 +1643,28 @@ mod tests {
     }
 
     #[test]
-    fn set_kind_refuses_to_leave_cloud() {
-        for target in [
-            IssueKind::Agentic,
-            IssueKind::NonAgentic,
-            IssueKind::Orchestrator,
-        ] {
-            let mut issue = Issue {
-                kind: IssueKind::Cloud,
-                cloud: Some(cloud_agent(true)),
-                ..Issue::new("bork-1", "T", Column::Todo, AgentKind::Cursor)
-            };
-            let before = issue.clone();
-            assert!(!issue.kind_change_allowed(target));
-            assert!(!issue.set_kind(target));
-            assert_eq!(issue, before);
+    fn cloud_kind_is_locked_both_ways() {
+        use IssueKind::{Agentic, Cloud, NonAgentic, Orchestrator};
+        let cases = [
+            (Cloud, Agentic, false),
+            (Cloud, NonAgentic, false),
+            (Cloud, Orchestrator, false),
+            (Agentic, Cloud, false),
+            (NonAgentic, Cloud, false),
+            (Orchestrator, Cloud, false),
+            (Cloud, Cloud, true),
+            (Agentic, Orchestrator, true),
+            (Agentic, NonAgentic, true),
+        ];
+        for (from, to, allowed) in cases {
+            let mut issue = issue_with_session_state(from);
+            assert_eq!(issue.kind_change_allowed(to), allowed, "{from} -> {to}");
+            if !allowed {
+                let before = issue.clone();
+                assert!(!issue.set_kind(to));
+                assert_eq!(issue, before, "{from} -> {to}");
+            }
         }
-    }
-
-    #[test]
-    fn set_kind_refuses_to_become_cloud() {
-        for start in [
-            IssueKind::Agentic,
-            IssueKind::NonAgentic,
-            IssueKind::Orchestrator,
-        ] {
-            let mut issue = issue_with_session_state(start);
-            let before = issue.clone();
-            assert!(!issue.kind_change_allowed(IssueKind::Cloud));
-            assert!(!issue.set_kind(IssueKind::Cloud));
-            assert_eq!(issue, before);
-        }
-    }
-
-    #[test]
-    fn kind_lock_leaves_local_kind_changes_alone() {
-        let issue = issue_with_session_state(IssueKind::Agentic);
-        assert!(issue.kind_change_allowed(IssueKind::Orchestrator));
-        assert!(issue.kind_change_allowed(IssueKind::NonAgentic));
-        let cloud = Issue {
-            kind: IssueKind::Cloud,
-            ..Issue::new("bork-1", "T", Column::Todo, AgentKind::Cursor)
-        };
-        assert!(cloud.kind_change_allowed(IssueKind::Cloud));
     }
 
     #[test]

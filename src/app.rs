@@ -23,9 +23,9 @@ use crate::external::git::PollClass;
 use crate::external::linear::LinearIssue;
 use crate::prune::{PruneAction, PruneCandidate};
 use crate::types::{
-    cloud_card_status, AgentKind, AgentStatus, AgentStatusInfo, ChecksStatus, CloudRunInfo, Column,
-    GithubStack, Issue, IssueKind, LinkedGithubPr, MergeBlocker, PrImportBaseline, PrImportSource,
-    PrState, PrStatus, ReviewDecision, WorktreeStatus,
+    cloud_card_status, AgentKind, AgentStatus, AgentStatusInfo, ChecksStatus, CloudAgent,
+    CloudRunInfo, Column, GithubStack, Issue, IssueKind, LinkedGithubPr, MergeBlocker,
+    PrImportBaseline, PrImportSource, PrState, PrStatus, ReviewDecision, WorktreeStatus,
 };
 use crate::undo::UndoEntry;
 
@@ -1862,7 +1862,7 @@ fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
         pr_import_baseline: _,
         stack_review_import: _,
         linked_issues: _,
-        // File wins while memory's copy is unconfirmed, else merge_field!().
+        // Merged field-wise in merge_cloud_fields().
         cloud: _,
         // Merged entry-wise, interleaved with the kind/orchestrator logic below.
         sessions: _,
@@ -1905,15 +1905,7 @@ fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
     merge_field!(stack_review_import);
     merge_field!(linked_issues);
 
-    // The CLI creates and confirms the cloud agent while the TUI may hold a
-    // copy that predates confirmation, so the file's copy wins until memory
-    // has a confirmed one.
-    let memory_cloud_unconfirmed = memory.cloud.as_ref().is_none_or(|agent| !agent.created);
-    if memory_cloud_unconfirmed && file.cloud.is_some() {
-        memory.cloud = file.cloud.clone();
-    } else {
-        merge_field!(cloud);
-    }
+    merge_cloud_fields(memory, base, file);
 
     // `sessions` merges entry-wise: per-agent entries are independent, so a
     // concurrent write to one agent's session (e.g. `bork issue start` from a
@@ -1947,6 +1939,53 @@ fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
     if file_crossed_boundary && !memory_crossed_boundary && memory.kind == file.kind {
         memory.sessions = file.sessions.clone();
     }
+}
+
+/// `cloud` merges field-wise: the CLI (create, cancel, archive) and the TUI
+/// poller write different fields of the same agent, so neither may clobber
+/// the other's. A side that adds or drops the whole agent is merged as one
+/// value.
+fn merge_cloud_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
+    let (Some(memory_agent), Some(base_agent), Some(file_agent)) = (
+        memory.cloud.as_mut(),
+        base.cloud.as_ref(),
+        file.cloud.as_ref(),
+    ) else {
+        if memory.cloud == base.cloud && file.cloud != base.cloud {
+            memory.cloud = file.cloud.clone();
+        }
+        return;
+    };
+    // Same compile-time coverage guard as `merge_issue_fields`.
+    let CloudAgent {
+        agent_id: _, // stable key, never merged
+        created: _,
+        run_id: _,
+        url: _,
+        repo_url: _,
+        starting_ref: _,
+        branch: _,
+        last_run_status: _,
+        archived: _,
+        gone: _,
+    } = memory_agent;
+
+    macro_rules! merge_cloud_field {
+        ($field:ident) => {
+            if memory_agent.$field == base_agent.$field && file_agent.$field != base_agent.$field {
+                memory_agent.$field = file_agent.$field.clone();
+            }
+        };
+    }
+    merge_cloud_field!(created);
+    merge_cloud_field!(run_id);
+    merge_cloud_field!(url);
+    merge_cloud_field!(repo_url);
+    merge_cloud_field!(starting_ref);
+    merge_cloud_field!(branch);
+    merge_cloud_field!(last_run_status);
+    merge_cloud_field!(archived);
+    merge_cloud_field!(gone);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -7819,17 +7858,10 @@ mod tests {
     fn cloud_issue(id: &str, created: bool) -> Issue {
         Issue {
             kind: IssueKind::Cloud,
-            cloud: Some(crate::types::CloudAgent {
+            cloud: Some(CloudAgent {
                 agent_id: format!("bc-{id}"),
                 created,
-                run_id: None,
-                url: None,
-                repo_url: "https://github.com/acme/scratch".to_string(),
-                starting_ref: None,
-                branch: None,
-                last_run_status: None,
-                archived: false,
-                gone: false,
+                ..Default::default()
             }),
             ..test_issue(id, Column::InProgress)
         }
@@ -7899,23 +7931,18 @@ mod tests {
     }
 
     #[test]
-    fn merge_cloud_memory_wins_once_confirmed_and_both_changed() {
+    fn merge_cloud_keeps_both_sides_field_changes() {
         let base = cloud_issue("bork-1", true);
         let mut memory = base.clone();
         memory.cloud.as_mut().unwrap().branch = Some("cursor/memory".to_string());
         let mut file = base.clone();
         file.cloud.as_mut().unwrap().archived = true;
+        file.cloud.as_mut().unwrap().branch = Some("cursor/file".to_string());
 
         merge_issue_fields(&mut memory, &base, &file);
-        assert_eq!(
-            memory.cloud.as_ref().unwrap().branch.as_deref(),
-            Some("cursor/memory")
-        );
-        assert!(!memory.cloud.as_ref().unwrap().archived);
-
-        // Memory untouched since base: the file's change comes through.
-        let mut memory = base.clone();
-        merge_issue_fields(&mut memory, &base, &file);
-        assert!(memory.cloud.as_ref().unwrap().archived);
+        let merged = memory.cloud.as_ref().unwrap();
+        // Different fields: both come through. Same field: memory wins.
+        assert!(merged.archived);
+        assert_eq!(merged.branch.as_deref(), Some("cursor/memory"));
     }
 }

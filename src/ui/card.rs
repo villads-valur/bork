@@ -47,7 +47,7 @@ pub fn render_card(frame: &mut Frame, ctx: &CardContext, area: Rect, card_size: 
     let (type_label, type_style) = match ctx.issue.kind {
         IssueKind::Orchestrator => ("· orch ", styles::orchestrator_badge_style()),
         IssueKind::NonAgentic => ("· todo ", styles::dim_style()),
-        IssueKind::Cloud => ("· cloud ", Style::default().fg(Color::Blue)),
+        IssueKind::Cloud => ("· cloud ", styles::cloud_badge_style()),
         IssueKind::Agentic => ("", title_style),
     };
     let id_text = styles::truncate(

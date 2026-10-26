@@ -1586,15 +1586,8 @@ args = ["--dangerously-skip-permissions"]
             kind: IssueKind::Cloud,
             cloud: Some(CloudAgent {
                 agent_id: "bc-11111111-1111-4111-8111-111111111111".to_string(),
-                created: false,
-                run_id: None,
-                url: None,
                 repo_url: "git@github.com:acme/scratch.git".to_string(),
-                starting_ref: None,
-                branch: None,
-                last_run_status: None,
-                archived: false,
-                gone: false,
+                ..Default::default()
             }),
             ..Issue::new("bork-4", "pending", Column::Todo, AgentKind::Cursor)
         };
