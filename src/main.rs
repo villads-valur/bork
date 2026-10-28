@@ -1,6 +1,7 @@
 mod agent_config;
 mod app;
 mod attention;
+mod cloud;
 mod config;
 mod dialog_state;
 mod error;
@@ -628,6 +629,12 @@ enum Command {
         command: ConfigCommand,
     },
 
+    /// Cursor cloud agents (experimental, macOS only)
+    Cloud {
+        #[command(subcommand)]
+        command: CloudCommand,
+    },
+
     /// Update bork to the latest version (git pull + cargo build)
     Update {
         /// Only check whether a new version is available; don't pull or build.
@@ -673,6 +680,15 @@ enum ProjectCommand {
         /// Path to project container
         path: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum CloudCommand {
+    /// Store a Cursor API key in the macOS keychain and check it with Cursor
+    Login,
+
+    /// Remove the Cursor API key from the keychain
+    Logout,
 }
 
 #[derive(Subcommand)]
@@ -994,6 +1010,10 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Issue { command }) => run_issue_command(command),
         Some(Command::Integration { command }) => run_integration_command(command),
         Some(Command::Config { command }) => run_config_command(command),
+        Some(Command::Cloud { command }) => match command {
+            CloudCommand::Login => cloud::login(),
+            CloudCommand::Logout => cloud::logout(),
+        },
         Some(Command::Update { check }) => {
             if check {
                 update::run_check_command()
