@@ -77,6 +77,7 @@ pub fn attention_badge(attention: Attention) -> (&'static str, Color) {
         Attention::ChangesRequested => ("\u{21a9} review", Color::Red),
         Attention::ChecksAndChanges => ("\u{2717} CI \u{21a9} review", Color::Red),
         Attention::NeedsRebase => ("\u{21a5} rebase", Color::Yellow),
+        Attention::NeedsUpdate => ("\u{21a7} update", Color::Yellow),
         Attention::Blocked => ("\u{2298} blocked", Color::Magenta),
         Attention::Queued => ("\u{29d6} queued", DIM),
         Attention::AgentBlocked => ("\u{2691} agent blocked", Color::Yellow),

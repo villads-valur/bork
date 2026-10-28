@@ -11,9 +11,11 @@ pub enum Attention {
     ChangesRequested,
     /// Own PR: changes requested and checks failing or erroring.
     ChecksAndChanges,
-    /// Own PR: approved and green, but in conflict with its base. Merely
-    /// being behind is not this: a merge queue rebases on enqueue.
+    /// Own PR: in conflict with its base, whatever its review and checks say.
     NeedsRebase,
+    /// Own PR: approved and green, but behind a base branch that has no merge
+    /// queue to bring it up to date.
+    NeedsUpdate,
     /// Own PR: approved and green, but GitHub blocks the merge, typically on
     /// an unresolved conversation.
     Blocked,

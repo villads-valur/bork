@@ -699,6 +699,12 @@ pub enum MergeBlocker {
     /// `BLOCKED`: a branch rule still objects, typically an unresolved
     /// conversation.
     Blocked,
+    /// `BEHIND` on a base branch without a merge queue: the branch must be
+    /// brought up to date before it can merge.
+    Behind,
+    /// `UNKNOWN`: GitHub is still computing the merge state, as it does right
+    /// after every push.
+    Computing,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

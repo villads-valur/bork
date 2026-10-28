@@ -2551,14 +2551,17 @@ fn run_tui() -> anyhow::Result<()> {
         {
             protected_imports.insert(id.clone());
         }
-        let outcome = drain_project_workers(
-            app.project_mut(),
-            &workers,
-            &action_tx,
-            now,
-            picker,
-            &protected_imports,
-        );
+        let query = app.search_query.clone();
+        let outcome = app.project_mut().keep_selection(&query, |project| {
+            drain_project_workers(
+                project,
+                &workers,
+                &action_tx,
+                now,
+                picker,
+                &protected_imports,
+            )
+        });
         needs_redraw |= apply_drain_outcome(&mut app, outcome);
 
         // --- Update check (periodic worker results) ---
@@ -2653,14 +2656,17 @@ fn run_tui() -> anyhow::Result<()> {
             let Some(proj_pos) = app.projects.iter().position(|p| p.id() == *proj_id) else {
                 continue;
             };
-            let outcome = drain_project_workers(
-                &mut app.projects[proj_pos],
-                sw,
-                &action_tx,
-                now,
-                picker_project.as_ref() == Some(proj_id),
-                &protected_imports,
-            );
+            let query = app.search_query.clone();
+            let outcome = app.projects[proj_pos].keep_selection(&query, |project| {
+                drain_project_workers(
+                    project,
+                    sw,
+                    &action_tx,
+                    now,
+                    picker_project.as_ref() == Some(proj_id),
+                    &protected_imports,
+                )
+            });
             needs_redraw |= apply_drain_outcome(&mut app, outcome);
         }
 
