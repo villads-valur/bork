@@ -2224,6 +2224,7 @@ fn run_tui() -> anyhow::Result<()> {
 
     // --- Main event loop ---
     loop {
+        needs_redraw |= handler::show_queued_force_archive(&mut app);
         if needs_redraw {
             terminal.draw(|frame| {
                 ui::render(frame, &app);
@@ -2401,6 +2402,7 @@ fn run_tui() -> anyhow::Result<()> {
             for (project_id, issue_id) in result.issues_to_archive {
                 handler::archive_issue_in_app(&mut app, &project_id, &issue_id);
             }
+            handler::queue_force_archive(&mut app, result.force_archive_offers);
 
             if let Some(launch_id) = result.launched_issue_id {
                 // A kill during the detection window (x kill, done-TTL)

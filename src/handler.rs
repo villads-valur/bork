@@ -14,6 +14,7 @@ use crate::types::{
     AgentKind, Column, Issue, IssueDraft, IssueKind, LinkedGithubPr, LinkedLinear, PrImportSource,
 };
 use crate::undo::{self, Change, ColumnSnapshot, UndoEntry, UNDO_WINDOW};
+use crate::worktree::{ForceRequired, Removal};
 
 pub struct ActionChannels<'a> {
     pub action_tx: &'a mpsc::Sender<ActionResult>,
@@ -56,6 +57,9 @@ pub struct ActionResult {
     /// asynchronous teardown (session kill + teardown script + worktree
     /// removal) succeeds.
     pub issues_to_archive: Vec<(ProjectId, String)>,
+    /// Archives that stopped short of removing the worktree but would go
+    /// through with `--force`. The main loop asks before forcing them.
+    pub force_archive_offers: Vec<(ProjectId, String, ForceRequired)>,
 }
 
 pub enum PostAction {
@@ -370,6 +374,9 @@ fn combine_results(results: Vec<ActionResult>, summary: String) -> ActionResult 
         }
         combined.issues_to_delete.extend(result.issues_to_delete);
         combined.issues_to_archive.extend(result.issues_to_archive);
+        combined
+            .force_archive_offers
+            .extend(result.force_archive_offers);
     }
     match failures.first() {
         None => combined.message = summary,
@@ -708,6 +715,7 @@ fn handle_normal(
                 ConfirmAction::ArchiveIssue {
                     issue_ids,
                     project_id: ctx.project_id.clone(),
+                    force: false,
                 },
             );
             PostAction::None
@@ -2089,6 +2097,7 @@ fn handle_confirm(
                     ConfirmAction::ArchiveIssue {
                         issue_ids,
                         project_id,
+                        force,
                     } => run_confirmed(
                         app,
                         action_tx,
@@ -2096,14 +2105,14 @@ fn handle_confirm(
                         &issue_ids,
                         "Archived",
                         "issue",
-                        |config, project_id, issue| {
-                            archive_to_result(
-                                config,
-                                project_id.clone(),
-                                issue.id.clone(),
-                                &issue.session_name(&config.project_name),
-                                issue.worktree.as_deref(),
-                            )
+                        if force {
+                            |config, project_id, issue| {
+                                archive_issue_off_thread(config, project_id, issue, true)
+                            }
+                        } else {
+                            |config, project_id, issue| {
+                                archive_issue_off_thread(config, project_id, issue, false)
+                            }
                         },
                     ),
                 }
@@ -2117,17 +2126,36 @@ fn handle_confirm(
 }
 
 /// Run the off-thread half of a TUI archive: kill the agent session, run the
-/// teardown script, and remove the worktree (never forced, matching the CLI's
-/// default — a failing teardown or dirty worktree aborts and reports an
-/// error). On success it sets `issues_to_archive` so the main thread applies
-/// the move-to-Done and worktree drop against the live in-memory board,
-/// instead of writing state.json directly and racing concurrent merges.
+/// teardown script, and remove the worktree. Without `force`, a failing
+/// teardown or dirty worktree stops the archive and comes back as a force
+/// offer for the main loop to confirm; with it, teardown is skipped and
+/// uncommitted changes are discarded. On success it sets `issues_to_archive`
+/// so the main thread applies the move-to-Done and worktree drop against the
+/// live in-memory board, instead of writing state.json directly and racing
+/// concurrent merges.
+fn archive_issue_off_thread(
+    config: &AppConfig,
+    project_id: &ProjectId,
+    issue: &Issue,
+    force: bool,
+) -> ActionResult {
+    archive_to_result(
+        config,
+        project_id.clone(),
+        issue.id.clone(),
+        &issue.session_name(&config.project_name),
+        issue.worktree.as_deref(),
+        force,
+    )
+}
+
 fn archive_to_result(
     config: &AppConfig,
     project_id: ProjectId,
     issue_id: String,
     session_name: &str,
     worktree: Option<&str>,
+    force: bool,
 ) -> ActionResult {
     let session_killed = match agent::terminate_session(&config.project_root, session_name) {
         Ok(killed) => killed,
@@ -2141,10 +2169,21 @@ fn archive_to_result(
     };
 
     if let Some(dir) = worktree {
-        if let Err(e) = crate::worktree::remove_worktree_in(config, dir, false) {
+        // A force archive always follows an attempt whose teardown already ran.
+        let removal = if force {
+            Removal::ForceSkipTeardown
+        } else {
+            Removal::Safe
+        };
+        if let Err(e) = crate::worktree::remove_worktree_in(config, dir, removal) {
+            let force_archive_offers = e
+                .downcast_ref::<ForceRequired>()
+                .map(|reason| vec![(project_id, issue_id.clone(), reason.clone())])
+                .unwrap_or_default();
             return ActionResult {
                 message: format!("Failed to archive {issue_id}: {e}"),
                 message_kind: MessageKind::Error,
+                force_archive_offers,
                 ..Default::default()
             };
         }
@@ -2160,6 +2199,102 @@ fn archive_to_result(
         message,
         issues_to_archive: vec![(project_id, issue_id)],
         ..Default::default()
+    }
+}
+
+/// Hold archives that stopped short until `show_queued_force_archive` can
+/// offer them. A later offer for the same card replaces the earlier one.
+pub fn queue_force_archive(app: &mut App, offers: Vec<(ProjectId, String, ForceRequired)>) {
+    for offer in offers {
+        app.queued_force_archives
+            .retain(|(project_id, issue_id, _)| (project_id, issue_id) != (&offer.0, &offer.1));
+        app.queued_force_archives.push(offer);
+    }
+}
+
+/// Ask whether to force one project's queued archives. Waits while the user
+/// is in a dialog, search or another prompt, so a `y` meant for something
+/// else never forces an archive. Returns whether a prompt opened.
+pub fn show_queued_force_archive(app: &mut App) -> bool {
+    if app.input_mode != InputMode::Normal || app.pending_confirm.is_some() {
+        return false;
+    }
+    let Some((project_id, _, _)) = app.queued_force_archives.first() else {
+        return false;
+    };
+    let project_id = project_id.clone();
+
+    let (offers, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut app.queued_force_archives)
+        .into_iter()
+        .partition(|(offer_project, _, _)| *offer_project == project_id);
+    app.queued_force_archives = rest;
+
+    let offers: Vec<(String, ForceRequired)> = offers
+        .into_iter()
+        .map(|(_, issue_id, reason)| (issue_id, reason))
+        .collect();
+    let message = force_archive_prompt(&offers);
+    app.start_confirm(
+        message,
+        ConfirmAction::ArchiveIssue {
+            issue_ids: offers.into_iter().map(|(issue_id, _)| issue_id).collect(),
+            project_id,
+            force: true,
+        },
+    );
+    true
+}
+
+/// How many cards a combined force prompt names before summarising the rest.
+const FORCE_PROMPT_NAMED: usize = 3;
+
+fn force_archive_prompt(offers: &[(String, ForceRequired)]) -> String {
+    match offers {
+        [(issue_id, ForceRequired::Uncommitted(_))] => format!(
+            "{issue_id}'s worktree has uncommitted changes. Archive anyway and discard them? (y/n)"
+        ),
+        [(issue_id, ForceRequired::TeardownFailed { code, dirty: false })] => format!(
+            "{issue_id}'s teardown script failed (exit {code}). Archive anyway? (y/n)"
+        ),
+        [(issue_id, ForceRequired::TeardownFailed { code, dirty: true })] => format!(
+            "{issue_id}'s teardown script failed (exit {code}) and its worktree has uncommitted changes. Archive anyway and discard them? (y/n)"
+        ),
+        _ => {
+            let mut named: Vec<String> = offers
+                .iter()
+                .take(FORCE_PROMPT_NAMED)
+                .map(|(issue_id, reason)| format!("{issue_id}: {}", force_reason(reason)))
+                .collect();
+            if offers.len() > FORCE_PROMPT_NAMED {
+                named.push(format!("{} more", offers.len() - FORCE_PROMPT_NAMED));
+            }
+            let any_dirty = offers.iter().any(|(_, reason)| {
+                matches!(
+                    reason,
+                    ForceRequired::Uncommitted(_) | ForceRequired::TeardownFailed { dirty: true, .. }
+                )
+            });
+            let question = if any_dirty {
+                "Archive anyway and discard their uncommitted changes?"
+            } else {
+                "Archive anyway?"
+            };
+            format!(
+                "{} stopped short ({}). {question} (y/n)",
+                count_of(offers.len(), "issue"),
+                named.join(", ")
+            )
+        }
+    }
+}
+
+fn force_reason(reason: &ForceRequired) -> String {
+    match reason {
+        ForceRequired::Uncommitted(_) => "uncommitted changes".to_string(),
+        ForceRequired::TeardownFailed { code, dirty: false } => format!("teardown exit {code}"),
+        ForceRequired::TeardownFailed { code, dirty: true } => {
+            format!("teardown exit {code}, uncommitted changes")
+        }
     }
 }
 
@@ -4001,6 +4136,294 @@ mod tests {
         assert!(issue.done_at.is_some());
         assert!(issue.worktree.is_none());
         assert!(app.project().state_dirty);
+    }
+
+    /// A project root with a real `main/` checkout and one worktree,
+    /// `bork-1-slug`, holding an uncommitted file.
+    fn project_with_dirty_worktree() -> (tempfile::TempDir, AppConfig) {
+        let root = tempfile::tempdir().unwrap();
+        let main = root.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
+                .args(args)
+                .current_dir(&main)
+                .output()
+                .unwrap();
+            assert!(status.status.success(), "git {args:?}: {status:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            "../bork-1-slug",
+            "-b",
+            "bork-1/slug",
+        ]);
+        std::fs::write(root.path().join("bork-1-slug/dirty.txt"), "uncommitted").unwrap();
+
+        let mut config = test_config();
+        config.project_root = root.path().to_path_buf();
+        (root, config)
+    }
+
+    fn unique_session() -> String {
+        format!("bork-force-archive-test-{}", std::process::id())
+    }
+
+    #[test]
+    fn archiving_a_dirty_worktree_offers_to_force_it() {
+        let (root, config) = project_with_dirty_worktree();
+        let project_id = root.path().to_path_buf();
+
+        let result = archive_to_result(
+            &config,
+            project_id.clone(),
+            "bork-1".into(),
+            &unique_session(),
+            Some("bork-1-slug"),
+            false,
+        );
+
+        assert!(result.issues_to_archive.is_empty());
+        assert_eq!(result.force_archive_offers.len(), 1);
+        let (offer_project, offer_issue, reason) = &result.force_archive_offers[0];
+        assert_eq!(offer_project, &project_id);
+        assert_eq!(offer_issue, "bork-1");
+        assert!(matches!(reason, ForceRequired::Uncommitted(_)));
+        assert!(root.path().join("bork-1-slug").exists());
+    }
+
+    #[test]
+    fn a_forced_archive_discards_the_uncommitted_changes() {
+        let (root, config) = project_with_dirty_worktree();
+        let project_id = root.path().to_path_buf();
+
+        let result = archive_to_result(
+            &config,
+            project_id.clone(),
+            "bork-1".into(),
+            &unique_session(),
+            Some("bork-1-slug"),
+            true,
+        );
+
+        assert_eq!(
+            result.issues_to_archive,
+            vec![(project_id, "bork-1".to_string())]
+        );
+        assert!(result.force_archive_offers.is_empty());
+        assert!(!root.path().join("bork-1-slug").exists());
+    }
+
+    fn offer(app: &mut App, offers: Vec<(ProjectId, String, ForceRequired)>) -> bool {
+        queue_force_archive(app, offers);
+        show_queued_force_archive(app)
+    }
+
+    fn dirty(project_id: &ProjectId, issue_id: &str) -> (ProjectId, String, ForceRequired) {
+        (
+            project_id.clone(),
+            issue_id.into(),
+            ForceRequired::Uncommitted("fatal: dirty".into()),
+        )
+    }
+
+    fn teardown_failed(
+        project_id: &ProjectId,
+        issue_id: &str,
+        dirty: bool,
+    ) -> (ProjectId, String, ForceRequired) {
+        (
+            project_id.clone(),
+            issue_id.into(),
+            ForceRequired::TeardownFailed { code: 2, dirty },
+        )
+    }
+
+    #[test]
+    fn a_force_offer_asks_before_discarding_anything() {
+        let mut app = app_with_issues();
+        let project_id = app.project().id();
+
+        assert!(offer(&mut app, vec![dirty(&project_id, "bork-1")]));
+
+        assert_eq!(app.input_mode, InputMode::Confirm);
+        assert_eq!(
+            app.confirm_message.as_deref(),
+            Some(
+                "bork-1's worktree has uncommitted changes. Archive anyway and discard them? (y/n)"
+            )
+        );
+        match &app.pending_confirm {
+            Some(ConfirmAction::ArchiveIssue {
+                issue_ids,
+                project_id: confirmed_project,
+                force: true,
+            }) => {
+                assert_eq!(issue_ids, &["bork-1"]);
+                assert_eq!(confirmed_project, &project_id);
+            }
+            _ => panic!("expected a forced ArchiveIssue"),
+        }
+        assert!(app.queued_force_archives.is_empty());
+    }
+
+    #[test]
+    fn a_force_offer_names_a_failing_teardown() {
+        let mut app = app_with_issues();
+        let project_id = app.project().id();
+
+        offer(
+            &mut app,
+            vec![teardown_failed(&project_id, "bork-1", false)],
+        );
+
+        assert_eq!(
+            app.confirm_message.as_deref(),
+            Some("bork-1's teardown script failed (exit 2). Archive anyway? (y/n)")
+        );
+    }
+
+    #[test]
+    fn a_failing_teardown_on_a_dirty_worktree_warns_about_the_changes() {
+        let mut app = app_with_issues();
+        let project_id = app.project().id();
+
+        offer(&mut app, vec![teardown_failed(&project_id, "bork-1", true)]);
+
+        assert_eq!(
+            app.confirm_message.as_deref(),
+            Some("bork-1's teardown script failed (exit 2) and its worktree has uncommitted changes. Archive anyway and discard them? (y/n)")
+        );
+    }
+
+    #[test]
+    fn several_force_offers_become_one_prompt_naming_each_card() {
+        let mut app = app_with_issues();
+        let project_id = app.project().id();
+
+        offer(
+            &mut app,
+            vec![
+                dirty(&project_id, "bork-1"),
+                teardown_failed(&project_id, "bork-2", false),
+            ],
+        );
+
+        assert_eq!(
+            app.confirm_message.as_deref(),
+            Some("2 issues stopped short (bork-1: uncommitted changes, bork-2: teardown exit 2). Archive anyway and discard their uncommitted changes? (y/n)")
+        );
+        match &app.pending_confirm {
+            Some(ConfirmAction::ArchiveIssue {
+                issue_ids,
+                force: true,
+                ..
+            }) => assert_eq!(issue_ids, &["bork-1", "bork-2"]),
+            _ => panic!("expected a forced ArchiveIssue"),
+        }
+    }
+
+    #[test]
+    fn a_combined_prompt_without_dirty_worktrees_does_not_mention_discarding() {
+        let mut app = app_with_issues();
+        let project_id = app.project().id();
+
+        offer(
+            &mut app,
+            ["bork-1", "bork-2", "bork-3", "bork-4", "bork-5"]
+                .into_iter()
+                .map(|id| teardown_failed(&project_id, id, false))
+                .collect(),
+        );
+
+        assert_eq!(
+            app.confirm_message.as_deref(),
+            Some("5 issues stopped short (bork-1: teardown exit 2, bork-2: teardown exit 2, bork-3: teardown exit 2, 2 more). Archive anyway? (y/n)")
+        );
+    }
+
+    #[test]
+    fn a_force_offer_waits_until_the_board_is_back_in_normal_mode() {
+        let mut app = app_with_issues();
+        let project_id = app.project().id();
+        app.start_search();
+
+        assert!(!offer(&mut app, vec![dirty(&project_id, "bork-1")]));
+        assert_eq!(app.input_mode, InputMode::Search);
+        assert!(app.pending_confirm.is_none());
+
+        app.input_mode = InputMode::Normal;
+        assert!(show_queued_force_archive(&mut app));
+        assert!(matches!(
+            &app.pending_confirm,
+            Some(ConfirmAction::ArchiveIssue { force: true, .. })
+        ));
+    }
+
+    #[test]
+    fn a_force_offer_leaves_an_open_prompt_alone_and_queues_behind_it() {
+        let mut app = app_with_issues();
+        let project_id = app.project().id();
+        offer(&mut app, vec![dirty(&project_id, "bork-1")]);
+
+        assert!(!offer(&mut app, vec![dirty(&project_id, "bork-2")]));
+        match &app.pending_confirm {
+            Some(ConfirmAction::ArchiveIssue { issue_ids, .. }) => {
+                assert_eq!(issue_ids, &["bork-1"])
+            }
+            _ => panic!("expected the first offer to stay open"),
+        }
+
+        app.cancel_confirm();
+        assert!(show_queued_force_archive(&mut app));
+        match &app.pending_confirm {
+            Some(ConfirmAction::ArchiveIssue { issue_ids, .. }) => {
+                assert_eq!(issue_ids, &["bork-2"])
+            }
+            _ => panic!("expected the queued offer"),
+        }
+    }
+
+    #[test]
+    fn a_repeated_offer_for_a_card_replaces_the_queued_one() {
+        let mut app = app_with_issues();
+        let project_id = app.project().id();
+        app.start_search();
+
+        queue_force_archive(&mut app, vec![dirty(&project_id, "bork-1")]);
+        queue_force_archive(
+            &mut app,
+            vec![teardown_failed(&project_id, "bork-1", false)],
+        );
+
+        assert_eq!(
+            app.queued_force_archives,
+            vec![teardown_failed(&project_id, "bork-1", false)]
+        );
+    }
+
+    #[test]
+    fn combined_results_keep_every_force_offer() {
+        let project_id = PathBuf::from("/tmp/test-bork");
+        let offer = |id: &str| ActionResult {
+            message: format!("{id} is dirty"),
+            message_kind: MessageKind::Error,
+            force_archive_offers: vec![(
+                project_id.clone(),
+                id.to_string(),
+                ForceRequired::Uncommitted("fatal: dirty".into()),
+            )],
+            ..Default::default()
+        };
+
+        let combined = combine_results(vec![offer("bork-1"), offer("bork-2")], "done".into());
+
+        assert_eq!(combined.force_archive_offers.len(), 2);
     }
 
     #[test]

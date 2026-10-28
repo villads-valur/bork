@@ -270,7 +270,7 @@ bork update --check   # force a fresh check without pulling
 | `n` | Create new issue |
 | `e` | Edit selected issue |
 | `d` | Delete issue (with confirmation) |
-| `A` | Archive issue: kill session, run teardown, remove worktree, move to Done (with confirmation) |
+| `A` | Archive issue: kill session, run teardown, remove worktree, move to Done (with confirmation; offers to force it when the worktree is dirty or the teardown fails) |
 | `x` | Kill session (with confirmation) |
 | `a` | Add issue in current column |
 | `H` | Move issue to previous column |

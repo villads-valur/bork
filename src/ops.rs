@@ -602,7 +602,12 @@ pub fn archive_issue(
 
     let worktree_removed = match issue.worktree.as_deref() {
         Some(dir) => {
-            worktree::remove_worktree_in(&app_config, dir, force)?;
+            let removal = if force {
+                worktree::Removal::Force
+            } else {
+                worktree::Removal::Safe
+            };
+            worktree::remove_worktree_in(&app_config, dir, removal)?;
             Some(dir.to_string())
         }
         None => None,
