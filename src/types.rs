@@ -178,10 +178,15 @@ pub enum IssueKind {
     /// Coordinates work across multiple bork issues: maintains a plan file,
     /// spawns issues via `bork issue start`, and monitors their agents.
     Orchestrator,
+    /// A Cursor cloud agent. Runs on Cursor's VMs, so it has no tmux session
+    /// and no worktree; its state lives in `Issue.cloud`. Not agentic in the
+    /// `is_agentic` sense, so no local launch path (including bulk start)
+    /// ever picks it up.
+    Cloud,
 }
 
 impl IssueKind {
-    /// Whether this kind launches an agent session.
+    /// Whether this kind launches a local agent session.
     pub fn is_agentic(self) -> bool {
         matches!(self, Self::Agentic | Self::Orchestrator)
     }
@@ -193,7 +198,148 @@ impl fmt::Display for IssueKind {
             Self::Agentic => write!(f, "Agentic"),
             Self::NonAgentic => write!(f, "Todo"),
             Self::Orchestrator => write!(f, "Orchestrator"),
+            Self::Cloud => write!(f, "Cloud"),
         }
+    }
+}
+
+/// Shown when a kind change is refused by [`Issue::kind_change_allowed`].
+pub const CLOUD_KIND_LOCKED: &str =
+    "cloud issues can't change kind, and other issues can't become cloud issues";
+
+/// Status of a Cursor cloud agent run. Stored as Cursor's own string, and
+/// any value bork doesn't know becomes `Unknown` instead of failing to load:
+/// the API is beta and a new status must not break `state.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+pub enum CloudRunStatus {
+    Creating,
+    Running,
+    Finished,
+    Error,
+    Cancelled,
+    Expired,
+    Unknown(String),
+}
+
+impl CloudRunStatus {
+    /// Map a run status onto the card status and its activity text.
+    /// `error` is the run's (already redacted) error message, if any.
+    fn card_status<'a>(&'a self, error: Option<&'a str>) -> (AgentStatus, Option<&'a str>) {
+        match self {
+            Self::Creating => (AgentStatus::Busy, Some("starting VM")),
+            Self::Running => (AgentStatus::Busy, Some("running")),
+            Self::Finished => (AgentStatus::Idle, None),
+            Self::Error => (AgentStatus::Error, error),
+            Self::Cancelled => (AgentStatus::Idle, Some("cancelled")),
+            Self::Expired => (AgentStatus::Stopped, Some("expired")),
+            Self::Unknown(raw) => (AgentStatus::Idle, Some(raw.as_str())),
+        }
+    }
+}
+
+impl From<String> for CloudRunStatus {
+    fn from(raw: String) -> Self {
+        match raw.as_str() {
+            "CREATING" => Self::Creating,
+            "RUNNING" => Self::Running,
+            "FINISHED" => Self::Finished,
+            "ERROR" => Self::Error,
+            "CANCELLED" => Self::Cancelled,
+            "EXPIRED" => Self::Expired,
+            _ => Self::Unknown(raw),
+        }
+    }
+}
+
+impl From<CloudRunStatus> for String {
+    fn from(status: CloudRunStatus) -> Self {
+        match status {
+            CloudRunStatus::Creating => "CREATING".to_string(),
+            CloudRunStatus::Running => "RUNNING".to_string(),
+            CloudRunStatus::Finished => "FINISHED".to_string(),
+            CloudRunStatus::Error => "ERROR".to_string(),
+            CloudRunStatus::Cancelled => "CANCELLED".to_string(),
+            CloudRunStatus::Expired => "EXPIRED".to_string(),
+            CloudRunStatus::Unknown(raw) => raw,
+        }
+    }
+}
+
+/// Durable facts about a Cursor cloud agent, persisted on `Issue.cloud`.
+/// In-flight run state lives in `LiveState.cloud_runs` instead.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudAgent {
+    /// `bc-<uuid>`, minted by bork before the create request.
+    pub agent_id: String,
+    /// False until Cursor confirms the agent exists.
+    #[serde(default)]
+    pub created: bool,
+    /// Latest run bork knows about.
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// The agent's Cursor web page.
+    #[serde(default)]
+    pub url: Option<String>,
+    pub repo_url: String,
+    #[serde(default)]
+    pub starting_ref: Option<String>,
+    /// Branch Cursor pushed to, shown on the card only.
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// Last terminal run status seen.
+    #[serde(default)]
+    pub last_run_status: Option<CloudRunStatus>,
+    #[serde(default)]
+    pub archived: bool,
+    /// The agent was deleted in Cursor (GET returned 404).
+    #[serde(default)]
+    pub gone: bool,
+}
+
+/// Live, never-persisted state of a cloud agent's latest run, keyed by agent
+/// id in `LiveState.cloud_runs`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CloudRunInfo {
+    pub status: Option<CloudRunStatus>,
+    /// Redacted error from the run, or from a failed create attempt.
+    pub error: Option<String>,
+}
+
+/// Card status and activity text for a Cloud issue. Never looks at tmux.
+/// `enabled` is the `cloud_agents` flag; `run` is the issue's entry in
+/// `LiveState.cloud_runs`, if the poller has reported one.
+pub fn cloud_card_status<'a>(
+    enabled: bool,
+    cloud: Option<&'a CloudAgent>,
+    run: Option<&'a CloudRunInfo>,
+) -> (AgentStatus, Option<&'a str>) {
+    if !enabled {
+        return (AgentStatus::Stopped, Some("cloud agents disabled"));
+    }
+    let Some(cloud) = cloud else {
+        return (AgentStatus::Stopped, Some("no cloud agent"));
+    };
+    let run_error = run.and_then(|info| info.error.as_deref());
+    if !cloud.created {
+        if run_error.is_some() {
+            return (AgentStatus::Error, run_error);
+        }
+        return (AgentStatus::Busy, Some("submitting"));
+    }
+    if cloud.gone {
+        return (AgentStatus::Stopped, Some("deleted in Cursor"));
+    }
+    if cloud.archived {
+        return (AgentStatus::Stopped, Some("archived"));
+    }
+    let status = run
+        .and_then(|info| info.status.as_ref())
+        .or(cloud.last_run_status.as_ref());
+    match status {
+        Some(status) => status.card_status(run_error),
+        // Created, but no run status seen yet: the first run is starting.
+        None => (AgentStatus::Busy, None),
     }
 }
 
@@ -335,6 +481,10 @@ pub struct Issue {
     #[serde(default)]
     pub linked_issues: Vec<String>,
 
+    /// Cursor cloud agent, only for `IssueKind::Cloud` issues.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud: Option<CloudAgent>,
+
     // --- Legacy singular fields (read-only, for migration from old state.json) ---
     #[serde(default, skip_serializing)]
     pub session_id: Option<String>,
@@ -397,6 +547,7 @@ impl Issue {
             pr_import_baseline: None,
             stack_review_import: None,
             linked_issues: Vec::new(),
+            cloud: None,
             session_id: None,
             linear_id: None,
             linear_identifier: None,
@@ -564,8 +715,14 @@ impl Issue {
     /// Returns `true` when the orchestrator boundary was crossed. Callers
     /// should then kill any live tmux session, since re-attaching it would
     /// silently resume the old agent with the previous kind's prompt.
+    ///
+    /// A change the kind lock forbids (see [`Issue::kind_change_allowed`]) is
+    /// a no-op; callers that can report it should check first.
     #[must_use]
     pub fn set_kind(&mut self, kind: IssueKind) -> bool {
+        if !self.kind_change_allowed(kind) {
+            return false;
+        }
         let resets_session = self.kind_change_resets_session(kind);
         self.kind = kind;
         if !resets_session {
@@ -579,6 +736,13 @@ impl Issue {
             self.stack_review_import = None;
         }
         true
+    }
+
+    /// Cloud kind is locked both ways: a Cloud card can't become anything
+    /// else (that would orphan a billed remote agent) and nothing can become
+    /// Cloud (a cloud agent is only created through `bork issue start --cloud`).
+    pub fn kind_change_allowed(&self, kind: IssueKind) -> bool {
+        self.kind == kind || (self.kind != IssueKind::Cloud && kind != IssueKind::Cloud)
     }
 
     /// Change the selected agent, keeping every agent's stored session
@@ -1403,5 +1567,199 @@ mod tests {
         assert!(json.contains("\"github_pr_links\""));
         assert!(!json.contains("\"linear_id\""));
         assert!(!json.contains("\"pr_number\""));
+    }
+
+    // --- Cursor cloud agents (bork-214) ---
+
+    fn cloud_agent(created: bool) -> CloudAgent {
+        CloudAgent {
+            agent_id: "bc-1".to_string(),
+            created,
+            repo_url: "https://github.com/acme/scratch".to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn run(status: &str, error: Option<&str>) -> CloudRunInfo {
+        CloudRunInfo {
+            status: Some(CloudRunStatus::from(status.to_string())),
+            error: error.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn cloud_is_not_agentic() {
+        assert!(!IssueKind::Cloud.is_agentic());
+        assert_eq!(IssueKind::Cloud.to_string(), "Cloud");
+    }
+
+    #[test]
+    fn cloud_kind_serializes_as_plain_string() {
+        assert_eq!(
+            serde_json::to_string(&IssueKind::Cloud).unwrap(),
+            r#""Cloud""#
+        );
+        let back: IssueKind = serde_json::from_str(r#""Cloud""#).unwrap();
+        assert_eq!(back, IssueKind::Cloud);
+    }
+
+    #[test]
+    fn issue_without_cloud_omits_the_field() {
+        let issue = Issue::new("bork-1", "T", Column::Todo, AgentKind::OpenCode);
+        let json = serde_json::to_string(&issue).unwrap();
+        assert!(!json.contains("cloud"), "{json}");
+    }
+
+    #[test]
+    fn cloud_agent_missing_optional_fields_default() {
+        let agent: CloudAgent =
+            serde_json::from_str(r#"{"agent_id":"bc-1","repo_url":"https://x"}"#).unwrap();
+        assert_eq!(
+            agent,
+            CloudAgent {
+                repo_url: "https://x".to_string(),
+                ..cloud_agent(false)
+            }
+        );
+    }
+
+    #[test]
+    fn cloud_run_status_round_trips_known_and_unknown_values() {
+        for raw in [
+            "CREATING",
+            "RUNNING",
+            "FINISHED",
+            "ERROR",
+            "CANCELLED",
+            "EXPIRED",
+            "SOMETHING_NEW",
+        ] {
+            let json = format!("\"{raw}\"");
+            let status: CloudRunStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(serde_json::to_string(&status).unwrap(), json);
+        }
+        let status: CloudRunStatus = serde_json::from_str(r#""SOMETHING_NEW""#).unwrap();
+        assert_eq!(status, CloudRunStatus::Unknown("SOMETHING_NEW".to_string()));
+    }
+
+    #[test]
+    fn cloud_kind_is_locked_both_ways() {
+        use IssueKind::{Agentic, Cloud, NonAgentic, Orchestrator};
+        let cases = [
+            (Cloud, Agentic, false),
+            (Cloud, NonAgentic, false),
+            (Cloud, Orchestrator, false),
+            (Agentic, Cloud, false),
+            (NonAgentic, Cloud, false),
+            (Orchestrator, Cloud, false),
+            (Cloud, Cloud, true),
+            (Agentic, Orchestrator, true),
+            (Agentic, NonAgentic, true),
+        ];
+        for (from, to, allowed) in cases {
+            let mut issue = issue_with_session_state(from);
+            assert_eq!(issue.kind_change_allowed(to), allowed, "{from} -> {to}");
+            if !allowed {
+                let before = issue.clone();
+                assert!(!issue.set_kind(to));
+                assert_eq!(issue, before, "{from} -> {to}");
+            }
+        }
+    }
+
+    #[test]
+    fn cloud_status_with_flag_off_is_disabled() {
+        let agent = cloud_agent(true);
+        let running = run("RUNNING", None);
+        assert_eq!(
+            cloud_card_status(false, Some(&agent), Some(&running)),
+            (AgentStatus::Stopped, Some("cloud agents disabled"))
+        );
+    }
+
+    #[test]
+    fn cloud_status_before_and_after_create() {
+        let pending = cloud_agent(false);
+        assert_eq!(
+            cloud_card_status(true, Some(&pending), None),
+            (AgentStatus::Busy, Some("submitting"))
+        );
+        let failed = CloudRunInfo {
+            status: None,
+            error: Some("401 unauthorized".to_string()),
+        };
+        assert_eq!(
+            cloud_card_status(true, Some(&pending), Some(&failed)),
+            (AgentStatus::Error, Some("401 unauthorized"))
+        );
+        // Created but nothing polled yet (the PR1 state: cloud_runs is empty).
+        let created = cloud_agent(true);
+        assert_eq!(
+            cloud_card_status(true, Some(&created), None),
+            (AgentStatus::Busy, None)
+        );
+        assert_eq!(
+            cloud_card_status(true, None, None),
+            (AgentStatus::Stopped, Some("no cloud agent"))
+        );
+    }
+
+    #[test]
+    fn cloud_status_gone_and_archived_win_over_runs() {
+        let running = run("RUNNING", None);
+        let gone = CloudAgent {
+            gone: true,
+            archived: true,
+            ..cloud_agent(true)
+        };
+        assert_eq!(
+            cloud_card_status(true, Some(&gone), Some(&running)),
+            (AgentStatus::Stopped, Some("deleted in Cursor"))
+        );
+        let archived = CloudAgent {
+            archived: true,
+            ..cloud_agent(true)
+        };
+        assert_eq!(
+            cloud_card_status(true, Some(&archived), Some(&running)),
+            (AgentStatus::Stopped, Some("archived"))
+        );
+    }
+
+    #[test]
+    fn cloud_status_maps_every_run_status() {
+        let agent = cloud_agent(true);
+        let cases = [
+            ("CREATING", AgentStatus::Busy, Some("starting VM")),
+            ("RUNNING", AgentStatus::Busy, Some("running")),
+            ("FINISHED", AgentStatus::Idle, None),
+            ("ERROR", AgentStatus::Error, Some("boom")),
+            ("CANCELLED", AgentStatus::Idle, Some("cancelled")),
+            ("EXPIRED", AgentStatus::Stopped, Some("expired")),
+            ("PAUSED", AgentStatus::Idle, Some("PAUSED")),
+        ];
+        for (raw, status, activity) in cases {
+            let info = run(raw, Some("boom"));
+            let (got_status, got_activity) = cloud_card_status(true, Some(&agent), Some(&info));
+            assert_eq!(got_status, status, "{raw}");
+            assert_eq!(got_activity, activity, "{raw}");
+        }
+    }
+
+    #[test]
+    fn cloud_status_falls_back_to_last_terminal_status() {
+        let agent = CloudAgent {
+            last_run_status: Some(CloudRunStatus::Finished),
+            ..cloud_agent(true)
+        };
+        assert_eq!(
+            cloud_card_status(true, Some(&agent), None),
+            (AgentStatus::Idle, None)
+        );
+        let live = run("RUNNING", None);
+        assert_eq!(
+            cloud_card_status(true, Some(&agent), Some(&live)),
+            (AgentStatus::Busy, Some("running"))
+        );
     }
 }

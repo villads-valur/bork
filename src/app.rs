@@ -23,9 +23,9 @@ use crate::external::git::PollClass;
 use crate::external::linear::LinearIssue;
 use crate::prune::{PruneAction, PruneCandidate};
 use crate::types::{
-    AgentKind, AgentStatus, AgentStatusInfo, ChecksStatus, Column, GithubStack, Issue, IssueKind,
-    LinkedGithubPr, MergeBlocker, PrImportBaseline, PrImportSource, PrState, PrStatus,
-    ReviewDecision, WorktreeStatus,
+    cloud_card_status, AgentKind, AgentStatus, AgentStatusInfo, ChecksStatus, CloudAgent,
+    CloudRunInfo, Column, GithubStack, Issue, IssueKind, LinkedGithubPr, MergeBlocker,
+    PrImportBaseline, PrImportSource, PrState, PrStatus, ReviewDecision, WorktreeStatus,
 };
 use crate::undo::UndoEntry;
 
@@ -104,6 +104,9 @@ pub struct LiveState {
     /// every ~2s, so without a cap the cleanup loop would spawn a kill thread
     /// forever. Cleared when the session finally disappears.
     pub cleanup_attempts: HashMap<String, u32>,
+    /// Live run state of Cursor cloud agents, keyed by agent id. Never
+    /// persisted; durable facts live on `Issue.cloud`.
+    pub cloud_runs: HashMap<String, CloudRunInfo>,
 }
 
 /// Work produced by one tick of `Project::drive_session_cleanup`, applied by
@@ -759,6 +762,9 @@ impl Project {
     }
 
     pub fn resolved_agent_status(&self, issue: &Issue) -> AgentStatus {
+        if issue.kind == IssueKind::Cloud {
+            return self.cloud_status(issue).0;
+        }
         let session_name = issue.session_name(&self.config.project_name);
         let live = &self.live;
 
@@ -776,12 +782,23 @@ impl Project {
         AgentStatus::Stopped
     }
 
-    pub fn resolved_activity(&self, issue: &Issue) -> Option<&str> {
+    pub fn resolved_activity<'a>(&'a self, issue: &'a Issue) -> Option<&'a str> {
+        if issue.kind == IssueKind::Cloud {
+            return self.cloud_status(issue).1;
+        }
         let session_name = issue.session_name(&self.config.project_name);
         self.live
             .agent_statuses
             .get(&session_name)
             .and_then(|info| info.activity.as_deref())
+    }
+
+    /// Cloud issues never have a tmux session; their status comes from the
+    /// cloud poller's `cloud_runs` and the persisted `Issue.cloud`.
+    fn cloud_status<'a>(&'a self, issue: &'a Issue) -> (AgentStatus, Option<&'a str>) {
+        let cloud = issue.cloud.as_ref();
+        let run = cloud.and_then(|agent| self.live.cloud_runs.get(&agent.agent_id));
+        cloud_card_status(self.config.cloud_agents, cloud, run)
     }
 
     pub fn listening_ports_for(&self, issue: &Issue) -> Option<&Vec<u16>> {
@@ -852,7 +869,11 @@ impl Project {
     pub fn auto_assign_worktrees(&mut self) -> bool {
         let assignments: Vec<(usize, String)> = (0..self.issues.len())
             .filter(|&i| {
-                self.issues[i].worktree.is_none() && self.issues[i].kind != IssueKind::Orchestrator
+                self.issues[i].worktree.is_none()
+                    && !matches!(
+                        self.issues[i].kind,
+                        IssueKind::Orchestrator | IssueKind::Cloud
+                    )
             })
             .filter_map(|i| self.detect_worktree(&self.issues[i]).map(|wt| (i, wt)))
             .collect();
@@ -1841,6 +1862,8 @@ fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
         pr_import_baseline: _,
         stack_review_import: _,
         linked_issues: _,
+        // Merged field-wise in merge_cloud_fields().
+        cloud: _,
         // Merged entry-wise, interleaved with the kind/orchestrator logic below.
         sessions: _,
         // Legacy fields are zeroed on both sides by migrate_legacy_fields at
@@ -1882,6 +1905,8 @@ fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
     merge_field!(stack_review_import);
     merge_field!(linked_issues);
 
+    merge_cloud_fields(memory, base, file);
+
     // `sessions` merges entry-wise: per-agent entries are independent, so a
     // concurrent write to one agent's session (e.g. `bork issue start` from a
     // spawned agent) must not clobber another agent's entry held in memory.
@@ -1914,6 +1939,53 @@ fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
     if file_crossed_boundary && !memory_crossed_boundary && memory.kind == file.kind {
         memory.sessions = file.sessions.clone();
     }
+}
+
+/// `cloud` merges field-wise: the CLI (create, cancel, archive) and the TUI
+/// poller write different fields of the same agent, so neither may clobber
+/// the other's. A side that adds or drops the whole agent is merged as one
+/// value.
+fn merge_cloud_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
+    let (Some(memory_agent), Some(base_agent), Some(file_agent)) = (
+        memory.cloud.as_mut(),
+        base.cloud.as_ref(),
+        file.cloud.as_ref(),
+    ) else {
+        if memory.cloud == base.cloud && file.cloud != base.cloud {
+            memory.cloud = file.cloud.clone();
+        }
+        return;
+    };
+    // Same compile-time coverage guard as `merge_issue_fields`.
+    let CloudAgent {
+        agent_id: _, // stable key, never merged
+        created: _,
+        run_id: _,
+        url: _,
+        repo_url: _,
+        starting_ref: _,
+        branch: _,
+        last_run_status: _,
+        archived: _,
+        gone: _,
+    } = memory_agent;
+
+    macro_rules! merge_cloud_field {
+        ($field:ident) => {
+            if memory_agent.$field == base_agent.$field && file_agent.$field != base_agent.$field {
+                memory_agent.$field = file_agent.$field.clone();
+            }
+        };
+    }
+    merge_cloud_field!(created);
+    merge_cloud_field!(run_id);
+    merge_cloud_field!(url);
+    merge_cloud_field!(repo_url);
+    merge_cloud_field!(starting_ref);
+    merge_cloud_field!(branch);
+    merge_cloud_field!(last_run_status);
+    merge_cloud_field!(archived);
+    merge_cloud_field!(gone);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -2717,6 +2789,7 @@ mod tests {
             agents_allowlist: None,
             prune_threshold: crate::config::DEFAULT_PRUNE_THRESHOLD,
             auto_prune_check_interval: crate::config::DEFAULT_AUTO_PRUNE_CHECK_INTERVAL,
+            cloud_agents: false,
             agent_launch: std::collections::HashMap::new(),
         }
     }
@@ -6523,6 +6596,7 @@ mod tests {
             agents_allowlist: None,
             prune_threshold: crate::config::DEFAULT_PRUNE_THRESHOLD,
             auto_prune_check_interval: crate::config::DEFAULT_AUTO_PRUNE_CHECK_INTERVAL,
+            cloud_agents: false,
             agent_launch: std::collections::HashMap::new(),
         }
     }
@@ -7775,5 +7849,100 @@ mod tests {
         let candidates = app.link_picker_candidates();
         let ids: Vec<&str> = candidates.iter().map(|(id, _, _)| id.as_str()).collect();
         assert_eq!(ids, vec!["bork-2"]);
+    }
+
+    // ---------------------------------------------------------------
+    // Cursor cloud agents (bork-214)
+    // ---------------------------------------------------------------
+
+    fn cloud_issue(id: &str, created: bool) -> Issue {
+        Issue {
+            kind: IssueKind::Cloud,
+            cloud: Some(CloudAgent {
+                agent_id: format!("bc-{id}"),
+                created,
+                ..Default::default()
+            }),
+            ..test_issue(id, Column::InProgress)
+        }
+    }
+
+    #[test]
+    fn cloud_status_ignores_tmux_and_reads_cloud_runs() {
+        let issue = cloud_issue("bork-1", true);
+        let mut project = test_project(vec![issue.clone()]);
+        // A stray tmux session or status file under the cloud issue's
+        // session name must not leak into its status.
+        let session = issue.session_name(&project.config.project_name);
+        project.live.active_sessions.insert(session.clone());
+        project.live.agent_statuses.insert(
+            session,
+            AgentStatusInfo {
+                status: AgentStatus::WaitingPermission,
+                activity: Some("tmux".to_string()),
+                updated_at: 0,
+            },
+        );
+
+        assert_eq!(project.resolved_agent_status(&issue), AgentStatus::Stopped);
+        assert_eq!(
+            project.resolved_activity(&issue),
+            Some("cloud agents disabled")
+        );
+
+        project.config.cloud_agents = true;
+        assert_eq!(project.resolved_agent_status(&issue), AgentStatus::Busy);
+        assert_eq!(project.resolved_activity(&issue), None);
+
+        project.live.cloud_runs.insert(
+            "bc-bork-1".to_string(),
+            CloudRunInfo {
+                status: Some(crate::types::CloudRunStatus::Finished),
+                error: None,
+            },
+        );
+        assert_eq!(project.resolved_agent_status(&issue), AgentStatus::Idle);
+    }
+
+    #[test]
+    fn cloud_issue_is_never_auto_assigned_a_worktree() {
+        let mut project = test_project(vec![cloud_issue("bork-1", true)]);
+        project
+            .live
+            .worktree_branches
+            .insert("bork-1-readme".to_string(), "bork-1/readme".to_string());
+        assert!(!project.auto_assign_worktrees());
+        assert!(project.issues[0].worktree.is_none());
+    }
+
+    #[test]
+    fn merge_cloud_file_wins_while_memory_is_unconfirmed() {
+        let base = cloud_issue("bork-1", false);
+        let mut memory = Issue {
+            title: "edited in TUI".to_string(),
+            ..base.clone()
+        };
+        let mut file = cloud_issue("bork-1", true);
+        file.cloud.as_mut().unwrap().url = Some("https://cursor.com/a".to_string());
+
+        merge_issue_fields(&mut memory, &base, &file);
+        assert_eq!(memory.cloud, file.cloud);
+        assert_eq!(memory.title, "edited in TUI");
+    }
+
+    #[test]
+    fn merge_cloud_keeps_both_sides_field_changes() {
+        let base = cloud_issue("bork-1", true);
+        let mut memory = base.clone();
+        memory.cloud.as_mut().unwrap().branch = Some("cursor/memory".to_string());
+        let mut file = base.clone();
+        file.cloud.as_mut().unwrap().archived = true;
+        file.cloud.as_mut().unwrap().branch = Some("cursor/file".to_string());
+
+        merge_issue_fields(&mut memory, &base, &file);
+        let merged = memory.cloud.as_ref().unwrap();
+        // Different fields: both come through. Same field: memory wins.
+        assert!(merged.archived);
+        assert_eq!(merged.branch.as_deref(), Some("cursor/memory"));
     }
 }

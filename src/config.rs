@@ -44,6 +44,10 @@ pub struct AppConfig {
     pub prune_threshold: u64,
     /// Minimum seconds between auto-prune prompts.
     pub auto_prune_check_interval: u64,
+    /// Experimental Cursor cloud agents. Off by default; set it in one
+    /// project's `.bork/config.toml` to try it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cloud_agents: bool,
     /// Per-agent launch overrides. Keyed by `AgentKind`. Use
     /// [`AppConfig::launch_args_for`] to resolve mode-specific args.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -131,6 +135,7 @@ impl Default for AppConfig {
             agents_allowlist: None,
             prune_threshold: DEFAULT_PRUNE_THRESHOLD,
             auto_prune_check_interval: DEFAULT_AUTO_PRUNE_CHECK_INTERVAL,
+            cloud_agents: false,
             agent_launch: HashMap::new(),
         }
     }
@@ -241,6 +246,7 @@ pub struct PartialConfig {
     pub agents_allowlist: Option<Vec<AgentKind>>,
     pub prune_threshold: Option<u64>,
     pub auto_prune_check_interval: Option<u64>,
+    pub cloud_agents: Option<bool>,
     /// Per-agent launch overrides parsed from `[agent.<name>]` sections.
     pub agent_launch: HashMap<AgentKind, PartialAgentLaunch>,
 }
@@ -306,6 +312,7 @@ impl PartialConfig {
             auto_prune_check_interval: other
                 .auto_prune_check_interval
                 .or(self.auto_prune_check_interval),
+            cloud_agents: other.cloud_agents.or(self.cloud_agents),
             agent_launch,
         }
     }
@@ -358,6 +365,7 @@ fn materialize(merged: PartialConfig, project_root: &Path) -> AppConfig {
         auto_prune_check_interval: merged
             .auto_prune_check_interval
             .unwrap_or(DEFAULT_AUTO_PRUNE_CHECK_INTERVAL),
+        cloud_agents: merged.cloud_agents.unwrap_or(false),
         agent_launch,
     }
 }
@@ -466,6 +474,7 @@ fn partial_from_table(table: &Table) -> PartialConfig {
     let auto_prune_check_interval = table
         .get("auto_prune_check_interval")
         .and_then(|v| v.as_u64());
+    let cloud_agents = table.get("cloud_agents").and_then(|v| v.as_bool());
     let agent_launch = collect_agent_launch(table);
 
     PartialConfig {
@@ -485,6 +494,7 @@ fn partial_from_table(table: &Table) -> PartialConfig {
         agents_allowlist,
         prune_threshold,
         auto_prune_check_interval,
+        cloud_agents,
         agent_launch,
     }
 }
@@ -1473,5 +1483,148 @@ args = ["--dangerously-skip-permissions"]
         assert!(!is_stale_tmp_name("state.tmp."));
         assert!(!is_stale_tmp_name("state.tmp.abc"));
         assert!(!is_stale_tmp_name("notes.tmp.md"));
+    }
+
+    // --- Cursor cloud agents (bork-214) ---
+
+    /// A `state.json` as written before cloud agents existed: one plain
+    /// agentic issue with a session, a link and a PR, and one orchestrator.
+    const PRE_CLOUD_STATE: &str = r#"{
+  "issues": [
+    {
+      "id": "bork-1",
+      "title": "Local work",
+      "kind": "Agentic",
+      "column": "InProgress",
+      "agent_kind": "Claude",
+      "agent_mode": "Build",
+      "prompt": "Do the thing",
+      "worktree": "bork-1-local-work",
+      "done_at": null,
+      "sessions": {
+        "Claude": "sess-1"
+      },
+      "pruned_at": null,
+      "setup_ran": true,
+      "linear_links": [],
+      "github_pr_links": [
+        {
+          "number": 42,
+          "imported": false,
+          "import_source": null
+        }
+      ],
+      "linked_issues": [
+        "bork-2"
+      ]
+    },
+    {
+      "id": "bork-2",
+      "title": "Coordinate",
+      "kind": "Orchestrator",
+      "column": "Todo",
+      "agent_kind": "OpenCode",
+      "agent_mode": "Plan",
+      "prompt": null,
+      "worktree": null,
+      "done_at": null,
+      "sessions": {},
+      "pruned_at": null,
+      "setup_ran": false,
+      "linear_links": [],
+      "github_pr_links": [],
+      "linked_issues": [
+        "bork-1"
+      ]
+    }
+  ],
+  "last_prune_at": 1700000000
+}"#;
+
+    #[test]
+    fn pre_cloud_state_loads_and_saves_byte_for_byte() {
+        let dir = temp_project();
+        fs::write(dir.path().join(".bork/state.json"), PRE_CLOUD_STATE).unwrap();
+
+        let state = try_load_state(dir.path()).expect("pre-cloud state must load");
+        assert_eq!(state.issues.len(), 2);
+        assert!(state.issues.iter().all(|issue| issue.cloud.is_none()));
+
+        save_state(&state, dir.path()).unwrap();
+        let saved = fs::read_to_string(dir.path().join(".bork/state.json")).unwrap();
+        assert_eq!(saved, PRE_CLOUD_STATE);
+    }
+
+    #[test]
+    fn cloud_issue_survives_save_load() {
+        use crate::types::{CloudAgent, CloudRunStatus, Column, Issue, IssueKind};
+
+        let dir = temp_project();
+        let cloud_issue = Issue {
+            kind: IssueKind::Cloud,
+            prompt: Some("Append one line to README.md".to_string()),
+            cloud: Some(CloudAgent {
+                agent_id: "bc-00000000-0000-4000-8000-000000000000".to_string(),
+                created: true,
+                run_id: Some("run-1".to_string()),
+                url: Some("https://cursor.com/agents?id=bc-0".to_string()),
+                repo_url: "https://github.com/acme/scratch".to_string(),
+                starting_ref: Some("main".to_string()),
+                branch: Some("cursor/readme-line".to_string()),
+                last_run_status: Some(CloudRunStatus::Unknown("PAUSED".to_string())),
+                archived: false,
+                gone: false,
+            }),
+            ..Issue::new(
+                "bork-3",
+                "readme line",
+                Column::InProgress,
+                AgentKind::Cursor,
+            )
+        };
+        let unconfirmed = Issue {
+            kind: IssueKind::Cloud,
+            cloud: Some(CloudAgent {
+                agent_id: "bc-11111111-1111-4111-8111-111111111111".to_string(),
+                repo_url: "git@github.com:acme/scratch.git".to_string(),
+                ..Default::default()
+            }),
+            ..Issue::new("bork-4", "pending", Column::Todo, AgentKind::Cursor)
+        };
+        let state = AppState {
+            issues: vec![cloud_issue.clone(), unconfirmed.clone()],
+            last_prune_at: None,
+        };
+
+        save_state(&state, dir.path()).unwrap();
+        let raw = fs::read_to_string(dir.path().join(".bork/state.json")).unwrap();
+        assert!(raw.contains(r#""kind": "Cloud""#), "{raw}");
+        assert!(raw.contains(r#""last_run_status": "PAUSED""#), "{raw}");
+
+        let loaded = try_load_state(dir.path()).expect("cloud state must load");
+        assert_eq!(loaded.issues, vec![cloud_issue, unconfirmed]);
+    }
+
+    #[test]
+    fn cloud_agents_defaults_off() {
+        let cfg = merge_to_app("", "");
+        assert!(!cfg.cloud_agents);
+        assert!(!AppConfig::default().cloud_agents);
+    }
+
+    #[test]
+    fn cloud_agents_project_overrides_global() {
+        assert!(merge_to_app("", "cloud_agents = true").cloud_agents);
+        assert!(!merge_to_app("cloud_agents = true", "cloud_agents = false").cloud_agents);
+    }
+
+    #[test]
+    fn app_config_serialization_omits_cloud_agents_when_off() {
+        let mut cfg = merge_to_app("", "");
+        let off = serde_json::to_string(&cfg).unwrap();
+        assert!(!off.contains("cloud_agents"), "{off}");
+        cfg.cloud_agents = true;
+        let on = serde_json::to_string(&cfg).unwrap();
+        assert!(on.contains(r#""cloud_agents":true"#), "{on}");
     }
 }
