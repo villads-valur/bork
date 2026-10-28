@@ -69,7 +69,7 @@ impl Project {
     /// PRs linked directly to an issue (no stack), shaped like stack members so
     /// the details popup can list them. Unknown PRs are treated as open.
     pub fn linked_pr_members(&self, issue: &Issue) -> Vec<GithubStackPullRequest> {
-        issue
+        let members: Vec<_> = issue
             .pr_numbers()
             .into_iter()
             .map(|number| match self.pr_by_number(number) {
@@ -86,7 +86,8 @@ impl Project {
                     head_branch: String::new(),
                 },
             })
-            .collect()
+            .collect();
+        open_first(&members)
     }
 
     /// Rows in the details popup: the attached stack's members, or the issue's
@@ -95,7 +96,7 @@ impl Project {
         if issue.github_stack.is_some() {
             return self
                 .attached_stack(issue)
-                .map_or_else(Vec::new, |stack| stack.pull_requests.clone());
+                .map_or_else(Vec::new, |stack| open_first(&stack.pull_requests));
         }
         self.linked_pr_members(issue)
     }
@@ -130,6 +131,14 @@ impl Project {
         }
         summary
     }
+}
+
+/// Display order for PR lists: open PRs first, then merged or closed ones,
+/// each group by PR number.
+fn open_first(members: &[GithubStackPullRequest]) -> Vec<GithubStackPullRequest> {
+    let mut sorted = members.to_vec();
+    sorted.sort_by_key(|pr| (pr.state != PrState::Open, pr.number));
+    sorted
 }
 
 fn open_member_numbers(
