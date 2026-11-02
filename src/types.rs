@@ -299,6 +299,10 @@ pub struct Issue {
     pub agent_kind: AgentKind,
     pub agent_mode: AgentMode,
     pub prompt: Option<String>,
+    /// Model passed to the agent's `--model` flag. Cleared on agent switch,
+    /// since model names are agent-specific.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     #[serde(default)]
     pub worktree: Option<String>,
     #[serde(default)]
@@ -366,6 +370,7 @@ pub struct IssueDraft {
     pub kind: IssueKind,
     pub agent_mode: AgentMode,
     pub prompt: Option<String>,
+    pub model: Option<String>,
 }
 
 impl Issue {
@@ -386,6 +391,7 @@ impl Issue {
             agent_kind,
             agent_mode: AgentMode::Plan,
             prompt: None,
+            model: None,
             worktree: None,
             done_at: None,
             sessions: BTreeMap::new(),
@@ -444,11 +450,13 @@ impl Issue {
             kind,
             agent_mode,
             prompt,
+            model,
         } = draft;
         Issue {
             kind,
             agent_mode,
             prompt,
+            model,
             done_at: (column == Column::Done).then_some(now),
             ..Issue::new(id, title, column, agent_kind)
         }
@@ -582,12 +590,16 @@ impl Issue {
     }
 
     /// Change the selected agent, keeping every agent's stored session
-    /// resumable. Returns `true` when it changed; callers must then kill any
-    /// live tmux session, which is still running the old agent's process.
+    /// resumable and clearing the agent-specific model. Returns `true` when it
+    /// changed; callers must then kill any live tmux session, which is still
+    /// running the old agent's process.
     #[must_use]
     pub fn set_agent_kind(&mut self, kind: AgentKind) -> bool {
         let changed = kind != self.agent_kind;
         self.agent_kind = kind;
+        if changed {
+            self.model = None;
+        }
         changed
     }
 
@@ -1040,6 +1052,7 @@ mod tests {
             kind: IssueKind::Agentic,
             agent_mode: AgentMode::Plan,
             prompt: prompt.map(str::to_string),
+            model: None,
         }
     }
 
@@ -1079,6 +1092,20 @@ mod tests {
         }"#;
         let issue: Issue = serde_json::from_str(json).unwrap();
         assert_eq!(issue.done_at, None);
+        assert_eq!(issue.model, None);
+    }
+
+    #[test]
+    fn model_roundtrips_and_is_omitted_when_unset() {
+        let issue = Issue::new("bork-1", "Test", Column::Todo, AgentKind::Claude);
+        assert!(!serde_json::to_string(&issue).unwrap().contains("model"));
+        let issue = Issue {
+            model: Some("sonnet".into()),
+            ..issue
+        };
+        let json = serde_json::to_string(&issue).unwrap();
+        let back: Issue = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.model.as_deref(), Some("sonnet"));
     }
 
     #[test]

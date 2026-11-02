@@ -1322,6 +1322,7 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
             kind: dialog.kind,
             agent_mode: dialog.agent_mode,
             prompt,
+            model: None,
         },
         crate::app::unix_now(),
     );

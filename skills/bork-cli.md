@@ -35,6 +35,7 @@ Options:
 - `--mode`: plan (default), build, yolo
 - `--kind`: agentic (default), todo (non-agentic)
 - `--prompt`: agent prompt text
+- `--model`: model passed to the agent's `--model` flag (e.g. `sonnet`). Errors for opencode, which has no such flag. Changing the agent clears it.
 
 ### Start an issue agent
 
@@ -43,6 +44,7 @@ Use this when you want to spin off a new issue and have another agent work on it
 ```bash
 bork issue start "Implement search" --prompt "Add search using the existing indexing code"
 bork issue start "Fix auth bug" --agent claude --mode build --slug fix-auth-bug
+bork issue start "Review PR 42" --agent claude --model sonnet --prompt "Review the diff"
 bork issue start "Add API route" --project my-api --prompt "Implement this in my-api"
 bork issue start "Investigate flaky test" --no-worktree --prompt "Find the root cause"
 ```
@@ -53,6 +55,7 @@ Options:
 - `--prompt`: agent prompt text
 - `--agent`: opencode (default from project config), claude, codex
 - `--mode`: plan, build (default), yolo
+- `--model`: model passed to the agent's `--model` flag (e.g. `sonnet`). Errors for opencode, which has no such flag. Changing the agent clears it.
 - `--slug`: worktree/branch slug (generated from title by default)
 - `--no-worktree`: launch without creating a worktree
 - `--project`: registered project name or path (defaults to current project)
@@ -72,6 +75,8 @@ bork issue update bork-1 --column code-review
 bork issue update bork-1 --agent claude --mode build
 bork issue update bork-1 --prompt "Updated instructions for the agent"
 bork issue update bork-1 --prompt ""     # clear the prompt
+bork issue update bork-1 --model opus    # used from the next launch or resume
+bork issue update bork-1 --model ""      # clear the model
 ```
 
 Only provided fields are changed; others remain untouched.

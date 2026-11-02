@@ -738,6 +738,10 @@ enum IssueCommand {
         #[arg(long)]
         prompt: Option<String>,
 
+        /// Model passed to the agent's --model flag (e.g. sonnet). Not supported by opencode.
+        #[arg(long)]
+        model: Option<String>,
+
         /// Issue kind (agentic, todo, orchestrator)
         #[arg(long, value_parser = parse_issue_kind)]
         kind: Option<IssueKind>,
@@ -759,6 +763,10 @@ enum IssueCommand {
         /// Agent mode (plan, build, yolo). Defaults to build.
         #[arg(long, value_parser = parse_agent_mode)]
         mode: Option<AgentMode>,
+
+        /// Model passed to the agent's --model flag (e.g. sonnet). Not supported by opencode.
+        #[arg(long)]
+        model: Option<String>,
 
         /// Branch/worktree slug. Defaults to a slug generated from the title.
         #[arg(long)]
@@ -806,6 +814,10 @@ enum IssueCommand {
         /// Update prompt text (empty string clears it)
         #[arg(long)]
         prompt: Option<String>,
+
+        /// Change the model for the next launch (empty string clears it)
+        #[arg(long)]
+        model: Option<String>,
 
         /// Change issue kind (agentic, todo, orchestrator)
         #[arg(long, value_parser = parse_issue_kind)]
@@ -1332,6 +1344,7 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
             agent,
             mode,
             prompt,
+            model,
             kind,
         } => {
             let issue = ops::create_issue(
@@ -1342,6 +1355,7 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
                     agent_kind: agent,
                     agent_mode: mode,
                     prompt,
+                    model,
                     kind,
                 },
             )?;
@@ -1353,6 +1367,7 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
             prompt,
             agent,
             mode,
+            model,
             slug,
             no_worktree,
             base,
@@ -1367,6 +1382,7 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
                     prompt,
                     agent_kind: agent,
                     agent_mode: mode,
+                    model,
                     slug,
                     no_worktree,
                     base_branch: base,
@@ -1391,6 +1407,7 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
             agent,
             mode,
             prompt,
+            model,
             kind,
         } => {
             let issue = ops::update_issue(
@@ -1402,6 +1419,7 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
                     agent_kind: agent,
                     agent_mode: mode,
                     prompt,
+                    model,
                     kind,
                 },
             )?;
@@ -1463,6 +1481,7 @@ struct StartIssueOptions {
     prompt: Option<String>,
     agent_kind: Option<AgentKind>,
     agent_mode: Option<AgentMode>,
+    model: Option<String>,
     slug: Option<String>,
     no_worktree: bool,
     base_branch: Option<String>,
@@ -1520,6 +1539,7 @@ fn start_issue(project_root: &Path, opts: StartIssueOptions) -> anyhow::Result<S
             agent_kind: opts.agent_kind,
             agent_mode: opts.agent_mode,
             prompt: opts.prompt,
+            model: opts.model,
             kind: Some(IssueKind::Agentic),
         },
     )?;
