@@ -24,6 +24,11 @@ Managed with bork across git worktrees and tmux.
 - Linear-imported issue IDs: lowercase Linear identifier (e.g. `abc-123` for `ABC-123`)
 - Tmux sessions: `{project_name}-{issue-id}`
 
+## Pull Requests
+
+- After opening a PR, link it to your issue: `bork integration attach-pr <pr-number>` (inside an agent session the issue ID comes from `BORK_ISSUE_ID`; elsewhere pass it first, e.g. `bork integration attach-pr {project_name}-1 42`)
+- Link every PR you open for the issue, including stacked or follow-up PRs
+
 ## CLI: Managing Issues
 
 Use `bork issue` and `bork integration` to manage the board from the command line. The TUI picks up changes within 2 seconds.
@@ -40,7 +45,7 @@ bork issue move {project_name}-1 done         # Move to column
 bork issue archive {project_name}-1           # Kill session + teardown + remove worktree + Done
 bork issue delete {project_name}-1            # Delete
 bork integration attach-linear {project_name}-1 VIL-123   # Link Linear ticket
-bork integration attach-pr {project_name}-1 42             # Link GitHub PR
+bork integration attach-pr {project_name}-1 42             # Link GitHub PR (issue ID optional inside an agent session)
 bork integration detach-linear {project_name}-1 VIL-123   # Unlink a Linear ticket
 bork integration detach-pr {project_name}-1 42             # Unlink a PR
 bork integration clear-linear {project_name}-1             # Remove all Linear links

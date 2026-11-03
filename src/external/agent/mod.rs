@@ -375,6 +375,12 @@ fn build_agent_cmd(
             prompt.push_str(worktree);
             prompt.push_str(". Do all work for this issue inside that directory.");
         }
+        if issue.kind == IssueKind::Agentic {
+            prompt.push_str(&format!(
+                "\n\nWhen you open a pull request for this work, link it to this issue with `bork integration attach-pr {} <pr-number>`.",
+                issue.id
+            ));
+        }
         if issue.kind == IssueKind::Orchestrator {
             prompt.push_str(&format!(
                 "\n\nMaintain your plan in plans/{}/planning.md, relative to the project root (the directory containing main/).",
@@ -1277,6 +1283,16 @@ mod tests {
     }
 
     #[test]
+    fn agentic_prompt_asks_to_link_prs() {
+        let issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        let config = test_config();
+        let (_, _, prompt) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(prompt
+            .unwrap()
+            .contains("bork integration attach-pr bork-1 <pr-number>"));
+    }
+
+    #[test]
     fn orchestrator_prompt_uses_orchestrator_template() {
         let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
         issue.kind = crate::types::IssueKind::Orchestrator;
@@ -1287,6 +1303,7 @@ mod tests {
         assert!(prompt.contains("bork issue start"));
         assert!(prompt.contains("plans/bork-1/planning.md"));
         assert!(!prompt.contains("Assigned worktree"));
+        assert!(!prompt.contains("attach-pr"));
         // The regular default prompt is not used for orchestrators.
         assert!(!prompt.contains("The source code is in main/."));
     }
