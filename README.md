@@ -13,7 +13,7 @@
 ---
 
 <p align="center">
-  <img src="assets/board-light.png" alt="bork kanban board" width="720">
+  <img src="assets/hero.png" alt="bork in a light and a dark terminal, showing the kanban board" width="720">
   <br>
   <sub>Adapts to your terminal theme (ANSI 16 colors)</sub>
 </p>
@@ -77,6 +77,12 @@ Press `n` to create an issue, `Enter` to launch an agent session. You're up and 
 - **Issue kinds** &mdash; Agentic issues launch AI sessions; non-agentic "todo" items skip the agent entirely; orchestrator issues launch a coordinating agent that breaks a goal into bork issues, spawns them via `bork issue start`, and monitors their agents
 - **Multi-project view** &mdash; Register multiple projects and view them in stacked swimlanes with a collapsible project sidebar
 - **Zero-dependency state** &mdash; JSON file persistence with atomic writes, no database
+
+## Screenshots
+
+| Dark | Light |
+|------|-------|
+| ![bork in a dark terminal](assets/board-dark.png) | ![bork in a light terminal](assets/board-light.png) |
 
 ## Requirements
 
