@@ -532,6 +532,19 @@ Cards with unresolved comments also count as needing you. Review threads from bo
 
 The `gh` CLI must be installed and authenticated. If `gh` is not available or the repo is not on GitHub, PR polling is silently skipped.
 
+### Merge queues
+
+Your own PRs show where they are in a merge queue. Bork reads GitHub's native merge queue and [Trunk](https://trunk.io/merge-queue) (from the `Trunk Merge Queue` check Trunk posts on the PR, so no Trunk token is needed).
+
+| Badge | Meaning | Needs you |
+|-------|---------|-----------|
+| `⧖ queued` (dim) | Waiting its turn, or passed and about to merge | No |
+| `⧖ testing` (blue) | The queue is running checks on it | No |
+| `✗ queue failed` (red) | The queue removed it after a failed run | Yes |
+| `⧖ dequeued` (yellow) | Cancelled before it merged | Yes |
+
+While a PR is queued, the queue badge replaces the CI, review and merge badges. Pushing a new commit clears a failed or dequeued badge, since Trunk's check stays on the old commit. A PR Trunk hasn't admitted yet (not ready) has no check, so it shows its normal status.
+
 ### Attached PR stacks
 
 The GitHub picker marks PRs that belong to a stack. **Enter** still imports or

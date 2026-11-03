@@ -203,6 +203,11 @@ Issues can be tied to other issues in the same project via a symmetric `linked_i
 - Fetch the repository-wide recent-PR list and stack discovery only when the GitHub picker is open. Board status polling covers linked PRs, attached stack members, and issue worktree branches.
 - Prioritize Code Review, In Progress, To Do, then Done. Reuse `.bork/github-cache.json` across restarts, batch and deduplicate requests, and preserve retry cooldowns. Do not reintroduce a sweep of every repository stack's PR statuses.
 
+## Merge queue status
+
+- `PrStatus.merge_queue` comes from GitHub's `mergeQueueEntry`/`isInMergeQueue` first, then Trunk's `Trunk Merge Queue (<branch>)` check run on the head commit. `PR_FIELDS` asks only for check suites from Trunk's GitHub App (id 120106), so the query stays small in repos with many checks.
+- Trunk's check is part of `statusCheckRollup`, so `pr_attention` checks the queue state before CI and review. Queued/testing stay out of the needs-you count; failed/dequeued count.
+
 ## Automatic stack review imports
 
 - Review discovery uses `user-review-requested` (direct personal requests), not `review-requested` (which includes team queues) or `involves`. Return PRs and their stack numbers atomically, after all pages succeed.

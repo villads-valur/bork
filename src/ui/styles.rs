@@ -79,6 +79,9 @@ pub fn attention_badge(attention: Attention) -> (&'static str, Color) {
         Attention::NeedsRebase => ("\u{21a5} rebase", Color::Yellow),
         Attention::Blocked => ("\u{2298} blocked", Color::Magenta),
         Attention::Queued => ("\u{29d6} queued", DIM),
+        Attention::QueueTesting => ("\u{29d6} testing", Color::Blue),
+        Attention::QueueFailed => ("\u{2717} queue failed", Color::Red),
+        Attention::QueueCancelled => ("\u{29d6} dequeued", Color::Yellow),
         Attention::AgentBlocked => ("\u{2691} agent blocked", Color::Yellow),
         Attention::AgentError => ("\u{2691} agent error", Color::Red),
     }
@@ -145,6 +148,22 @@ pub fn review_icon(decision: Option<ReviewDecision>) -> (&'static str, Color) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_badges_name_their_state() {
+        for (attention, label, color) in [
+            (Attention::Queued, "\u{29d6} queued", DIM),
+            (Attention::QueueTesting, "\u{29d6} testing", Color::Blue),
+            (Attention::QueueFailed, "\u{2717} queue failed", Color::Red),
+            (
+                Attention::QueueCancelled,
+                "\u{29d6} dequeued",
+                Color::Yellow,
+            ),
+        ] {
+            assert_eq!(attention_badge(attention), (label, color), "{attention:?}");
+        }
+    }
 
     #[test]
     fn test_checks_icon_success() {

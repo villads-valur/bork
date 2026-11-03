@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex};
 
 use crate::types::{
-    ChecksStatus, GithubStack, GithubStackPullRequest, MergeBlocker, PrState, PrStatus,
-    ReviewDecision,
+    ChecksStatus, GithubStack, GithubStackPullRequest, MergeBlocker, MergeQueueState, PrState,
+    PrStatus, ReviewDecision,
 };
 
 #[derive(Clone)]
@@ -33,16 +33,25 @@ const PR_FIELDS: &str = r#"
     reviewDecision
     mergeStateStatus
     isInMergeQueue
+    mergeQueueEntry { state }
     additions deletions
     reviewThreads(first: 100) { nodes { isResolved } }
     commits(last: 1) {
         nodes {
             commit {
                 statusCheckRollup { state }
+                checkSuites(first: 5, filterBy: { appId: 120106 }) {
+                    nodes { checkRuns(first: 10) { nodes { name status conclusion } } }
+                }
             }
         }
     }
 "#;
+
+/// Trunk's merge queue reports progress as a check run on the PR's head commit,
+/// one per queue branch. `PR_FIELDS` asks only for checks from Trunk's GitHub
+/// App (id 120106, slug `trunk-io`), which also posts unrelated checks.
+const TRUNK_QUEUE_CHECK_PREFIX: &str = "Trunk Merge Queue";
 
 /// Process-global viewer-login cache with single-flight. Concurrent cold-cache
 /// callers wait on `GITHUB_USER_WAIT` for the one in-flight `gh api user`.
@@ -537,10 +546,7 @@ fn parse_pr_node(node: &serde_json::Value) -> Option<PrStatus> {
             "BLOCKED" => Some(MergeBlocker::Blocked),
             _ => None,
         });
-    let in_merge_queue = node
-        .get("isInMergeQueue")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let merge_queue = github_queue_state(node).or_else(|| trunk_queue_state(node));
     let unresolved_threads = node
         .pointer("/reviewThreads/nodes")
         .and_then(|v| v.as_array())
@@ -565,9 +571,74 @@ fn parse_pr_node(node: &serde_json::Value) -> Option<PrStatus> {
         head_branch,
         is_cross_repository,
         merge_blocker,
-        in_merge_queue,
+        merge_queue,
         unresolved_threads,
     })
+}
+
+/// GitHub's native merge queue. An entry without a known state still means
+/// the PR is queued.
+fn github_queue_state(node: &serde_json::Value) -> Option<MergeQueueState> {
+    let entry_state = node
+        .pointer("/mergeQueueEntry/state")
+        .and_then(|v| v.as_str());
+    match entry_state {
+        Some("AWAITING_CHECKS") => return Some(MergeQueueState::Testing),
+        Some("UNMERGEABLE") => return Some(MergeQueueState::Failed),
+        Some(_) => return Some(MergeQueueState::Queued),
+        None => {}
+    }
+    let in_queue = node
+        .get("isInMergeQueue")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    in_queue.then_some(MergeQueueState::Queued)
+}
+
+/// Trunk's merge queue, read from its check runs. With more than one queue
+/// branch, the run still in flight wins over a finished one.
+fn trunk_queue_state(node: &serde_json::Value) -> Option<MergeQueueState> {
+    let suites = node
+        .pointer("/commits/nodes/0/commit/checkSuites/nodes")
+        .and_then(|v| v.as_array())?;
+    suites
+        .iter()
+        .filter_map(|suite| suite.pointer("/checkRuns/nodes").and_then(|v| v.as_array()))
+        .flatten()
+        .filter(|run| {
+            run.get("name")
+                .and_then(|v| v.as_str())
+                .is_some_and(|name| name.starts_with(TRUNK_QUEUE_CHECK_PREFIX))
+        })
+        .filter_map(|run| {
+            let status = run.get("status").and_then(|v| v.as_str())?;
+            let conclusion = run.get("conclusion").and_then(|v| v.as_str());
+            trunk_check_state(status, conclusion)
+        })
+        .min_by_key(|state| match state {
+            MergeQueueState::Testing => 0,
+            MergeQueueState::Queued => 1,
+            MergeQueueState::Failed => 2,
+            MergeQueueState::Cancelled => 3,
+        })
+}
+
+/// A passed run still maps to `Queued`: the PR is about to merge, and once it
+/// has, the PR is no longer open and its queue state is ignored.
+fn trunk_check_state(status: &str, conclusion: Option<&str>) -> Option<MergeQueueState> {
+    match status {
+        "QUEUED" | "PENDING" | "WAITING" | "REQUESTED" => Some(MergeQueueState::Queued),
+        "IN_PROGRESS" => Some(MergeQueueState::Testing),
+        "COMPLETED" => match conclusion? {
+            "SUCCESS" => Some(MergeQueueState::Queued),
+            "FAILURE" | "TIMED_OUT" | "ACTION_REQUIRED" | "STARTUP_FAILURE" => {
+                Some(MergeQueueState::Failed)
+            }
+            "CANCELLED" | "STALE" | "NEUTRAL" | "SKIPPED" => Some(MergeQueueState::Cancelled),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn parse_review_decision(value: &str) -> Option<ReviewDecision> {
@@ -1313,11 +1384,220 @@ mod tests {
         );
     }
 
+    /// A PR node whose head commit carries these Trunk check runs, split
+    /// into one check suite per inner list.
+    fn pr_node_with_trunk_suites(suites: &[&str]) -> serde_json::Value {
+        let suites: Vec<String> = suites
+            .iter()
+            .map(|runs| format!(r#"{{"checkRuns": {{"nodes": [{runs}]}}}}"#))
+            .collect();
+        make_pr_node(&format!(
+            r#"{{"commits": {{"nodes": [{{"commit": {{
+                "statusCheckRollup": {{"state": "PENDING"}},
+                "checkSuites": {{"nodes": [{}]}}
+            }}}}]}}}}"#,
+            suites.join(",")
+        ))
+    }
+
+    fn trunk_run(name: &str, status: &str, conclusion: Option<&str>) -> String {
+        let conclusion = match conclusion {
+            Some(value) => format!(r#""{value}""#),
+            None => "null".to_string(),
+        };
+        format!(r#"{{"name": "{name}", "status": "{status}", "conclusion": {conclusion}}}"#)
+    }
+
+    fn queue_of(node: &serde_json::Value) -> Option<MergeQueueState> {
+        parse_pr_node(node).unwrap().merge_queue
+    }
+
     #[test]
     fn test_parse_in_merge_queue() {
         let node = make_pr_node(r#"{"isInMergeQueue": true}"#);
-        assert!(parse_pr_node(&node).unwrap().in_merge_queue);
-        assert!(!parse_pr_node(&make_pr_node("")).unwrap().in_merge_queue);
+        assert_eq!(queue_of(&node), Some(MergeQueueState::Queued));
+        assert_eq!(queue_of(&make_pr_node("")), None);
+        assert_eq!(
+            queue_of(&make_pr_node(
+                r#"{"isInMergeQueue": false, "mergeQueueEntry": null}"#
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn github_queue_entry_state_maps_to_queue_state() {
+        for (entry, expected) in [
+            ("QUEUED", MergeQueueState::Queued),
+            ("MERGEABLE", MergeQueueState::Queued),
+            ("LOCKED", MergeQueueState::Queued),
+            ("AWAITING_CHECKS", MergeQueueState::Testing),
+            ("UNMERGEABLE", MergeQueueState::Failed),
+            ("SOMETHING_NEW", MergeQueueState::Queued),
+        ] {
+            let node = make_pr_node(&format!(
+                r#"{{"isInMergeQueue": true, "mergeQueueEntry": {{"state": "{entry}"}}}}"#
+            ));
+            assert_eq!(queue_of(&node), Some(expected), "{entry}");
+        }
+    }
+
+    #[test]
+    fn trunk_check_status_and_conclusion_map_to_queue_state() {
+        use MergeQueueState::*;
+        for (status, conclusion, expected) in [
+            ("QUEUED", None, Some(Queued)),
+            ("PENDING", None, Some(Queued)),
+            ("WAITING", None, Some(Queued)),
+            ("REQUESTED", None, Some(Queued)),
+            ("IN_PROGRESS", None, Some(Testing)),
+            ("COMPLETED", Some("SUCCESS"), Some(Queued)),
+            ("COMPLETED", Some("FAILURE"), Some(Failed)),
+            ("COMPLETED", Some("TIMED_OUT"), Some(Failed)),
+            ("COMPLETED", Some("ACTION_REQUIRED"), Some(Failed)),
+            ("COMPLETED", Some("STARTUP_FAILURE"), Some(Failed)),
+            ("COMPLETED", Some("CANCELLED"), Some(Cancelled)),
+            ("COMPLETED", Some("STALE"), Some(Cancelled)),
+            ("COMPLETED", Some("NEUTRAL"), Some(Cancelled)),
+            ("COMPLETED", Some("SKIPPED"), Some(Cancelled)),
+            ("COMPLETED", None, None),
+            ("COMPLETED", Some("SOMETHING_NEW"), None),
+            ("SOMETHING_NEW", None, None),
+        ] {
+            assert_eq!(
+                trunk_check_state(status, conclusion),
+                expected,
+                "{status} {conclusion:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_trunk_queue_check_sets_the_queue_state() {
+        let node = pr_node_with_trunk_suites(&[&trunk_run(
+            "Trunk Merge Queue (main)",
+            "IN_PROGRESS",
+            None,
+        )]);
+        assert_eq!(queue_of(&node), Some(MergeQueueState::Testing));
+    }
+
+    #[test]
+    fn a_failed_trunk_run_reads_as_failed() {
+        // Shape of a real PR Trunk removed for failing tests.
+        let node = pr_node_with_trunk_suites(&[&trunk_run(
+            "Trunk Merge Queue (main)",
+            "COMPLETED",
+            Some("FAILURE"),
+        )]);
+        assert_eq!(queue_of(&node), Some(MergeQueueState::Failed));
+    }
+
+    #[test]
+    fn other_trunk_checks_are_not_queue_state() {
+        let node =
+            pr_node_with_trunk_suites(&[&trunk_run("Trunk Check", "COMPLETED", Some("FAILURE"))]);
+        assert_eq!(queue_of(&node), None);
+    }
+
+    #[test]
+    fn the_queue_check_is_found_among_other_trunk_checks() {
+        let runs = [
+            trunk_run("Trunk Check", "COMPLETED", Some("FAILURE")),
+            trunk_run("Trunk Merge Queue (main)", "QUEUED", None),
+        ]
+        .join(",");
+        let node = pr_node_with_trunk_suites(&[&runs]);
+        assert_eq!(queue_of(&node), Some(MergeQueueState::Queued));
+    }
+
+    #[test]
+    fn an_in_flight_trunk_run_wins_over_a_finished_one() {
+        use MergeQueueState::*;
+        for (first, second, expected) in [
+            (
+                ("COMPLETED", Some("FAILURE")),
+                ("IN_PROGRESS", None),
+                Testing,
+            ),
+            (("COMPLETED", Some("CANCELLED")), ("QUEUED", None), Queued),
+            (("QUEUED", None), ("IN_PROGRESS", None), Testing),
+            (
+                ("COMPLETED", Some("CANCELLED")),
+                ("COMPLETED", Some("FAILURE")),
+                Failed,
+            ),
+        ] {
+            let a = trunk_run("Trunk Merge Queue (main)", first.0, first.1);
+            let b = trunk_run("Trunk Merge Queue (release)", second.0, second.1);
+            // Same answer whether the runs share a suite or not, in either order.
+            for node in [
+                pr_node_with_trunk_suites(&[&format!("{a},{b}")]),
+                pr_node_with_trunk_suites(&[&format!("{b},{a}")]),
+                pr_node_with_trunk_suites(&[&a, &b]),
+            ] {
+                assert_eq!(queue_of(&node), Some(expected), "{first:?} {second:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_trunk_runs_are_skipped() {
+        let runs = [
+            r#"{"status": "IN_PROGRESS", "conclusion": null}"#.to_string(),
+            r#"{"name": "Trunk Merge Queue (main)", "conclusion": "FAILURE"}"#.to_string(),
+            r#"{"name": 7, "status": "IN_PROGRESS"}"#.to_string(),
+            trunk_run("Trunk Merge Queue (main)", "COMPLETED", Some("CANCELLED")),
+        ]
+        .join(",");
+        let node = pr_node_with_trunk_suites(&[&runs]);
+        assert_eq!(queue_of(&node), Some(MergeQueueState::Cancelled));
+    }
+
+    #[test]
+    fn missing_or_empty_check_suites_mean_no_trunk_state() {
+        assert_eq!(queue_of(&pr_node_with_trunk_suites(&[])), None);
+        assert_eq!(queue_of(&pr_node_with_trunk_suites(&[""])), None);
+        let null_suites =
+            make_pr_node(r#"{"commits": {"nodes": [{"commit": {"checkSuites": null}}]}}"#);
+        assert_eq!(queue_of(&null_suites), None);
+        let no_commits = make_pr_node(r#"{"commits": {"nodes": []}}"#);
+        assert_eq!(queue_of(&no_commits), None);
+    }
+
+    #[test]
+    fn github_queue_entry_wins_over_a_stale_trunk_check() {
+        let mut node = pr_node_with_trunk_suites(&[&trunk_run(
+            "Trunk Merge Queue (main)",
+            "COMPLETED",
+            Some("FAILURE"),
+        )]);
+        let obj = node.as_object_mut().unwrap();
+        obj.insert("isInMergeQueue".into(), serde_json::json!(true));
+        obj.insert(
+            "mergeQueueEntry".into(),
+            serde_json::json!({"state": "AWAITING_CHECKS"}),
+        );
+        assert_eq!(queue_of(&node), Some(MergeQueueState::Testing));
+    }
+
+    #[test]
+    fn trunk_checks_do_not_change_the_checks_rollup() {
+        let node = pr_node_with_trunk_suites(&[&trunk_run(
+            "Trunk Merge Queue (main)",
+            "IN_PROGRESS",
+            None,
+        )]);
+        assert_eq!(
+            parse_pr_node(&node).unwrap().checks,
+            Some(ChecksStatus::Pending)
+        );
+    }
+
+    #[test]
+    fn pr_fields_ask_for_trunk_checks_and_the_github_queue_entry() {
+        assert!(PR_FIELDS.contains("mergeQueueEntry { state }"));
+        assert!(PR_FIELDS.contains("filterBy: { appId: 120106 }"));
     }
 
     #[test]
@@ -1611,7 +1891,7 @@ mod tests {
             head_branch: branch.into(),
             is_cross_repository: false,
             merge_blocker: None,
-            in_merge_queue: false,
+            merge_queue: None,
             unresolved_threads: 0,
         }
     }
