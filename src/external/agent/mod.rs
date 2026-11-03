@@ -6,9 +6,11 @@ use std::time::Duration;
 
 use crate::config::{self, AppConfig};
 use crate::error::AppError;
-use crate::external::process::{self, BORK_SESSION_VAR};
+use crate::external::process::{self, BORK_ISSUE_ID_VAR, BORK_SESSION_VAR};
 use crate::external::{github, tmux};
-use crate::types::{AgentKind, AgentMode, Issue, IssueKind, LinkedGithubPr, LinkedLinear};
+use crate::types::{
+    AgentKind, AgentMode, Issue, IssueKind, LinkedGithubPr, LinkedLinear, PrImportSource,
+};
 
 mod claude;
 mod codex;
@@ -337,7 +339,7 @@ fn build_agent_cmd(
     prompt_path_str: &str,
 ) -> (String, Option<String>, Option<String>) {
     let env_prefix = format!(
-        "export {BORK_SESSION_VAR}='{}' BORK_STATUS_DIR='{}' BORK_ISSUE_ID='{}'",
+        "export {BORK_SESSION_VAR}='{}' BORK_STATUS_DIR='{}' {BORK_ISSUE_ID_VAR}='{}'",
         shell_escape_single_quotes(session_name),
         shell_escape_single_quotes(status_dir_str),
         shell_escape_single_quotes(&issue.id),
@@ -374,6 +376,13 @@ fn build_agent_cmd(
             prompt.push_str("\n\nAssigned worktree: ");
             prompt.push_str(worktree);
             prompt.push_str(". Do all work for this issue inside that directory.");
+        }
+        let is_review = issue.primary_pr_import_source() == Some(PrImportSource::ReviewRequested);
+        if issue.kind == IssueKind::Agentic && !is_review {
+            prompt.push_str(&format!(
+                "\n\nWhen you open a pull request for this work, link it to this issue with `bork integration attach-pr {} <pr-number>`.",
+                issue.id
+            ));
         }
         if issue.kind == IssueKind::Orchestrator {
             prompt.push_str(&format!(
@@ -1277,6 +1286,29 @@ mod tests {
     }
 
     #[test]
+    fn agentic_prompt_asks_to_link_prs() {
+        let issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        let config = test_config();
+        let (_, _, prompt) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(prompt
+            .unwrap()
+            .contains("bork integration attach-pr bork-1 <pr-number>"));
+    }
+
+    #[test]
+    fn review_prompt_does_not_ask_to_link_prs() {
+        let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        issue.github_pr_links.push(LinkedGithubPr {
+            number: 42,
+            imported: true,
+            import_source: Some(PrImportSource::ReviewRequested),
+        });
+        let config = test_config();
+        let (_, _, prompt) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(!prompt.unwrap().contains("attach-pr"));
+    }
+
+    #[test]
     fn orchestrator_prompt_uses_orchestrator_template() {
         let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
         issue.kind = crate::types::IssueKind::Orchestrator;
@@ -1287,6 +1319,7 @@ mod tests {
         assert!(prompt.contains("bork issue start"));
         assert!(prompt.contains("plans/bork-1/planning.md"));
         assert!(!prompt.contains("Assigned worktree"));
+        assert!(!prompt.contains("attach-pr"));
         // The regular default prompt is not used for orchestrators.
         assert!(!prompt.contains("The source code is in main/."));
     }
