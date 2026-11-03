@@ -883,7 +883,7 @@ enum IntegrationCommand {
     /// agent session, where it defaults to `BORK_ISSUE_ID`.
     #[command(override_usage = "bork integration attach-pr [ISSUE_ID] <PR_NUMBER>")]
     AttachPr {
-        /// Issue ID (e.g. bork-1) followed by the GitHub PR number, or just the PR number
+        /// Optional issue ID (e.g. bork-1), then the GitHub PR number
         #[arg(num_args = 1..=2, value_names = ["ISSUE_ID", "PR_NUMBER"], required = true)]
         args: Vec<String>,
     },
@@ -1479,22 +1479,29 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
     }
 }
 
+/// The issue the current agent session works on, from `BORK_ISSUE_ID`.
+fn session_issue_id() -> Option<String> {
+    std::env::var(external::process::BORK_ISSUE_ID_VAR)
+        .ok()
+        .filter(|id| !id.is_empty())
+}
+
 /// Split `attach-pr` args into (issue id, PR number). A lone PR number uses
 /// the session's issue id.
 fn resolve_attach_pr_args(
-    args: &[String],
-    env_issue_id: Option<&str>,
+    args: &[impl AsRef<str>],
+    session_issue_id: Option<String>,
 ) -> anyhow::Result<(String, u32)> {
     let (issue_id, pr_number) = match args {
         [pr] => {
-            let Some(id) = env_issue_id.filter(|id| !id.is_empty()) else {
+            let Some(id) = session_issue_id else {
                 anyhow::bail!(
                     "no issue id given and BORK_ISSUE_ID is not set; use `bork integration attach-pr <issue-id> <pr-number>`"
                 );
             };
-            (id.to_string(), pr)
+            (id, pr.as_ref())
         }
-        [id, pr] => (id.clone(), pr),
+        [id, pr] => (id.as_ref().to_string(), pr.as_ref()),
         _ => anyhow::bail!("expected `[issue-id] <pr-number>`"),
     };
     let pr_number = pr_number
@@ -1600,7 +1607,7 @@ fn start_issue(project_root: &Path, opts: StartIssueOptions) -> anyhow::Result<S
     let explicit_link = opts.link.is_some();
     let link_target = opts
         .link
-        .or_else(|| std::env::var("BORK_ISSUE_ID").ok())
+        .or_else(session_issue_id)
         .filter(|id| !id.is_empty() && !id.eq_ignore_ascii_case(&issue.id));
 
     // Reload state so we don't clobber concurrent updates that happened during launch
@@ -1674,8 +1681,7 @@ fn run_integration_command(command: IntegrationCommand) -> anyhow::Result<()> {
             Ok(())
         }
         IntegrationCommand::AttachPr { args } => {
-            let env_issue_id = std::env::var("BORK_ISSUE_ID").ok();
-            let (issue_id, pr_number) = resolve_attach_pr_args(&args, env_issue_id.as_deref())?;
+            let (issue_id, pr_number) = resolve_attach_pr_args(&args, session_issue_id())?;
             let issue = ops::attach_pr(&project_root, &issue_id, pr_number)?;
             println!("Linked {} to PR #{}", issue.id, pr_number);
             Ok(())
@@ -3229,31 +3235,25 @@ mod tests {
         assert!(!sleep_with_wake(&wake_rx, Duration::from_secs(5)));
     }
 
-    fn attach_pr_args(args: &[&str]) -> Vec<String> {
-        args.iter().map(|a| a.to_string()).collect()
-    }
-
     #[test]
     fn attach_pr_uses_explicit_issue_id() {
-        let (id, pr) =
-            resolve_attach_pr_args(&attach_pr_args(&["bork-1", "42"]), Some("bork-9")).unwrap();
+        let (id, pr) = resolve_attach_pr_args(&["bork-1", "42"], Some("bork-9".into())).unwrap();
         assert_eq!((id.as_str(), pr), ("bork-1", 42));
     }
 
     #[test]
     fn attach_pr_falls_back_to_session_issue_id() {
-        let (id, pr) = resolve_attach_pr_args(&attach_pr_args(&["#42"]), Some("bork-9")).unwrap();
+        let (id, pr) = resolve_attach_pr_args(&["#42"], Some("bork-9".into())).unwrap();
         assert_eq!((id.as_str(), pr), ("bork-9", 42));
     }
 
     #[test]
     fn attach_pr_without_issue_id_or_session_errors() {
-        assert!(resolve_attach_pr_args(&attach_pr_args(&["42"]), None).is_err());
-        assert!(resolve_attach_pr_args(&attach_pr_args(&["42"]), Some("")).is_err());
+        assert!(resolve_attach_pr_args(&["42"], None).is_err());
     }
 
     #[test]
     fn attach_pr_rejects_bad_pr_number() {
-        assert!(resolve_attach_pr_args(&attach_pr_args(&["bork-1", "abc"]), None).is_err());
+        assert!(resolve_attach_pr_args(&["bork-1", "abc"], None).is_err());
     }
 }
