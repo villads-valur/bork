@@ -208,9 +208,11 @@ bork issue archive bork-3                 # cleanup when work is merged
 bork issue delete bork-3
 ```
 
-**Create options:** `--column` (todo, in-progress, code-review, done), `--agent` (opencode, claude, codex, pi), `--mode` (plan, build, yolo), `--prompt`, `--kind` (agentic, todo, orchestrator).
+**Create options:** `--column` (todo, in-progress, code-review, done), `--agent` (opencode, claude, codex, pi), `--mode` (plan, build, yolo), `--prompt`, `--model`, `--kind` (agentic, todo, orchestrator).
 
-**Start options:** `--prompt`, `--agent` (opencode, claude, codex), `--mode` (plan, build, yolo), `--slug`, `--no-worktree`, `--project` (registered project name or path). `bork issue start` defaults to build mode and creates a worktree with a slug generated from the title. If a `setup_script` is configured, it runs inside the worktree before the agent starts.
+**Start options:** `--prompt`, `--agent` (opencode, claude, codex), `--mode` (plan, build, yolo), `--model`, `--slug`, `--no-worktree`, `--project` (registered project name or path). `bork issue start` defaults to build mode and creates a worktree with a slug generated from the title. If a `setup_script` is configured, it runs inside the worktree before the agent starts.
+
+**Model per issue:** `--model <name>` on `create`, `start` and `update` is saved on the issue and passed to the agent as `--model <name>` on every launch and resume, e.g. `bork issue start "Review PR 42" --agent claude --model sonnet`. It replaces any `--model`/`-m` in `[agent.<name>].args`. Model names are agent-specific, so changing an issue's agent clears it. OpenCode's TUI has no `--model` flag, so `--model` on an opencode issue is an error. `bork issue update <id> --model ""` clears it.
 
 **Archive options:** `bork issue archive <id> [--force]` kills the issue's tmux session, runs the configured `teardown_script` inside the worktree, removes the worktree, and moves the issue to Done. `--force` proceeds past a failing teardown and discards uncommitted changes.
 

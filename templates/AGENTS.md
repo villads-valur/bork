@@ -49,4 +49,4 @@ bork integration link {project_name}-1 {project_name}-3    # Tie two issues toge
 bork integration unlink {project_name}-1 {project_name}-3  # Remove a link
 ```
 
-Create flags: `--column` (todo, in-progress, code-review, done), `--agent` (opencode, claude, codex, pi), `--mode` (plan, build, yolo), `--prompt`, `--kind` (agentic, todo).
+Create flags: `--column` (todo, in-progress, code-review, done), `--agent` (opencode, claude, codex, pi), `--mode` (plan, build, yolo), `--prompt`, `--model` (passed to the agent's `--model`, e.g. `sonnet`; not supported by opencode), `--kind` (agentic, todo).

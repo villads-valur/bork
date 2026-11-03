@@ -1831,6 +1831,7 @@ fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
         agent_kind: _,
         agent_mode: _,
         prompt: _,
+        model: _,
         worktree: _,
         done_at: _,
         pruned_at: _,
@@ -1871,6 +1872,11 @@ fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
     merge_field!(agent_kind);
     merge_field!(agent_mode);
     merge_field!(prompt);
+    // A file-side model was picked for the file's agent; don't pair it with
+    // an agent switch made in memory.
+    if memory.agent_kind == base.agent_kind {
+        merge_field!(model);
+    }
     merge_field!(worktree);
     merge_field!(done_at);
     merge_field!(pruned_at);
@@ -6982,6 +6988,30 @@ mod tests {
 
         merge_issue_fields(&mut memory, &base, &file);
         assert_eq!(memory.title, "Local edit");
+    }
+
+    #[test]
+    fn merge_model_from_file() {
+        let base = test_issue_titled("a", "T", Column::Todo);
+        let mut memory = base.clone();
+        let mut file = base.clone();
+        file.model = Some("sonnet".to_string());
+
+        merge_issue_fields(&mut memory, &base, &file);
+        assert_eq!(memory.model.as_deref(), Some("sonnet"));
+    }
+
+    #[test]
+    fn merge_skips_file_model_after_memory_agent_switch() {
+        let base = test_issue_titled("a", "T", Column::Todo);
+        let mut memory = base.clone();
+        let _ = memory.set_agent_kind(AgentKind::Codex);
+        let mut file = base.clone();
+        file.model = Some("sonnet".to_string());
+
+        merge_issue_fields(&mut memory, &base, &file);
+        assert_eq!(memory.agent_kind, AgentKind::Codex);
+        assert_eq!(memory.model, None);
     }
 
     #[test]

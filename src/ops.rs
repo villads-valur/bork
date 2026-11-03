@@ -170,7 +170,26 @@ pub struct CreateOptions {
     pub agent_kind: Option<AgentKind>,
     pub agent_mode: Option<AgentMode>,
     pub prompt: Option<String>,
+    pub model: Option<String>,
     pub kind: Option<IssueKind>,
+}
+
+/// Reject a `--model` value the agent can't take: blank, flag-like, or an
+/// agent with no model flag.
+fn validate_model(model: &str, agent_kind: AgentKind) -> anyhow::Result<()> {
+    if model.trim().is_empty() {
+        anyhow::bail!("--model can't be empty");
+    }
+    if model.starts_with('-') {
+        anyhow::bail!("--model value '{}' looks like a flag", model);
+    }
+    if !agent::supports_model(agent_kind) {
+        anyhow::bail!(
+            "{} doesn't support --model; set the model in its own config or use another agent",
+            agent_kind
+        );
+    }
+    Ok(())
 }
 
 pub fn create_issue(project_root: &Path, opts: CreateOptions) -> anyhow::Result<Issue> {
@@ -182,6 +201,9 @@ pub fn create_issue(project_root: &Path, opts: CreateOptions) -> anyhow::Result<
     let kind = opts.kind.unwrap_or(IssueKind::Agentic);
     let agent_kind = opts.agent_kind.unwrap_or(config.agent_kind);
     let agent_mode = opts.agent_mode.unwrap_or(config.agent_mode);
+    if let Some(model) = opts.model.as_deref() {
+        validate_model(model, agent_kind)?;
+    }
 
     let issue = Issue::build(
         IssueDraft {
@@ -192,6 +214,7 @@ pub fn create_issue(project_root: &Path, opts: CreateOptions) -> anyhow::Result<
             kind,
             agent_mode,
             prompt: opts.prompt,
+            model: opts.model,
         },
         now_epoch(),
     );
@@ -209,6 +232,8 @@ pub struct UpdateOptions {
     pub agent_kind: Option<AgentKind>,
     pub agent_mode: Option<AgentMode>,
     pub prompt: Option<String>,
+    /// New model; an empty string clears it.
+    pub model: Option<String>,
     pub kind: Option<IssueKind>,
 }
 
@@ -236,6 +261,16 @@ pub fn update_issue(
     }
     if let Some(agent_mode) = opts.agent_mode {
         issue.agent_mode = agent_mode;
+    }
+    // After the agent change, which clears the model, so `--agent X --model Y`
+    // validates Y against X and keeps it.
+    if let Some(model) = opts.model {
+        if model.is_empty() {
+            issue.model = None;
+        } else {
+            validate_model(&model, issue.agent_kind)?;
+            issue.model = Some(model);
+        }
     }
     if let Some(prompt) = opts.prompt {
         if prompt.is_empty() {
@@ -360,6 +395,9 @@ pub fn show_issue(project_root: &Path, issue_id: &str, json: bool) -> anyhow::Re
     let _ = writeln!(out, "Column:   {}", issue.column);
     let _ = writeln!(out, "Agent:    {}", issue.agent_kind);
     let _ = writeln!(out, "Mode:     {}", issue.agent_mode);
+    if let Some(ref model) = issue.model {
+        let _ = writeln!(out, "Model:    {}", model);
+    }
     if let Some(ref prompt) = issue.prompt {
         let _ = writeln!(out, "Prompt:   {}", prompt);
     }
@@ -693,6 +731,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -723,6 +762,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: Some("Do the thing".into()),
+                model: None,
                 kind: None,
             },
         )
@@ -758,6 +798,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -779,6 +820,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -793,6 +835,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -815,6 +858,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -829,6 +873,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -850,6 +895,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -864,6 +910,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -885,6 +932,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -913,6 +961,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: Some(IssueKind::Orchestrator),
             },
         )
@@ -922,6 +971,136 @@ mod tests {
         assert!(updated.worktree.is_none());
         assert!(updated.sessions.is_empty());
         assert!(updated.github_pr_links.is_empty());
+    }
+
+    fn create_claude_with_model(root: &Path) -> Issue {
+        create_issue(
+            root,
+            CreateOptions {
+                title: "Review".into(),
+                agent_kind: Some(AgentKind::Claude),
+                model: Some("sonnet".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn create_stores_model() {
+        let dir = setup_project();
+        let issue = create_claude_with_model(dir.path());
+        assert_eq!(issue.model.as_deref(), Some("sonnet"));
+        let state = config::load_state(dir.path());
+        assert_eq!(state.issues[0].model.as_deref(), Some("sonnet"));
+    }
+
+    #[test]
+    fn create_rejects_model_for_unsupported_agent() {
+        // The project default agent is opencode, which has no --model flag.
+        let dir = setup_project();
+        let err = create_issue(
+            dir.path(),
+            CreateOptions {
+                title: "Nope".into(),
+                model: Some("sonnet".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("opencode doesn't support --model"));
+        assert!(config::load_state(dir.path()).issues.is_empty());
+    }
+
+    #[test]
+    fn create_rejects_blank_or_flag_like_model() {
+        let dir = setup_project();
+        for model in ["", "  ", "--dangerously-skip-permissions"] {
+            let result = create_issue(
+                dir.path(),
+                CreateOptions {
+                    title: "Nope".into(),
+                    agent_kind: Some(AgentKind::Claude),
+                    model: Some(model.into()),
+                    ..Default::default()
+                },
+            );
+            assert!(result.is_err(), "{model:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn update_sets_and_clears_model() {
+        let dir = setup_project();
+        let root = dir.path();
+        create_claude_with_model(root);
+
+        let set = |model: &str| {
+            update_issue(
+                root,
+                "test-1",
+                UpdateOptions {
+                    model: Some(model.into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+        assert_eq!(set("opus").model.as_deref(), Some("opus"));
+        assert_eq!(set("").model, None);
+    }
+
+    #[test]
+    fn update_agent_clears_model_unless_given() {
+        let dir = setup_project();
+        let root = dir.path();
+        create_claude_with_model(root);
+
+        let switched = update_issue(
+            root,
+            "test-1",
+            UpdateOptions {
+                agent_kind: Some(AgentKind::Codex),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(switched.model, None);
+
+        let both = update_issue(
+            root,
+            "test-1",
+            UpdateOptions {
+                agent_kind: Some(AgentKind::Claude),
+                model: Some("haiku".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(both.agent_kind, AgentKind::Claude);
+        assert_eq!(both.model.as_deref(), Some("haiku"));
+    }
+
+    #[test]
+    fn update_rejects_model_for_unsupported_agent() {
+        let dir = setup_project();
+        let root = dir.path();
+        create_claude_with_model(root);
+
+        let result = update_issue(
+            root,
+            "test-1",
+            UpdateOptions {
+                agent_kind: Some(AgentKind::OpenCode),
+                model: Some("sonnet".into()),
+                ..Default::default()
+            },
+        );
+        assert!(result.is_err());
+        // Nothing was saved: still claude on sonnet.
+        let issue = &config::load_state(root).issues[0];
+        assert_eq!(issue.agent_kind, AgentKind::Claude);
+        assert_eq!(issue.model.as_deref(), Some("sonnet"));
     }
 
     #[test]
@@ -980,6 +1159,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: Some(IssueKind::Orchestrator),
             },
         )
@@ -1006,6 +1186,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -1054,6 +1235,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: Some("A prompt".into()),
+                model: None,
                 kind: None,
             },
         )
@@ -1078,6 +1260,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -1102,6 +1285,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -1114,6 +1298,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -1145,6 +1330,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -1177,6 +1363,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -1200,6 +1387,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -1222,6 +1410,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         );
@@ -1241,6 +1430,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -1262,6 +1452,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -1292,6 +1483,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: Some(IssueKind::Orchestrator),
             },
         )
@@ -1325,6 +1517,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -1346,6 +1539,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
