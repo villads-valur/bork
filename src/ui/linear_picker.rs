@@ -19,9 +19,8 @@ pub fn render_import_picker(frame: &mut Frame, app: &App) {
         None => return,
     };
 
-    let has_linear = !app.active_project().live.linear_issues.is_empty();
-    let has_github = app.active_project().has_github_prs();
-    let show_tabs = has_linear && has_github;
+    let tabs = app.picker_tabs();
+    let show_tabs = tabs.len() > 1;
 
     let area = frame.area();
     let width = (area.width * 70 / 100)
@@ -37,7 +36,9 @@ pub fn render_import_picker(frame: &mut Frame, app: &App) {
     let picker_title = match (app.linear_picker_context, app.picker_tab) {
         (LinearPickerContext::Attach, ImportSource::GitHub) => " Attach GitHub PRs ",
         (LinearPickerContext::Attach, ImportSource::Linear) => " Attach Linear Issues ",
+        (LinearPickerContext::Attach, ImportSource::LinearProject) => " Attach Linear Projects ",
         (_, ImportSource::GitHub) => " Import GitHub PR ",
+        (_, ImportSource::LinearProject) => " Import Linear Project ",
         (_, ImportSource::Linear) => " Import Linear Issue ",
     };
 
@@ -63,7 +64,7 @@ pub fn render_import_picker(frame: &mut Frame, app: &App) {
 
     if show_tabs {
         let tab_area = Rect::new(inner.x + 1, row_y, inner.width - 2, 1);
-        render_tab_bar(frame, app.picker_tab, tab_area);
+        render_tab_bar(frame, &tabs, app.picker_tab, tab_area);
         row_y += 2;
     }
 
@@ -105,6 +106,15 @@ pub fn render_import_picker(frame: &mut Frame, app: &App) {
 
     match app.picker_tab {
         ImportSource::Linear => render_linear_list(
+            frame,
+            app,
+            picker,
+            list_start_y,
+            inner,
+            field_width,
+            visible_count,
+        ),
+        ImportSource::LinearProject => render_linear_project_list(
             frame,
             app,
             picker,
@@ -156,6 +166,7 @@ pub fn render_import_picker(frame: &mut Frame, app: &App) {
 
     let count = match app.picker_tab {
         ImportSource::Linear => app.filtered_linear_issues().len(),
+        ImportSource::LinearProject => app.filtered_linear_projects().len(),
         ImportSource::GitHub => app.filtered_github_prs().len(),
     };
 
@@ -221,7 +232,7 @@ fn picker_footer(
     Line::from(spans)
 }
 
-fn render_tab_bar(frame: &mut Frame, active: ImportSource, area: Rect) {
+fn render_tab_bar(frame: &mut Frame, tabs: &[ImportSource], active: ImportSource, area: Rect) {
     let active_style = Style::default()
         .fg(styles::ACCENT)
         .add_modifier(Modifier::BOLD);
@@ -229,18 +240,17 @@ fn render_tab_bar(frame: &mut Frame, active: ImportSource, area: Rect) {
     let inactive_style = styles::dim_style();
 
     let mut spans = Vec::new();
-    if active == ImportSource::Linear {
-        spans.push(Span::styled("[", bracket_style));
-        spans.push(Span::styled("Linear", active_style));
-        spans.push(Span::styled("]", bracket_style));
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled("GitHub", inactive_style));
-    } else {
-        spans.push(Span::styled("Linear", inactive_style));
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled("[", bracket_style));
-        spans.push(Span::styled("GitHub", active_style));
-        spans.push(Span::styled("]", bracket_style));
+    for (index, tab) in tabs.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("  "));
+        }
+        if *tab == active {
+            spans.push(Span::styled("[", bracket_style));
+            spans.push(Span::styled(tab.label(), active_style));
+            spans.push(Span::styled("]", bracket_style));
+        } else {
+            spans.push(Span::styled(tab.label(), inactive_style));
+        }
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -358,6 +368,101 @@ fn render_linear_list(
 
             frame.render_widget(Paragraph::new(line), row_area);
         }
+    }
+}
+
+fn render_linear_project_list(
+    frame: &mut Frame,
+    app: &App,
+    picker: &crate::app::LinearPickerState,
+    list_start_y: u16,
+    inner: Rect,
+    field_width: usize,
+    visible_count: usize,
+) {
+    let filtered = app.filtered_linear_projects();
+    let count = filtered.len();
+    let on_board_ids: HashSet<&str> = app
+        .active_project()
+        .issues
+        .iter()
+        .flat_map(|i| i.linear_projects.iter().map(|p| p.id.as_str()))
+        .collect();
+    let dialog_selected_ids: HashSet<&str> = app
+        .dialog
+        .as_ref()
+        .map(|d| d.linear_projects.iter().map(|p| p.id.as_str()).collect())
+        .unwrap_or_default();
+    let is_attach = app.linear_picker_context == LinearPickerContext::Attach;
+
+    let scroll = if visible_count == 0 || picker.selected < visible_count {
+        0
+    } else {
+        picker.selected - visible_count + 1
+    };
+
+    if count == 0 {
+        let empty_area = Rect::new(inner.x + 1, list_start_y, inner.width - 2, 1);
+        let msg = if app.active_project().live.linear_projects.is_empty() {
+            "No projects loaded"
+        } else {
+            "No matching projects"
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(msg, styles::dim_style()))),
+            empty_area,
+        );
+        return;
+    }
+
+    for i in 0..visible_count {
+        let idx = scroll + i;
+        if idx >= count {
+            break;
+        }
+
+        let project = filtered[idx];
+        let is_selected = idx == picker.selected;
+        let is_on_board = on_board_ids.contains(project.id.as_str());
+        let is_dialog_selected = is_attach && dialog_selected_ids.contains(project.id.as_str());
+        let row_area = Rect::new(inner.x + 1, list_start_y + i as u16, inner.width - 2, 1);
+
+        let pointer = if is_selected { "\u{25b8} " } else { "  " };
+        let pointer_style = if is_selected {
+            Style::default()
+                .fg(styles::ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+
+        let marker = if is_dialog_selected {
+            "\u{25cf} "
+        } else if is_on_board {
+            "\u{2713} "
+        } else {
+            "  "
+        };
+        let state_str = if is_on_board {
+            " \u{25cf} on board".to_string()
+        } else {
+            format!(" \u{25cf} {}", project.status_name)
+        };
+        let overhead = 2 + marker.chars().count() + state_str.chars().count();
+        let name = styles::truncate(&project.name, field_width.saturating_sub(overhead));
+        let name_style = if is_on_board && !is_attach {
+            styles::dim_style()
+        } else {
+            Style::default().fg(styles::TEXT)
+        };
+
+        let line = Line::from(vec![
+            Span::styled(pointer, pointer_style),
+            Span::styled(marker, Style::default().fg(styles::ACCENT)),
+            Span::styled(name, name_style),
+            Span::styled(state_str, styles::dim_style()),
+        ]);
+        frame.render_widget(Paragraph::new(line), row_area);
     }
 }
 

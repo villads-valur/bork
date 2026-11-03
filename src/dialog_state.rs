@@ -5,7 +5,9 @@ use ratatui::style::{Modifier, Style};
 use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 
 use crate::external::linear::LinearIssue;
-use crate::types::{AgentKind, AgentMode, Column, Issue, IssueKind, LinkedGithubPr};
+use crate::types::{
+    AgentKind, AgentMode, Column, Issue, IssueKind, LinkedGithubPr, LinkedLinearProject,
+};
 use crate::ui::styles;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,6 +16,7 @@ pub enum DialogField {
     Agent,
     Mode,
     Linear,
+    LinearProject,
     GithubPr,
     Title,
     Prompt,
@@ -42,6 +45,7 @@ pub struct DialogState {
     pub linear_issues: Vec<LinearIssue>,
     pub linear_detached: bool,
     pub linear_available: bool,
+    pub linear_projects: Vec<LinkedLinearProject>,
     pub github_prs: Vec<LinkedGithubPr>,
     pub github_stack: Option<u32>,
     pub github_pr_cleared: bool,
@@ -94,6 +98,7 @@ impl DialogState {
             linear_issues: Vec::new(),
             linear_detached: false,
             linear_available,
+            linear_projects: Vec::new(),
             github_prs: Vec::new(),
             github_stack: None,
             github_pr_cleared: false,
@@ -156,6 +161,7 @@ impl DialogState {
             linear_issues,
             linear_detached: false,
             linear_available,
+            linear_projects: issue.linear_projects.clone(),
             github_prs,
             github_stack: issue.github_stack,
             github_pr_cleared: false,
@@ -233,6 +239,10 @@ impl DialogState {
         if self.linear_available {
             fields.push(DialogField::Linear);
         }
+        // Only orchestrators drive Linear projects.
+        if self.linear_available && self.kind == IssueKind::Orchestrator {
+            fields.push(DialogField::LinearProject);
+        }
         // Orchestrators coordinate other issues and have no PR of their own.
         if self.github_available && self.kind != IssueKind::Orchestrator {
             fields.push(DialogField::GithubPr);
@@ -263,6 +273,9 @@ impl DialogState {
         if linear_available {
             idx += 1;
         }
+        if linear_available && kind == IssueKind::Orchestrator {
+            idx += 1;
+        }
         if github_available && kind != IssueKind::Orchestrator {
             idx += 1;
         }
@@ -279,6 +292,10 @@ impl DialogState {
 
     pub fn is_on_linear_field(&self) -> bool {
         self.current_field() == DialogField::Linear
+    }
+
+    pub fn is_on_linear_project_field(&self) -> bool {
+        self.current_field() == DialogField::LinearProject
     }
 
     pub fn is_on_github_field(&self) -> bool {
@@ -347,7 +364,7 @@ impl DialogState {
                     };
                 }
             }
-            DialogField::Linear | DialogField::GithubPr => {}
+            DialogField::Linear | DialogField::LinearProject | DialogField::GithubPr => {}
             DialogField::Title => insert_char(&mut self.title, &mut self.title_cursor, c),
             DialogField::Prompt => self.prompt.insert_char(c),
         }

@@ -107,7 +107,6 @@ Break the goal into discrete issues and spawn each one with `bork issue start \"
 Issues you spawn are automatically linked back to you (pass `--link <your-issue-id>` explicitly if a spawned issue ends up unlinked), so you can review just your sub-issues with `bork issue list --linked <your-issue-id> --json`. \
 Monitor progress with `bork issue list --json` and `bork issue show <id> --json`. \
 Inspect a running agent's output with `tmux capture-pane -p -t <project>-<issue-id>`, and if an agent is heading in the wrong direction, nudge it with `tmux send-keys -t <project>-<issue-id> 'your message' Enter`. \
-If this issue has a Linear ticket linked, keep it updated as milestones complete. \
 Do not create a worktree for yourself; the issues you spawn get their own worktrees.";
 
 impl Default for AppConfig {

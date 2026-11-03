@@ -42,6 +42,7 @@ bork issue delete {project_name}-1            # Delete
 bork integration attach-linear {project_name}-1 VIL-123   # Link Linear ticket
 bork integration attach-pr {project_name}-1 42             # Link GitHub PR
 bork integration detach-linear {project_name}-1 VIL-123   # Unlink a Linear ticket
+bork integration attach-linear-project {project_name}-1 <project-url>  # Link Linear project (orchestrators only)
 bork integration detach-pr {project_name}-1 42             # Unlink a PR
 bork integration clear-linear {project_name}-1             # Remove all Linear links
 bork integration clear-pr {project_name}-1                 # Remove all PR links
