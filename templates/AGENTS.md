@@ -34,6 +34,7 @@ bork issue list --json                        # JSON output
 bork issue create "Fix auth bug"              # Create in To Do column
 bork issue create "Task" --agent claude --mode build --prompt "Details..."
 bork issue start "Subtask" --project {project_name} --prompt "Implement this in a separate worktree"
+bork issue start "Subtask" --project {project_name} --linear VIL-123 --prompt "..."  # Link a Linear ticket at start
 bork issue show {project_name}-1              # Show details
 bork issue update {project_name}-1 --title "New title" --column code-review
 bork issue move {project_name}-1 done         # Move to column
@@ -43,6 +44,7 @@ bork integration attach-linear {project_name}-1 VIL-123   # Link Linear ticket
 bork integration attach-pr {project_name}-1 42             # Link GitHub PR
 bork integration detach-linear {project_name}-1 VIL-123   # Unlink a Linear ticket
 bork integration attach-linear-project {project_name}-1 <project-url>  # Link Linear project (orchestrators only)
+bork integration detach-linear-project {project_name}-1 <project-url>  # Unlink a Linear project
 bork integration detach-pr {project_name}-1 42             # Unlink a PR
 bork integration clear-linear {project_name}-1             # Remove all Linear links
 bork integration clear-pr {project_name}-1                 # Remove all PR links

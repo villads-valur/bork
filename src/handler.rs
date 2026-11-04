@@ -12,8 +12,7 @@ use crate::external::{agent, browser, github, tmux, tuicr};
 use crate::global_config::ReloadResult;
 use crate::input::Action;
 use crate::types::{
-    AgentKind, Column, Issue, IssueDraft, IssueKind, LinkedGithubPr, LinkedLinear,
-    LinkedLinearProject, PrImportSource,
+    AgentKind, Column, Issue, IssueDraft, IssueKind, LinkedGithubPr, LinkedLinear, PrImportSource,
 };
 use crate::undo::{self, Change, ColumnSnapshot, UndoEntry, UNDO_WINDOW};
 
@@ -1116,6 +1115,12 @@ fn handle_dialog(app: &mut App, action: Action, ctx: &ActionContext) -> PostActi
     if on_linear_project {
         match action {
             Action::DialogChar(' ') => {
+                // Without loaded projects the picker would fall back to
+                // another tab, and Enter would attach the wrong kind of link.
+                if app.context_project(ctx).live.linear_projects.is_empty() {
+                    app.set_warning("No Linear projects loaded yet");
+                    return PostAction::None;
+                }
                 app.picker_tab = ImportSource::LinearProject;
                 app.open_import_picker_with_context(LinearPickerContext::Attach, ctx);
                 return PostAction::None;
@@ -1123,6 +1128,7 @@ fn handle_dialog(app: &mut App, action: Action, ctx: &ActionContext) -> PostActi
             Action::DialogBackspace | Action::DialogDelete => {
                 if let Some(dialog) = app.dialog.as_mut() {
                     dialog.linear_projects.pop();
+                    dialog.linear_projects_edited = true;
                 }
                 return PostAction::None;
             }
@@ -1389,11 +1395,11 @@ fn apply_linear_fields(issue: &mut Issue, dialog: &crate::app::DialogState) {
 }
 
 fn apply_linear_project_fields(issue: &mut Issue, dialog: &crate::app::DialogState) {
-    // Only orchestrators carry projects; drop any left from a kind change.
-    if dialog.kind == IssueKind::Orchestrator {
+    // Untouched, the dialog's copy may be stale (a CLI attach while it was
+    // open). `set_kind` already dropped projects if the issue left the
+    // orchestrator kind.
+    if dialog.kind.links_linear_projects() && dialog.linear_projects_edited {
         issue.linear_projects = dialog.linear_projects.clone();
-    } else {
-        issue.linear_projects.clear();
     }
 }
 
@@ -1614,7 +1620,17 @@ fn import_linear_issue(app: &mut App, ctx: &ActionContext) {
         )
     };
 
-    let Some(p) = app.find_project_mut(&proj_id) else {
+    push_imported_todo(
+        app,
+        &proj_id,
+        issue,
+        format!("Imported {}", linear_issue.identifier),
+    );
+}
+
+/// Add an imported issue to Todo, select it, and close the picker.
+fn push_imported_todo(app: &mut App, proj_id: &ProjectId, issue: Issue, message: String) {
+    let Some(p) = app.find_project_mut(proj_id) else {
         return;
     };
     p.issues.push(issue);
@@ -1625,17 +1641,12 @@ fn import_linear_issue(app: &mut App, ctx: &ActionContext) {
     }
     p.mark_dirty();
 
-    app.set_message(format!("Imported {}", linear_issue.identifier));
+    app.set_message(message);
     app.close_linear_picker();
 }
 
 fn attach_linear_project_to_dialog(app: &mut App) {
-    let selected_idx = app.linear_picker.as_ref().map(|p| p.selected).unwrap_or(0);
-    let Some(project) = app
-        .filtered_linear_projects()
-        .get(selected_idx)
-        .map(|p| (*p).clone())
-    else {
+    let Some(project) = selected_linear_project(app) else {
         return;
     };
 
@@ -1647,19 +1658,15 @@ fn attach_linear_project_to_dialog(app: &mut App) {
         {
             dialog.linear_projects.remove(pos);
         } else {
-            dialog.linear_projects.push(linked_project(&project, false));
+            dialog.linear_projects.push(project.to_link(false));
         }
+        dialog.linear_projects_edited = true;
     }
 }
 
 /// Import a Linear project as a new orchestrator issue in Todo.
 fn import_linear_project(app: &mut App, ctx: &ActionContext) {
-    let selected_idx = app.linear_picker.as_ref().map(|p| p.selected).unwrap_or(0);
-    let Some(linear_project) = app
-        .filtered_linear_projects()
-        .get(selected_idx)
-        .map(|p| (*p).clone())
-    else {
+    let Some(linear_project) = selected_linear_project(app) else {
         return;
     };
 
@@ -1682,7 +1689,7 @@ fn import_linear_project(app: &mut App, ctx: &ActionContext) {
 
     let issue = Issue {
         kind: IssueKind::Orchestrator,
-        linear_projects: vec![linked_project(&linear_project, true)],
+        linear_projects: vec![linear_project.to_link(true)],
         ..Issue::new(
             project.next_issue_id(),
             linear_project.name.clone(),
@@ -1691,32 +1698,19 @@ fn import_linear_project(app: &mut App, ctx: &ActionContext) {
         )
     };
 
-    let Some(p) = app.find_project_mut(&proj_id) else {
-        return;
-    };
-    p.issues.push(issue);
-    let count = p.issues_in_column(Column::Todo, "").len();
-    if count > 0 {
-        p.selected_column = 0;
-        p.selected_row[0] = count - 1;
-    }
-    p.mark_dirty();
-
-    app.set_message(format!(
-        "Imported {} as an orchestrator",
-        linear_project.name
-    ));
-    app.close_linear_picker();
+    push_imported_todo(
+        app,
+        &proj_id,
+        issue,
+        format!("Imported {} as an orchestrator", linear_project.name),
+    );
 }
 
-fn linked_project(project: &LinearProject, imported: bool) -> LinkedLinearProject {
-    LinkedLinearProject {
-        id: project.id.clone(),
-        slug: project.slug.clone(),
-        name: project.name.clone(),
-        url: project.url.clone(),
-        imported,
-    }
+fn selected_linear_project(app: &App) -> Option<LinearProject> {
+    let selected_idx = app.linear_picker.as_ref().map(|p| p.selected).unwrap_or(0);
+    app.filtered_linear_projects()
+        .get(selected_idx)
+        .map(|p| (*p).clone())
 }
 
 fn import_github_pr(app: &mut App, ctx: &ActionContext) {

@@ -46,6 +46,9 @@ pub struct DialogState {
     pub linear_detached: bool,
     pub linear_available: bool,
     pub linear_projects: Vec<LinkedLinearProject>,
+    /// Set once the user adds or removes a project, so submit only writes
+    /// the list back when it was actually changed here.
+    pub linear_projects_edited: bool,
     pub github_prs: Vec<LinkedGithubPr>,
     pub github_stack: Option<u32>,
     pub github_pr_cleared: bool,
@@ -99,6 +102,7 @@ impl DialogState {
             linear_detached: false,
             linear_available,
             linear_projects: Vec::new(),
+            linear_projects_edited: false,
             github_prs: Vec::new(),
             github_stack: None,
             github_pr_cleared: false,
@@ -162,6 +166,7 @@ impl DialogState {
             linear_detached: false,
             linear_available,
             linear_projects: issue.linear_projects.clone(),
+            linear_projects_edited: false,
             github_prs,
             github_stack: issue.github_stack,
             github_pr_cleared: false,
@@ -240,7 +245,7 @@ impl DialogState {
             fields.push(DialogField::Linear);
         }
         // Only orchestrators drive Linear projects.
-        if self.linear_available && self.kind == IssueKind::Orchestrator {
+        if self.linear_available && self.kind.links_linear_projects() {
             fields.push(DialogField::LinearProject);
         }
         // Orchestrators coordinate other issues and have no PR of their own.
@@ -273,7 +278,7 @@ impl DialogState {
         if linear_available {
             idx += 1;
         }
-        if linear_available && kind == IssueKind::Orchestrator {
+        if linear_available && kind.links_linear_projects() {
             idx += 1;
         }
         if github_available && kind != IssueKind::Orchestrator {

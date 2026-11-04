@@ -377,9 +377,7 @@ fn spawn_linear_worker(
 
     thread::spawn(move || loop {
         wait_while_suspended(&suspended);
-        let fetched = external::linear::fetch_assigned_issues()
-            .and_then(|issues| Ok((issues, external::linear::fetch_projects()?)));
-        let result = match fetched {
+        let result = match external::linear::fetch_poll() {
             Ok((issues, projects)) => LinearPollResult {
                 issues,
                 projects,
@@ -1681,19 +1679,8 @@ fn run_integration_command(command: IntegrationCommand) -> anyhow::Result<()> {
         }
         IntegrationCommand::AttachLinearProject { issue_id, project } => {
             let found = external::linear::fetch_project(&project)?;
-            let name = found.name.clone();
-            let issue = ops::attach_linear_project(
-                &project_root,
-                &issue_id,
-                types::LinkedLinearProject {
-                    id: found.id,
-                    slug: found.slug,
-                    name: found.name,
-                    url: found.url,
-                    imported: false,
-                },
-            )?;
-            println!("Linked {} to Linear project {}", issue.id, name);
+            let issue = ops::attach_linear_project(&project_root, &issue_id, found.to_link(false))?;
+            println!("Linked {} to Linear project {}", issue.id, found.name);
             Ok(())
         }
         IntegrationCommand::DetachLinearProject { issue_id, project } => {
@@ -2718,14 +2705,13 @@ fn run_tui() -> anyhow::Result<()> {
                                 }
                             }
                         }
-                        if issue.is_any_linear_project_imported() {
-                            if let Some(first_project) = issue.linear_projects.first() {
-                                if let Some(linear_project) =
-                                    result.projects.iter().find(|p| p.id == first_project.id)
-                                {
-                                    issue.title = linear_project.name.clone();
-                                }
-                            }
+                        let imported_project = issue
+                            .linear_projects
+                            .iter()
+                            .find(|p| p.imported)
+                            .and_then(|link| result.projects.iter().find(|p| p.id == link.id));
+                        if let Some(linear_project) = imported_project {
+                            issue.title = linear_project.name.clone();
                         }
                     }
                     project.live.linear_projects = result.projects.clone();

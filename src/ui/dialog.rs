@@ -90,7 +90,7 @@ pub fn render_dialog(frame: &mut Frame, app: &App) {
     }
 
     // Takes the PR row's place: orchestrators have projects instead of PRs.
-    if dialog.linear_available && dialog.kind == IssueKind::Orchestrator {
+    if dialog.linear_available && dialog.kind.links_linear_projects() {
         let project_area = Rect::new(inner.x + 1, inner.y + next_row, inner.width - 2, 1);
         let names: Vec<&str> = dialog
             .linear_projects

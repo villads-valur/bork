@@ -185,6 +185,12 @@ impl IssueKind {
     pub fn is_agentic(self) -> bool {
         matches!(self, Self::Agentic | Self::Orchestrator)
     }
+
+    /// Whether this kind can link Linear projects. Single owner of the
+    /// "orchestrators only" rule the dialog, picker, CLI and prompt follow.
+    pub fn links_linear_projects(self) -> bool {
+        self == Self::Orchestrator
+    }
 }
 
 impl fmt::Display for IssueKind {
@@ -650,10 +656,6 @@ impl Issue {
             .iter()
             .map(|l| l.identifier.as_str())
             .collect()
-    }
-
-    pub fn is_any_linear_project_imported(&self) -> bool {
-        self.linear_projects.iter().any(|p| p.imported)
     }
 
     pub fn is_any_linear_imported(&self) -> bool {

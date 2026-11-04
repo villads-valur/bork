@@ -532,7 +532,7 @@ pub fn attach_linear_project(
 
     let issue = &mut state.issues[idx];
 
-    if issue.kind != IssueKind::Orchestrator {
+    if !issue.kind.links_linear_projects() {
         anyhow::bail!(
             "Cannot attach a Linear project to '{}': only orchestrator issues have project links",
             issue.id

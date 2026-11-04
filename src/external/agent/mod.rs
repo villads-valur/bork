@@ -384,7 +384,7 @@ fn build_agent_cmd(
         if issue.kind == IssueKind::Orchestrator && issue.has_linear() {
             prompt.push_str(LINEAR_TICKET_UPDATES);
         }
-        if issue.kind == IssueKind::Orchestrator && !issue.linear_projects.is_empty() {
+        if issue.kind.links_linear_projects() && !issue.linear_projects.is_empty() {
             append_section(
                 &mut prompt,
                 &issue.linear_projects,

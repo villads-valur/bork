@@ -4,6 +4,7 @@ use std::process::{Command, Stdio};
 use serde::Deserialize;
 
 use crate::error::AppError;
+use crate::types::LinkedLinearProject;
 
 const API_ENDPOINT: &str = "https://api.linear.app/graphql";
 const API_KEY_ENV: &str = "LINEAR_API_KEY";
@@ -28,6 +29,18 @@ pub struct LinearProject {
     pub name: String,
     pub url: String,
     pub status_name: String,
+}
+
+impl LinearProject {
+    pub fn to_link(&self, imported: bool) -> LinkedLinearProject {
+        LinkedLinearProject {
+            id: self.id.clone(),
+            slug: self.slug.clone(),
+            name: self.name.clone(),
+            url: self.url.clone(),
+            imported,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -85,29 +98,25 @@ pub fn check_available() -> bool {
     transport().is_some()
 }
 
-const QUERY: &str = concat!(
+/// Assigned issues and open projects in one request, so each poll costs a
+/// single round trip.
+const POLL_QUERY: &str = concat!(
     "{ viewer { assignedIssues(",
     "filter: { state: { type: { nin: [\"completed\", \"canceled\"] } } }, ",
     "first: 50, ",
     "orderBy: updatedAt",
     ") { nodes { id identifier title url branchName priority ",
-    "state { name } team { key } } } } }",
-);
-
-pub fn fetch_assigned_issues() -> Result<Vec<LinearIssue>, AppError> {
-    parse_issues(&run_query(QUERY)?)
-}
-
-const PROJECTS_QUERY: &str = concat!(
-    "{ projects(",
+    "state { name } team { key } } } } ",
+    "projects(",
     "filter: { status: { type: { nin: [\"completed\", \"canceled\"] } } }, ",
     "first: 100, ",
     "orderBy: updatedAt",
     ") { nodes { id name slugId url status { name } } } }",
 );
 
-pub fn fetch_projects() -> Result<Vec<LinearProject>, AppError> {
-    parse_projects(&run_query(PROJECTS_QUERY)?)
+pub fn fetch_poll() -> Result<(Vec<LinearIssue>, Vec<LinearProject>), AppError> {
+    let body = run_query(POLL_QUERY)?;
+    Ok((parse_issues(&body)?, parse_projects(&body)?))
 }
 
 /// Look up one project by its URL, `name-slug` path segment, or bare slug.
@@ -527,7 +536,7 @@ mod live_tests {
     #[ignore]
     fn linear_api_smoke() {
         let key = api_key().expect("LINEAR_API_KEY must be set for this test");
-        let body = run_via_api(&key, QUERY).expect("request should succeed");
+        let body = run_via_api(&key, POLL_QUERY).expect("request should succeed");
         let issues = parse_issues(&body).expect("response should parse");
         println!("fetched {} assigned issues", issues.len());
     }

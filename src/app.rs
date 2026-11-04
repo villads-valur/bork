@@ -1946,6 +1946,13 @@ fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
     if file_crossed_boundary && !memory_crossed_boundary && memory.kind == file.kind {
         memory.sessions = file.sessions.clone();
     }
+
+    // Kind and projects merge separately, so a kind change on one side and a
+    // project attach on the other could combine into projects on an issue
+    // that can't carry them.
+    if !memory.kind.links_linear_projects() {
+        memory.linear_projects.clear();
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -2452,7 +2459,7 @@ impl App {
             LinearPickerContext::Attach => self
                 .dialog
                 .as_ref()
-                .is_some_and(|d| d.kind == IssueKind::Orchestrator),
+                .is_some_and(|d| d.kind.links_linear_projects()),
         };
         let mut tabs = Vec::new();
         if !project.live.linear_issues.is_empty() {

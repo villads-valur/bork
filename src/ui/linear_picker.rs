@@ -256,6 +256,23 @@ fn render_tab_bar(frame: &mut Frame, tabs: &[ImportSource], active: ImportSource
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// First row to show so the selected row stays visible.
+fn scroll_offset(selected: usize, visible_count: usize) -> usize {
+    if visible_count == 0 || selected < visible_count {
+        0
+    } else {
+        selected - visible_count + 1
+    }
+}
+
+fn render_empty_message(frame: &mut Frame, msg: &str, inner: Rect, list_start_y: u16) {
+    let area = Rect::new(inner.x + 1, list_start_y, inner.width - 2, 1);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(msg, styles::dim_style()))),
+        area,
+    );
+}
+
 fn render_linear_list(
     frame: &mut Frame,
     app: &App,
@@ -282,23 +299,15 @@ fn render_linear_list(
         .unwrap_or_default();
     let is_attach = app.linear_picker_context == LinearPickerContext::Attach;
 
-    let scroll = if visible_count == 0 || picker.selected < visible_count {
-        0
-    } else {
-        picker.selected - visible_count + 1
-    };
+    let scroll = scroll_offset(picker.selected, visible_count);
 
     if count == 0 {
-        let empty_area = Rect::new(inner.x + 1, list_start_y, inner.width - 2, 1);
         let msg = if app.active_project().live.linear_issues.is_empty() {
             "No issues loaded"
         } else {
             "No matching issues"
         };
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(msg, styles::dim_style()))),
-            empty_area,
-        );
+        render_empty_message(frame, msg, inner, list_start_y);
     } else {
         for i in 0..visible_count {
             let idx = scroll + i;
@@ -395,23 +404,15 @@ fn render_linear_project_list(
         .unwrap_or_default();
     let is_attach = app.linear_picker_context == LinearPickerContext::Attach;
 
-    let scroll = if visible_count == 0 || picker.selected < visible_count {
-        0
-    } else {
-        picker.selected - visible_count + 1
-    };
+    let scroll = scroll_offset(picker.selected, visible_count);
 
     if count == 0 {
-        let empty_area = Rect::new(inner.x + 1, list_start_y, inner.width - 2, 1);
         let msg = if app.active_project().live.linear_projects.is_empty() {
             "No projects loaded"
         } else {
             "No matching projects"
         };
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(msg, styles::dim_style()))),
-            empty_area,
-        );
+        render_empty_message(frame, msg, inner, list_start_y);
         return;
     }
 
@@ -492,23 +493,15 @@ fn render_github_list(
         .unwrap_or_default();
     let is_attach = app.linear_picker_context == LinearPickerContext::Attach;
 
-    let scroll = if visible_count == 0 || picker.selected < visible_count {
-        0
-    } else {
-        picker.selected - visible_count + 1
-    };
+    let scroll = scroll_offset(picker.selected, visible_count);
 
     if count == 0 {
-        let empty_area = Rect::new(inner.x + 1, list_start_y, inner.width - 2, 1);
         let msg = if app.active_project().live.pr_statuses.is_empty() {
             "No PRs loaded"
         } else {
             "No matching PRs"
         };
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(msg, styles::dim_style()))),
-            empty_area,
-        );
+        render_empty_message(frame, msg, inner, list_start_y);
     } else {
         for i in 0..visible_count {
             let idx = scroll + i;
