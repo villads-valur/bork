@@ -68,6 +68,12 @@ pub trait AgentProvider {
         None
     }
 
+    /// Whether the agent can still resume `session_id`. Harnesses that can't
+    /// tell return `true` so the stored session is kept.
+    fn has_session(&self, _project_root: &Path, _session_id: &str) -> bool {
+        true
+    }
+
     /// Install hooks (plugin/extension/settings) for this harness. Providers
     /// with no status plumbing return `Ok(())` without touching disk.
     fn install_hooks(&self) -> anyhow::Result<()> {
@@ -167,31 +173,54 @@ pub fn supports_model(kind: AgentKind) -> bool {
     provider(kind).supports_model()
 }
 
+pub struct LaunchOutcome {
+    pub session_name: String,
+    /// The agent's own session id, used to resume the conversation later:
+    ///   - Claude: UUID pre-assigned via --session-id
+    ///   - OpenCode: ses_xxx detected by polling `opencode session list` after launch
+    ///   - Codex: UUID detected from newest ~/.codex/sessions rollout transcript
+    pub agent_session_id: Option<String>,
+    /// The launch included the one-time worktree setup script.
+    pub setup_ran: bool,
+    /// The stored session was gone, so this launch started a new one.
+    pub replaced_lost_session: bool,
+}
+
 /// Launch an agent session for an issue.
 /// Creates a tmux session with two windows:
 ///   1. The agent launched at the project root with issue context
 ///   2. A bare terminal
 ///
 /// Exports BORK_SESSION and BORK_STATUS_DIR so hooks/plugins can write status files.
-/// Returns (tmux_session_name, agent_session_id).
-/// The agent_session_id is the agent's internal session ID for resuming conversations:
-///   - Claude: UUID pre-assigned via --session-id
-///   - OpenCode: ses_xxx detected by polling `opencode session list` after launch
-///   - Codex: UUID detected from newest ~/.codex/sessions rollout transcript
-pub fn launch_session(
-    issue: &Issue,
-    config: &AppConfig,
-) -> Result<(String, Option<String>, bool), AppError> {
+pub fn launch_session(issue: &Issue, config: &AppConfig) -> Result<LaunchOutcome, AppError> {
     let session_name = issue.session_name(&config.project_name);
     let cwd = &config.project_root;
 
     if tmux::session_exists(&session_name) {
-        return Ok((
-            session_name.clone(),
-            issue.current_session_id().map(str::to_string),
-            false,
-        ));
+        return Ok(LaunchOutcome {
+            session_name,
+            agent_session_id: issue.current_session_id().map(str::to_string),
+            setup_ran: false,
+            replaced_lost_session: false,
+        });
     }
+
+    let provider = provider(issue.agent_kind);
+
+    // A stored session the agent no longer has (e.g. Claude cleaned up the
+    // transcript) would fail to resume, so launch fresh instead.
+    let replaced_lost_session = issue
+        .current_session_id()
+        .is_some_and(|sid| !provider.has_session(cwd, sid));
+    let fresh_issue;
+    let issue = if replaced_lost_session {
+        let mut copy = issue.clone();
+        copy.sessions.remove(&copy.agent_kind);
+        fresh_issue = copy;
+        &fresh_issue
+    } else {
+        issue
+    };
 
     tmux::create_session(&session_name, cwd)?;
 
@@ -224,7 +253,6 @@ pub fn launch_session(
         None => agent_cmd,
     };
 
-    let provider = provider(issue.agent_kind);
     let before = if pre_assigned_session_id.is_none() {
         provider.snapshot_session_ids(&config.project_root)
     } else {
@@ -249,7 +277,12 @@ pub fn launch_session(
         }),
     };
 
-    Ok((session_name, agent_session_id, setup.is_some()))
+    Ok(LaunchOutcome {
+        session_name,
+        agent_session_id,
+        setup_ran: setup.is_some(),
+        replaced_lost_session,
+    })
 }
 
 /// Kill an issue's tmux session and remove its transient hook/prompt files.

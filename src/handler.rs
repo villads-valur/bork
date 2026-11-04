@@ -1091,6 +1091,17 @@ fn handle_dialog(app: &mut App, action: Action, ctx: &ActionContext) -> PostActi
         .is_some_and(|d| d.is_on_linear_project_field());
     let on_github = app.dialog.as_ref().is_some_and(|d| d.is_on_github_field());
 
+    if app.dialog.as_ref().is_some_and(|d| d.is_on_agent_field())
+        && matches!(action, Action::DialogBackspace | Action::DialogDelete)
+    {
+        if let Some(dialog) = app.dialog.as_mut() {
+            if !dialog.forgotten_sessions.contains(&dialog.agent_kind) {
+                dialog.forgotten_sessions.push(dialog.agent_kind);
+            }
+        }
+        return PostAction::None;
+    }
+
     if on_linear {
         match action {
             Action::DialogChar(' ') => {
@@ -1272,8 +1283,13 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
             let switches_agent = picker_moved && dialog.agent_kind != issue.agent_kind;
             let crosses_boundary =
                 (issue.kind == IssueKind::Orchestrator) != (dialog.kind == IssueKind::Orchestrator);
-            if (switches_agent || crosses_boundary) && app.launches_in_flight.contains(&issue.id) {
-                app.set_warning("Launch in progress; wait for it before switching agent or kind");
+            let forgets_sessions = !dialog.forgotten_sessions.is_empty();
+            if (switches_agent || crosses_boundary || forgets_sessions)
+                && app.launches_in_flight.contains(&issue.id)
+            {
+                app.set_warning(
+                    "Launch in progress; wait for it before switching agent or kind, or starting a new session",
+                );
                 return;
             }
         }
@@ -1288,8 +1304,22 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
             let crossed_orchestrator_boundary =
                 p.issues[idx].kind_change_resets_session(dialog.kind);
             let agent_changed = picker_moved && dialog.agent_kind != p.issues[idx].agent_kind;
+            let agent_after_edit = if picker_moved {
+                dialog.agent_kind
+            } else {
+                p.issues[idx].agent_kind
+            };
+            // Only forget sessions that are still stored, so the message
+            // doesn't claim a reset a background change already made.
+            let forgotten: Vec<AgentKind> = dialog
+                .forgotten_sessions
+                .iter()
+                .copied()
+                .filter(|agent| p.issues[idx].sessions.contains_key(agent))
+                .collect();
+            let current_session_forgotten = forgotten.contains(&agent_after_edit);
 
-            if crossed_orchestrator_boundary || agent_changed {
+            if crossed_orchestrator_boundary || agent_changed || current_session_forgotten {
                 // A live session would otherwise be re-attached with the old
                 // kind's prompt and cwd, or the old agent's process. Kill it
                 // before committing the edit so a failed cleanup can't leave
@@ -1313,6 +1343,9 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
             apply_linear_fields(&mut p.issues[idx], &dialog);
             apply_linear_project_fields(&mut p.issues[idx], &dialog);
             apply_pr_fields(&mut p.issues[idx], &dialog);
+            for agent in &forgotten {
+                p.issues[idx].sessions.remove(agent);
+            }
 
             let updated_id = p.issues[idx].id.clone();
             p.mark_dirty();
@@ -1329,6 +1362,11 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
                 app.set_message(format!(
                     "Updated {} (switched to {}, other sessions kept)",
                     updated_id, dialog.agent_kind
+                ));
+            } else if !forgotten.is_empty() {
+                app.set_message(format!(
+                    "Updated {} (next launch starts a new session)",
+                    updated_id
                 ));
             } else {
                 app.set_message(format!("Updated {}", updated_id));
@@ -2437,18 +2475,35 @@ pub fn delete_issue_from_app(app: &mut App, project_id: &ProjectId, issue_id: &s
 
 fn launch_and_report(issue: Issue, config: AppConfig) -> ActionResult {
     match agent::launch_session(&issue, &config) {
-        Ok((session_name, agent_sid, setup_ran)) => ActionResult {
-            launched_setup_ran: setup_ran,
-            message: format!("Session '{}' started", session_name),
-            session_to_open: Some(session_name),
-            launched_session: agent_sid.map(|sid| LaunchedSession {
-                agent: issue.agent_kind,
-                kind: issue.kind,
-                session_id: sid,
-            }),
-            launched_issue_id: Some(issue.id),
-            ..Default::default()
-        },
+        Ok(outcome) => {
+            let (message, message_kind) = if outcome.replaced_lost_session {
+                (
+                    format!(
+                        "Previous {} session for {} was gone, started a new one",
+                        issue.agent_kind, issue.id
+                    ),
+                    MessageKind::Warning,
+                )
+            } else {
+                (
+                    format!("Session '{}' started", outcome.session_name),
+                    MessageKind::Info,
+                )
+            };
+            ActionResult {
+                launched_setup_ran: outcome.setup_ran,
+                message,
+                message_kind,
+                session_to_open: Some(outcome.session_name),
+                launched_session: outcome.agent_session_id.map(|sid| LaunchedSession {
+                    agent: issue.agent_kind,
+                    kind: issue.kind,
+                    session_id: sid,
+                }),
+                launched_issue_id: Some(issue.id),
+                ..Default::default()
+            }
+        }
         Err(e) => ActionResult {
             message: format!("Failed to launch: {e}"),
             message_kind: MessageKind::Error,
@@ -3915,6 +3970,74 @@ mod tests {
         assert_eq!(
             app.project().issues[0].current_session_id(),
             Some("ses_live")
+        );
+    }
+
+    fn open_dialog_on_agent_field(app: &mut App) -> ActionContext {
+        let ctx = app.action_context();
+        let issue = app.project().issues[0].clone();
+        app.open_edit_dialog(&issue, 0, &ctx);
+        let dialog = app.dialog.as_mut().unwrap();
+        dialog.focused_field = dialog
+            .ordered_fields()
+            .iter()
+            .position(|field| *field == crate::dialog_state::DialogField::Agent)
+            .unwrap();
+        ctx
+    }
+
+    fn issue_with_two_sessions() -> Issue {
+        let mut issue = test_issue_titled("bork-1", "Test issue", Column::Todo);
+        issue
+            .sessions
+            .insert(issue.agent_kind, "ses_old".to_string());
+        let other = if issue.agent_kind == AgentKind::Claude {
+            AgentKind::OpenCode
+        } else {
+            AgentKind::Claude
+        };
+        issue.sessions.insert(other, "ses_other".to_string());
+        issue
+    }
+
+    #[test]
+    fn backspace_on_agent_field_forgets_current_session_on_save() {
+        let mut app = test_app();
+        app.project_mut().issues.push(issue_with_two_sessions());
+        let ctx = open_dialog_on_agent_field(&mut app);
+        let agent = app.project().issues[0].agent_kind;
+
+        handle_action(&mut app, Action::DialogBackspace, &ctx, &test_channels());
+        let session_agents: Vec<AgentKind> =
+            app.project().issues[0].sessions.keys().copied().collect();
+        assert!(!app
+            .dialog
+            .as_ref()
+            .unwrap()
+            .shows_session(agent, &session_agents));
+        // Nothing is dropped until the dialog is saved.
+        assert_eq!(
+            app.project().issues[0].current_session_id(),
+            Some("ses_old")
+        );
+
+        handle_action(&mut app, Action::DialogSubmit, &ctx, &test_channels());
+        let issue = &app.project().issues[0];
+        assert_eq!(issue.current_session_id(), None);
+        assert_eq!(issue.sessions.len(), 1);
+    }
+
+    #[test]
+    fn cancel_after_backspace_keeps_session() {
+        let mut app = test_app();
+        app.project_mut().issues.push(issue_with_two_sessions());
+        let ctx = open_dialog_on_agent_field(&mut app);
+
+        handle_action(&mut app, Action::DialogBackspace, &ctx, &test_channels());
+        handle_action(&mut app, Action::DialogCancel, &ctx, &test_channels());
+        assert_eq!(
+            app.project().issues[0].current_session_id(),
+            Some("ses_old")
         );
     }
 

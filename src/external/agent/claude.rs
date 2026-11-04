@@ -1,3 +1,6 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+
 use crate::external::hooks;
 use crate::types::AgentMode;
 
@@ -76,11 +79,78 @@ impl AgentProvider for Claude {
         }
     }
 
+    fn has_session(&self, _project_root: &Path, session_id: &str) -> bool {
+        projects_dir()
+            .and_then(|dir| transcript_exists(&dir, session_id))
+            .unwrap_or(true)
+    }
+
     fn install_hooks(&self) -> anyhow::Result<()> {
         hooks::install_claude_hooks()
     }
 
     fn uninstall_hooks(&self) -> anyhow::Result<()> {
         hooks::uninstall_claude_hooks()
+    }
+}
+
+/// Claude keeps transcripts in `<config dir>/projects/<encoded cwd>/<id>.jsonl`,
+/// with the config dir overridable via `CLAUDE_CONFIG_DIR`.
+fn projects_dir() -> Option<PathBuf> {
+    let config_dir = match std::env::var("CLAUDE_CONFIG_DIR") {
+        Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => PathBuf::from(std::env::var("HOME").ok()?).join(".claude"),
+    };
+    Some(config_dir.join("projects"))
+}
+
+/// Whether any project dir holds the transcript. Searches every dir rather
+/// than re-deriving Claude's cwd encoding, which truncates long paths.
+/// `None` when the projects dir can't be read, so callers keep resuming.
+fn transcript_exists(projects_dir: &Path, session_id: &str) -> Option<bool> {
+    let file_name = format!("{session_id}.jsonl");
+    let entries = fs::read_dir(projects_dir).ok()?;
+    Some(
+        entries
+            .flatten()
+            .any(|entry| entry.path().join(&file_name).is_file()),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SID: &str = "cb2f9a52-8df5-4b17-8088-883ed5edcec6";
+
+    #[test]
+    fn transcript_found_in_any_project_dir() {
+        let root = tempfile::TempDir::new().unwrap();
+        fs::create_dir(root.path().join("-Users-x-code-bork")).unwrap();
+        fs::create_dir(root.path().join("-Users-x-other")).unwrap();
+        fs::write(
+            root.path()
+                .join("-Users-x-other")
+                .join(format!("{SID}.jsonl")),
+            "",
+        )
+        .unwrap();
+
+        assert_eq!(transcript_exists(root.path(), SID), Some(true));
+    }
+
+    #[test]
+    fn transcript_missing() {
+        let root = tempfile::TempDir::new().unwrap();
+        fs::create_dir(root.path().join("-Users-x-code-bork")).unwrap();
+
+        assert_eq!(transcript_exists(root.path(), SID), Some(false));
+    }
+
+    #[test]
+    fn unreadable_projects_dir_is_unknown() {
+        let root = tempfile::TempDir::new().unwrap();
+
+        assert_eq!(transcript_exists(&root.path().join("nope"), SID), None);
     }
 }

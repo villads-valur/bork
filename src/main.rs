@@ -849,6 +849,16 @@ enum IssueCommand {
         id: String,
     },
 
+    /// Forget an issue's stored agent session so the next launch starts fresh
+    ResetSession {
+        /// Issue ID (e.g. bork-1)
+        id: String,
+
+        /// Agent whose session to forget (defaults to the issue's agent)
+        #[arg(long, value_parser = parse_agent_kind)]
+        agent: Option<AgentKind>,
+    },
+
     /// Show issue details
     Show {
         /// Issue ID (e.g. bork-1)
@@ -1476,6 +1486,18 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
             println!("Deleted {}: \"{}\"", issue.id, issue.title);
             Ok(())
         }
+        IssueCommand::ResetSession { id, agent } => {
+            let reset = ops::reset_session(&project_root, &id, agent)?;
+            if reset.removed {
+                println!(
+                    "Forgot {}'s {} session; the next launch starts a new one",
+                    reset.issue_id, reset.agent
+                );
+            } else {
+                println!("{} has no stored {} session", reset.issue_id, reset.agent);
+            }
+            Ok(())
+        }
         IssueCommand::Show { id, json } => {
             let output = ops::show_issue(&project_root, &id, json)?;
             println!("{}", output);
@@ -1634,9 +1656,13 @@ fn start_issue(project_root: &Path, opts: StartIssueOptions) -> anyhow::Result<S
     };
 
     let launched_agent = issue.agent_kind;
-    let (session_name, agent_session_id, setup_ran) =
-        external::agent::launch_session(&issue, &config)
-            .map_err(|e| anyhow::anyhow!("Failed to launch agent: {e}"))?;
+    let external::agent::LaunchOutcome {
+        session_name,
+        agent_session_id,
+        setup_ran,
+        ..
+    } = external::agent::launch_session(&issue, &config)
+        .map_err(|e| anyhow::anyhow!("Failed to launch agent: {e}"))?;
 
     // Resolve the link target: explicit --link wins, else the spawning agent's
     // issue from BORK_ISSUE_ID. Only link when the target exists in this same

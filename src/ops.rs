@@ -298,6 +298,45 @@ pub fn update_issue(
     Ok(updated)
 }
 
+pub struct SessionReset {
+    pub issue_id: String,
+    pub agent: AgentKind,
+    pub removed: bool,
+}
+
+/// Forget the stored session for `agent` (default: the issue's agent) so the
+/// next launch starts fresh. Kills the live session when it runs that agent,
+/// since re-attaching it would keep the old conversation going.
+pub fn reset_session(
+    project_root: &Path,
+    issue_id: &str,
+    agent: Option<AgentKind>,
+) -> anyhow::Result<SessionReset> {
+    let mut state = config::load_state(project_root);
+
+    let idx = find_issue_index(&state.issues, issue_id)
+        .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", issue_id))?;
+
+    let issue = &mut state.issues[idx];
+    let agent = agent.unwrap_or(issue.agent_kind);
+    let removed = issue.sessions.contains_key(&agent);
+
+    if removed {
+        if agent == issue.agent_kind {
+            let config = config::load_config_from(project_root);
+            agent::terminate_session(project_root, &issue.session_name(&config.project_name))?;
+        }
+        issue.sessions.remove(&agent);
+        config::save_state(&state, project_root)?;
+    }
+
+    Ok(SessionReset {
+        issue_id: state.issues[idx].id.clone(),
+        agent,
+        removed,
+    })
+}
+
 pub fn delete_issue(project_root: &Path, issue_id: &str) -> anyhow::Result<Issue> {
     let mut state = config::load_state(project_root);
 
@@ -1162,6 +1201,44 @@ mod tests {
         let issue = &config::load_state(root).issues[0];
         assert_eq!(issue.agent_kind, AgentKind::Claude);
         assert_eq!(issue.model.as_deref(), Some("sonnet"));
+    }
+
+    #[test]
+    fn reset_session_forgets_only_the_chosen_agent() {
+        let dir = setup_project();
+        let root = dir.path();
+        create_issue(
+            root,
+            CreateOptions {
+                title: "Lost session".into(),
+                agent_kind: Some(AgentKind::OpenCode),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mut state = config::load_state(root);
+        state.issues[0]
+            .sessions
+            .insert(AgentKind::OpenCode, "ses_abc".into());
+        state.issues[0]
+            .sessions
+            .insert(AgentKind::Claude, "uuid-1".into());
+        config::save_state(&state, root).unwrap();
+
+        let reset = reset_session(root, "test-1", None).unwrap();
+        assert_eq!(reset.agent, AgentKind::OpenCode);
+        assert!(reset.removed);
+
+        let sessions = &config::load_state(root).issues[0].sessions;
+        assert!(!sessions.contains_key(&AgentKind::OpenCode));
+        assert_eq!(
+            sessions.get(&AgentKind::Claude).map(String::as_str),
+            Some("uuid-1")
+        );
+
+        let again = reset_session(root, "test-1", Some(AgentKind::Codex)).unwrap();
+        assert!(!again.removed);
     }
 
     #[test]

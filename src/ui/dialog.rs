@@ -121,24 +121,25 @@ pub fn render_dialog(frame: &mut Frame, app: &App) {
         next_row += 2;
     }
 
+    // Resume markers come from the live issue, not a dialog-open snapshot:
+    // background launch results and external merges can change the sessions
+    // map while the dialog is up.
+    let session_agents: Vec<AgentKind> = dialog
+        .editing_issue_id
+        .as_deref()
+        .and_then(|id| {
+            let lower = id.to_lowercase();
+            app.active_project()
+                .issues
+                .iter()
+                .find(|issue| issue.id.to_lowercase() == lower)
+        })
+        .map(|issue| issue.sessions.keys().copied().collect())
+        .unwrap_or_default();
+
     if dialog.kind.is_agentic() {
         if !dialog.available_agents.is_empty() {
             let agent_area = Rect::new(inner.x + 1, inner.y + next_row, inner.width - 2, 1);
-            // Resume markers come from the live issue, not a dialog-open
-            // snapshot: background launch results and external merges can
-            // change the sessions map while the dialog is up.
-            let session_agents: Vec<AgentKind> = dialog
-                .editing_issue_id
-                .as_deref()
-                .and_then(|id| {
-                    let lower = id.to_lowercase();
-                    app.active_project()
-                        .issues
-                        .iter()
-                        .find(|issue| issue.id.to_lowercase() == lower)
-                })
-                .map(|issue| issue.sessions.keys().copied().collect())
-                .unwrap_or_default();
             render_agent_field(
                 frame,
                 dialog,
@@ -235,6 +236,13 @@ pub fn render_dialog(frame: &mut Frame, app: &App) {
         if is_prompt_focused {
             spans.push(Span::styled("Ctrl+e", styles::statusbar_key_style()));
             spans.push(Span::styled(":editor  ", styles::statusbar_desc_style()));
+        }
+        if dialog.is_on_agent_field() && dialog.shows_session(dialog.agent_kind, &session_agents) {
+            spans.push(Span::styled("Bksp", styles::statusbar_key_style()));
+            spans.push(Span::styled(
+                ":new session  ",
+                styles::statusbar_desc_style(),
+            ));
         }
         spans.extend([
             Span::styled("Ctrl+S", styles::statusbar_key_style()),
@@ -488,7 +496,7 @@ fn render_agent_field(
         }
         let selected = *kind == dialog.agent_kind;
         // ↺ = this agent has a session to resume.
-        let resume_marker = if session_agents.contains(kind) {
+        let resume_marker = if dialog.shows_session(*kind, session_agents) {
             " \u{21ba}"
         } else {
             ""

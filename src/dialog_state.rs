@@ -53,6 +53,12 @@ pub struct DialogState {
     pub github_stack: Option<u32>,
     pub github_pr_cleared: bool,
     pub github_available: bool,
+    /// Agents whose stored session can't be resumed anymore, so the picker
+    /// hides their resume marker. Detected once at open.
+    pub lost_sessions: Vec<AgentKind>,
+    /// Agents whose stored session the user dropped; submit forgets them so
+    /// the next launch starts fresh.
+    pub forgotten_sessions: Vec<AgentKind>,
 }
 
 fn make_prompt_textarea(text: &str) -> TextArea<'static> {
@@ -107,6 +113,8 @@ impl DialogState {
             github_stack: None,
             github_pr_cleared: false,
             github_available,
+            lost_sessions: Vec::new(),
+            forgotten_sessions: Vec::new(),
         }
     }
 
@@ -171,6 +179,8 @@ impl DialogState {
             github_stack: issue.github_stack,
             github_pr_cleared: false,
             github_available,
+            lost_sessions: Vec::new(),
+            forgotten_sessions: Vec::new(),
         }
     }
 
@@ -305,6 +315,18 @@ impl DialogState {
 
     pub fn is_on_github_field(&self) -> bool {
         self.current_field() == DialogField::GithubPr
+    }
+
+    pub fn is_on_agent_field(&self) -> bool {
+        self.current_field() == DialogField::Agent
+    }
+
+    /// Whether the resume marker should show for `agent`, given the live
+    /// issue's stored sessions.
+    pub fn shows_session(&self, agent: AgentKind, session_agents: &[AgentKind]) -> bool {
+        session_agents.contains(&agent)
+            && !self.lost_sessions.contains(&agent)
+            && !self.forgotten_sessions.contains(&agent)
     }
 
     pub fn next_field(&mut self) {
