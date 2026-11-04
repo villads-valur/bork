@@ -33,7 +33,7 @@ pub fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     )];
     if !has_swimlanes {
         title_spans.push(Span::styled(
-            format!("- {} ", app.active_project().config.project_name),
+            format!("- {} ", app.active_project().display_name()),
             Style::default().fg(styles::TEXT),
         ));
     }
@@ -87,6 +87,20 @@ pub fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+/// One-line text field with a block cursor, used by search and rename.
+fn render_text_input(frame: &mut Frame, area: Rect, text: &str) {
+    let line = Line::from(vec![
+        Span::styled(
+            text.to_string(),
+            Style::default()
+                .fg(styles::TEXT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("\u{2588}", Style::default().fg(styles::ACCENT)),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
 fn render_footer_content(frame: &mut Frame, app: &App, area: Rect) {
     // Confirm mode
     if app.input_mode == InputMode::Confirm {
@@ -104,16 +118,17 @@ fn render_footer_content(frame: &mut Frame, app: &App, area: Rect) {
 
     // Search mode: show /query with cursor
     if app.input_mode == InputMode::Search {
-        let line = Line::from(vec![
-            Span::styled(
-                format!(" /{}", app.search_query),
-                Style::default()
-                    .fg(styles::TEXT)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("\u{2588}", Style::default().fg(styles::ACCENT)),
-        ]);
-        frame.render_widget(Paragraph::new(line), area);
+        render_text_input(frame, area, &format!(" /{}", app.search_query));
+        return;
+    }
+
+    if app.input_mode == InputMode::SidebarRename {
+        let buffer = app
+            .sidebar
+            .as_ref()
+            .and_then(|sidebar| sidebar.rename.as_ref())
+            .map_or("", |rename| rename.buffer.as_str());
+        render_text_input(frame, area, &format!(" Rename: {buffer}"));
         return;
     }
 
@@ -128,6 +143,14 @@ fn render_footer_content(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(":switch  ", styles::statusbar_desc_style()),
             Span::styled("Space", styles::statusbar_key_style()),
             Span::styled(":swimlane  ", styles::statusbar_desc_style()),
+            Span::styled("J", styles::statusbar_key_style()),
+            Span::styled("/", styles::statusbar_desc_style()),
+            Span::styled("K", styles::statusbar_key_style()),
+            Span::styled(":move  ", styles::statusbar_desc_style()),
+            Span::styled("r", styles::statusbar_key_style()),
+            Span::styled(":rename  ", styles::statusbar_desc_style()),
+            Span::styled("d", styles::statusbar_key_style()),
+            Span::styled(":remove  ", styles::statusbar_desc_style()),
             Span::styled("Esc", styles::statusbar_key_style()),
             Span::styled(":close", styles::statusbar_desc_style()),
         ]);
@@ -250,7 +273,7 @@ fn render_footer_content(frame: &mut Frame, app: &App, area: Rect) {
     let mut right_spans: Vec<Span> = Vec::new();
 
     if swimlane_count > 1 {
-        let active_name = &app.active_project().config.project_name;
+        let active_name = app.active_project().display_name();
         right_spans.push(Span::styled(
             format!(
                 "{} ({}/{}) ",

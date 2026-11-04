@@ -35,6 +35,8 @@ pub fn map_key_to_action(
         InputMode::Help => map_help_key(key),
         InputMode::DebugInspector => map_debug_inspector_key(key),
         InputMode::Sidebar => map_sidebar_key(key),
+        // Rename is a one-line text field, same as search.
+        InputMode::SidebarRename => map_search_key(key),
         InputMode::PruneDialog => map_prune_dialog_key(key),
     }
 }
@@ -144,6 +146,10 @@ fn map_sidebar_key(key: KeyEvent) -> Action {
         KeyCode::Char('k') | KeyCode::Up => Action::SidebarUp,
         KeyCode::Enter => Action::SidebarSelect,
         KeyCode::Char(' ') => Action::SidebarToggleSwimlane,
+        KeyCode::Char('K') => Action::SidebarMoveUp,
+        KeyCode::Char('J') => Action::SidebarMoveDown,
+        KeyCode::Char('r') => Action::SidebarRename,
+        KeyCode::Char('d') => Action::SidebarRemove,
         KeyCode::Char('?') => Action::ShowHelp,
         _ => Action::Noop,
     }

@@ -311,6 +311,9 @@ With issues marked, `H`, `L`, `D`, `T`, `Shift+Enter`, `o`, `O`, `x`, `d` and `A
 | `k` / `Up` | Move selection up |
 | `Enter` | Focus selected project (single board view) |
 | `Space` | Toggle project as swimlane (add/remove from view) |
+| `J` / `K` | Move project down / up in the list |
+| `r` | Rename project in bork's UI (issue IDs and tmux sessions keep the config name). Renaming back to the config name clears it |
+| `d` | Remove project from the list (files stay on disk) |
 | `Esc` / `Ctrl+P` | Close sidebar |
 
 ### Confirm Mode

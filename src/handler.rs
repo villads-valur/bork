@@ -4,7 +4,7 @@ use std::thread;
 
 use crate::app::{
     ActionContext, App, ConfirmAction, ImportSource, InputMode, LinearPickerContext, MessageKind,
-    Project, ProjectId,
+    Project, ProjectId, ProjectRename,
 };
 use crate::config::AppConfig;
 use crate::external::{agent, browser, github, tmux, tuicr};
@@ -113,6 +113,10 @@ pub fn handle_action(
         }
         InputMode::Normal => handle_normal(app, action, ctx, ch),
         InputMode::Sidebar => handle_sidebar(app, action),
+        InputMode::SidebarRename => {
+            handle_sidebar_rename(app, action);
+            PostAction::None
+        }
         InputMode::PruneDialog => {
             handle_prune_dialog(app, action, ctx, ch.action_tx);
             PostAction::None
@@ -2020,6 +2024,40 @@ fn handle_sidebar(app: &mut App, action: Action) -> PostAction {
             }
             PostAction::None
         }
+        Action::SidebarMoveUp | Action::SidebarMoveDown => {
+            let up = action == Action::SidebarMoveUp;
+            if let Some(order) = app.move_sidebar_project(up) {
+                if let Err(e) = crate::global_config::set_project_order(&order) {
+                    app.set_error(format!("Failed to save project order: {e}"));
+                }
+            }
+            PostAction::None
+        }
+        Action::SidebarRename => {
+            if let Some(project_id) = app.sidebar_selected_id() {
+                let buffer = app.project_display_name(&project_id);
+                if let Some(sidebar) = app.sidebar.as_mut() {
+                    sidebar.rename = Some(ProjectRename { project_id, buffer });
+                    app.input_mode = InputMode::SidebarRename;
+                }
+            }
+            PostAction::None
+        }
+        Action::SidebarRemove => {
+            let Some(project_id) = app.sidebar_selected_id() else {
+                return PostAction::None;
+            };
+            if project_id == app.focused_project {
+                app.set_warning("Can't remove the open project, switch to another one first");
+                return PostAction::None;
+            }
+            let name = app.project_display_name(&project_id);
+            app.start_confirm(
+                format!("Remove '{name}' from the project list? Files stay on disk (y/n)"),
+                ConfirmAction::RemoveProject { project_id },
+            );
+            PostAction::None
+        }
         Action::ShowHelp => {
             app.open_help();
             PostAction::None
@@ -2029,6 +2067,65 @@ fn handle_sidebar(app: &mut App, action: Action) -> PostAction {
             PostAction::None
         }
         _ => PostAction::None,
+    }
+}
+
+fn handle_sidebar_rename(app: &mut App, action: Action) {
+    let Some(rename) = app.sidebar.as_mut().and_then(|s| s.rename.as_mut()) else {
+        app.input_mode = InputMode::Sidebar;
+        return;
+    };
+    match action {
+        Action::SearchChar(c) => rename.buffer.push(c),
+        Action::SearchBackspace => {
+            rename.buffer.pop();
+        }
+        Action::SearchCancel => end_sidebar_rename(app),
+        Action::SearchConfirm => {
+            let name = rename.buffer.trim().to_string();
+            let project_id = rename.project_id.clone();
+            if name.is_empty() {
+                app.set_warning("Project name can't be empty");
+                return;
+            }
+            let Some(project) = app.find_project(&project_id) else {
+                end_sidebar_rename(app);
+                return;
+            };
+            // Renaming back to the config name clears the label, so later
+            // config.toml edits show up again.
+            let label = Some(name.as_str()).filter(|name| *name != project.config.project_name);
+            // Errors keep the field open so the name can be fixed.
+            match crate::global_config::set_project_label(&project_id, label) {
+                Ok(entries) => {
+                    app.sync_with_registry(&entries);
+                    end_sidebar_rename(app);
+                }
+                Err(e) => app.set_error(format!("Rename failed: {e}")),
+            }
+        }
+        _ => {}
+    }
+}
+
+fn end_sidebar_rename(app: &mut App) {
+    if let Some(sidebar) = app.sidebar.as_mut() {
+        sidebar.rename = None;
+    }
+    app.input_mode = InputMode::Sidebar;
+}
+
+fn unregister_sidebar_project(app: &mut App, project_id: ProjectId) {
+    let name = app.project_display_name(&project_id);
+    match crate::global_config::unregister_project(&project_id) {
+        Ok(_) => {
+            app.remove_projects(&[project_id]);
+            app.show_message(
+                format!("Removed '{name}' from the project list"),
+                MessageKind::Info,
+            );
+        }
+        Err(e) => app.set_error(format!("Failed to remove '{name}': {e}")),
     }
 }
 
@@ -2087,6 +2184,9 @@ fn handle_confirm(
                             result
                         },
                     ),
+                    ConfirmAction::RemoveProject { project_id } => {
+                        unregister_sidebar_project(app, project_id)
+                    }
                     ConfirmAction::ArchiveIssue {
                         issue_ids,
                         project_id,
@@ -4378,6 +4478,229 @@ mod tests {
 
         let post = handle_sidebar(&mut app, Action::SidebarSelect);
         assert!(matches!(post, PostAction::None));
+    }
+
+    fn register_test_projects(app: &App) {
+        for project in &app.projects {
+            crate::global_config::register_project(
+                &project.config.project_name,
+                &project.config.project_root,
+            )
+            .unwrap();
+        }
+    }
+
+    fn open_sidebar(app: &mut App, selected: usize) {
+        let sidebar = app.sidebar.as_mut().unwrap();
+        sidebar.visible = true;
+        sidebar.focused = true;
+        sidebar.selected = selected;
+        app.input_mode = InputMode::Sidebar;
+    }
+
+    #[test]
+    fn sidebar_move_persists_order() {
+        crate::global_config::tests::with_temp_config("sidebar-move", || {
+            let mut app = test_multi_app();
+            register_test_projects(&app);
+            open_sidebar(&mut app, 2);
+
+            handle_sidebar(&mut app, Action::SidebarMoveUp);
+
+            let names: Vec<String> = crate::global_config::list_projects()
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect();
+            assert_eq!(names, ["alpha", "gamma", "beta"]);
+            assert_eq!(app.sidebar.as_ref().unwrap().selected, 1);
+        });
+    }
+
+    #[test]
+    fn sidebar_move_at_edge_saves_nothing() {
+        crate::global_config::tests::with_temp_config("sidebar-move-edge", || {
+            let mut app = test_multi_app();
+            open_sidebar(&mut app, 0);
+
+            handle_sidebar(&mut app, Action::SidebarMoveUp);
+
+            assert!(crate::global_config::list_projects().is_empty());
+            assert_eq!(app.sidebar.as_ref().unwrap().selected, 0);
+            assert!(app.message.is_none());
+        });
+    }
+
+    fn rename_buffer(app: &mut App) -> &mut String {
+        &mut app
+            .sidebar
+            .as_mut()
+            .unwrap()
+            .rename
+            .as_mut()
+            .unwrap()
+            .buffer
+    }
+
+    #[test]
+    fn sidebar_rename_saves_label() {
+        crate::global_config::tests::with_temp_config("sidebar-rename", || {
+            let mut app = test_multi_app();
+            register_test_projects(&app);
+            open_sidebar(&mut app, 1);
+
+            handle_sidebar(&mut app, Action::SidebarRename);
+            assert_eq!(app.input_mode, InputMode::SidebarRename);
+            assert_eq!(rename_buffer(&mut app), "beta");
+
+            handle_sidebar_rename(&mut app, Action::SearchBackspace);
+            assert_eq!(rename_buffer(&mut app), "bet");
+            rename_buffer(&mut app).clear();
+            for c in "  Bee ".chars() {
+                handle_sidebar_rename(&mut app, Action::SearchChar(c));
+            }
+            handle_sidebar_rename(&mut app, Action::SearchConfirm);
+
+            assert_eq!(app.input_mode, InputMode::Sidebar);
+            assert!(app.sidebar.as_ref().unwrap().rename.is_none());
+            assert_eq!(app.projects[1].display_name(), "Bee");
+            assert_eq!(app.projects[1].config.project_name, "beta");
+            let entry = &crate::global_config::list_projects()[1];
+            assert_eq!(entry.name, "beta");
+            assert_eq!(entry.label.as_deref(), Some("Bee"));
+        });
+    }
+
+    #[test]
+    fn sidebar_rename_to_config_name_clears_label() {
+        crate::global_config::tests::with_temp_config("sidebar-rename-clear", || {
+            let mut app = test_multi_app();
+            register_test_projects(&app);
+            crate::global_config::set_project_label(&app.projects[1].id(), Some("Bee")).unwrap();
+            app.sync_with_registry(&crate::global_config::list_projects());
+            open_sidebar(&mut app, 1);
+
+            handle_sidebar(&mut app, Action::SidebarRename);
+            *rename_buffer(&mut app) = "beta".into();
+            handle_sidebar_rename(&mut app, Action::SearchConfirm);
+
+            assert_eq!(app.projects[1].label, None);
+            assert_eq!(crate::global_config::list_projects()[1].label, None);
+        });
+    }
+
+    #[test]
+    fn sidebar_rename_keeps_target_when_list_shifts() {
+        crate::global_config::tests::with_temp_config("sidebar-rename-shift", || {
+            let mut app = test_multi_app();
+            register_test_projects(&app);
+            open_sidebar(&mut app, 1);
+            let beta_id = app.projects[1].id();
+
+            handle_sidebar(&mut app, Action::SidebarRename);
+            // A reload moves the cursor off beta while the field is open.
+            app.sidebar.as_mut().unwrap().selected = 2;
+            *rename_buffer(&mut app) = "Bee".into();
+            handle_sidebar_rename(&mut app, Action::SearchConfirm);
+
+            assert_eq!(app.find_project(&beta_id).unwrap().display_name(), "Bee");
+            assert_eq!(app.projects[2].display_name(), "gamma");
+        });
+    }
+
+    #[test]
+    fn sidebar_rename_rejects_empty_and_duplicate_names() {
+        crate::global_config::tests::with_temp_config("sidebar-rename-bad", || {
+            let mut app = test_multi_app();
+            register_test_projects(&app);
+            open_sidebar(&mut app, 1);
+
+            handle_sidebar(&mut app, Action::SidebarRename);
+            *rename_buffer(&mut app) = "   ".into();
+            handle_sidebar_rename(&mut app, Action::SearchConfirm);
+            assert_eq!(app.input_mode, InputMode::SidebarRename);
+
+            *rename_buffer(&mut app) = "gamma".into();
+            handle_sidebar_rename(&mut app, Action::SearchConfirm);
+            assert_eq!(app.input_mode, InputMode::SidebarRename);
+            assert_eq!(app.projects[1].display_name(), "beta");
+
+            handle_sidebar_rename(&mut app, Action::SearchCancel);
+            assert_eq!(app.input_mode, InputMode::Sidebar);
+            assert!(app.sidebar.as_ref().unwrap().rename.is_none());
+        });
+    }
+
+    #[test]
+    fn sidebar_remove_blocks_focused_project() {
+        let mut app = test_multi_app();
+        open_sidebar(&mut app, 0);
+
+        handle_sidebar(&mut app, Action::SidebarRemove);
+
+        assert_eq!(app.input_mode, InputMode::Sidebar);
+        assert!(app.pending_confirm.is_none());
+    }
+
+    #[test]
+    fn sidebar_remove_unregisters_after_confirm() {
+        crate::global_config::tests::with_temp_config("sidebar-remove", || {
+            let mut app = test_multi_app();
+            register_test_projects(&app);
+            open_sidebar(&mut app, 1);
+            let beta_id = app.projects[1].id();
+            let (tx, _rx) = mpsc::channel();
+            let ctx = app.action_context();
+
+            handle_sidebar(&mut app, Action::SidebarRemove);
+            assert_eq!(app.input_mode, InputMode::Confirm);
+            handle_confirm(&mut app, Action::ConfirmYes, &ctx, &tx);
+
+            assert_eq!(app.input_mode, InputMode::Sidebar);
+            assert!(app.find_project(&beta_id).is_none());
+            assert_eq!(crate::global_config::list_projects().len(), 2);
+        });
+    }
+
+    #[test]
+    fn sidebar_remove_visible_swimlane_drops_its_lane() {
+        crate::global_config::tests::with_temp_config("sidebar-remove-lane", || {
+            let mut app = test_multi_app();
+            register_test_projects(&app);
+            let alpha_id = app.projects[0].id();
+            let beta_id = app.projects[1].id();
+            let gamma_id = app.projects[2].id();
+            app.sidebar.as_mut().unwrap().swimlanes =
+                vec![alpha_id.clone(), beta_id.clone(), gamma_id.clone()];
+            app.focused_swimlane = 2;
+            open_sidebar(&mut app, 1);
+            let (tx, _rx) = mpsc::channel();
+            let ctx = app.action_context();
+
+            handle_sidebar(&mut app, Action::SidebarRemove);
+            handle_confirm(&mut app, Action::ConfirmYes, &ctx, &tx);
+
+            assert_eq!(
+                app.sidebar.as_ref().unwrap().swimlanes,
+                vec![alpha_id, gamma_id.clone()]
+            );
+            // The focused lane follows gamma to its new position.
+            assert_eq!(app.focused_swimlane, 1);
+            assert_eq!(app.active_project_id(), gamma_id);
+        });
+    }
+
+    #[test]
+    fn sidebar_remove_cancel_returns_to_sidebar() {
+        let mut app = test_multi_app();
+        open_sidebar(&mut app, 1);
+        let (tx, _rx) = mpsc::channel();
+        let ctx = app.action_context();
+
+        handle_sidebar(&mut app, Action::SidebarRemove);
+        handle_confirm(&mut app, Action::ConfirmNo, &ctx, &tx);
+
+        assert_eq!(app.input_mode, InputMode::Sidebar);
+        assert_eq!(app.projects.len(), 3);
     }
 
     #[test]

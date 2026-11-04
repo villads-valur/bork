@@ -48,15 +48,14 @@ pub fn render_board(
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let separator = "\u{2500}".repeat(
-            area.width
-                .saturating_sub(project.config.project_name.len() as u16 + 4) as usize,
+        let title = Span::styled(
+            format!("\u{2500}\u{2500} {} ", project.display_name()),
+            name_style,
         );
+        // Display width, not bytes: names can hold non-ASCII characters.
+        let separator = "\u{2500}".repeat(area.width.saturating_sub(title.width() as u16) as usize);
         let header_line = Line::from(vec![
-            Span::styled(
-                format!("\u{2500}\u{2500} {} ", project.config.project_name),
-                name_style,
-            ),
+            title,
             Span::styled(separator, Style::default().fg(border_color)),
         ]);
         frame.render_widget(Paragraph::new(header_line), header_area);

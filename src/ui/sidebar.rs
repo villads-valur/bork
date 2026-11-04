@@ -57,7 +57,7 @@ pub fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
 
             let has_ports = project.has_listening_ports();
 
-            let name = &project.config.project_name;
+            let name = project.display_name();
             // The 🔌 is 2 cells wide plus a leading space; reserve room so the
             // name truncation never pushes the icon past the sidebar edge.
             let port_reserve = if has_ports { 3 } else { 0 };

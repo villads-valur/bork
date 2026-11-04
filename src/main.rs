@@ -1156,7 +1156,12 @@ fn run_project_command(command: ProjectCommand) -> anyhow::Result<()> {
                 println!("Run 'bork init' or 'bork project add' to register a project.");
             } else {
                 for entry in &projects {
-                    println!("  {} ({})", entry.name, entry.path.display());
+                    match &entry.label {
+                        Some(label) => {
+                            println!("  {} [{}] ({})", label, entry.name, entry.path.display())
+                        }
+                        None => println!("  {} ({})", entry.name, entry.path.display()),
+                    }
                 }
             }
             Ok(())
@@ -1548,7 +1553,7 @@ fn resolve_start_project_root(project: Option<&str>) -> anyhow::Result<PathBuf> 
     global_config::prune_stale_projects();
     global_config::list_projects()
         .into_iter()
-        .find(|entry| entry.name == project)
+        .find(|entry| entry.name == project || entry.label.as_deref() == Some(project))
         .map(|entry| entry.path)
         .ok_or_else(|| anyhow::anyhow!("Project '{}' not found", project))
 }
@@ -2186,7 +2191,8 @@ fn run_tui() -> anyhow::Result<()> {
     let _ = global_config::register_if_absent(&app.project().config.project_name, &current_root);
     let current_canonical =
         std::fs::canonicalize(&current_root).unwrap_or_else(|_| current_root.clone());
-    for entry in &global_config::load_global_config().projects {
+    let registry = global_config::list_projects();
+    for entry in &registry {
         let canonical = std::fs::canonicalize(&entry.path).unwrap_or_else(|_| entry.path.clone());
         if canonical == current_canonical || !entry.path.join(".bork").join("config.toml").exists()
         {
@@ -2196,7 +2202,12 @@ fn run_tui() -> anyhow::Result<()> {
         let proj_state = config::load_state(&entry.path);
         app.add_background_project(proj_config, proj_state);
     }
+    app.sync_with_registry(&registry);
     app.enable_sidebar();
+    let _ = execute!(
+        terminal.backend_mut(),
+        SetTitle(format!("bork: {}", app.project().display_name()))
+    );
 
     // Clean up tmp files left behind by writers that crashed mid-save.
     for project in &app.projects {
@@ -2336,7 +2347,7 @@ fn run_tui() -> anyhow::Result<()> {
                                     &mut terminal,
                                     &session_name,
                                     &popup_title,
-                                    &app.project().config.project_name,
+                                    app.project().display_name(),
                                     &shared.poll_suspended,
                                 )?;
                                 app.message = None;
@@ -2356,7 +2367,7 @@ fn run_tui() -> anyhow::Result<()> {
                                 if let Some(edited) = open_external_editor(
                                     &mut terminal,
                                     &initial_content,
-                                    &app.project().config.project_name,
+                                    app.project().display_name(),
                                     &shared.poll_suspended,
                                 )? {
                                     if let Some(dialog) = app.dialog.as_mut() {
@@ -2404,14 +2415,11 @@ fn run_tui() -> anyhow::Result<()> {
                                     }
                                     let _ = execute!(
                                         terminal.backend_mut(),
-                                        SetTitle(format!(
-                                            "bork: {}",
-                                            app.project().config.project_name
-                                        ))
+                                        SetTitle(format!("bork: {}", app.project().display_name()))
                                     );
                                     app.set_message(format!(
                                         "Switched to {}",
-                                        app.project().config.project_name
+                                        app.project().display_name()
                                     ));
                                 }
                             }
@@ -2530,7 +2538,7 @@ fn run_tui() -> anyhow::Result<()> {
                 &mut terminal,
                 &session_name,
                 &popup_title,
-                &app.project().config.project_name,
+                app.project().display_name(),
                 &shared.poll_suspended,
             )?;
             app.message = None;
@@ -2743,7 +2751,7 @@ fn run_tui() -> anyhow::Result<()> {
 
         while let Ok(result) = reload_rx.try_recv() {
             if !result.is_empty() {
-                app.apply_reload_result(result);
+                app.apply_reload_result(result, &global_config::list_projects());
                 needs_redraw = true;
             }
         }
@@ -2908,7 +2916,7 @@ fn open_tmux_popup(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     session_name: &str,
     title: &str,
-    project_name: &str,
+    display_name: &str,
     suspended: &AtomicBool,
 ) -> anyhow::Result<()> {
     let _guard = SuspendGuard::new(suspended);
@@ -2922,7 +2930,7 @@ fn open_tmux_popup(
     execute!(
         terminal.backend_mut(),
         EnterAlternateScreen,
-        SetTitle(format!("bork: {}", project_name))
+        SetTitle(format!("bork: {}", display_name))
     )?;
     push_kitty_flags(terminal.backend_mut());
     terminal.clear()?;
@@ -2933,7 +2941,7 @@ fn open_tmux_popup(
 fn open_external_editor(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     initial_content: &str,
-    project_name: &str,
+    display_name: &str,
     suspended: &AtomicBool,
 ) -> anyhow::Result<Option<String>> {
     let _guard = SuspendGuard::new(suspended);
@@ -2957,7 +2965,7 @@ fn open_external_editor(
     execute!(
         terminal.backend_mut(),
         EnterAlternateScreen,
-        SetTitle(format!("bork: {}", project_name))
+        SetTitle(format!("bork: {}", display_name))
     )?;
     push_kitty_flags(terminal.backend_mut());
     terminal.clear()?;
@@ -3035,6 +3043,25 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn project_flag_resolves_by_name_or_label() {
+        global_config::tests::with_temp_config("resolve-label", || {
+            let dir =
+                std::env::temp_dir().join(format!("bork-resolve-label-{}", std::process::id()));
+            std::fs::create_dir_all(dir.join(".bork")).unwrap();
+            std::fs::write(dir.join(".bork/config.toml"), "project_name = \"api\"\n").unwrap();
+            global_config::register_project("api", &dir).unwrap();
+            global_config::set_project_label(&dir, Some("Backend")).unwrap();
+            let root = std::fs::canonicalize(&dir).unwrap();
+
+            assert_eq!(resolve_start_project_root(Some("api")).unwrap(), root);
+            assert_eq!(resolve_start_project_root(Some("Backend")).unwrap(), root);
+            assert!(resolve_start_project_root(Some("nope")).is_err());
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
 
     #[test]
     fn toml_literal_escapes_control_chars_for_roundtrip() {
