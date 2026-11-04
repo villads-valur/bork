@@ -15,7 +15,7 @@ Main Thread (50ms tick event loop)
 ├── Shared workers (one each, app-wide)
 │   ├── Tmux Session Worker (polls every 2s - one global `tmux list-sessions`)
 │   ├── Port Poll Worker (polls every 10s - listening TCP ports via lsof/ps)
-│   ├── Linear Worker (polls every 45s - assigned Linear issues, conditional on `linear` CLI)
+│   ├── Linear Worker (polls every 45s - assigned Linear issues + open projects, conditional on `linear` CLI)
 │   ├── tuicr Draft Worker (polls every 10s - unposted tuicr comments, conditional on `tuicr`)
 │   ├── Activity Poller (polls every 5s - agent status dirs for all registered projects)
 │   └── Update Check Worker (every 6h - new-version banner, plus cache mtime poll every 2s)
@@ -80,7 +80,7 @@ src/
 │   │   └── setup.rs    # Worktree setup-script runner
 │   ├── git.rs        # Git worktree status polling
 │   ├── github.rs     # GitHub PR polling via gh api graphql (per-repo identity cache)
-│   ├── linear.rs     # Linear CLI integration (assigned issues via graphql)
+│   ├── linear.rs     # Linear CLI integration (assigned issues and projects via graphql)
 │   └── hooks.rs      # Shared hook install/uninstall helpers; install()/uninstall() iterate the registry
 └── ui/
     ├── mod.rs         # Root render, layout composition, swimlane splitting
@@ -89,7 +89,7 @@ src/
     ├── sidebar.rs     # Project sidebar with activity markers
     ├── dialog.rs      # New/edit issue dialog overlay
     ├── help.rs        # Help overlay (keybinding reference popup)
-    ├── linear_picker.rs # Import picker for Linear issues and GitHub PRs
+    ├── linear_picker.rs # Import picker for Linear issues, Linear projects, and GitHub PRs
     ├── status_bar.rs  # Header + footer (swimlane indicator)
     └── styles.rs      # Colors, styles, shared UI utilities (ANSI 16 only)
 ```
@@ -163,7 +163,7 @@ The binary is symlinked to `/opt/homebrew/bin/bork`.
 
 - `Agentic` (default) — launches a coding agent in a tmux session, usually in its own worktree
 - `NonAgentic` ("Todo") — plain checklist card, never launches an agent; Enter opens the edit dialog
-- `Orchestrator` — launches a coordinating agent at the project root with no worktree and no GitHub PR field. Its prompt comes from `orchestrator_prompt` (project overrides global, falls back to `DEFAULT_ORCHESTRATOR_PROMPT` in config.rs) instead of `default_prompt`, and bork appends the planning file path `plans/{issue-id}/planning.md`. The agent breaks the goal into issues, spawns them via `bork issue start`, and monitors/nudges their agents via `bork issue list --json` and tmux. Cards render with a magenta border and an `◆ orch` badge. `IssueKind::is_agentic()` is true for both `Agentic` and `Orchestrator`. Kind changes go through `Issue::set_kind()`, which clears all agent sessions when crossing the orchestrator boundary and additionally drops the worktree and PR links when becoming an orchestrator (`bork integration attach-pr` also rejects orchestrators).
+- `Orchestrator` — launches a coordinating agent at the project root with no worktree and no GitHub PR field. Its prompt comes from `orchestrator_prompt` (project overrides global, falls back to `DEFAULT_ORCHESTRATOR_PROMPT` in config.rs) instead of `default_prompt`, and bork appends the planning file path `plans/{issue-id}/planning.md`. The agent breaks the goal into issues, spawns them via `bork issue start`, and monitors/nudges their agents via `bork issue list --json` and tmux. Cards render with a magenta border and an `◆ orch` badge. `IssueKind::is_agentic()` is true for both `Agentic` and `Orchestrator`. Kind changes go through `Issue::set_kind()`, which clears all agent sessions when crossing the orchestrator boundary and additionally drops the worktree and PR links when becoming an orchestrator (`bork integration attach-pr` also rejects orchestrators). Only orchestrators carry Linear projects (`Issue.linear_projects`): leaving the kind drops them, `bork integration attach-linear-project` rejects other kinds, the dialog's Projects field only appears for orchestrators, and the picker's Projects tab is offered when attaching only if the dialog is an orchestrator (importing a project from it always creates an orchestrator, so the tab shows in import mode for any card). Linked projects are appended to the orchestrator prompt as context (read the project; link tickets via `--linear` when a spawned issue covers one), not as a backlog to work through.
 
 ## Agent Sessions
 
@@ -174,6 +174,7 @@ Each `Issue` stores agent session IDs in `sessions: BTreeMap<AgentKind, String>`
 Each `Issue` can link to multiple Linear issues and GitHub PRs via Vec fields:
 
 - `linear_links: Vec<LinkedLinear>` — each has `id`, `identifier`, `url`, `imported`
+- `linear_projects: Vec<LinkedLinearProject>` — orchestrators only; each has `id`, `slug` (Linear `slugId`), `name`, `url`, `imported`
 - `github_pr_links: Vec<LinkedGithubPr>` — each has `number`, `imported`, `import_source`
 
 Legacy singular fields (`linear_id`, `pr_number`, etc.) are kept for deserialization backward compat but marked `#[serde(skip_serializing)]`. Migration happens automatically in `load_state()`.

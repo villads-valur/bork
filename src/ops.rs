@@ -408,6 +408,14 @@ pub fn show_issue(project_root: &Path, issue_id: &str, json: bool) -> anyhow::Re
         let ids: Vec<&str> = issue.linear_identifiers();
         let _ = writeln!(out, "Linear:   {}", ids.join(", "));
     }
+    if !issue.linear_projects.is_empty() {
+        let names: Vec<&str> = issue
+            .linear_projects
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        let _ = writeln!(out, "Projects: {}", names.join(", "));
+    }
     if !issue.github_pr_links.is_empty() {
         let nums: Vec<String> = issue
             .pr_numbers()
@@ -504,6 +512,59 @@ pub fn detach_linear(
     issue.linear_links.retain(|l| l.identifier != identifier);
     if issue.linear_links.len() == before {
         anyhow::bail!("Issue '{}' has no Linear link '{}'", issue.id, identifier);
+    }
+
+    let updated = issue.clone();
+    config::save_state(&state, project_root)?;
+
+    Ok(updated)
+}
+
+pub fn attach_linear_project(
+    project_root: &Path,
+    issue_id: &str,
+    project: crate::types::LinkedLinearProject,
+) -> anyhow::Result<Issue> {
+    let mut state = config::load_state(project_root);
+
+    let idx = find_issue_index(&state.issues, issue_id)
+        .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", issue_id))?;
+
+    let issue = &mut state.issues[idx];
+
+    if !issue.kind.links_linear_projects() {
+        anyhow::bail!(
+            "Cannot attach a Linear project to '{}': only orchestrator issues have project links",
+            issue.id
+        );
+    }
+
+    if !issue.linear_projects.iter().any(|p| p.id == project.id) {
+        issue.linear_projects.push(project);
+    }
+
+    let updated = issue.clone();
+    config::save_state(&state, project_root)?;
+
+    Ok(updated)
+}
+
+pub fn detach_linear_project(
+    project_root: &Path,
+    issue_id: &str,
+    slug: &str,
+) -> anyhow::Result<Issue> {
+    let mut state = config::load_state(project_root);
+
+    let idx = find_issue_index(&state.issues, issue_id)
+        .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", issue_id))?;
+
+    let issue = &mut state.issues[idx];
+
+    let before = issue.linear_projects.len();
+    issue.linear_projects.retain(|p| p.slug != slug);
+    if issue.linear_projects.len() == before {
+        anyhow::bail!("Issue '{}' has no Linear project '{}'", issue.id, slug);
     }
 
     let updated = issue.clone();

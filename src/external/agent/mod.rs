@@ -390,6 +390,19 @@ fn build_agent_cmd(
                 issue.id
             ));
         }
+        if issue.kind == IssueKind::Orchestrator && issue.has_linear() {
+            prompt.push_str(LINEAR_TICKET_UPDATES);
+        }
+        if issue.kind.links_linear_projects() && !issue.linear_projects.is_empty() {
+            append_section(
+                &mut prompt,
+                &issue.linear_projects,
+                "Linear project",
+                "Linear projects",
+                |project| format!("{} - {}", project.name, project.url),
+            );
+            prompt.push_str(LINEAR_PROJECT_CONTEXT);
+        }
         prompt
     };
 
@@ -609,6 +622,12 @@ pub(crate) fn is_uuid_like(value: &str) -> bool {
         }
     })
 }
+
+const LINEAR_TICKET_UPDATES: &str =
+    "\n\nKeep the linked Linear tickets updated as milestones complete.";
+
+const LINEAR_PROJECT_CONTEXT: &str = "\n\nFor context on the goal, read each linked Linear project's description, documents, milestones, and tickets, using the Linear MCP or the `linear` CLI. \
+If an issue you start covers one of its tickets, pass `--linear <TICKET-ID>` to `bork issue start` to link it.";
 
 /// Build the full prompt sent to the agent.
 /// Always starts with issue context and the default prompt, then optionally

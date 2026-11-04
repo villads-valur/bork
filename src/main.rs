@@ -377,13 +377,15 @@ fn spawn_linear_worker(
 
     thread::spawn(move || loop {
         wait_while_suspended(&suspended);
-        let result = match external::linear::fetch_assigned_issues() {
-            Ok(issues) => LinearPollResult {
+        let result = match external::linear::fetch_poll() {
+            Ok((issues, projects)) => LinearPollResult {
                 issues,
+                projects,
                 error: None,
             },
             Err(e) => LinearPollResult {
                 issues: Vec::new(),
+                projects: Vec::new(),
                 error: Some(e.to_string()),
             },
         };
@@ -791,6 +793,10 @@ enum IssueCommand {
         /// to the spawning issue when run from inside an agent session.
         #[arg(long)]
         link: Option<String>,
+
+        /// Linear ticket to link before the agent starts (e.g. VIL-123)
+        #[arg(long)]
+        linear: Option<String>,
     },
 
     /// Update an existing issue
@@ -904,6 +910,24 @@ enum IntegrationCommand {
 
         /// GitHub PR number
         pr_number: u32,
+    },
+
+    /// Link a Linear project to an orchestrator issue
+    AttachLinearProject {
+        /// Issue ID (e.g. bork-1)
+        issue_id: String,
+
+        /// Linear project URL or slug (e.g. https://linear.app/acme/project/auth-1a2b3c4d5e6f)
+        project: String,
+    },
+
+    /// Unlink a Linear project from an issue
+    DetachLinearProject {
+        /// Issue ID (e.g. bork-1)
+        issue_id: String,
+
+        /// Linear project URL or slug
+        project: String,
     },
 
     /// Remove all Linear links from an issue
@@ -1376,6 +1400,7 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
             base,
             project,
             link,
+            linear,
         } => {
             let project_root = resolve_start_project_root(project.as_deref())?;
             let report = start_issue(
@@ -1390,6 +1415,7 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
                     no_worktree,
                     base_branch: base,
                     link,
+                    linear,
                 },
             )?;
             println!("Started {}: \"{}\"", report.issue_id, report.title);
@@ -1523,6 +1549,8 @@ struct StartIssueOptions {
     /// Explicit issue id to link the new issue to. Falls back to `BORK_ISSUE_ID`
     /// (the spawning agent's issue) when None.
     link: Option<String>,
+    /// Linear ticket identifier to link before launch.
+    linear: Option<String>,
 }
 
 struct StartIssueReport {
@@ -1578,6 +1606,10 @@ fn start_issue(project_root: &Path, opts: StartIssueOptions) -> anyhow::Result<S
             kind: Some(IssueKind::Agentic),
         },
     )?;
+    // Linked before launch so the ticket lands in the agent's prompt.
+    if let Some(identifier) = opts.linear.as_deref() {
+        issue = ops::attach_linear(project_root, &issue.id, identifier)?;
+    }
 
     let worktree_dir = if opts.no_worktree {
         None
@@ -1676,8 +1708,22 @@ fn run_integration_command(command: IntegrationCommand) -> anyhow::Result<()> {
             println!(
                 "Linked {} to Linear {}",
                 issue.id,
-                issue.linear_identifier.as_deref().unwrap_or("?")
+                linear_identifier.to_uppercase()
             );
+            Ok(())
+        }
+        IntegrationCommand::AttachLinearProject { issue_id, project } => {
+            let found = external::linear::fetch_project(&project)?;
+            let issue = ops::attach_linear_project(&project_root, &issue_id, found.to_link(false))?;
+            println!("Linked {} to Linear project {}", issue.id, found.name);
+            Ok(())
+        }
+        IntegrationCommand::DetachLinearProject { issue_id, project } => {
+            let slug = external::linear::project_slug(&project).ok_or_else(|| {
+                anyhow::anyhow!("'{project}' is not a Linear project URL or slug")
+            })?;
+            let issue = ops::detach_linear_project(&project_root, &issue_id, &slug)?;
+            println!("Unlinked Linear project {} from {}", slug, issue.id);
             Ok(())
         }
         IntegrationCommand::AttachPr { args } => {
@@ -2692,7 +2738,16 @@ fn run_tui() -> anyhow::Result<()> {
                                 }
                             }
                         }
+                        let imported_project = issue
+                            .linear_projects
+                            .iter()
+                            .find(|p| p.imported)
+                            .and_then(|link| result.projects.iter().find(|p| p.id == link.id));
+                        if let Some(linear_project) = imported_project {
+                            issue.title = linear_project.name.clone();
+                        }
                     }
+                    project.live.linear_projects = result.projects.clone();
                 }
             }
         }

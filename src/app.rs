@@ -20,7 +20,7 @@ const MAX_CLEANUP_ATTEMPTS: u32 = 5;
 use crate::attention::Attention;
 use crate::config::{AppConfig, AppState, DEFAULT_REVIEW_PROMPT};
 use crate::external::git::PollClass;
-use crate::external::linear::LinearIssue;
+use crate::external::linear::{LinearIssue, LinearProject};
 use crate::prune::{PruneAction, PruneCandidate};
 use crate::types::{
     AgentKind, AgentStatus, AgentStatusInfo, ChecksStatus, Column, GithubStack, Issue, IssueKind,
@@ -80,6 +80,7 @@ pub struct LiveState {
     pub frozen_worktree_statuses: HashMap<String, WorktreeStatus>,
     pub frozen_worktree_branches: HashMap<String, String>,
     pub linear_issues: Vec<LinearIssue>,
+    pub linear_projects: Vec<LinearProject>,
     pub user_prs: Vec<PrStatus>,
     pub review_requested_prs: Vec<PrStatus>,
     pub review_stacks: Option<HashMap<u32, Option<u32>>>,
@@ -1567,6 +1568,18 @@ impl Project {
             .collect()
     }
 
+    pub fn filtered_linear_projects<'a>(
+        &'a self,
+        picker: &LinearPickerState,
+    ) -> Vec<&'a LinearProject> {
+        let query = picker.search.to_lowercase();
+        self.live
+            .linear_projects
+            .iter()
+            .filter(|p| query.is_empty() || p.name.to_lowercase().contains(&query))
+            .collect()
+    }
+
     pub fn filtered_github_prs<'a>(
         &'a self,
         picker: &LinearPickerState,
@@ -1804,7 +1817,18 @@ pub enum LinearPickerContext {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportSource {
     Linear,
+    LinearProject,
     GitHub,
+}
+
+impl ImportSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Linear => "Linear",
+            Self::LinearProject => "Projects",
+            Self::GitHub => "GitHub",
+        }
+    }
 }
 
 pub use crate::dialog_state::{DialogField, DialogState};
@@ -1837,6 +1861,7 @@ fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
         pruned_at: _,
         setup_ran: _,
         linear_links: _,
+        linear_projects: _,
         github_pr_links: _,
         github_stack: _,
         pr_import_baseline: _,
@@ -1882,6 +1907,7 @@ fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
     merge_field!(pruned_at);
     merge_field!(setup_ran);
     merge_field!(linear_links);
+    merge_field!(linear_projects);
     merge_field!(github_pr_links);
     merge_field!(github_stack);
     merge_field!(pr_import_baseline);
@@ -1919,6 +1945,13 @@ fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
     // orchestrator's session) is newer than the file's empty map.
     if file_crossed_boundary && !memory_crossed_boundary && memory.kind == file.kind {
         memory.sessions = file.sessions.clone();
+    }
+
+    // Kind and projects merge separately, so a kind change on one side and a
+    // project attach on the other could combine into projects on an issue
+    // that can't carry them.
+    if !memory.kind.links_linear_projects() {
+        memory.linear_projects.clear();
     }
 }
 
@@ -2349,23 +2382,18 @@ impl App {
         context: LinearPickerContext,
         ctx: &ActionContext,
     ) {
-        let p = self.context_project(ctx);
-        let has_linear = !p.live.linear_issues.is_empty();
-        let has_github = p.can_browse_github();
-
-        if !has_linear && !has_github {
-            if p.linear_available {
+        let tabs = self.picker_tabs_for(self.context_project(ctx), context);
+        let Some(&first_tab) = tabs.first() else {
+            if self.context_project(ctx).linear_available {
                 self.set_warning("No issues loaded yet");
             } else {
                 self.set_warning("No import sources available");
             }
             return;
-        }
+        };
 
-        if self.picker_tab == ImportSource::Linear && !has_linear {
-            self.picker_tab = ImportSource::GitHub;
-        } else if self.picker_tab == ImportSource::GitHub && !has_github {
-            self.picker_tab = ImportSource::Linear;
+        if !tabs.contains(&self.picker_tab) {
+            self.picker_tab = first_tab;
         }
 
         self.message = None;
@@ -2405,6 +2433,45 @@ impl App {
             return Vec::new();
         };
         self.active_project().filtered_linear_issues(picker)
+    }
+
+    pub fn filtered_linear_projects(&self) -> Vec<&LinearProject> {
+        let Some(picker) = &self.linear_picker else {
+            return Vec::new();
+        };
+        self.active_project().filtered_linear_projects(picker)
+    }
+
+    /// Tabs the open picker can show, in display order.
+    pub fn picker_tabs(&self) -> Vec<ImportSource> {
+        self.picker_tabs_for(self.active_project(), self.linear_picker_context)
+    }
+
+    /// Sources with something to pick. Projects can only be attached from an
+    /// orchestrator's dialog, since only orchestrators carry project links.
+    fn picker_tabs_for(
+        &self,
+        project: &Project,
+        context: LinearPickerContext,
+    ) -> Vec<ImportSource> {
+        let projects_allowed = match context {
+            LinearPickerContext::Import => true,
+            LinearPickerContext::Attach => self
+                .dialog
+                .as_ref()
+                .is_some_and(|d| d.kind.links_linear_projects()),
+        };
+        let mut tabs = Vec::new();
+        if !project.live.linear_issues.is_empty() {
+            tabs.push(ImportSource::Linear);
+        }
+        if projects_allowed && !project.live.linear_projects.is_empty() {
+            tabs.push(ImportSource::LinearProject);
+        }
+        if project.can_browse_github() {
+            tabs.push(ImportSource::GitHub);
+        }
+        tabs
     }
 
     pub fn filtered_github_prs(&self) -> Vec<GithubPickerEntry<'_>> {
@@ -4646,6 +4713,7 @@ mod tests {
             vec![
                 DialogField::Kind,
                 DialogField::Linear,
+                DialogField::LinearProject,
                 DialogField::Agent,
                 DialogField::Mode,
                 DialogField::Title,
@@ -7171,6 +7239,15 @@ mod tests {
             requested_prs: vec![42],
             generated_prompt: "review stack".into(),
         });
+        issue
+            .linear_projects
+            .push(crate::types::LinkedLinearProject {
+                id: "p".into(),
+                slug: "abc123".into(),
+                name: "Project".into(),
+                url: String::new(),
+                imported: false,
+            });
         let value = serde_json::to_value(&issue).expect("issue serializes");
         let object = value.as_object().expect("issue is a JSON object");
         let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
@@ -7190,6 +7267,7 @@ mod tests {
             "pruned_at",
             "setup_ran",
             "linear_links",
+            "linear_projects",
             "github_pr_links",
             "pr_import_baseline",
             "stack_review_import",

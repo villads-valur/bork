@@ -274,6 +274,19 @@ fn format_bottom_line(ctx: &CardContext, max_width: usize) -> Line<'static> {
         ));
         left.push(Span::raw(" "));
     }
+    let used = left.iter().map(Span::width).sum::<usize>() + comments_width;
+    if !issue.linear_projects.is_empty() && left_budget > used + 2 {
+        let names: Vec<&str> = issue
+            .linear_projects
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        left.push(Span::styled(
+            styles::truncate(&format!("▤ {}", names.join(", ")), left_budget - used),
+            Style::default().fg(Color::Blue),
+        ));
+        left.push(Span::raw(" "));
+    }
     if let Some(badge) = comments {
         left.push(badge);
     }

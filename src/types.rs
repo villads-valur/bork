@@ -185,6 +185,12 @@ impl IssueKind {
     pub fn is_agentic(self) -> bool {
         matches!(self, Self::Agentic | Self::Orchestrator)
     }
+
+    /// Whether this kind can link Linear projects. Single owner of the
+    /// "orchestrators only" rule the dialog, picker, CLI and prompt follow.
+    pub fn links_linear_projects(self) -> bool {
+        self == Self::Orchestrator
+    }
 }
 
 impl fmt::Display for IssueKind {
@@ -263,6 +269,18 @@ pub struct LinkedLinear {
     pub imported: bool,
 }
 
+/// A Linear project tied to an orchestrator issue. Projects have no
+/// `VIL-123`-style identifier; `slug` is the `slugId` from the project URL.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LinkedLinearProject {
+    pub id: String,
+    pub slug: String,
+    pub name: String,
+    pub url: String,
+    #[serde(default)]
+    pub imported: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LinkedGithubPr {
     pub number: u32,
@@ -325,6 +343,10 @@ pub struct Issue {
     // --- New multi-link fields ---
     #[serde(default)]
     pub linear_links: Vec<LinkedLinear>,
+    /// Linear projects this orchestrator drives. Only orchestrators carry
+    /// these; `set_kind` clears them when the issue leaves that kind.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub linear_projects: Vec<LinkedLinearProject>,
     #[serde(default)]
     pub github_pr_links: Vec<LinkedGithubPr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -398,6 +420,7 @@ impl Issue {
             pruned_at: None,
             setup_ran: false,
             linear_links: Vec::new(),
+            linear_projects: Vec::new(),
             github_pr_links: Vec::new(),
             github_stack: None,
             pr_import_baseline: None,
@@ -567,7 +590,8 @@ impl Issue {
     /// Crossing the orchestrator boundary drops all agent sessions (resuming
     /// any of them would skip the new kind's prompt); becoming an orchestrator
     /// also drops the worktree and PR links since orchestrators run at the
-    /// project root and have no PR of their own.
+    /// project root and have no PR of their own; leaving it drops Linear
+    /// project links, which only orchestrators carry.
     ///
     /// Returns `true` when the orchestrator boundary was crossed. Callers
     /// should then kill any live tmux session, since re-attaching it would
@@ -585,6 +609,8 @@ impl Issue {
             self.github_pr_links.clear();
             self.github_stack = None;
             self.stack_review_import = None;
+        } else {
+            self.linear_projects.clear();
         }
         true
     }

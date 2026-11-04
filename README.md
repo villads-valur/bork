@@ -144,6 +144,8 @@ bork --help
 | `bork issue archive <id>` | Kill session, run teardown, remove worktree, move to Done |
 | `bork issue delete <id>` | Delete an issue |
 | `bork integration attach-linear <id> <identifier>` | Link a Linear ticket to an issue (can attach multiple) |
+| `bork integration attach-linear-project <id> <url-or-slug>` | Link a Linear project to an orchestrator issue (can attach multiple) |
+| `bork integration detach-linear-project <id> <url-or-slug>` | Unlink a Linear project from an issue |
 | `bork integration attach-pr [id] <number>` | Link a GitHub PR to an issue (can attach multiple; `id` defaults to `BORK_ISSUE_ID` inside an agent session) |
 | `bork config list` | Show all resolved config values |
 | `bork config get <key>` | Print a resolved config value |
@@ -229,6 +231,9 @@ bork integration attach-linear bork-3 VIL-123   # link a Linear ticket
 bork integration attach-linear bork-3 VIL-456   # link another Linear ticket to the same issue
 bork integration attach-pr bork-3 42             # link a GitHub PR
 bork integration attach-pr bork-3 43             # link another PR to the same issue
+bork integration attach-linear-project bork-5 https://linear.app/acme/project/auth-1a2b3c4d5e6f
+                                                 # link a Linear project to an orchestrator
+bork issue start "Fix login" --linear VIL-789    # start an issue with a ticket already linked
 ```
 
 All commands must be run from within a bork project directory (any directory containing or nested under `.bork/`). Issue IDs are case-insensitive.
@@ -585,12 +590,13 @@ export LINEAR_API_KEY="lin_api_..."
 
 It belongs in your shell profile rather than `config.toml` — that file lives
 inside the project directory and is easy to commit by accident. bork only reads
-your assigned issues, so a read-scoped key is enough.
+your assigned issues and open projects, so a read-scoped key is enough.
 
-With a key set, bork polls your assigned issues every 45 seconds and enables:
+With a key set, bork polls your assigned issues and open projects every 45 seconds and enables:
 
 - **Import issues** &mdash; Press `I` to open a fuzzy-search picker of your assigned Linear issues. Imported issues use the Linear identifier as the bork issue ID (e.g. `BORK-14` becomes `bork-14`).
 - **Attach issues to a card** &mdash; In the issue dialog, the Linear field opens a multi-select picker; Enter toggles selection, Backspace removes the last item. `bork integration attach-linear <issue-id> <identifier>` does the same from the CLI, and one card can hold several Linear issues.
+- **Linear projects on orchestrators** &mdash; The picker's Projects tab imports a Linear project as an orchestrator issue named after it. On an orchestrator, the dialog's Projects field attaches more. The orchestrator's prompt lists its projects and tells it to read their description, documents, milestones and tickets for context, and to link a ticket with `bork issue start --linear <ticket>` when an issue it starts covers one. Only orchestrators carry projects; switching an issue to another kind drops them.
 - **Open in Linear** &mdash; Press `O` to open all linked Linear issues in your browser.
 - **State refresh** &mdash; Linear issue state is re-read on each poll cycle, and imported issues follow their Linear title. Nothing is written back to Linear.
 
