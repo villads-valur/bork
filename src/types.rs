@@ -739,6 +739,19 @@ pub enum MergeBlocker {
     Blocked,
 }
 
+/// Where an open PR stands in a merge queue, GitHub's own or Trunk's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MergeQueueState {
+    /// Waiting its turn, or passed and about to merge.
+    Queued,
+    /// The queue is running checks on it.
+    Testing,
+    /// The queue removed it after a failed run.
+    Failed,
+    /// Dequeued before it merged, by a person or by the queue.
+    Cancelled,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReviewDecision {
     Approved,
@@ -763,7 +776,7 @@ pub struct PrStatus {
     /// branch-keyed indexing since their branch names can collide with upstream.
     pub is_cross_repository: bool,
     pub merge_blocker: Option<MergeBlocker>,
-    pub in_merge_queue: bool,
+    pub merge_queue: Option<MergeQueueState>,
     /// Unresolved review threads (inline comments that can be resolved).
     #[serde(default)]
     pub unresolved_threads: u32,
@@ -844,7 +857,7 @@ mod tests {
             head_branch: "main".into(),
             is_cross_repository: false,
             merge_blocker: None,
-            in_merge_queue: false,
+            merge_queue: None,
             unresolved_threads: 0,
         };
         let cloned = pr.clone();

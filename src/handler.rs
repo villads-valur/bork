@@ -2556,7 +2556,7 @@ mod tests {
                 head_branch: format!("branch-{number}"),
                 is_cross_repository: false,
                 merge_blocker: None,
-                in_merge_queue: false,
+                merge_queue: None,
                 unresolved_threads: 0,
             };
             members.push(GithubStackPullRequest {
@@ -5044,7 +5044,7 @@ mod tests {
             head_branch: "feature".to_string(),
             is_cross_repository: false,
             merge_blocker: None,
-            in_merge_queue: false,
+            merge_queue: None,
             unresolved_threads: 0,
         };
         app.projects[0]
