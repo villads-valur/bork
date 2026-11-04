@@ -122,8 +122,8 @@ This sets the Linear identifier on the issue so the TUI can display the link and
 ### Link a Linear project (orchestrators only)
 
 ```bash
-bork integration attach-linear-project bork-1 https://linear.app/acme/project/auth-cc81bfd01639
-bork integration detach-linear-project bork-1 cc81bfd01639
+bork integration attach-linear-project bork-1 https://linear.app/acme/project/auth-1a2b3c4d5e6f
+bork integration detach-linear-project bork-1 1a2b3c4d5e6f
 ```
 
 Takes a project URL or slug. Fails on issues that aren't orchestrators.

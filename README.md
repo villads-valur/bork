@@ -231,7 +231,7 @@ bork integration attach-linear bork-3 VIL-123   # link a Linear ticket
 bork integration attach-linear bork-3 VIL-456   # link another Linear ticket to the same issue
 bork integration attach-pr bork-3 42             # link a GitHub PR
 bork integration attach-pr bork-3 43             # link another PR to the same issue
-bork integration attach-linear-project bork-5 https://linear.app/acme/project/auth-cc81bfd01639
+bork integration attach-linear-project bork-5 https://linear.app/acme/project/auth-1a2b3c4d5e6f
                                                  # link a Linear project to an orchestrator
 bork issue start "Fix login" --linear VIL-789    # start an issue with a ticket already linked
 ```

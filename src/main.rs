@@ -917,7 +917,7 @@ enum IntegrationCommand {
         /// Issue ID (e.g. bork-1)
         issue_id: String,
 
-        /// Linear project URL or slug (e.g. https://linear.app/acme/project/auth-cc81bfd01639)
+        /// Linear project URL or slug (e.g. https://linear.app/acme/project/auth-1a2b3c4d5e6f)
         project: String,
     },
 
