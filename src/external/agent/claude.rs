@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::external::hooks;
 use crate::types::AgentMode;
@@ -79,10 +79,9 @@ impl AgentProvider for Claude {
         }
     }
 
-    fn has_session(&self, _project_root: &Path, session_id: &str) -> bool {
-        projects_dir()
-            .and_then(|dir| transcript_exists(&dir, session_id))
-            .unwrap_or(true)
+    fn has_session(&self, session_id: &str) -> bool {
+        let projects_dir = hooks::claude_config_dir().join("projects");
+        transcript_exists(&projects_dir, session_id).unwrap_or(true)
     }
 
     fn install_hooks(&self) -> anyhow::Result<()> {
@@ -94,17 +93,8 @@ impl AgentProvider for Claude {
     }
 }
 
-/// Claude keeps transcripts in `<config dir>/projects/<encoded cwd>/<id>.jsonl`,
-/// with the config dir overridable via `CLAUDE_CONFIG_DIR`.
-fn projects_dir() -> Option<PathBuf> {
-    let config_dir = match std::env::var("CLAUDE_CONFIG_DIR") {
-        Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => PathBuf::from(std::env::var("HOME").ok()?).join(".claude"),
-    };
-    Some(config_dir.join("projects"))
-}
-
-/// Whether any project dir holds the transcript. Searches every dir rather
+/// Whether any project dir holds the transcript. Claude keeps them in
+/// `<config dir>/projects/<encoded cwd>/<id>.jsonl`. Searches every dir rather
 /// than re-deriving Claude's cwd encoding, which truncates long paths.
 /// `None` when the projects dir can't be read, so callers keep resuming.
 fn transcript_exists(projects_dir: &Path, session_id: &str) -> Option<bool> {

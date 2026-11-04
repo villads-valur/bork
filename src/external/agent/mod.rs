@@ -70,7 +70,7 @@ pub trait AgentProvider {
 
     /// Whether the agent can still resume `session_id`. Harnesses that can't
     /// tell return `true` so the stored session is kept.
-    fn has_session(&self, _project_root: &Path, _session_id: &str) -> bool {
+    fn has_session(&self, _session_id: &str) -> bool {
         true
     }
 
@@ -209,18 +209,10 @@ pub fn launch_session(issue: &Issue, config: &AppConfig) -> Result<LaunchOutcome
 
     // A stored session the agent no longer has (e.g. Claude cleaned up the
     // transcript) would fail to resume, so launch fresh instead.
-    let replaced_lost_session = issue
+    let resume_session = issue
         .current_session_id()
-        .is_some_and(|sid| !provider.has_session(cwd, sid));
-    let fresh_issue;
-    let issue = if replaced_lost_session {
-        let mut copy = issue.clone();
-        copy.sessions.remove(&copy.agent_kind);
-        fresh_issue = copy;
-        &fresh_issue
-    } else {
-        issue
-    };
+        .filter(|sid| provider.has_session(sid));
+    let replaced_lost_session = issue.current_session_id().is_some() && resume_session.is_none();
 
     tmux::create_session(&session_name, cwd)?;
 
@@ -232,6 +224,7 @@ pub fn launch_session(issue: &Issue, config: &AppConfig) -> Result<LaunchOutcome
 
     let (agent_cmd, pre_assigned_session_id, prompt_contents) = build_agent_cmd(
         issue,
+        resume_session,
         config,
         &session_name,
         status_dir_str,
@@ -366,6 +359,7 @@ fn write_prompt_file(path: &Path, contents: &str) -> Result<(), AppError> {
 /// caller) and `None` for resume sessions, which carry no prompt.
 fn build_agent_cmd(
     issue: &Issue,
+    resume_session: Option<&str>,
     config: &AppConfig,
     session_name: &str,
     status_dir_str: &str,
@@ -468,7 +462,7 @@ fn build_agent_cmd(
         trailing: &trailing,
         prompt_subst: &prompt_subst,
         prompt_cleanup: &prompt_cleanup,
-        current_session: issue.current_session_id(),
+        current_session: resume_session,
         build_prompt: &build_prompt_contents,
     };
 
@@ -1291,7 +1285,14 @@ mod tests {
         session: &str,
         status_dir: &str,
     ) -> (String, Option<String>, Option<String>) {
-        build_agent_cmd(issue, config, session, status_dir, TEST_PROMPT_PATH)
+        build_agent_cmd(
+            issue,
+            issue.current_session_id(),
+            config,
+            session,
+            status_dir,
+            TEST_PROMPT_PATH,
+        )
     }
 
     // --- OpenCode ---
@@ -1723,6 +1724,27 @@ mod tests {
         assert!(!cmd.contains("ses_abc123"));
         // Fresh launch for the new agent carries the full prompt.
         assert!(prompt.is_some());
+    }
+
+    #[test]
+    fn lost_session_launches_fresh() {
+        let issue = resumable_issue(AgentKind::Claude, AgentMode::Build, "dead-uuid");
+        let config = test_config();
+        // launch_session passes no resume id when has_session says it's gone.
+        let (cmd, sid, prompt) = build_agent_cmd(
+            &issue,
+            None,
+            &config,
+            "bork-bork-1",
+            "/tmp/status",
+            TEST_PROMPT_PATH,
+        );
+        assert!(!cmd.contains("--resume"));
+        assert!(!cmd.contains("dead-uuid"));
+        assert!(prompt.is_some());
+        if let Some(id) = sid {
+            assert!(cmd.contains(&format!("--session-id '{id}'")));
+        }
     }
 
     #[test]

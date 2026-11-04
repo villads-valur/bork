@@ -41,6 +41,9 @@ pub struct ActionResult {
     pub session_to_open: Option<String>,
     pub popup_title: Option<String>,
     pub launched_session: Option<LaunchedSession>,
+    /// Set when a launch replaced a lost session but captured no new id, so
+    /// the dead id is dropped instead of being retried on every launch.
+    pub forget_lost_session: Option<AgentKind>,
     /// True when this launch's command included the one-time worktree setup
     /// prefix, so the issue's `setup_ran` flag must be persisted even if
     /// session-id detection failed.
@@ -1091,15 +1094,11 @@ fn handle_dialog(app: &mut App, action: Action, ctx: &ActionContext) -> PostActi
         .is_some_and(|d| d.is_on_linear_project_field());
     let on_github = app.dialog.as_ref().is_some_and(|d| d.is_on_github_field());
 
-    if app.dialog.as_ref().is_some_and(|d| d.is_on_agent_field())
-        && matches!(action, Action::DialogBackspace | Action::DialogDelete)
-    {
-        if let Some(dialog) = app.dialog.as_mut() {
-            if !dialog.forgotten_sessions.contains(&dialog.agent_kind) {
-                dialog.forgotten_sessions.push(dialog.agent_kind);
-            }
+    if matches!(action, Action::DialogBackspace | Action::DialogDelete) {
+        if let Some(dialog) = app.dialog.as_mut().filter(|d| d.is_on_agent_field()) {
+            dialog.forgotten_sessions.insert(dialog.agent_kind);
+            return PostAction::None;
         }
-        return PostAction::None;
     }
 
     if on_linear {
@@ -1283,8 +1282,11 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
             let switches_agent = picker_moved && dialog.agent_kind != issue.agent_kind;
             let crosses_boundary =
                 (issue.kind == IssueKind::Orchestrator) != (dialog.kind == IssueKind::Orchestrator);
-            let forgets_sessions = !dialog.forgotten_sessions.is_empty();
-            if (switches_agent || crosses_boundary || forgets_sessions)
+            let forgets_live_session = dialog
+                .forgotten_sessions
+                .iter()
+                .any(|agent| issue.forgetting_kills_session(*agent));
+            if (switches_agent || crosses_boundary || forgets_live_session)
                 && app.launches_in_flight.contains(&issue.id)
             {
                 app.set_warning(
@@ -1304,11 +1306,6 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
             let crossed_orchestrator_boundary =
                 p.issues[idx].kind_change_resets_session(dialog.kind);
             let agent_changed = picker_moved && dialog.agent_kind != p.issues[idx].agent_kind;
-            let agent_after_edit = if picker_moved {
-                dialog.agent_kind
-            } else {
-                p.issues[idx].agent_kind
-            };
             // Only forget sessions that are still stored, so the message
             // doesn't claim a reset a background change already made.
             let forgotten: Vec<AgentKind> = dialog
@@ -1317,7 +1314,11 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
                 .copied()
                 .filter(|agent| p.issues[idx].sessions.contains_key(agent))
                 .collect();
-            let current_session_forgotten = forgotten.contains(&agent_after_edit);
+            // An agent switch already kills; otherwise only forgetting the
+            // current agent's session does.
+            let current_session_forgotten = forgotten
+                .iter()
+                .any(|agent| p.issues[idx].forgetting_kills_session(*agent));
 
             if crossed_orchestrator_boundary || agent_changed || current_session_forgotten {
                 // A live session would otherwise be re-attached with the old
@@ -1344,7 +1345,7 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
             apply_linear_project_fields(&mut p.issues[idx], &dialog);
             apply_pr_fields(&mut p.issues[idx], &dialog);
             for agent in &forgotten {
-                p.issues[idx].sessions.remove(agent);
+                p.issues[idx].forget_session(*agent);
             }
 
             let updated_id = p.issues[idx].id.clone();
@@ -1358,6 +1359,11 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
                     )),
                     None => app.set_message(format!("Updated {} (session reset)", updated_id)),
                 }
+            } else if agent_changed && forgotten.contains(&dialog.agent_kind) {
+                app.set_message(format!(
+                    "Updated {} (switched to {}, starts a new session)",
+                    updated_id, dialog.agent_kind
+                ));
             } else if agent_changed {
                 app.set_message(format!(
                     "Updated {} (switched to {}, other sessions kept)",
@@ -2475,41 +2481,56 @@ pub fn delete_issue_from_app(app: &mut App, project_id: &ProjectId, issue_id: &s
 
 fn launch_and_report(issue: Issue, config: AppConfig) -> ActionResult {
     match agent::launch_session(&issue, &config) {
-        Ok(outcome) => {
-            let (message, message_kind) = if outcome.replaced_lost_session {
-                (
-                    format!(
-                        "Previous {} session for {} was gone, started a new one",
-                        issue.agent_kind, issue.id
-                    ),
-                    MessageKind::Warning,
-                )
-            } else {
-                (
-                    format!("Session '{}' started", outcome.session_name),
-                    MessageKind::Info,
-                )
-            };
-            ActionResult {
-                launched_setup_ran: outcome.setup_ran,
-                message,
-                message_kind,
-                session_to_open: Some(outcome.session_name),
-                launched_session: outcome.agent_session_id.map(|sid| LaunchedSession {
-                    agent: issue.agent_kind,
-                    kind: issue.kind,
-                    session_id: sid,
-                }),
-                launched_issue_id: Some(issue.id),
-                ..Default::default()
-            }
-        }
+        Ok(outcome) => launch_result(issue, outcome),
         Err(e) => ActionResult {
             message: format!("Failed to launch: {e}"),
             message_kind: MessageKind::Error,
             launched_issue_id: Some(issue.id),
             ..Default::default()
         },
+    }
+}
+
+fn launch_result(issue: Issue, outcome: agent::LaunchOutcome) -> ActionResult {
+    let lost = outcome.replaced_lost_session;
+    let (message, message_kind) = if lost {
+        (
+            format!(
+                "Previous {} session for {} was gone, started a new one",
+                issue.agent_kind, issue.id
+            ),
+            MessageKind::Warning,
+        )
+    } else {
+        (
+            format!("Session '{}' started", outcome.session_name),
+            MessageKind::Info,
+        )
+    };
+    // The status bar is hidden behind the popup that opens right away, so the
+    // popup title repeats the news.
+    let popup_title = lost.then(|| {
+        format!(
+            "{} (new session, the previous one was gone)",
+            issue.popup_title()
+        )
+    });
+    let forget_lost_session =
+        (lost && outcome.agent_session_id.is_none()).then_some(issue.agent_kind);
+    ActionResult {
+        launched_setup_ran: outcome.setup_ran,
+        message,
+        message_kind,
+        popup_title,
+        forget_lost_session,
+        session_to_open: Some(outcome.session_name),
+        launched_session: outcome.agent_session_id.map(|sid| LaunchedSession {
+            agent: issue.agent_kind,
+            kind: issue.kind,
+            session_id: sid,
+        }),
+        launched_issue_id: Some(issue.id),
+        ..Default::default()
     }
 }
 
@@ -3991,13 +4012,127 @@ mod tests {
         issue
             .sessions
             .insert(issue.agent_kind, "ses_old".to_string());
-        let other = if issue.agent_kind == AgentKind::Claude {
-            AgentKind::OpenCode
-        } else {
-            AgentKind::Claude
-        };
-        issue.sessions.insert(other, "ses_other".to_string());
+        // Codex, not Claude: Claude's has_session reads the real ~/.claude.
         issue
+            .sessions
+            .insert(AgentKind::Codex, "ses_other".to_string());
+        issue
+    }
+
+    fn focus_agent(app: &mut App, agent: AgentKind) {
+        app.dialog.as_mut().unwrap().agent_kind = agent;
+    }
+
+    #[test]
+    fn forgetting_current_session_kills_live_session() {
+        let mut app = test_app();
+        app.project_mut().issues.push(issue_with_two_sessions());
+        let session_name = app.project().issues[0].session_name("bork");
+        app.project_mut()
+            .live
+            .active_sessions
+            .insert(session_name.clone());
+        let ctx = open_dialog_on_agent_field(&mut app);
+
+        handle_action(&mut app, Action::DialogBackspace, &ctx, &test_channels());
+        handle_action(&mut app, Action::DialogSubmit, &ctx, &test_channels());
+
+        assert!(!app.project().live.active_sessions.contains(&session_name));
+    }
+
+    #[test]
+    fn forgetting_other_agent_session_keeps_live_session() {
+        let mut app = test_app();
+        app.project_mut().issues.push(issue_with_two_sessions());
+        let session_name = app.project().issues[0].session_name("bork");
+        app.project_mut()
+            .live
+            .active_sessions
+            .insert(session_name.clone());
+        let ctx = open_dialog_on_agent_field(&mut app);
+
+        // Move the picker to Codex, forget its session, then move back.
+        focus_agent(&mut app, AgentKind::Codex);
+        handle_action(&mut app, Action::DialogBackspace, &ctx, &test_channels());
+        focus_agent(&mut app, AgentKind::OpenCode);
+        handle_action(&mut app, Action::DialogSubmit, &ctx, &test_channels());
+
+        let issue = &app.project().issues[0];
+        assert!(!issue.sessions.contains_key(&AgentKind::Codex));
+        assert_eq!(issue.current_session_id(), Some("ses_old"));
+        assert!(app.project().live.active_sessions.contains(&session_name));
+    }
+
+    #[test]
+    fn forgetting_live_session_waits_for_in_flight_launch() {
+        let mut app = test_app();
+        app.project_mut().issues.push(issue_with_two_sessions());
+        app.launches_in_flight.insert("bork-1".to_string());
+        let ctx = open_dialog_on_agent_field(&mut app);
+
+        handle_action(&mut app, Action::DialogBackspace, &ctx, &test_channels());
+        handle_action(&mut app, Action::DialogSubmit, &ctx, &test_channels());
+
+        assert_eq!(app.message.as_ref().unwrap().1, MessageKind::Warning);
+        assert_eq!(app.project().issues[0].sessions.len(), 2);
+    }
+
+    #[test]
+    fn forgetting_agent_without_session_saves_during_launch() {
+        let mut app = test_app();
+        app.project_mut().issues.push(issue_with_two_sessions());
+        app.launches_in_flight.insert("bork-1".to_string());
+        let ctx = open_dialog_on_agent_field(&mut app);
+
+        focus_agent(&mut app, AgentKind::Pi);
+        handle_action(&mut app, Action::DialogBackspace, &ctx, &test_channels());
+        focus_agent(&mut app, AgentKind::OpenCode);
+        handle_action(&mut app, Action::DialogSubmit, &ctx, &test_channels());
+
+        assert_eq!(app.message.as_ref().unwrap().1, MessageKind::Info);
+        assert_eq!(app.project().issues[0].sessions.len(), 2);
+    }
+
+    fn launch_outcome(agent_session_id: Option<&str>, lost: bool) -> agent::LaunchOutcome {
+        agent::LaunchOutcome {
+            session_name: "bork-bork-1".to_string(),
+            agent_session_id: agent_session_id.map(str::to_string),
+            setup_ran: false,
+            replaced_lost_session: lost,
+        }
+    }
+
+    #[test]
+    fn launch_result_reports_replaced_lost_session() {
+        let issue = test_issue("bork-1", Column::InProgress);
+        let result = launch_result(issue, launch_outcome(Some("new-id"), true));
+
+        assert_eq!(result.message_kind, MessageKind::Warning);
+        assert!(result.message.contains("was gone"));
+        assert!(result
+            .popup_title
+            .as_deref()
+            .is_some_and(|title| title.contains("previous one was gone")));
+        assert_eq!(result.forget_lost_session, None);
+        assert_eq!(result.launched_session.unwrap().session_id, "new-id");
+    }
+
+    #[test]
+    fn launch_result_forgets_lost_session_without_new_id() {
+        let issue = test_issue("bork-1", Column::InProgress);
+        let result = launch_result(issue, launch_outcome(None, true));
+
+        assert_eq!(result.forget_lost_session, Some(AgentKind::OpenCode));
+    }
+
+    #[test]
+    fn launch_result_normal_launch_is_quiet() {
+        let issue = test_issue("bork-1", Column::InProgress);
+        let result = launch_result(issue, launch_outcome(Some("id"), false));
+
+        assert_eq!(result.message_kind, MessageKind::Info);
+        assert_eq!(result.popup_title, None);
+        assert_eq!(result.forget_lost_session, None);
     }
 
     #[test]

@@ -1656,12 +1656,7 @@ fn start_issue(project_root: &Path, opts: StartIssueOptions) -> anyhow::Result<S
     };
 
     let launched_agent = issue.agent_kind;
-    let external::agent::LaunchOutcome {
-        session_name,
-        agent_session_id,
-        setup_ran,
-        ..
-    } = external::agent::launch_session(&issue, &config)
+    let outcome = external::agent::launch_session(&issue, &config)
         .map_err(|e| anyhow::anyhow!("Failed to launch agent: {e}"))?;
 
     // Resolve the link target: explicit --link wins, else the spawning agent's
@@ -1682,11 +1677,12 @@ fn start_issue(project_root: &Path, opts: StartIssueOptions) -> anyhow::Result<S
         // A kind change during the launch detached what it produced (see
         // Issue::accepts_launch_result); setup_ran additionally ignores
         // agent changes since the setup script is agent-independent.
-        if setup_ran && saved.kind == issue.kind {
+        if outcome.setup_ran && saved.kind == issue.kind {
             saved.setup_ran = true;
         }
-        if let Some(sid) =
-            agent_session_id.filter(|_| saved.accepts_launch_result(issue.kind, launched_agent))
+        if let Some(sid) = outcome
+            .agent_session_id
+            .filter(|_| saved.accepts_launch_result(issue.kind, launched_agent))
         {
             saved.sessions.insert(launched_agent, sid);
         }
@@ -1722,7 +1718,7 @@ fn start_issue(project_root: &Path, opts: StartIssueOptions) -> anyhow::Result<S
         issue_id: issue.id,
         title: issue.title,
         worktree_dir,
-        session_name,
+        session_name: outcome.session_name,
         linked_to,
     })
 }
@@ -2559,6 +2555,12 @@ fn run_tui() -> anyhow::Result<()> {
                             dirty = true;
                         }
                     }
+                    if let Some(agent) = result.forget_lost_session.filter(|_| !invalidated) {
+                        if issue.agent_kind == agent {
+                            issue.forget_session(agent);
+                            dirty = true;
+                        }
+                    }
                     if dirty {
                         project.mark_dirty();
                     }
@@ -2581,6 +2583,7 @@ fn run_tui() -> anyhow::Result<()> {
                             }
                         }
                         if open_popup {
+                            let popup_title = result.popup_title.unwrap_or(popup_title);
                             pending_popup_session = Some((session_name, popup_title));
                         }
                     }

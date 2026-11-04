@@ -1,6 +1,8 @@
 //! New/edit issue dialog state: field ordering, focus, and the plain-text
 //! editing primitives used by the title field.
 
+use std::collections::BTreeSet;
+
 use ratatui::style::{Modifier, Style};
 use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 
@@ -55,10 +57,10 @@ pub struct DialogState {
     pub github_available: bool,
     /// Agents whose stored session can't be resumed anymore, so the picker
     /// hides their resume marker. Detected once at open.
-    pub lost_sessions: Vec<AgentKind>,
+    pub lost_sessions: BTreeSet<AgentKind>,
     /// Agents whose stored session the user dropped; submit forgets them so
     /// the next launch starts fresh.
-    pub forgotten_sessions: Vec<AgentKind>,
+    pub forgotten_sessions: BTreeSet<AgentKind>,
 }
 
 fn make_prompt_textarea(text: &str) -> TextArea<'static> {
@@ -113,8 +115,8 @@ impl DialogState {
             github_stack: None,
             github_pr_cleared: false,
             github_available,
-            lost_sessions: Vec::new(),
-            forgotten_sessions: Vec::new(),
+            lost_sessions: BTreeSet::new(),
+            forgotten_sessions: BTreeSet::new(),
         }
     }
 
@@ -179,8 +181,8 @@ impl DialogState {
             github_stack: issue.github_stack,
             github_pr_cleared: false,
             github_available,
-            lost_sessions: Vec::new(),
-            forgotten_sessions: Vec::new(),
+            lost_sessions: BTreeSet::new(),
+            forgotten_sessions: BTreeSet::new(),
         }
     }
 

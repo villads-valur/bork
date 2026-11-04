@@ -322,11 +322,12 @@ pub fn reset_session(
     let removed = issue.sessions.contains_key(&agent);
 
     if removed {
-        if agent == issue.agent_kind {
+        // Kill first so a failed cleanup aborts before the state is saved.
+        if issue.forgetting_kills_session(agent) {
             let config = config::load_config_from(project_root);
             agent::terminate_session(project_root, &issue.session_name(&config.project_name))?;
         }
-        issue.sessions.remove(&agent);
+        issue.forget_session(agent);
         config::save_state(&state, project_root)?;
     }
 
