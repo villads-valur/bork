@@ -63,6 +63,7 @@ pub enum InputMode {
     Help,
     DebugInspector,
     Sidebar,
+    SidebarRename,
     PruneDialog,
 }
 
@@ -151,6 +152,8 @@ pub struct Project {
     /// Canonicalized project root, computed once at construction. `id()` is
     /// called in per-frame render paths, so it must not hit the filesystem.
     id: ProjectId,
+    /// Sidebar label from the global registry. See `display_name`.
+    pub label: Option<String>,
     pub issues: Vec<Issue>,
     pub config: AppConfig,
     pub available_agents: Vec<AgentKind>,
@@ -218,6 +221,7 @@ impl Project {
         let last_config_mtime = crate::config::config_mtime(&config.project_root);
         let mut project = Project {
             id,
+            label: None,
             issues,
             config,
             available_agents: Vec::new(),
@@ -251,6 +255,12 @@ impl Project {
 
     pub fn id(&self) -> ProjectId {
         self.id.clone()
+    }
+
+    /// Shown in the sidebar, header and lane titles. Issue IDs and tmux
+    /// sessions always use `config.project_name`.
+    pub fn display_name(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.config.project_name)
     }
 
     fn refresh_available_agents(&mut self) {
@@ -1666,6 +1676,14 @@ pub struct SidebarState {
     pub selected: usize,
     pub activity: HashMap<ProjectId, bool>,
     pub swimlanes: Vec<ProjectId>,
+    pub rename: Option<ProjectRename>,
+}
+
+/// Rename in progress. Holds the project id so a reload that shifts the
+/// list can't move the rename onto another row.
+pub struct ProjectRename {
+    pub project_id: ProjectId,
+    pub buffer: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1806,6 +1824,8 @@ pub enum ConfirmAction {
         issue_ids: Vec<String>,
         project_id: ProjectId,
     },
+    /// Unregister the project. Its files stay on disk.
+    RemoveProject { project_id: ProjectId },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1972,6 +1992,8 @@ pub struct App {
     pub search_query: String,
     pub confirm_message: Option<String>,
     pub pending_confirm: Option<ConfirmAction>,
+    /// Mode to go back to when the confirm prompt closes.
+    confirm_return_mode: InputMode,
     pub dialog: Option<DialogState>,
     pub prune_dialog: Option<PruneDialogState>,
     pub should_quit: bool,
@@ -2016,6 +2038,7 @@ impl App {
             search_query: String::new(),
             confirm_message: None,
             pending_confirm: None,
+            confirm_return_mode: InputMode::Normal,
             dialog: None,
             prune_dialog: None,
             should_quit: false,
@@ -2051,6 +2074,7 @@ impl App {
                 selected: 0,
                 activity: HashMap::new(),
                 swimlanes: vec![self.focused_project.clone()],
+                rename: None,
             });
         }
     }
@@ -2059,19 +2083,86 @@ impl App {
         self.projects.iter().map(|p| p.id()).collect()
     }
 
-    pub fn apply_reload_result(&mut self, result: crate::global_config::ReloadResult) {
+    /// `registry` should be read on the main thread: the reload thread's
+    /// snapshot can predate a rename or move made while it ran.
+    pub fn apply_reload_result(
+        &mut self,
+        result: crate::global_config::ReloadResult,
+        registry: &[crate::global_config::ProjectEntry],
+    ) {
         self.remove_projects(&result.removed_projects);
         for (config, state) in result.new_projects {
             self.add_background_project(config, state);
         }
+        self.sync_with_registry(registry);
         if self.projects.len() > 1 && self.sidebar.is_none() {
             self.enable_sidebar();
         }
     }
 
+    /// Applies registry labels and order. Projects missing from the registry
+    /// lose their label and go last.
+    pub fn sync_with_registry(&mut self, entries: &[crate::global_config::ProjectEntry]) {
+        let paths: Vec<ProjectId> = entries
+            .iter()
+            .map(|entry| crate::global_config::normalize_path(&entry.path))
+            .collect();
+        let selected_id = self.sidebar_selected_id();
+
+        let mut ranked: Vec<(usize, Project)> = std::mem::take(&mut self.projects)
+            .into_iter()
+            .map(|mut project| {
+                let position = paths.iter().position(|path| *path == project.id);
+                project.label = position.and_then(|i| entries[i].label.clone());
+                (position.unwrap_or(usize::MAX), project)
+            })
+            .collect();
+        ranked.sort_by_key(|(position, _)| *position);
+        self.projects = ranked.into_iter().map(|(_, project)| project).collect();
+
+        if let Some(id) = selected_id {
+            self.select_sidebar_project(&id);
+        }
+    }
+
+    pub fn project_display_name(&self, id: &ProjectId) -> String {
+        self.find_project(id)
+            .map(|p| p.display_name().to_string())
+            .unwrap_or_default()
+    }
+
+    pub fn sidebar_selected_id(&self) -> Option<ProjectId> {
+        let sidebar = self.sidebar.as_ref()?;
+        self.projects.get(sidebar.selected).map(|p| p.id())
+    }
+
+    fn select_sidebar_project(&mut self, id: &ProjectId) {
+        let index = self.project_index(id);
+        if let (Some(sidebar), Some(index)) = (self.sidebar.as_mut(), index) {
+            sidebar.selected = index;
+        }
+    }
+
+    /// Swaps the selected sidebar project with its neighbour and returns the
+    /// new order, or `None` at the edge of the list.
+    pub fn move_sidebar_project(&mut self, up: bool) -> Option<Vec<ProjectId>> {
+        let selected = self.sidebar.as_ref()?.selected;
+        let target = if up {
+            selected.checked_sub(1)?
+        } else {
+            selected + 1
+        };
+        if target >= self.projects.len() {
+            return None;
+        }
+        self.projects.swap(selected, target);
+        self.sidebar.as_mut()?.selected = target;
+        Some(self.projects.iter().map(|p| p.id()).collect())
+    }
+
     /// Drops projects that left the registry. The focused project is kept so
     /// the board always has something to show.
-    fn remove_projects(&mut self, ids: &[ProjectId]) {
+    pub(crate) fn remove_projects(&mut self, ids: &[ProjectId]) {
         let to_remove: HashSet<&ProjectId> = ids
             .iter()
             .filter(|id| **id != self.focused_project)
@@ -2079,17 +2170,15 @@ impl App {
         // Selection and focused lane are indices, so remember what they point
         // at and re-find it after the lists shrink.
         let active_id = self.active_project_id();
-        let selected_id = self
-            .sidebar
-            .as_ref()
-            .and_then(|sidebar| self.projects.get(sidebar.selected))
-            .map(|p| p.id());
+        let old_selected = self.sidebar.as_ref().map_or(0, |sidebar| sidebar.selected);
+        let selected_id = self.sidebar_selected_id();
 
         self.projects.retain(|p| !to_remove.contains(&p.id()));
 
+        // A removed selection stays on the same row rather than jumping to the top.
         let selected = selected_id
             .and_then(|id| self.projects.iter().position(|p| p.id() == id))
-            .unwrap_or(0);
+            .unwrap_or_else(|| old_selected.min(self.projects.len().saturating_sub(1)));
         if let Some(ref mut sidebar) = self.sidebar {
             sidebar.swimlanes.retain(|id| !to_remove.contains(id));
             if sidebar.swimlanes.is_empty() {
@@ -2112,7 +2201,6 @@ impl App {
         self.projects.iter_mut().find(|p| p.id() == *id)
     }
 
-    #[allow(dead_code)] // Future sidebar/swimlane reordering
     pub(crate) fn project_index(&self, id: &ProjectId) -> Option<usize> {
         self.projects.iter().position(|p| p.id() == *id)
     }
@@ -2538,19 +2626,20 @@ impl App {
     }
 
     pub fn start_confirm(&mut self, message: String, action: ConfirmAction) {
+        self.confirm_return_mode = self.input_mode;
         self.input_mode = InputMode::Confirm;
         self.confirm_message = Some(message);
         self.pending_confirm = Some(action);
     }
 
     pub fn cancel_confirm(&mut self) {
-        self.input_mode = InputMode::Normal;
+        self.input_mode = self.confirm_return_mode;
         self.confirm_message = None;
         self.pending_confirm = None;
     }
 
     pub fn take_confirm_action(&mut self) -> Option<ConfirmAction> {
-        self.input_mode = InputMode::Normal;
+        self.input_mode = self.confirm_return_mode;
         self.confirm_message = None;
         self.pending_confirm.take()
     }
@@ -6877,6 +6966,58 @@ mod tests {
 
     // --- apply_reload_result tests ---
 
+    fn registry_entry(label: &str, project: &str) -> crate::global_config::ProjectEntry {
+        crate::global_config::ProjectEntry {
+            name: project.into(),
+            path: PathBuf::from(format!("/tmp/test-{}", project)),
+            label: Some(label.into()),
+        }
+    }
+
+    #[test]
+    fn sync_with_registry_applies_names_and_order() {
+        let mut app = test_multi_app();
+        let beta_id = app.projects[1].id();
+        app.sidebar.as_mut().unwrap().selected = 1;
+
+        app.sync_with_registry(&[
+            registry_entry("Gamma!", "gamma"),
+            registry_entry("Beta!", "beta"),
+        ]);
+
+        let names: Vec<&str> = app.projects.iter().map(|p| p.display_name()).collect();
+        // alpha is missing from the registry, so it shows its config name and goes last.
+        assert_eq!(names, ["Gamma!", "Beta!", "alpha"]);
+        assert_eq!(app.sidebar_selected_id(), Some(beta_id));
+    }
+
+    #[test]
+    fn move_sidebar_project_swaps_and_stops_at_edges() {
+        let mut app = test_multi_app();
+        let alpha_id = app.projects[0].id();
+
+        assert!(app.move_sidebar_project(true).is_none());
+        let order = app.move_sidebar_project(false).unwrap();
+        assert_eq!(order[1], alpha_id);
+        assert_eq!(app.sidebar_selected_id(), Some(alpha_id.clone()));
+
+        app.move_sidebar_project(false).unwrap();
+        assert!(app.move_sidebar_project(false).is_none());
+        assert_eq!(app.projects[2].id(), alpha_id);
+    }
+
+    #[test]
+    fn removing_selected_project_keeps_cursor_row() {
+        let mut app = test_multi_app();
+        let beta_id = app.projects[1].id();
+        app.sidebar.as_mut().unwrap().selected = 1;
+
+        app.remove_projects(&[beta_id]);
+
+        assert_eq!(app.projects.len(), 2);
+        assert_eq!(app.sidebar.as_ref().unwrap().selected, 1);
+    }
+
     #[test]
     fn apply_reload_adds_new_projects() {
         let mut app = test_app(vec![]);
@@ -6887,7 +7028,7 @@ mod tests {
             new_projects: vec![(test_config_named("beta"), AppState::default())],
             ..Default::default()
         };
-        app.apply_reload_result(result);
+        app.apply_reload_result(result, &[]);
 
         assert_eq!(app.projects.len(), 2);
         assert_eq!(app.projects[1].config.project_name, "beta");
@@ -6898,7 +7039,7 @@ mod tests {
     fn apply_reload_empty_is_noop() {
         let mut app = test_app(vec![]);
         let result = crate::global_config::ReloadResult::default();
-        app.apply_reload_result(result);
+        app.apply_reload_result(result, &[]);
 
         assert_eq!(app.projects.len(), 1);
         assert!(app.sidebar.is_none());
@@ -6912,7 +7053,7 @@ mod tests {
         app.sidebar.as_mut().unwrap().selected = 1;
 
         let result = crate::global_config::ReloadResult::default();
-        app.apply_reload_result(result);
+        app.apply_reload_result(result, &[]);
 
         let sidebar = app.sidebar.as_ref().unwrap();
         assert_eq!(sidebar.swimlanes.len(), 2);
@@ -6932,7 +7073,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        app.apply_reload_result(result);
+        app.apply_reload_result(result, &[]);
 
         assert_eq!(app.projects.len(), 3);
         assert!(app.sidebar.is_some());
@@ -6946,14 +7087,14 @@ mod tests {
             new_projects: vec![(test_config_named("beta"), AppState::default())],
             ..Default::default()
         };
-        app.apply_reload_result(result1);
+        app.apply_reload_result(result1, &[]);
         assert_eq!(app.projects.len(), 2);
 
         let result2 = crate::global_config::ReloadResult {
             new_projects: vec![(test_config_named("gamma"), AppState::default())],
             ..Default::default()
         };
-        app.apply_reload_result(result2);
+        app.apply_reload_result(result2, &[]);
         assert_eq!(app.projects.len(), 3);
         assert_eq!(app.projects[2].config.project_name, "gamma");
     }
@@ -6972,7 +7113,7 @@ mod tests {
             new_projects: vec![],
             removed_projects: vec![beta_id.clone()],
         };
-        app.apply_reload_result(result);
+        app.apply_reload_result(result, &[]);
 
         assert_eq!(app.projects.len(), 2);
         assert!(app.find_project(&beta_id).is_none());
@@ -6998,7 +7139,7 @@ mod tests {
             removed_projects: vec![alpha_id],
             ..Default::default()
         };
-        app.apply_reload_result(result);
+        app.apply_reload_result(result, &[]);
 
         assert_eq!(app.sidebar.as_ref().unwrap().selected, 0);
         assert_eq!(app.focused_swimlane, 0);
@@ -7014,7 +7155,7 @@ mod tests {
             new_projects: vec![],
             removed_projects: vec![alpha_id.clone()],
         };
-        app.apply_reload_result(result);
+        app.apply_reload_result(result, &[]);
 
         assert_eq!(app.projects.len(), 3);
         assert!(app.find_project(&alpha_id).is_some());
