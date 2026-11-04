@@ -515,6 +515,9 @@ Start here (for AI agents):
                                  (--base <branch> to pick its base branch)
   bork issue archive <id>        Kill session + teardown + remove worktree
                                  (--force to discard uncommitted changes)
+  bork integration attach-pr <pr>
+                                 Link a PR you opened to your issue (run it
+                                 right after creating the PR)
 
   Agentic issues each run one coding agent. Pick which and how with:
     --agent   {agents}     # must be on your PATH
@@ -882,13 +885,13 @@ enum IntegrationCommand {
         linear_identifier: String,
     },
 
-    /// Link a GitHub PR to an issue
+    /// Link a GitHub PR to an issue. The issue ID can be left out inside an
+    /// agent session, where it defaults to `BORK_ISSUE_ID`.
+    #[command(override_usage = "bork integration attach-pr [ISSUE_ID] <PR_NUMBER>")]
     AttachPr {
-        /// Issue ID (e.g. bork-1)
-        issue_id: String,
-
-        /// GitHub PR number
-        pr_number: u32,
+        /// Optional issue ID (e.g. bork-1), then the GitHub PR number
+        #[arg(num_args = 1..=2, value_names = ["ISSUE_ID", "PR_NUMBER"], required = true)]
+        args: Vec<String>,
     },
 
     /// Unlink a Linear ticket from an issue
@@ -1502,6 +1505,38 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
     }
 }
 
+/// The issue the current agent session works on, from `BORK_ISSUE_ID`.
+fn session_issue_id() -> Option<String> {
+    std::env::var(external::process::BORK_ISSUE_ID_VAR)
+        .ok()
+        .filter(|id| !id.is_empty())
+}
+
+/// Split `attach-pr` args into (issue id, PR number). A lone PR number uses
+/// the session's issue id.
+fn resolve_attach_pr_args(
+    args: &[impl AsRef<str>],
+    session_issue_id: Option<String>,
+) -> anyhow::Result<(String, u32)> {
+    let (issue_id, pr_number) = match args {
+        [pr] => {
+            let Some(id) = session_issue_id else {
+                anyhow::bail!(
+                    "no issue id given and BORK_ISSUE_ID is not set; use `bork integration attach-pr <issue-id> <pr-number>`"
+                );
+            };
+            (id, pr.as_ref())
+        }
+        [id, pr] => (id.as_ref().to_string(), pr.as_ref()),
+        _ => anyhow::bail!("expected `[issue-id] <pr-number>`"),
+    };
+    let pr_number = pr_number
+        .trim_start_matches('#')
+        .parse::<u32>()
+        .map_err(|_| anyhow::anyhow!("invalid PR number: {pr_number}"))?;
+    Ok((issue_id, pr_number))
+}
+
 struct StartIssueOptions {
     title: String,
     prompt: Option<String>,
@@ -1604,7 +1639,7 @@ fn start_issue(project_root: &Path, opts: StartIssueOptions) -> anyhow::Result<S
     let explicit_link = opts.link.is_some();
     let link_target = opts
         .link
-        .or_else(|| std::env::var("BORK_ISSUE_ID").ok())
+        .or_else(session_issue_id)
         .filter(|id| !id.is_empty() && !id.eq_ignore_ascii_case(&issue.id));
 
     // Reload state so we don't clobber concurrent updates that happened during launch
@@ -1691,10 +1726,8 @@ fn run_integration_command(command: IntegrationCommand) -> anyhow::Result<()> {
             println!("Unlinked Linear project {} from {}", slug, issue.id);
             Ok(())
         }
-        IntegrationCommand::AttachPr {
-            issue_id,
-            pr_number,
-        } => {
+        IntegrationCommand::AttachPr { args } => {
+            let (issue_id, pr_number) = resolve_attach_pr_args(&args, session_issue_id())?;
             let issue = ops::attach_pr(&project_root, &issue_id, pr_number)?;
             println!("Linked {} to PR #{}", issue.id, pr_number);
             Ok(())
@@ -3255,5 +3288,27 @@ mod tests {
         let (wake_tx, wake_rx) = mpsc::channel::<()>();
         drop(wake_tx);
         assert!(!sleep_with_wake(&wake_rx, Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn attach_pr_uses_explicit_issue_id() {
+        let (id, pr) = resolve_attach_pr_args(&["bork-1", "42"], Some("bork-9".into())).unwrap();
+        assert_eq!((id.as_str(), pr), ("bork-1", 42));
+    }
+
+    #[test]
+    fn attach_pr_falls_back_to_session_issue_id() {
+        let (id, pr) = resolve_attach_pr_args(&["#42"], Some("bork-9".into())).unwrap();
+        assert_eq!((id.as_str(), pr), ("bork-9", 42));
+    }
+
+    #[test]
+    fn attach_pr_without_issue_id_or_session_errors() {
+        assert!(resolve_attach_pr_args(&["42"], None).is_err());
+    }
+
+    #[test]
+    fn attach_pr_rejects_bad_pr_number() {
+        assert!(resolve_attach_pr_args(&["bork-1", "abc"], None).is_err());
     }
 }

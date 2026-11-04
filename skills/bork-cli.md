@@ -132,15 +132,16 @@ Takes a project URL or slug. Fails on issues that aren't orchestrators.
 
 ```bash
 bork integration attach-pr bork-1 42
+bork integration attach-pr 42          # inside an agent session: uses BORK_ISSUE_ID
 ```
 
-This sets the PR number on the issue so the TUI can display PR status (checks, reviews, etc.).
+This sets the PR number on the issue so the TUI can display PR status (checks, reviews, etc.). Always run it right after you open a PR for an issue, including stacked or follow-up PRs.
 
 ## Typical workflow
 
 1. Spin off work: `bork issue start "Implement feature X" --prompt "Details..."`
 2. The new agent works in the created worktree
-3. Link a PR when ready: `bork integration attach-pr bork-1 123`
+3. Open a PR and link it straight away: `bork integration attach-pr bork-1 123`
 4. Move to review: `bork issue move bork-1 code-review`
 5. When merged, clean up: `bork issue archive bork-1` (kills session, runs teardown, removes worktree, marks Done)
 

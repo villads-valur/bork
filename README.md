@@ -146,7 +146,7 @@ bork --help
 | `bork integration attach-linear <id> <identifier>` | Link a Linear ticket to an issue (can attach multiple) |
 | `bork integration attach-linear-project <id> <url-or-slug>` | Link a Linear project to an orchestrator issue (can attach multiple) |
 | `bork integration detach-linear-project <id> <url-or-slug>` | Unlink a Linear project from an issue |
-| `bork integration attach-pr <id> <number>` | Link a GitHub PR to an issue (can attach multiple) |
+| `bork integration attach-pr [id] <number>` | Link a GitHub PR to an issue (can attach multiple; `id` defaults to `BORK_ISSUE_ID` inside an agent session) |
 | `bork config list` | Show all resolved config values |
 | `bork config get <key>` | Print a resolved config value |
 | `bork config set <key> <value>` | Set a config value (`--global` for the global file) |

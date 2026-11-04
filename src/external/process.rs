@@ -9,6 +9,10 @@ use std::{fs, path::Path};
 /// commands it starts. Linux uses it as an additional cleanup fallback.
 pub const BORK_SESSION_VAR: &str = "BORK_SESSION";
 
+/// Env var exported into every agent pane with the issue the agent works on,
+/// so CLI calls from inside the session can default to that issue.
+pub const BORK_ISSUE_ID_VAR: &str = "BORK_ISSUE_ID";
+
 #[cfg(not(test))]
 const TERM_GRACE: Duration = Duration::from_secs(2);
 const KILL_GRACE: Duration = Duration::from_secs(1);
