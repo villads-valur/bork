@@ -185,41 +185,76 @@ impl PruneOutcome {
     }
 }
 
-/// Run `git worktree remove` for each worktree. We deliberately never pass
-/// `--force`, so git itself refuses dirty or otherwise unsafe removals at
-/// execute time and we surface its stderr. Returns one result per worktree.
-pub fn execute_removals(project_root: &Path, worktrees: &[String]) -> PruneOutcome {
+/// Run `git worktree remove` for each safe worktree and report each dirty
+/// one as skipped, so one bad worktree never sinks the rest of the batch.
+/// We deliberately never pass `--force`, so git itself refuses unsafe
+/// removals at execute time and we surface its stderr. Failures are also
+/// appended to the project's error log.
+pub fn execute_removals(
+    project_root: &Path,
+    worktrees: &[String],
+    dirty: &[String],
+) -> PruneOutcome {
     let main_dir = project_root.join("main");
-    let results = worktrees
+    let mut results: Vec<PruneResult> = worktrees
         .iter()
         .map(|name| PruneResult {
             worktree: name.clone(),
-            outcome: run_git_worktree_remove(&main_dir, &project_root.join(name)),
+            outcome: remove_worktree(&main_dir, &project_root.join(name)),
         })
         .collect();
-    PruneOutcome { results }
+    results.extend(dirty.iter().map(|name| PruneResult {
+        worktree: name.clone(),
+        outcome: RemoveOutcome::Failed("uncommitted changes, commit or stash first".into()),
+    }));
+    let outcome = PruneOutcome { results };
+    log_failures(project_root, &outcome);
+    outcome
 }
 
-fn run_git_worktree_remove(main_dir: &Path, worktree_path: &Path) -> RemoveOutcome {
+/// Remove one worktree. If git doesn't recognise it (typically because the
+/// project folder was moved, which breaks the `.git` links in both
+/// directions), run `git worktree repair` on it and try once more.
+fn remove_worktree(main_dir: &Path, worktree_path: &Path) -> RemoveOutcome {
+    let result = run_git_worktree(main_dir, "remove", worktree_path).or_else(|first_err| {
+        run_git_worktree(main_dir, "repair", worktree_path).map_err(|_| first_err)?;
+        run_git_worktree(main_dir, "remove", worktree_path)
+    });
+    match result {
+        Ok(()) => RemoveOutcome::Removed,
+        Err(msg) => RemoveOutcome::Failed(msg),
+    }
+}
+
+fn run_git_worktree(main_dir: &Path, subcommand: &str, worktree_path: &Path) -> Result<(), String> {
     let output = crate::external::git_command()
-        .args(["worktree", "remove"])
+        .args(["worktree", subcommand])
         .arg(worktree_path)
         .current_dir(main_dir)
         .output();
 
     match output {
-        Ok(out) if out.status.success() => RemoveOutcome::Removed,
-        Ok(out) => {
-            let msg = String::from_utf8_lossy(&out.stderr)
-                .lines()
-                .next()
-                .unwrap_or("git worktree remove failed")
-                .trim()
-                .to_string();
-            RemoveOutcome::Failed(msg)
-        }
-        Err(e) => RemoveOutcome::Failed(format!("failed to spawn git: {e}")),
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => Err(String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .next()
+            .unwrap_or("git worktree failed")
+            .trim()
+            .to_string()),
+        Err(e) => Err(format!("failed to spawn git: {e}")),
     }
+}
+
+fn log_failures(project_root: &Path, outcome: &PruneOutcome) {
+    let lines: Vec<String> = outcome
+        .results
+        .iter()
+        .filter_map(|r| match &r.outcome {
+            RemoveOutcome::Failed(msg) => Some(format!("prune {}: {}", r.worktree, msg)),
+            RemoveOutcome::Removed => None,
+        })
+        .collect();
+    crate::config::append_error_log(project_root, &lines);
 }
 
 /// Apply the result of a prune run back to the in-memory issue list. Returns
@@ -349,6 +384,56 @@ mod tests {
         let (safe, dirty_names) = partition_selection(&[clean, dirty, kept]);
         assert_eq!(safe, vec!["clean-wt".to_string()]);
         assert_eq!(dirty_names, vec!["dirty-wt".to_string()]);
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = crate::external::git_command()
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap()
+            .status;
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    #[test]
+    fn execute_removals_repairs_worktrees_after_project_move() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let old_root = tmp.path().join("old");
+        let main = old_root.join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        git(&main, &["init", "-q"]);
+        git(
+            &main,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        );
+        git(&main, &["worktree", "add", "-q", "../wt-1", "-b", "wt-1"]);
+        std::fs::create_dir_all(old_root.join(".bork")).unwrap();
+
+        let new_root = tmp.path().join("new");
+        std::fs::rename(&old_root, &new_root).unwrap();
+
+        let outcome = execute_removals(&new_root, &["wt-1".into()], &["wt-dirty".into()]);
+        assert_eq!(outcome.results[0].outcome, RemoveOutcome::Removed);
+        assert!(!new_root.join("wt-1").exists());
+        assert!(matches!(
+            outcome.results[1].outcome,
+            RemoveOutcome::Failed(_)
+        ));
+
+        let log = std::fs::read_to_string(new_root.join(".bork").join("errors.log")).unwrap();
+        assert!(log.contains("prune wt-dirty: uncommitted changes"));
+        assert!(!log.contains("wt-1"));
     }
 
     fn make_issue(id: &str, worktree: Option<&str>) -> Issue {

@@ -185,6 +185,12 @@ impl IssueKind {
     pub fn is_agentic(self) -> bool {
         matches!(self, Self::Agentic | Self::Orchestrator)
     }
+
+    /// Whether this kind can link Linear projects. Single owner of the
+    /// "orchestrators only" rule the dialog, picker, CLI and prompt follow.
+    pub fn links_linear_projects(self) -> bool {
+        self == Self::Orchestrator
+    }
 }
 
 impl fmt::Display for IssueKind {
@@ -263,6 +269,18 @@ pub struct LinkedLinear {
     pub imported: bool,
 }
 
+/// A Linear project tied to an orchestrator issue. Projects have no
+/// `VIL-123`-style identifier; `slug` is the `slugId` from the project URL.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LinkedLinearProject {
+    pub id: String,
+    pub slug: String,
+    pub name: String,
+    pub url: String,
+    #[serde(default)]
+    pub imported: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LinkedGithubPr {
     pub number: u32,
@@ -299,6 +317,10 @@ pub struct Issue {
     pub agent_kind: AgentKind,
     pub agent_mode: AgentMode,
     pub prompt: Option<String>,
+    /// Model passed to the agent's `--model` flag. Cleared on agent switch,
+    /// since model names are agent-specific.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     #[serde(default)]
     pub worktree: Option<String>,
     #[serde(default)]
@@ -321,6 +343,10 @@ pub struct Issue {
     // --- New multi-link fields ---
     #[serde(default)]
     pub linear_links: Vec<LinkedLinear>,
+    /// Linear projects this orchestrator drives. Only orchestrators carry
+    /// these; `set_kind` clears them when the issue leaves that kind.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub linear_projects: Vec<LinkedLinearProject>,
     #[serde(default)]
     pub github_pr_links: Vec<LinkedGithubPr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -366,6 +392,7 @@ pub struct IssueDraft {
     pub kind: IssueKind,
     pub agent_mode: AgentMode,
     pub prompt: Option<String>,
+    pub model: Option<String>,
 }
 
 impl Issue {
@@ -386,12 +413,14 @@ impl Issue {
             agent_kind,
             agent_mode: AgentMode::Plan,
             prompt: None,
+            model: None,
             worktree: None,
             done_at: None,
             sessions: BTreeMap::new(),
             pruned_at: None,
             setup_ran: false,
             linear_links: Vec::new(),
+            linear_projects: Vec::new(),
             github_pr_links: Vec::new(),
             github_stack: None,
             pr_import_baseline: None,
@@ -444,11 +473,13 @@ impl Issue {
             kind,
             agent_mode,
             prompt,
+            model,
         } = draft;
         Issue {
             kind,
             agent_mode,
             prompt,
+            model,
             done_at: (column == Column::Done).then_some(now),
             ..Issue::new(id, title, column, agent_kind)
         }
@@ -559,7 +590,8 @@ impl Issue {
     /// Crossing the orchestrator boundary drops all agent sessions (resuming
     /// any of them would skip the new kind's prompt); becoming an orchestrator
     /// also drops the worktree and PR links since orchestrators run at the
-    /// project root and have no PR of their own.
+    /// project root and have no PR of their own; leaving it drops Linear
+    /// project links, which only orchestrators carry.
     ///
     /// Returns `true` when the orchestrator boundary was crossed. Callers
     /// should then kill any live tmux session, since re-attaching it would
@@ -577,17 +609,23 @@ impl Issue {
             self.github_pr_links.clear();
             self.github_stack = None;
             self.stack_review_import = None;
+        } else {
+            self.linear_projects.clear();
         }
         true
     }
 
     /// Change the selected agent, keeping every agent's stored session
-    /// resumable. Returns `true` when it changed; callers must then kill any
-    /// live tmux session, which is still running the old agent's process.
+    /// resumable and clearing the agent-specific model. Returns `true` when it
+    /// changed; callers must then kill any live tmux session, which is still
+    /// running the old agent's process.
     #[must_use]
     pub fn set_agent_kind(&mut self, kind: AgentKind) -> bool {
         let changed = kind != self.agent_kind;
         self.agent_kind = kind;
+        if changed {
+            self.model = None;
+        }
         changed
     }
 
@@ -690,6 +728,36 @@ pub enum ChecksStatus {
     Error,
 }
 
+/// Why GitHub's `mergeStateStatus` refuses a merge that review and checks
+/// alone would allow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MergeBlocker {
+    /// `DIRTY`: the branch conflicts with its base.
+    Conflicts,
+    /// `BLOCKED`: a branch rule still objects, typically an unresolved
+    /// conversation.
+    Blocked,
+    /// `BEHIND` on a base branch without a merge queue: the branch must be
+    /// brought up to date before it can merge.
+    Behind,
+    /// `UNKNOWN`: GitHub is still computing the merge state, as it does right
+    /// after every push.
+    Computing,
+}
+
+/// Where an open PR stands in a merge queue, GitHub's own or Trunk's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MergeQueueState {
+    /// Waiting its turn, or passed and about to merge.
+    Queued,
+    /// The queue is running checks on it.
+    Testing,
+    /// The queue removed it after a failed run.
+    Failed,
+    /// Dequeued before it merged, by a person or by the queue.
+    Cancelled,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReviewDecision {
     Approved,
@@ -713,6 +781,11 @@ pub struct PrStatus {
     /// True when the head branch lives in a fork. Fork PRs are excluded from
     /// branch-keyed indexing since their branch names can collide with upstream.
     pub is_cross_repository: bool,
+    pub merge_blocker: Option<MergeBlocker>,
+    pub merge_queue: Option<MergeQueueState>,
+    /// Unresolved review threads (inline comments that can be resolved).
+    #[serde(default)]
+    pub unresolved_threads: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -789,6 +862,9 @@ mod tests {
             deletions: 5,
             head_branch: "main".into(),
             is_cross_repository: false,
+            merge_blocker: None,
+            merge_queue: None,
+            unresolved_threads: 0,
         };
         let cloned = pr.clone();
         assert_eq!(cloned.number, 1);
@@ -1021,6 +1097,7 @@ mod tests {
             kind: IssueKind::Agentic,
             agent_mode: AgentMode::Plan,
             prompt: prompt.map(str::to_string),
+            model: None,
         }
     }
 
@@ -1060,6 +1137,20 @@ mod tests {
         }"#;
         let issue: Issue = serde_json::from_str(json).unwrap();
         assert_eq!(issue.done_at, None);
+        assert_eq!(issue.model, None);
+    }
+
+    #[test]
+    fn model_roundtrips_and_is_omitted_when_unset() {
+        let issue = Issue::new("bork-1", "Test", Column::Todo, AgentKind::Claude);
+        assert!(!serde_json::to_string(&issue).unwrap().contains("model"));
+        let issue = Issue {
+            model: Some("sonnet".into()),
+            ..issue
+        };
+        let json = serde_json::to_string(&issue).unwrap();
+        let back: Issue = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.model.as_deref(), Some("sonnet"));
     }
 
     #[test]

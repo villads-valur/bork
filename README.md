@@ -13,7 +13,7 @@
 ---
 
 <p align="center">
-  <img src="assets/board-light.png" alt="bork kanban board" width="720">
+  <img src="assets/hero.png" alt="bork in a light and a dark terminal, showing the kanban board" width="720">
   <br>
   <sub>Adapts to your terminal theme (ANSI 16 colors)</sub>
 </p>
@@ -78,6 +78,12 @@ Press `n` to create an issue, `Enter` to launch an agent session. You're up and 
 - **Multi-project view** &mdash; Register multiple projects and view them in stacked swimlanes with a collapsible project sidebar
 - **Zero-dependency state** &mdash; JSON file persistence with atomic writes, no database
 
+## Screenshots
+
+| Dark | Light |
+|------|-------|
+| ![bork in a dark terminal](assets/board-dark.png) | ![bork in a light terminal](assets/board-light.png) |
+
 ## Requirements
 
 | Dependency | Purpose |
@@ -138,7 +144,9 @@ bork --help
 | `bork issue archive <id>` | Kill session, run teardown, remove worktree, move to Done |
 | `bork issue delete <id>` | Delete an issue |
 | `bork integration attach-linear <id> <identifier>` | Link a Linear ticket to an issue (can attach multiple) |
-| `bork integration attach-pr <id> <number>` | Link a GitHub PR to an issue (can attach multiple) |
+| `bork integration attach-linear-project <id> <url-or-slug>` | Link a Linear project to an orchestrator issue (can attach multiple) |
+| `bork integration detach-linear-project <id> <url-or-slug>` | Unlink a Linear project from an issue |
+| `bork integration attach-pr [id] <number>` | Link a GitHub PR to an issue (can attach multiple; `id` defaults to `BORK_ISSUE_ID` inside an agent session) |
 | `bork config list` | Show all resolved config values |
 | `bork config get <key>` | Print a resolved config value |
 | `bork config set <key> <value>` | Set a config value (`--global` for the global file) |
@@ -208,9 +216,11 @@ bork issue archive bork-3                 # cleanup when work is merged
 bork issue delete bork-3
 ```
 
-**Create options:** `--column` (todo, in-progress, code-review, done), `--agent` (opencode, claude, codex, pi), `--mode` (plan, build, yolo), `--prompt`, `--kind` (agentic, todo, orchestrator).
+**Create options:** `--column` (todo, in-progress, code-review, done), `--agent` (opencode, claude, codex, pi), `--mode` (plan, build, yolo), `--prompt`, `--model`, `--kind` (agentic, todo, orchestrator).
 
-**Start options:** `--prompt`, `--agent` (opencode, claude, codex), `--mode` (plan, build, yolo), `--slug`, `--no-worktree`, `--project` (registered project name or path). `bork issue start` defaults to build mode and creates a worktree with a slug generated from the title. If a `setup_script` is configured, it runs inside the worktree before the agent starts.
+**Start options:** `--prompt`, `--agent` (opencode, claude, codex), `--mode` (plan, build, yolo), `--model`, `--slug`, `--no-worktree`, `--project` (registered project name or path). `bork issue start` defaults to build mode and creates a worktree with a slug generated from the title. If a `setup_script` is configured, it runs inside the worktree before the agent starts.
+
+**Model per issue:** `--model <name>` on `create`, `start` and `update` is saved on the issue and passed to the agent as `--model <name>` on every launch and resume, e.g. `bork issue start "Review PR 42" --agent claude --model sonnet`. It replaces any `--model`/`-m` in `[agent.<name>].args`. Model names are agent-specific, so changing an issue's agent clears it. OpenCode's TUI has no `--model` flag, so `--model` on an opencode issue is an error. `bork issue update <id> --model ""` clears it.
 
 **Archive options:** `bork issue archive <id> [--force]` kills the issue's tmux session, runs the configured `teardown_script` inside the worktree, removes the worktree, and moves the issue to Done. `--force` proceeds past a failing teardown and discards uncommitted changes.
 
@@ -221,6 +231,9 @@ bork integration attach-linear bork-3 VIL-123   # link a Linear ticket
 bork integration attach-linear bork-3 VIL-456   # link another Linear ticket to the same issue
 bork integration attach-pr bork-3 42             # link a GitHub PR
 bork integration attach-pr bork-3 43             # link another PR to the same issue
+bork integration attach-linear-project bork-5 https://linear.app/acme/project/auth-1a2b3c4d5e6f
+                                                 # link a Linear project to an orchestrator
+bork issue start "Fix login" --linear VIL-789    # start an issue with a ticket already linked
 ```
 
 All commands must be run from within a bork project directory (any directory containing or nested under `.bork/`). Issue IDs are case-insensitive.
@@ -303,6 +316,9 @@ With issues marked, `H`, `L`, `D`, `T`, `Shift+Enter`, `o`, `O`, `x`, `d` and `A
 | `k` / `Up` | Move selection up |
 | `Enter` | Focus selected project (single board view) |
 | `Space` | Toggle project as swimlane (add/remove from view) |
+| `Shift+J` / `Shift+K` | Move project down / up in the list |
+| `Shift+R` | Rename project in bork's UI (issue IDs and tmux sessions keep the config name). Renaming back to the config name clears it |
+| `Shift+D` | Remove project from the list (files stay on disk) |
 | `Esc` / `Ctrl+P` | Close sidebar |
 
 ### Confirm Mode
@@ -518,8 +534,67 @@ Each card shows PR status when a matching PR is found:
 | `●` (red) | Changes requested |
 | `○` (yellow) | Review required |
 | `+12/-3` | Lines added/removed |
+| `✎3` (yellow, bottom line) | Unresolved comments: open review threads on the card's open PRs plus unposted tuicr drafts |
+
+Cards with unresolved comments also count as needing you. Review threads from bots count too; plain PR conversation comments don't. With tuicr installed, its drafts count until you post them with `:submit` or clear them with `:clearc`. Done cards never count.
 
 The `gh` CLI must be installed and authenticated. If `gh` is not available or the repo is not on GitHub, PR polling is silently skipped.
+
+### Merge queues
+
+Your own PRs show where they are in a merge queue. Bork reads GitHub's native merge queue and [Trunk](https://trunk.io/merge-queue) (from the `Trunk Merge Queue` check Trunk posts on the PR, so no Trunk token is needed).
+
+| Badge | Meaning | Needs you |
+|-------|---------|-----------|
+| `⧖ queued` (dim) | Waiting its turn, or passed and about to merge | No |
+| `⧖ testing` (blue) | The queue is running checks on it | No |
+| `✗ queue failed` (red) | The queue removed it after a failed run | Yes |
+| `⧖ dequeued` (yellow) | Cancelled before it merged (Trunk only) | Yes |
+
+While a PR is in a queue, its queue badge takes the place of the status badge (`✗ CI`, `↩ review`, `✓ merge`). The PR line's CI and review icons stay, so a failed Trunk run also shows a red CI `✗`, since Trunk's check is part of the CI result. GitHub clears its queue entry once it removes a PR, so a PR dropped from GitHub's queue goes back to its normal badges. Trunk's check stays on the commit, so its failed and dequeued badges last until you push a new commit or re-queue. A PR Trunk hasn't admitted yet (not ready) has no check, so it shows its normal status.
+
+### Attached PR stacks
+
+The GitHub picker marks PRs that belong to a stack. **Enter** still imports or
+attaches only the selected PR. **Ctrl+S** imports the whole stack, or toggles its
+attachment when editing an issue. Typing continues to search, including `s`.
+An issue can follow one stack alongside its existing individual PR links.
+
+An attached stack follows GitHub's current membership. Its card summarizes CI
+across open PRs, with failures, pending checks, and unknown checks shown separately.
+Small stacks show connected PR rows; larger stacks show a count and check summary.
+Merged and closed PRs remain visible in the expanded list. Stack cards omit diff
+counts. Individual PRs show additions/deletions, or `draft` while still in draft.
+Linked issues and Linear IDs sit at bottom-left. Selecting a stack issue shows
+`s view stack` in the app shortcut bar.
+Orchestrator and todo cards show their type beside the issue ID in the border.
+
+Stack controls appear only when the repository supports GitHub's stack API;
+no CLI extension is required. Without `gh`, live GitHub details are hidden and
+saved links remain editable. Loading is separate from errors. Failed refreshes
+keep cached status and show the error in the picker or stack details.
+
+- **s** expands the stack into a scrollable panel; **j/k** navigates and **Esc** closes.
+- **o** opens the selected PR; **O** opens all open PRs in the attached stack, in stack order.
+- **R** reviews each open PR separately with `tuicr pr <number>`. After exiting a
+  review, press Enter for the next PR or `q` to stop. This needs a tuicr version
+  with the `pr` subcommand; an issue worktree is not required.
+- **P** refreshes GitHub data. When stack data is unavailable, stack-wide actions
+  wait for a successful refresh rather than opening a partial list.
+
+To detach a stack, edit the issue, focus GitHub, and press Backspace. Existing
+individual PR links remain attached. Issues without a stack keep their existing
+browser and review shortcuts.
+
+### Automatic stack reviews
+
+A review request on any member imports one card for the stack. Bork checks stack membership before importing individual PRs, deduplicates repeated results, and fetches only the stacks referenced by your review requests. Only review requests addressed directly to you qualify. Team-only requests and mentions do not fill your personal review column.
+
+The stack detail view marks members that need your review. Automatic stack cards move to Done when no member has an outstanding request and return to Code Review when a new request arrives. Failed or incomplete discovery preserves the previous state. Manually attached stacks keep their existing lifecycle.
+
+`stack_review_prompt` is separate from `review_prompt`. Set it in `~/.config/bork/config.toml` or the project's `.bork/config.toml`; the project value wins. Bork appends the ordered PR list, URLs, and which members need your review. Custom prompts edited on individual cards are preserved.
+
+Untouched automatic PR cards can be consolidated into a stack card. Explicit PR-only attachments and edited cards are preserved, and Bork avoids creating a stack card over them. In that case, each other requested member gets its own card so no request goes missing. Cards in Done are left alone.
 
 ## Linear Integration
 
@@ -531,12 +606,13 @@ export LINEAR_API_KEY="lin_api_..."
 
 It belongs in your shell profile rather than `config.toml` — that file lives
 inside the project directory and is easy to commit by accident. bork only reads
-your assigned issues, so a read-scoped key is enough.
+your assigned issues and open projects, so a read-scoped key is enough.
 
-With a key set, bork polls your assigned issues every 45 seconds and enables:
+With a key set, bork polls your assigned issues and open projects every 45 seconds and enables:
 
 - **Import issues** &mdash; Press `I` to open a fuzzy-search picker of your assigned Linear issues. Imported issues use the Linear identifier as the bork issue ID (e.g. `BORK-14` becomes `bork-14`).
 - **Attach issues to a card** &mdash; In the issue dialog, the Linear field opens a multi-select picker; Enter toggles selection, Backspace removes the last item. `bork integration attach-linear <issue-id> <identifier>` does the same from the CLI, and one card can hold several Linear issues.
+- **Linear projects on orchestrators** &mdash; The picker's Projects tab imports a Linear project as an orchestrator issue named after it. On an orchestrator, the dialog's Projects field attaches more. The orchestrator's prompt lists its projects and tells it to read their description, documents, milestones and tickets for context, and to link a ticket with `bork issue start --linear <ticket>` when an issue it starts covers one. Only orchestrators carry projects; switching an issue to another kind drops them.
 - **Open in Linear** &mdash; Press `O` to open all linked Linear issues in your browser.
 - **State refresh** &mdash; Linear issue state is re-read on each poll cycle, and imported issues follow their Linear title. Nothing is written back to Linear.
 
@@ -669,46 +745,3 @@ Want to contribute? Open an issue or PR &mdash; contributions of all sizes are w
 This project is licensed under the [MIT License](LICENSE).
 
 Made by [Villads Valur](https://valur.xyz/projects/bork).
-
-### Attached PR stacks
-
-The GitHub picker marks PRs that belong to a stack. **Enter** still imports or
-attaches only the selected PR. **Ctrl+S** imports the whole stack, or toggles its
-attachment when editing an issue. Typing continues to search, including `s`.
-An issue can follow one stack alongside its existing individual PR links.
-
-An attached stack follows GitHub's current membership. Its card summarizes CI
-across open PRs, with failures, pending checks, and unknown checks shown separately.
-Small stacks show connected PR rows; larger stacks show a count and check summary.
-Merged and closed PRs remain visible in the expanded list. Stack cards omit diff
-counts. Individual PRs show additions/deletions, or `draft` while still in draft.
-Linked issues and Linear IDs sit at bottom-left. Selecting a stack issue shows
-`s view stack` in the app shortcut bar.
-Orchestrator and todo cards show their type beside the issue ID in the border.
-
-Stack controls appear only when the repository supports GitHub's stack API;
-no CLI extension is required. Without `gh`, live GitHub details are hidden and
-saved links remain editable. Loading is separate from errors. Failed refreshes
-keep cached status and show the error in the picker or stack details.
-
-- **s** expands the stack into a scrollable panel; **j/k** navigates and **Esc** closes.
-- **o** opens all open PRs in the attached stack, in stack order.
-- **R** reviews each open PR separately with `tuicr pr <number>`. After exiting a
-  review, press Enter for the next PR or `q` to stop. This needs a tuicr version
-  with the `pr` subcommand; an issue worktree is not required.
-- **P** refreshes GitHub data. When stack data is unavailable, stack-wide actions
-  wait for a successful refresh rather than opening a partial list.
-
-To detach a stack, edit the issue, focus GitHub, and press Backspace. Existing
-individual PR links remain attached. Issues without a stack keep their existing
-browser and review shortcuts.
-
-### Automatic stack reviews
-
-A review request on any member imports one card for the stack. Bork checks stack membership before importing individual PRs, deduplicates repeated results, and fetches only the stacks referenced by your review requests. Only review requests addressed directly to you qualify. Team-only requests and mentions do not fill your personal review column.
-
-The stack detail view marks members that need your review. Automatic stack cards move to Done when no member has an outstanding request and return to Code Review when a new request arrives. Failed or incomplete discovery preserves the previous state. Manually attached stacks keep their existing lifecycle.
-
-`stack_review_prompt` is separate from `review_prompt`. Set it in `~/.config/bork/config.toml` or the project's `.bork/config.toml`; the project value wins. Bork appends the ordered PR list, URLs, and which members need your review. Custom prompts edited on individual cards are preserved.
-
-Untouched automatic PR cards can be consolidated into a stack card. Explicit PR-only attachments and edited cards are preserved, and Bork avoids creating a stack card over them. In that case, each other requested member gets its own card so no request goes missing. Cards in Done are left alone.

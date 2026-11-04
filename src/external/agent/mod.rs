@@ -6,9 +6,11 @@ use std::time::Duration;
 
 use crate::config::{self, AppConfig};
 use crate::error::AppError;
-use crate::external::process::{self, BORK_SESSION_VAR};
+use crate::external::process::{self, BORK_ISSUE_ID_VAR, BORK_SESSION_VAR};
 use crate::external::{github, tmux};
-use crate::types::{AgentKind, AgentMode, Issue, IssueKind, LinkedGithubPr, LinkedLinear};
+use crate::types::{
+    AgentKind, AgentMode, Issue, IssueKind, LinkedGithubPr, LinkedLinear, PrImportSource,
+};
 
 mod claude;
 mod codex;
@@ -43,6 +45,12 @@ pub trait AgentProvider {
 
     /// Whether the dialog offers a yolo pip / the mode cycle includes Yolo.
     fn supports_yolo(&self) -> bool;
+
+    /// Whether the launch command takes `--model <name>`, on fresh launches
+    /// and resumes alike.
+    fn supports_model(&self) -> bool {
+        true
+    }
 
     /// Build the launch/resume command. Returns
     /// (command, pre_assigned_session_id, prompt_contents), matching what
@@ -152,6 +160,11 @@ pub fn display_names_csv() -> String {
 /// the mode-cycle behaviour).
 pub fn supports_yolo(kind: AgentKind) -> bool {
     provider(kind).supports_yolo()
+}
+
+/// Whether `kind` accepts a per-issue `--model`.
+pub fn supports_model(kind: AgentKind) -> bool {
+    provider(kind).supports_model()
 }
 
 /// Launch an agent session for an issue.
@@ -326,7 +339,7 @@ fn build_agent_cmd(
     prompt_path_str: &str,
 ) -> (String, Option<String>, Option<String>) {
     let env_prefix = format!(
-        "export {BORK_SESSION_VAR}='{}' BORK_STATUS_DIR='{}' BORK_ISSUE_ID='{}'",
+        "export {BORK_SESSION_VAR}='{}' BORK_STATUS_DIR='{}' {BORK_ISSUE_ID_VAR}='{}'",
         shell_escape_single_quotes(session_name),
         shell_escape_single_quotes(status_dir_str),
         shell_escape_single_quotes(&issue.id),
@@ -364,11 +377,31 @@ fn build_agent_cmd(
             prompt.push_str(worktree);
             prompt.push_str(". Do all work for this issue inside that directory.");
         }
+        let is_review = issue.primary_pr_import_source() == Some(PrImportSource::ReviewRequested);
+        if issue.kind == IssueKind::Agentic && !is_review {
+            prompt.push_str(&format!(
+                "\n\nWhen you open a pull request for this work, link it to this issue with `bork integration attach-pr {} <pr-number>`.",
+                issue.id
+            ));
+        }
         if issue.kind == IssueKind::Orchestrator {
             prompt.push_str(&format!(
                 "\n\nMaintain your plan in plans/{}/planning.md, relative to the project root (the directory containing main/).",
                 issue.id
             ));
+        }
+        if issue.kind == IssueKind::Orchestrator && issue.has_linear() {
+            prompt.push_str(LINEAR_TICKET_UPDATES);
+        }
+        if issue.kind.links_linear_projects() && !issue.linear_projects.is_empty() {
+            append_section(
+                &mut prompt,
+                &issue.linear_projects,
+                "Linear project",
+                "Linear projects",
+                |project| format!("{} - {}", project.name, project.url),
+            );
+            prompt.push_str(LINEAR_PROJECT_CONTEXT);
         }
         prompt
     };
@@ -386,11 +419,13 @@ fn build_agent_cmd(
     // per-mode args under `[agent.<name>.mode.<mode>]`.
     let builtin_mode_flag = provider.mode_flag(issue.agent_mode);
 
+    let model = issue.model.as_deref().filter(|_| provider.supports_model());
     let trailing = trailing_args(
         config,
         issue.agent_kind,
         issue.agent_mode,
         builtin_mode_flag,
+        model,
     );
 
     let ctx = LaunchContext {
@@ -417,6 +452,9 @@ fn build_agent_cmd(
 /// - When no per-mode override is configured, bork's built-in mode flags
 ///   are used.
 ///
+/// - The issue's `model` goes last as `--model '<m>'`, and any `--model` /
+///   `-m` in the configured args is dropped (codex rejects a repeated flag).
+///
 /// All configured args are individually shell-escaped so values containing
 /// spaces or quotes are passed through safely.
 fn trailing_args(
@@ -424,16 +462,22 @@ fn trailing_args(
     kind: AgentKind,
     mode: AgentMode,
     builtin_mode_flag: &str,
+    model: Option<&str>,
 ) -> String {
     let (base_args, mode_args_override) = config.launch_args_for(kind, mode);
+    let configured = |args: &[String]| -> Vec<String> {
+        let args = match model {
+            Some(_) => strip_model_args(args),
+            None => args.to_vec(),
+        };
+        args.iter()
+            .map(|arg| format!("'{}'", shell_escape_single_quotes(arg)))
+            .collect()
+    };
 
     let mut parts: Vec<String> = Vec::new();
     match mode_args_override {
-        Some(args) => {
-            for arg in args {
-                parts.push(format!("'{}'", shell_escape_single_quotes(arg)));
-            }
-        }
+        Some(args) => parts.extend(configured(args)),
         None => {
             let trimmed = builtin_mode_flag.trim();
             if !trimmed.is_empty() {
@@ -441,8 +485,9 @@ fn trailing_args(
             }
         }
     }
-    for arg in base_args {
-        parts.push(format!("'{}'", shell_escape_single_quotes(arg)));
+    parts.extend(configured(base_args));
+    if let Some(model) = model {
+        parts.push(format!("--model '{}'", shell_escape_single_quotes(model)));
     }
 
     if parts.is_empty() {
@@ -450,6 +495,21 @@ fn trailing_args(
     } else {
         format!(" {}", parts.join(" "))
     }
+}
+
+/// Drop `--model <m>`, `-m <m>` and `--model=<m>` from configured args so the
+/// issue's model is the only one passed.
+fn strip_model_args(args: &[String]) -> Vec<String> {
+    let mut kept = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--model" || arg == "-m" {
+            iter.next();
+        } else if !arg.starts_with("--model=") {
+            kept.push(arg.clone());
+        }
+    }
+    kept
 }
 
 /// Generate a UUID using the system `uuidgen` command.
@@ -562,6 +622,12 @@ pub(crate) fn is_uuid_like(value: &str) -> bool {
         }
     })
 }
+
+const LINEAR_TICKET_UPDATES: &str =
+    "\n\nKeep the linked Linear tickets updated as milestones complete.";
+
+const LINEAR_PROJECT_CONTEXT: &str = "\n\nFor context on the goal, read each linked Linear project's description, documents, milestones, and tickets, using the Linear MCP or the `linear` CLI. \
+If an issue you start covers one of its tickets, pass `--linear <TICKET-ID>` to `bork issue start` to link it.";
 
 /// Build the full prompt sent to the agent.
 /// Always starts with issue context and the default prompt, then optionally
@@ -1239,6 +1305,29 @@ mod tests {
     }
 
     #[test]
+    fn agentic_prompt_asks_to_link_prs() {
+        let issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        let config = test_config();
+        let (_, _, prompt) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(prompt
+            .unwrap()
+            .contains("bork integration attach-pr bork-1 <pr-number>"));
+    }
+
+    #[test]
+    fn review_prompt_does_not_ask_to_link_prs() {
+        let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
+        issue.github_pr_links.push(LinkedGithubPr {
+            number: 42,
+            imported: true,
+            import_source: Some(PrImportSource::ReviewRequested),
+        });
+        let config = test_config();
+        let (_, _, prompt) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(!prompt.unwrap().contains("attach-pr"));
+    }
+
+    #[test]
     fn orchestrator_prompt_uses_orchestrator_template() {
         let mut issue = test_issue(AgentKind::OpenCode, AgentMode::Build);
         issue.kind = crate::types::IssueKind::Orchestrator;
@@ -1249,6 +1338,7 @@ mod tests {
         assert!(prompt.contains("bork issue start"));
         assert!(prompt.contains("plans/bork-1/planning.md"));
         assert!(!prompt.contains("Assigned worktree"));
+        assert!(!prompt.contains("attach-pr"));
         // The regular default prompt is not used for orchestrators.
         assert!(!prompt.contains("The source code is in main/."));
     }
@@ -1735,6 +1825,101 @@ mod tests {
         let config = test_config();
         let (cmd, _, _) = agent_cmd(&issue, &config, "it's-a-test", "/tmp/status");
         assert!(cmd.contains("BORK_SESSION='it'\\''s-a-test'"));
+    }
+
+    // --- per-issue model ---
+
+    fn issue_with_model(issue: Issue, model: &str) -> Issue {
+        Issue {
+            model: Some(model.to_string()),
+            ..issue
+        }
+    }
+
+    #[test]
+    fn model_flag_on_fresh_and_resume() {
+        let config = test_config();
+        let cases = [
+            (
+                test_issue(AgentKind::Claude, AgentMode::Build),
+                "claude --name",
+            ),
+            (
+                resumable_issue(AgentKind::Claude, AgentMode::Build, "abc"),
+                "--resume 'abc'",
+            ),
+            (test_issue(AgentKind::Codex, AgentMode::Build), "codex "),
+            (
+                resumable_issue(AgentKind::Codex, AgentMode::Build, "abc"),
+                "codex resume 'abc'",
+            ),
+            (test_issue(AgentKind::Pi, AgentMode::Build), "pi --name"),
+            (
+                resumable_issue(AgentKind::Pi, AgentMode::Build, "abc"),
+                "pi --session 'abc'",
+            ),
+            (
+                resumable_issue(AgentKind::Cursor, AgentMode::Build, "abc"),
+                "cursor-agent --resume 'abc'",
+            ),
+        ];
+        for (issue, expected) in cases {
+            let issue = issue_with_model(issue, "sonnet");
+            let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+            assert!(cmd.contains(expected), "{cmd}");
+            assert_eq!(cmd.matches("--model 'sonnet'").count(), 1, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn no_model_flag_when_unset() {
+        let issue = test_issue(AgentKind::Claude, AgentMode::Build);
+        let (cmd, _, _) = agent_cmd(&issue, &test_config(), "bork-bork-1", "/tmp/status");
+        assert!(!cmd.contains("--model"));
+    }
+
+    #[test]
+    fn opencode_never_gets_model_flag() {
+        let issue = issue_with_model(test_issue(AgentKind::OpenCode, AgentMode::Build), "x/y");
+        let (cmd, _, _) = agent_cmd(&issue, &test_config(), "bork-bork-1", "/tmp/status");
+        assert!(!cmd.contains("--model"));
+    }
+
+    #[test]
+    fn issue_model_replaces_configured_model_args() {
+        let issue = issue_with_model(test_issue(AgentKind::Codex, AgentMode::Build), "gpt-5");
+        let config = config_with_launch(
+            AgentKind::Codex,
+            &["-m", "o3", "--verbose", "--model=o4"],
+            &[(
+                AgentMode::Build,
+                &["--model", "o1", "--sandbox", "read-only"],
+            )],
+        );
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(
+            cmd.contains("'--sandbox' 'read-only' '--verbose' --model 'gpt-5'"),
+            "{cmd}"
+        );
+        assert!(
+            !cmd.contains("o3") && !cmd.contains("o4") && !cmd.contains("o1"),
+            "{cmd}"
+        );
+    }
+
+    #[test]
+    fn configured_model_args_kept_without_issue_model() {
+        let issue = test_issue(AgentKind::Claude, AgentMode::Build);
+        let config = config_with_launch(AgentKind::Claude, &["--model", "opus"], &[]);
+        let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(cmd.contains("'--model' 'opus'"));
+    }
+
+    #[test]
+    fn model_value_is_shell_escaped() {
+        let issue = issue_with_model(test_issue(AgentKind::Claude, AgentMode::Build), "it's");
+        let (cmd, _, _) = agent_cmd(&issue, &test_config(), "bork-bork-1", "/tmp/status");
+        assert!(cmd.contains("--model 'it'\\''s'"));
     }
 
     // --- agent_launch / trailing_args integration ---

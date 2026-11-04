@@ -4,9 +4,10 @@ use std::thread;
 
 use crate::app::{
     ActionContext, App, ConfirmAction, ImportSource, InputMode, LinearPickerContext, MessageKind,
-    Project, ProjectId,
+    Project, ProjectId, ProjectRename,
 };
 use crate::config::AppConfig;
+use crate::external::linear::LinearProject;
 use crate::external::{agent, browser, github, tmux, tuicr};
 use crate::global_config::ReloadResult;
 use crate::input::Action;
@@ -117,6 +118,10 @@ pub fn handle_action(
         }
         InputMode::Normal => handle_normal(app, action, ctx, ch),
         InputMode::Sidebar => handle_sidebar(app, action),
+        InputMode::SidebarRename => {
+            handle_sidebar_rename(app, action);
+            PostAction::None
+        }
         InputMode::PruneDialog => {
             handle_prune_dialog(app, action, ctx, ch.action_tx);
             PostAction::None
@@ -734,6 +739,10 @@ fn handle_normal(
             app.toggle_link_filter(ctx);
             PostAction::None
         }
+        Action::ToggleAttentionFilter => {
+            app.toggle_attention_filter(ctx);
+            PostAction::None
+        }
         Action::OpenLinkPicker => {
             app.open_link_picker(ctx);
             PostAction::None
@@ -1084,6 +1093,10 @@ fn handle_debug_inspector(app: &mut App, action: Action) {
 
 fn handle_dialog(app: &mut App, action: Action, ctx: &ActionContext) -> PostAction {
     let on_linear = app.dialog.as_ref().is_some_and(|d| d.is_on_linear_field());
+    let on_linear_project = app
+        .dialog
+        .as_ref()
+        .is_some_and(|d| d.is_on_linear_project_field());
     let on_github = app.dialog.as_ref().is_some_and(|d| d.is_on_github_field());
 
     if on_linear {
@@ -1103,6 +1116,31 @@ fn handle_dialog(app: &mut App, action: Action, ctx: &ActionContext) -> PostActi
                             dialog.linear_detached = true;
                         }
                     }
+                }
+                return PostAction::None;
+            }
+            Action::DialogChar(_) => return PostAction::None,
+            _ => {}
+        }
+    }
+
+    if on_linear_project {
+        match action {
+            Action::DialogChar(' ') => {
+                // Without loaded projects the picker would fall back to
+                // another tab, and Enter would attach the wrong kind of link.
+                if app.context_project(ctx).live.linear_projects.is_empty() {
+                    app.set_warning("No Linear projects loaded yet");
+                    return PostAction::None;
+                }
+                app.picker_tab = ImportSource::LinearProject;
+                app.open_import_picker_with_context(LinearPickerContext::Attach, ctx);
+                return PostAction::None;
+            }
+            Action::DialogBackspace | Action::DialogDelete => {
+                if let Some(dialog) = app.dialog.as_mut() {
+                    dialog.linear_projects.pop();
+                    dialog.linear_projects_edited = true;
                 }
                 return PostAction::None;
             }
@@ -1281,6 +1319,7 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
             let _ = p.issues[idx].set_kind(dialog.kind);
 
             apply_linear_fields(&mut p.issues[idx], &dialog);
+            apply_linear_project_fields(&mut p.issues[idx], &dialog);
             apply_pr_fields(&mut p.issues[idx], &dialog);
 
             let updated_id = p.issues[idx].id.clone();
@@ -1326,11 +1365,13 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
             kind: dialog.kind,
             agent_mode: dialog.agent_mode,
             prompt,
+            model: None,
         },
         crate::app::unix_now(),
     );
 
     apply_linear_fields(&mut issue, &dialog);
+    apply_linear_project_fields(&mut issue, &dialog);
     apply_pr_fields(&mut issue, &dialog);
 
     let Some(p) = app.find_project_mut(&proj_id) else {
@@ -1362,6 +1403,15 @@ fn apply_linear_fields(issue: &mut Issue, dialog: &crate::app::DialogState) {
                 imported: false,
             })
             .collect();
+    }
+}
+
+fn apply_linear_project_fields(issue: &mut Issue, dialog: &crate::app::DialogState) {
+    // Untouched, the dialog's copy may be stale (a CLI attach while it was
+    // open). `set_kind` already dropped projects if the issue left the
+    // orchestrator kind.
+    if dialog.kind.links_linear_projects() && dialog.linear_projects_edited {
+        issue.linear_projects = dialog.linear_projects.clone();
     }
 }
 
@@ -1398,13 +1448,10 @@ fn handle_linear_picker(
             app.close_linear_picker();
         }
         Action::PickerSwitchTab => {
-            let has_linear = !app.context_project(ctx).live.linear_issues.is_empty();
-            let has_github = app.context_project(ctx).can_browse_github();
-            if has_linear && has_github {
-                app.picker_tab = match app.picker_tab {
-                    ImportSource::Linear => ImportSource::GitHub,
-                    ImportSource::GitHub => ImportSource::Linear,
-                };
+            let tabs = app.picker_tabs();
+            if tabs.len() > 1 {
+                let current = tabs.iter().position(|t| *t == app.picker_tab).unwrap_or(0);
+                app.picker_tab = tabs[(current + 1) % tabs.len()];
                 if let Some(ref mut picker) = app.linear_picker {
                     picker.selected = 0;
                 }
@@ -1413,6 +1460,7 @@ fn handle_linear_picker(
         Action::LinearPickerDown => {
             let count = match app.picker_tab {
                 ImportSource::Linear => app.filtered_linear_issues().len(),
+                ImportSource::LinearProject => app.filtered_linear_projects().len(),
                 ImportSource::GitHub => app.filtered_github_prs().len(),
             };
             if let Some(ref mut picker) = app.linear_picker {
@@ -1445,16 +1493,20 @@ fn handle_linear_picker(
             (LinearPickerContext::Attach, ImportSource::Linear) => {
                 attach_linear_to_dialog(app, ctx)
             }
+            (LinearPickerContext::Attach, ImportSource::LinearProject) => {
+                attach_linear_project_to_dialog(app)
+            }
             (LinearPickerContext::Attach, ImportSource::GitHub) => {
                 attach_github_to_dialog(app, ctx)
             }
             (_, ImportSource::Linear) => import_linear_issue(app, ctx),
+            (_, ImportSource::LinearProject) => import_linear_project(app, ctx),
             (_, ImportSource::GitHub) => import_github_pr(app, ctx),
         },
         Action::LinearPickerRefresh => match app.picker_tab {
-            ImportSource::Linear => {
+            ImportSource::Linear | ImportSource::LinearProject => {
                 let _ = linear_wake_tx.send(());
-                app.set_message("Refreshing Linear issues...");
+                app.set_message("Refreshing Linear...");
             }
             ImportSource::GitHub => {
                 let _ = pr_wake_tx.send(crate::github_poll::Wake::Refresh);
@@ -1580,7 +1632,17 @@ fn import_linear_issue(app: &mut App, ctx: &ActionContext) {
         )
     };
 
-    let Some(p) = app.find_project_mut(&proj_id) else {
+    push_imported_todo(
+        app,
+        &proj_id,
+        issue,
+        format!("Imported {}", linear_issue.identifier),
+    );
+}
+
+/// Add an imported issue to Todo, select it, and close the picker.
+fn push_imported_todo(app: &mut App, proj_id: &ProjectId, issue: Issue, message: String) {
+    let Some(p) = app.find_project_mut(proj_id) else {
         return;
     };
     p.issues.push(issue);
@@ -1591,8 +1653,76 @@ fn import_linear_issue(app: &mut App, ctx: &ActionContext) {
     }
     p.mark_dirty();
 
-    app.set_message(format!("Imported {}", linear_issue.identifier));
+    app.set_message(message);
     app.close_linear_picker();
+}
+
+fn attach_linear_project_to_dialog(app: &mut App) {
+    let Some(project) = selected_linear_project(app) else {
+        return;
+    };
+
+    if let Some(ref mut dialog) = app.dialog {
+        if let Some(pos) = dialog
+            .linear_projects
+            .iter()
+            .position(|p| p.id == project.id)
+        {
+            dialog.linear_projects.remove(pos);
+        } else {
+            dialog.linear_projects.push(project.to_link(false));
+        }
+        dialog.linear_projects_edited = true;
+    }
+}
+
+/// Import a Linear project as a new orchestrator issue in Todo.
+fn import_linear_project(app: &mut App, ctx: &ActionContext) {
+    let Some(linear_project) = selected_linear_project(app) else {
+        return;
+    };
+
+    let proj_id = ctx.project_id.clone();
+    let Some(project) = app.find_project(&proj_id) else {
+        app.set_warning("Project no longer available");
+        app.close_linear_picker();
+        return;
+    };
+
+    if project
+        .issues
+        .iter()
+        .any(|i| i.linear_projects.iter().any(|p| p.id == linear_project.id))
+    {
+        app.set_message(format!("{} is already on the board", linear_project.name));
+        app.close_linear_picker();
+        return;
+    }
+
+    let issue = Issue {
+        kind: IssueKind::Orchestrator,
+        linear_projects: vec![linear_project.to_link(true)],
+        ..Issue::new(
+            project.next_issue_id(),
+            linear_project.name.clone(),
+            Column::Todo,
+            project.config.agent_kind,
+        )
+    };
+
+    push_imported_todo(
+        app,
+        &proj_id,
+        issue,
+        format!("Imported {} as an orchestrator", linear_project.name),
+    );
+}
+
+fn selected_linear_project(app: &App) -> Option<LinearProject> {
+    let selected_idx = app.linear_picker.as_ref().map(|p| p.selected).unwrap_or(0);
+    app.filtered_linear_projects()
+        .get(selected_idx)
+        .map(|p| (*p).clone())
 }
 
 fn import_github_pr(app: &mut App, ctx: &ActionContext) {
@@ -1659,6 +1789,7 @@ fn handle_stack_details(app: &mut App, action: Action, ch: &ActionChannels<'_>) 
     let ctx = ActionContext {
         project_id: details.project_id.clone(),
     };
+    let selected = details.selected;
     let issue = app
         .find_project(&ctx.project_id)
         .and_then(|project| {
@@ -1678,7 +1809,7 @@ fn handle_stack_details(app: &mut App, action: Action, ch: &ActionChannels<'_>) 
     };
     match action {
         Action::StackDown | Action::StackUp => {
-            let count = app.context_project(&ctx).detail_member_count(&issue);
+            let count = app.context_project(&ctx).detail_members(&issue).len();
             if let Some(details) = &mut app.stack_details {
                 if action == Action::StackDown {
                     details.selected = (details.selected + 1).min(count.saturating_sub(1));
@@ -1690,7 +1821,20 @@ fn handle_stack_details(app: &mut App, action: Action, ch: &ActionChannels<'_>) 
         Action::SyncPRs => {
             let _ = ch.pr_wake_tx.send(crate::github_poll::Wake::Refresh);
         }
-        Action::OpenPR | Action::OpenReviewPR => {
+        Action::OpenPR => {
+            let project = app.context_project(&ctx);
+            let Some(number) = project
+                .detail_members(&issue)
+                .get(selected)
+                .map(|member| member.number)
+            else {
+                app.set_warning("No PR selected");
+                return PostAction::None;
+            };
+            let cwd = project.config.project_root.join("main");
+            spawn_open_prs(app, ch, cwd, vec![number], String::new());
+        }
+        Action::OpenAllPRs | Action::OpenReviewPR => {
             return open_pr_group(app, action, &ctx, &issue, ch)
         }
         _ => {}
@@ -1876,7 +2020,7 @@ fn submit_prune_dialog(app: &mut App, action_tx: &mpsc::Sender<ActionResult>) {
     };
 
     let (to_remove, dirty) = crate::prune::partition_selection(&dialog.candidates);
-    if !dirty.is_empty() {
+    if to_remove.is_empty() && !dirty.is_empty() {
         dialog.error = Some(format!(
             "Refusing: dirty worktrees can't be pruned ({}). Commit/stash first.",
             dirty.join(", ")
@@ -1903,7 +2047,7 @@ fn submit_prune_dialog(app: &mut App, action_tx: &mpsc::Sender<ActionResult>) {
 
     let tx = action_tx.clone();
     thread::spawn(move || {
-        let outcome = crate::prune::execute_removals(&project_root, &to_remove);
+        let outcome = crate::prune::execute_removals(&project_root, &to_remove, &dirty);
         let (message, message_kind) = format_prune_result(&outcome);
         let _ = tx.send(ActionResult {
             message,
@@ -1930,7 +2074,7 @@ fn format_prune_result(outcome: &crate::prune::PruneOutcome) -> (String, Message
         .collect();
     (
         format!(
-            "Pruned {} worktree(s), {} failed ({})",
+            "Pruned {} worktree(s), {} failed ({}), see .bork/errors.log",
             removed,
             failed,
             failure_summary.join("; ")
@@ -2009,6 +2153,40 @@ fn handle_sidebar(app: &mut App, action: Action) -> PostAction {
             }
             PostAction::None
         }
+        Action::SidebarMoveUp | Action::SidebarMoveDown => {
+            let up = action == Action::SidebarMoveUp;
+            if let Some(order) = app.move_sidebar_project(up) {
+                if let Err(e) = crate::global_config::set_project_order(&order) {
+                    app.set_error(format!("Failed to save project order: {e}"));
+                }
+            }
+            PostAction::None
+        }
+        Action::SidebarRename => {
+            if let Some(project_id) = app.sidebar_selected_id() {
+                let buffer = app.project_display_name(&project_id);
+                if let Some(sidebar) = app.sidebar.as_mut() {
+                    sidebar.rename = Some(ProjectRename { project_id, buffer });
+                    app.input_mode = InputMode::SidebarRename;
+                }
+            }
+            PostAction::None
+        }
+        Action::SidebarRemove => {
+            let Some(project_id) = app.sidebar_selected_id() else {
+                return PostAction::None;
+            };
+            if project_id == app.focused_project {
+                app.set_warning("Can't remove the open project, switch to another one first");
+                return PostAction::None;
+            }
+            let name = app.project_display_name(&project_id);
+            app.start_confirm(
+                format!("Remove '{name}' from the project list? Files stay on disk (y/n)"),
+                ConfirmAction::RemoveProject { project_id },
+            );
+            PostAction::None
+        }
         Action::ShowHelp => {
             app.open_help();
             PostAction::None
@@ -2018,6 +2196,65 @@ fn handle_sidebar(app: &mut App, action: Action) -> PostAction {
             PostAction::None
         }
         _ => PostAction::None,
+    }
+}
+
+fn handle_sidebar_rename(app: &mut App, action: Action) {
+    let Some(rename) = app.sidebar.as_mut().and_then(|s| s.rename.as_mut()) else {
+        app.input_mode = InputMode::Sidebar;
+        return;
+    };
+    match action {
+        Action::SearchChar(c) => rename.buffer.push(c),
+        Action::SearchBackspace => {
+            rename.buffer.pop();
+        }
+        Action::SearchCancel => end_sidebar_rename(app),
+        Action::SearchConfirm => {
+            let name = rename.buffer.trim().to_string();
+            let project_id = rename.project_id.clone();
+            if name.is_empty() {
+                app.set_warning("Project name can't be empty");
+                return;
+            }
+            let Some(project) = app.find_project(&project_id) else {
+                end_sidebar_rename(app);
+                return;
+            };
+            // Renaming back to the config name clears the label, so later
+            // config.toml edits show up again.
+            let label = Some(name.as_str()).filter(|name| *name != project.config.project_name);
+            // Errors keep the field open so the name can be fixed.
+            match crate::global_config::set_project_label(&project_id, label) {
+                Ok(entries) => {
+                    app.sync_with_registry(&entries);
+                    end_sidebar_rename(app);
+                }
+                Err(e) => app.set_error(format!("Rename failed: {e}")),
+            }
+        }
+        _ => {}
+    }
+}
+
+fn end_sidebar_rename(app: &mut App) {
+    if let Some(sidebar) = app.sidebar.as_mut() {
+        sidebar.rename = None;
+    }
+    app.input_mode = InputMode::Sidebar;
+}
+
+fn unregister_sidebar_project(app: &mut App, project_id: ProjectId) {
+    let name = app.project_display_name(&project_id);
+    match crate::global_config::unregister_project(&project_id) {
+        Ok(_) => {
+            app.remove_projects(&[project_id]);
+            app.show_message(
+                format!("Removed '{name}' from the project list"),
+                MessageKind::Info,
+            );
+        }
+        Err(e) => app.set_error(format!("Failed to remove '{name}': {e}")),
     }
 }
 
@@ -2076,6 +2313,9 @@ fn handle_confirm(
                             result
                         },
                     ),
+                    ConfirmAction::RemoveProject { project_id } => {
+                        unregister_sidebar_project(app, project_id)
+                    }
                     ConfirmAction::ArchiveIssue {
                         issue_ids,
                         project_id,
@@ -2450,6 +2690,9 @@ mod tests {
                 deletions: 20,
                 head_branch: format!("branch-{number}"),
                 is_cross_repository: false,
+                merge_blocker: None,
+                merge_queue: None,
+                unresolved_threads: 0,
             };
             members.push(GithubStackPullRequest {
                 number,
@@ -4781,6 +5024,229 @@ mod tests {
         assert!(matches!(post, PostAction::None));
     }
 
+    fn register_test_projects(app: &App) {
+        for project in &app.projects {
+            crate::global_config::register_project(
+                &project.config.project_name,
+                &project.config.project_root,
+            )
+            .unwrap();
+        }
+    }
+
+    fn open_sidebar(app: &mut App, selected: usize) {
+        let sidebar = app.sidebar.as_mut().unwrap();
+        sidebar.visible = true;
+        sidebar.focused = true;
+        sidebar.selected = selected;
+        app.input_mode = InputMode::Sidebar;
+    }
+
+    #[test]
+    fn sidebar_move_persists_order() {
+        crate::global_config::tests::with_temp_config("sidebar-move", || {
+            let mut app = test_multi_app();
+            register_test_projects(&app);
+            open_sidebar(&mut app, 2);
+
+            handle_sidebar(&mut app, Action::SidebarMoveUp);
+
+            let names: Vec<String> = crate::global_config::list_projects()
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect();
+            assert_eq!(names, ["alpha", "gamma", "beta"]);
+            assert_eq!(app.sidebar.as_ref().unwrap().selected, 1);
+        });
+    }
+
+    #[test]
+    fn sidebar_move_at_edge_saves_nothing() {
+        crate::global_config::tests::with_temp_config("sidebar-move-edge", || {
+            let mut app = test_multi_app();
+            open_sidebar(&mut app, 0);
+
+            handle_sidebar(&mut app, Action::SidebarMoveUp);
+
+            assert!(crate::global_config::list_projects().is_empty());
+            assert_eq!(app.sidebar.as_ref().unwrap().selected, 0);
+            assert!(app.message.is_none());
+        });
+    }
+
+    fn rename_buffer(app: &mut App) -> &mut String {
+        &mut app
+            .sidebar
+            .as_mut()
+            .unwrap()
+            .rename
+            .as_mut()
+            .unwrap()
+            .buffer
+    }
+
+    #[test]
+    fn sidebar_rename_saves_label() {
+        crate::global_config::tests::with_temp_config("sidebar-rename", || {
+            let mut app = test_multi_app();
+            register_test_projects(&app);
+            open_sidebar(&mut app, 1);
+
+            handle_sidebar(&mut app, Action::SidebarRename);
+            assert_eq!(app.input_mode, InputMode::SidebarRename);
+            assert_eq!(rename_buffer(&mut app), "beta");
+
+            handle_sidebar_rename(&mut app, Action::SearchBackspace);
+            assert_eq!(rename_buffer(&mut app), "bet");
+            rename_buffer(&mut app).clear();
+            for c in "  Bee ".chars() {
+                handle_sidebar_rename(&mut app, Action::SearchChar(c));
+            }
+            handle_sidebar_rename(&mut app, Action::SearchConfirm);
+
+            assert_eq!(app.input_mode, InputMode::Sidebar);
+            assert!(app.sidebar.as_ref().unwrap().rename.is_none());
+            assert_eq!(app.projects[1].display_name(), "Bee");
+            assert_eq!(app.projects[1].config.project_name, "beta");
+            let entry = &crate::global_config::list_projects()[1];
+            assert_eq!(entry.name, "beta");
+            assert_eq!(entry.label.as_deref(), Some("Bee"));
+        });
+    }
+
+    #[test]
+    fn sidebar_rename_to_config_name_clears_label() {
+        crate::global_config::tests::with_temp_config("sidebar-rename-clear", || {
+            let mut app = test_multi_app();
+            register_test_projects(&app);
+            crate::global_config::set_project_label(&app.projects[1].id(), Some("Bee")).unwrap();
+            app.sync_with_registry(&crate::global_config::list_projects());
+            open_sidebar(&mut app, 1);
+
+            handle_sidebar(&mut app, Action::SidebarRename);
+            *rename_buffer(&mut app) = "beta".into();
+            handle_sidebar_rename(&mut app, Action::SearchConfirm);
+
+            assert_eq!(app.projects[1].label, None);
+            assert_eq!(crate::global_config::list_projects()[1].label, None);
+        });
+    }
+
+    #[test]
+    fn sidebar_rename_keeps_target_when_list_shifts() {
+        crate::global_config::tests::with_temp_config("sidebar-rename-shift", || {
+            let mut app = test_multi_app();
+            register_test_projects(&app);
+            open_sidebar(&mut app, 1);
+            let beta_id = app.projects[1].id();
+
+            handle_sidebar(&mut app, Action::SidebarRename);
+            // A reload moves the cursor off beta while the field is open.
+            app.sidebar.as_mut().unwrap().selected = 2;
+            *rename_buffer(&mut app) = "Bee".into();
+            handle_sidebar_rename(&mut app, Action::SearchConfirm);
+
+            assert_eq!(app.find_project(&beta_id).unwrap().display_name(), "Bee");
+            assert_eq!(app.projects[2].display_name(), "gamma");
+        });
+    }
+
+    #[test]
+    fn sidebar_rename_rejects_empty_and_duplicate_names() {
+        crate::global_config::tests::with_temp_config("sidebar-rename-bad", || {
+            let mut app = test_multi_app();
+            register_test_projects(&app);
+            open_sidebar(&mut app, 1);
+
+            handle_sidebar(&mut app, Action::SidebarRename);
+            *rename_buffer(&mut app) = "   ".into();
+            handle_sidebar_rename(&mut app, Action::SearchConfirm);
+            assert_eq!(app.input_mode, InputMode::SidebarRename);
+
+            *rename_buffer(&mut app) = "gamma".into();
+            handle_sidebar_rename(&mut app, Action::SearchConfirm);
+            assert_eq!(app.input_mode, InputMode::SidebarRename);
+            assert_eq!(app.projects[1].display_name(), "beta");
+
+            handle_sidebar_rename(&mut app, Action::SearchCancel);
+            assert_eq!(app.input_mode, InputMode::Sidebar);
+            assert!(app.sidebar.as_ref().unwrap().rename.is_none());
+        });
+    }
+
+    #[test]
+    fn sidebar_remove_blocks_focused_project() {
+        let mut app = test_multi_app();
+        open_sidebar(&mut app, 0);
+
+        handle_sidebar(&mut app, Action::SidebarRemove);
+
+        assert_eq!(app.input_mode, InputMode::Sidebar);
+        assert!(app.pending_confirm.is_none());
+    }
+
+    #[test]
+    fn sidebar_remove_unregisters_after_confirm() {
+        crate::global_config::tests::with_temp_config("sidebar-remove", || {
+            let mut app = test_multi_app();
+            register_test_projects(&app);
+            open_sidebar(&mut app, 1);
+            let beta_id = app.projects[1].id();
+            let (tx, _rx) = mpsc::channel();
+            let ctx = app.action_context();
+
+            handle_sidebar(&mut app, Action::SidebarRemove);
+            assert_eq!(app.input_mode, InputMode::Confirm);
+            handle_confirm(&mut app, Action::ConfirmYes, &ctx, &tx);
+
+            assert_eq!(app.input_mode, InputMode::Sidebar);
+            assert!(app.find_project(&beta_id).is_none());
+            assert_eq!(crate::global_config::list_projects().len(), 2);
+        });
+    }
+
+    #[test]
+    fn sidebar_remove_visible_swimlane_drops_its_lane() {
+        crate::global_config::tests::with_temp_config("sidebar-remove-lane", || {
+            let mut app = test_multi_app();
+            register_test_projects(&app);
+            let alpha_id = app.projects[0].id();
+            let beta_id = app.projects[1].id();
+            let gamma_id = app.projects[2].id();
+            app.sidebar.as_mut().unwrap().swimlanes =
+                vec![alpha_id.clone(), beta_id.clone(), gamma_id.clone()];
+            app.focused_swimlane = 2;
+            open_sidebar(&mut app, 1);
+            let (tx, _rx) = mpsc::channel();
+            let ctx = app.action_context();
+
+            handle_sidebar(&mut app, Action::SidebarRemove);
+            handle_confirm(&mut app, Action::ConfirmYes, &ctx, &tx);
+
+            assert_eq!(
+                app.sidebar.as_ref().unwrap().swimlanes,
+                vec![alpha_id, gamma_id.clone()]
+            );
+            // The focused lane follows gamma to its new position.
+            assert_eq!(app.focused_swimlane, 1);
+            assert_eq!(app.active_project_id(), gamma_id);
+        });
+    }
+
+    #[test]
+    fn sidebar_remove_cancel_returns_to_sidebar() {
+        let mut app = test_multi_app();
+        open_sidebar(&mut app, 1);
+        let (tx, _rx) = mpsc::channel();
+        let ctx = app.action_context();
+
+        handle_sidebar(&mut app, Action::SidebarRemove);
+        handle_confirm(&mut app, Action::ConfirmNo, &ctx, &tx);
+
+        assert_eq!(app.input_mode, InputMode::Sidebar);
+        assert_eq!(app.projects.len(), 3);
+    }
+
     #[test]
     fn sidebar_toggle_swimlane_add_remove() {
         let mut app = test_multi_app();
@@ -5000,6 +5466,9 @@ mod tests {
             deletions: 5,
             head_branch: "feature".to_string(),
             is_cross_repository: false,
+            merge_blocker: None,
+            merge_queue: None,
+            unresolved_threads: 0,
         };
         app.projects[0]
             .live
@@ -5153,6 +5622,33 @@ mod tests {
         assert!(app.prune_dialog.is_some());
         let err = app.prune_dialog.as_ref().unwrap().error.clone();
         assert!(err.is_some_and(|s| s.contains("dirty")));
+    }
+
+    #[test]
+    fn prune_confirm_skips_dirty_and_prunes_the_rest() {
+        let (_dir, mut app) = test_app_with_worktrees(&["wt-clean", "wt-dirty"]);
+        app.project_mut().live.worktree_statuses.insert(
+            "wt-clean".into(),
+            crate::types::WorktreeStatus {
+                staged: 0,
+                unstaged: 0,
+            },
+        );
+        app.project_mut().live.worktree_statuses.insert(
+            "wt-dirty".into(),
+            crate::types::WorktreeStatus {
+                staged: 1,
+                unstaged: 0,
+            },
+        );
+        act(&mut app, Action::OpenPruneDialog);
+        act(&mut app, Action::PruneSelectAllRemove);
+        act(&mut app, Action::PruneConfirm);
+        assert!(app.prune_dialog.is_none());
+        assert!(app
+            .message
+            .as_ref()
+            .is_some_and(|(m, _)| m.contains("Pruning 1 worktree(s)")));
     }
 
     #[test]

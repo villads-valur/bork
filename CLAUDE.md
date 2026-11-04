@@ -6,7 +6,7 @@ Terminal kanban board for orchestrating OpenCode/Claude Code/Codex/Pi/Cursor cod
 
 - **Language**: Rust (no async runtime, pure `std::thread` + `mpsc`)
 - **TUI**: ratatui + crossterm
-- **External tools**: tmux, git, gh, linear (optional), and the coding agents: `opencode`, `claude`, `codex`, `pi`, `cursor-agent` (all via `std::process::Command`)
+- **External tools**: tmux, git, gh, linear (optional), tuicr (optional), and the coding agents: `opencode`, `claude`, `codex`, `pi`, `cursor-agent` (all via `std::process::Command`)
 
 ### Threading Model
 
@@ -15,7 +15,8 @@ Main Thread (50ms tick event loop)
 ├── Shared workers (one each, app-wide)
 │   ├── Tmux Session Worker (polls every 2s - one global `tmux list-sessions`)
 │   ├── Port Poll Worker (polls every 10s - listening TCP ports via lsof/ps)
-│   ├── Linear Worker (polls every 45s - assigned Linear issues, conditional on `linear` CLI)
+│   ├── Linear Worker (polls every 45s - assigned Linear issues + open projects, conditional on `linear` CLI)
+│   ├── tuicr Draft Worker (polls every 10s - unposted tuicr comments, conditional on `tuicr`)
 │   ├── Activity Poller (polls every 5s - agent status dirs for all registered projects)
 │   └── Update Check Worker (every 6h - new-version banner, plus cache mtime poll every 2s)
 ├── Primary ProjectWorkers (for focused project)
@@ -79,7 +80,7 @@ src/
 │   │   └── setup.rs    # Worktree setup-script runner
 │   ├── git.rs        # Git worktree status polling
 │   ├── github.rs     # GitHub PR polling via gh api graphql (per-repo identity cache)
-│   ├── linear.rs     # Linear CLI integration (assigned issues via graphql)
+│   ├── linear.rs     # Linear CLI integration (assigned issues and projects via graphql)
 │   └── hooks.rs      # Shared hook install/uninstall helpers; install()/uninstall() iterate the registry
 └── ui/
     ├── mod.rs         # Root render, layout composition, swimlane splitting
@@ -88,7 +89,7 @@ src/
     ├── sidebar.rs     # Project sidebar with activity markers
     ├── dialog.rs      # New/edit issue dialog overlay
     ├── help.rs        # Help overlay (keybinding reference popup)
-    ├── linear_picker.rs # Import picker for Linear issues and GitHub PRs
+    ├── linear_picker.rs # Import picker for Linear issues, Linear projects, and GitHub PRs
     ├── status_bar.rs  # Header + footer (swimlane indicator)
     └── styles.rs      # Colors, styles, shared UI utilities (ANSI 16 only)
 ```
@@ -107,6 +108,7 @@ App
 Project
 ├── issues: Vec<Issue>              # Persistent (saved to state.json)
 ├── config: AppConfig               # From .bork/config.toml
+├── label: Option<String>           # Sidebar rename from projects.json; display_name() falls back to config.project_name
 ├── available_agents: Vec<AgentKind> # Resolved at startup from layered config + PATH
 ├── selected_column/row             # Board cursor (per-project)
 ├── live: LiveState                 # Ephemeral worker data (sessions, git, PRs, etc.)
@@ -130,12 +132,12 @@ bork/                           # container (the agent's cwd)
 └── {issue-id}/                 # issue worktrees (created by agent)
 ```
 
-State lives in `.bork/` at the container root. Config is detected by walking up from cwd looking for a `.bork/` directory.
+State lives in `.bork/` at the container root. Config is detected by walking up from cwd looking for a `.bork/` directory. Failures that would otherwise only flash in the status bar (currently worktree prune) are appended to `.bork/errors.log`.
 
 ## Global State
 
 - `~/.config/bork/config.toml` — global config layer (agents allowlist, default_agent, default_mode, default_prompt, review_prompt, stack_review_prompt, orchestrator_prompt, setup_script, teardown_script, auto_import_reviews, auto_import_authored_prs, etc.). Same flat schema as `<project>/.bork/config.toml`; project values override global. `default_mode` (alias `agent_mode`) sets the default agent mode (plan/build/yolo) for new issues created via the TUI dialog or `bork issue create`/`bork issue start` when no `--mode` is given. Scalar keys can be read/written with `bork config get|set|list`.
-- `~/.config/bork/projects.json` — registry of all bork projects (auto-registered, auto-pruned, managed artifact)
+- `~/.config/bork/projects.json` — registry of all bork projects (auto-registered, auto-pruned). Its order is the sidebar order (Shift+J/K in the sidebar). Each entry's `name` follows the config `project_name`; an optional `label` holds a rename from the sidebar (Shift+R) and is shown in the sidebar, header, lane titles and terminal title. Issue IDs and tmux session names always use `project_name`. `--project` matches `name` or `label`. Removing from the sidebar (Shift+D, with a y/n prompt) only unregisters; files stay on disk.
 - `~/.config/bork/bork.pid` — flock-based single instance lock
 
 Legacy: `~/.config/bork/agents.toml` is no longer read (bork-119). A one-line stderr warning is printed if it still exists.
@@ -162,7 +164,7 @@ The binary is symlinked to `/opt/homebrew/bin/bork`.
 
 - `Agentic` (default) — launches a coding agent in a tmux session, usually in its own worktree
 - `NonAgentic` ("Todo") — plain checklist card, never launches an agent; Enter opens the edit dialog
-- `Orchestrator` — launches a coordinating agent at the project root with no worktree and no GitHub PR field. Its prompt comes from `orchestrator_prompt` (project overrides global, falls back to `DEFAULT_ORCHESTRATOR_PROMPT` in config.rs) instead of `default_prompt`, and bork appends the planning file path `plans/{issue-id}/planning.md`. The agent breaks the goal into issues, spawns them via `bork issue start`, and monitors/nudges their agents via `bork issue list --json` and tmux. Cards render with a magenta border and an `◆ orch` badge. `IssueKind::is_agentic()` is true for both `Agentic` and `Orchestrator`. Kind changes go through `Issue::set_kind()`, which clears all agent sessions when crossing the orchestrator boundary and additionally drops the worktree and PR links when becoming an orchestrator (`bork integration attach-pr` also rejects orchestrators).
+- `Orchestrator` — launches a coordinating agent at the project root with no worktree and no GitHub PR field. Its prompt comes from `orchestrator_prompt` (project overrides global, falls back to `DEFAULT_ORCHESTRATOR_PROMPT` in config.rs) instead of `default_prompt`, and bork appends the planning file path `plans/{issue-id}/planning.md`. The agent breaks the goal into issues, spawns them via `bork issue start`, and monitors/nudges their agents via `bork issue list --json` and tmux. Cards render with a magenta border and an `◆ orch` badge. `IssueKind::is_agentic()` is true for both `Agentic` and `Orchestrator`. Kind changes go through `Issue::set_kind()`, which clears all agent sessions when crossing the orchestrator boundary and additionally drops the worktree and PR links when becoming an orchestrator (`bork integration attach-pr` also rejects orchestrators). Only orchestrators carry Linear projects (`Issue.linear_projects`): leaving the kind drops them, `bork integration attach-linear-project` rejects other kinds, the dialog's Projects field only appears for orchestrators, and the picker's Projects tab is offered when attaching only if the dialog is an orchestrator (importing a project from it always creates an orchestrator, so the tab shows in import mode for any card). Linked projects are appended to the orchestrator prompt as context (read the project; link tickets via `--linear` when a spawned issue covers one), not as a backlog to work through.
 
 ## Agent Sessions
 
@@ -173,6 +175,7 @@ Each `Issue` stores agent session IDs in `sessions: BTreeMap<AgentKind, String>`
 Each `Issue` can link to multiple Linear issues and GitHub PRs via Vec fields:
 
 - `linear_links: Vec<LinkedLinear>` — each has `id`, `identifier`, `url`, `imported`
+- `linear_projects: Vec<LinkedLinearProject>` — orchestrators only; each has `id`, `slug` (Linear `slugId`), `name`, `url`, `imported`
 - `github_pr_links: Vec<LinkedGithubPr>` — each has `number`, `imported`, `import_source`
 
 Legacy singular fields (`linear_id`, `pr_number`, etc.) are kept for deserialization backward compat but marked `#[serde(skip_serializing)]`. Migration happens automatically in `load_state()`.
@@ -202,9 +205,15 @@ Issues can be tied to other issues in the same project via a symmetric `linked_i
 - Fetch the repository-wide recent-PR list and stack discovery only when the GitHub picker is open. Board status polling covers linked PRs, attached stack members, and issue worktree branches.
 - Prioritize Code Review, In Progress, To Do, then Done. Reuse `.bork/github-cache.json` across restarts, batch and deduplicate requests, and preserve retry cooldowns. Do not reintroduce a sweep of every repository stack's PR statuses.
 
+## Merge queue status
+
+- `PrStatus.merge_queue` comes from GitHub's `mergeQueueEntry`/`isInMergeQueue` first, then Trunk's `Trunk Merge Queue (<branch>)` check run on the head commit. `PR_FIELDS_WITH_QUEUE` asks only for the check suite of Trunk's GitHub App (id 120106), so the query stays small in repos with many checks. Review searches use plain `PR_FIELDS`, since queue state only matters on your own PRs; anything that can feed `pr_for` for your own PR must use the queue version.
+- Trunk's check is part of `statusCheckRollup`, so `pr_attention` checks the queue state before CI and review. `Attention::Queue(state)` carries the state; queued/testing stay out of the needs-you count, failed/dequeued count.
+
 ## Automatic stack review imports
 
 - Review discovery uses `user-review-requested` (direct personal requests), not `review-requested` (which includes team queues) or `involves`. Return PRs and their stack numbers atomically, after all pages succeed.
 - Resolve distinct stacks before importing cards. A known stack member must never fall back to an individual automatic card while metadata is pending. Preserve explicit PR-only attachments and edited cards; when they block a stack card, import the remaining requests individually so every direct request reaches the board. Done cards neither block nor get absorbed.
 - Track automatic stack review lifecycle separately from manual stack attachments. Complete only from a successful discovery with no outstanding requests; reopen on a new member request.
+- Submitting a review clears your GitHub review request, so discovery also searches open PRs you `reviewed-by`. A PR where your latest opinionated review is `CHANGES_REQUESTED` counts as still pending, for both single-PR and stack cards, until you approve or it closes.
 - `stack_review_prompt` has the same global/project precedence as `review_prompt`. Keep them independent and preserve per-card prompt edits.

@@ -17,13 +17,15 @@ const MESSAGE_TTL: Duration = Duration::from_secs(3);
 /// this cap the cleanup loop would spawn a kill thread indefinitely.
 const MAX_CLEANUP_ATTEMPTS: u32 = 5;
 
+use crate::attention::Attention;
 use crate::config::{AppConfig, AppState, DEFAULT_REVIEW_PROMPT};
 use crate::external::git::PollClass;
-use crate::external::linear::LinearIssue;
+use crate::external::linear::{LinearIssue, LinearProject};
 use crate::prune::{PruneAction, PruneCandidate};
 use crate::types::{
-    AgentKind, AgentStatus, AgentStatusInfo, Column, GithubStack, Issue, IssueKind, LinkedGithubPr,
-    PrImportBaseline, PrImportSource, PrState, PrStatus, WorktreeStatus,
+    AgentKind, AgentStatus, AgentStatusInfo, ChecksStatus, Column, GithubStack, Issue, IssueKind,
+    LinkedGithubPr, MergeBlocker, PrImportBaseline, PrImportSource, PrState, PrStatus,
+    ReviewDecision, WorktreeStatus,
 };
 use crate::undo::UndoEntry;
 use crate::worktree::ForceRequired;
@@ -62,6 +64,7 @@ pub enum InputMode {
     Help,
     DebugInspector,
     Sidebar,
+    SidebarRename,
     PruneDialog,
 }
 
@@ -79,12 +82,16 @@ pub struct LiveState {
     pub frozen_worktree_statuses: HashMap<String, WorktreeStatus>,
     pub frozen_worktree_branches: HashMap<String, String>,
     pub linear_issues: Vec<LinearIssue>,
+    pub linear_projects: Vec<LinearProject>,
     pub user_prs: Vec<PrStatus>,
     pub review_requested_prs: Vec<PrStatus>,
     pub review_stacks: Option<HashMap<u32, Option<u32>>>,
+    /// Open PRs where your latest review requests changes.
+    pub changes_requested_prs: Vec<u32>,
     /// Stack members whose stack card is blocked by an existing card; imported individually.
     pub review_stack_fallback: HashSet<u32>,
     pub github_user: Option<String>,
+    pub tuicr_drafts: crate::external::tuicr::DraftComments,
     pub git_poll_done: bool,
     pub pr_poll_done: bool,
     pub pr_loading_more: bool,
@@ -146,6 +153,8 @@ pub struct Project {
     /// Canonicalized project root, computed once at construction. `id()` is
     /// called in per-frame render paths, so it must not hit the filesystem.
     id: ProjectId,
+    /// Sidebar label from the global registry. See `display_name`.
+    pub label: Option<String>,
     pub issues: Vec<Issue>,
     pub config: AppConfig,
     pub available_agents: Vec<AgentKind>,
@@ -156,6 +165,8 @@ pub struct Project {
     /// contains this issue id (the anchor itself plus everything reachable
     /// through `linked_issues`). Cleared with the same key or Esc.
     pub link_filter: Option<String>,
+    /// Show only cards that need their owner (see `attention_for`).
+    pub attention_filter: bool,
     pub linear_available: bool,
     pub tuicr_available: bool,
     pub github_available: bool,
@@ -211,6 +222,7 @@ impl Project {
         let last_config_mtime = crate::config::config_mtime(&config.project_root);
         let mut project = Project {
             id,
+            label: None,
             issues,
             config,
             available_agents: Vec::new(),
@@ -218,6 +230,7 @@ impl Project {
             selected_row: [0; 4],
             marked_issues: HashSet::new(),
             link_filter: None,
+            attention_filter: false,
             linear_available: false,
             tuicr_available: false,
             github_available: false,
@@ -243,6 +256,12 @@ impl Project {
 
     pub fn id(&self) -> ProjectId {
         self.id.clone()
+    }
+
+    /// Shown in the sidebar, header and lane titles. Issue IDs and tmux
+    /// sessions always use `config.project_name`.
+    pub fn display_name(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.config.project_name)
     }
 
     fn refresh_available_agents(&mut self) {
@@ -383,6 +402,7 @@ impl Project {
             .filter(|(_, issue)| {
                 issue.column == column && (query.is_empty() || self.issue_matches(issue, &query))
             })
+            .filter(|(_, issue)| !self.attention_filter || self.needs_you(issue))
             .collect();
         let Some(anchor) = self.link_filter.as_deref() else {
             return matches;
@@ -947,28 +967,125 @@ impl Project {
             .ok_or("No PR found for this issue")
     }
 
+    /// Why a card needs its owner right now, or `None` when it can wait. A
+    /// blocked agent outranks its PR: the agent has stopped until you answer.
+    /// Derived on every read from data the pollers already carry, so there is
+    /// nothing to persist or invalidate.
+    pub fn attention_for(&self, issue: &Issue) -> Option<Attention> {
+        self.agent_attention(issue)
+            .or_else(|| self.pr_attention(issue))
+    }
+
+    /// Unresolved comments are an extra reason on top of `attention_for`, so
+    /// they count even when the card has another attention state.
+    pub fn needs_you(&self, issue: &Issue) -> bool {
+        self.attention_for(issue)
+            .is_some_and(|attention| attention.needs_you())
+            || self.unresolved_comments(issue) > 0
+    }
+
+    pub fn attention_count(&self) -> usize {
+        self.issues
+            .iter()
+            .filter(|issue| self.needs_you(issue))
+            .count()
+    }
+
+    fn agent_attention(&self, issue: &Issue) -> Option<Attention> {
+        match self.resolved_agent_status(issue) {
+            AgentStatus::WaitingPermission | AgentStatus::WaitingApproval => {
+                Some(Attention::AgentBlocked)
+            }
+            AgentStatus::Error => Some(Attention::AgentError),
+            _ => None,
+        }
+    }
+
+    /// Only the owner's own open, non-draft PRs. A review-requested card
+    /// waiting for its first review is the board's ordinary workload.
+    fn pr_attention(&self, issue: &Issue) -> Option<Attention> {
+        let pr = self.pr_for(issue)?;
+        let mine = self.live.user_prs.iter().any(|own| own.number == pr.number);
+        if pr.state != PrState::Open || pr.is_draft || !mine {
+            return None;
+        }
+
+        // While the queue holds the PR, its checks and merge-state describe
+        // the queue's work, not the owner's. Trunk's own check is part of the
+        // rollup, so a failed queue run would otherwise read as failing CI.
+        if let Some(state) = pr.merge_queue {
+            return Some(Attention::Queue(state));
+        }
+
+        let changes_requested = pr.review == Some(ReviewDecision::ChangesRequested);
+        let checks_failing = matches!(pr.checks, Some(ChecksStatus::Failure | ChecksStatus::Error));
+        match (checks_failing, changes_requested) {
+            (true, true) => return Some(Attention::ChecksAndChanges),
+            (true, false) => return Some(Attention::ChecksFailing),
+            (false, true) => return Some(Attention::ChangesRequested),
+            (false, false) => {}
+        }
+
+        // Actions does not run pull_request workflows on a conflicting PR, so
+        // its checks can stay pending until the rebase.
+        if pr.merge_blocker == Some(MergeBlocker::Conflicts) {
+            return Some(Attention::NeedsRebase);
+        }
+
+        // A null review decision means the repo requires no review.
+        // REVIEW_REQUIRED stays quiet: that PR waits on reviewers.
+        let approved = matches!(pr.review, Some(ReviewDecision::Approved) | None);
+        let green = matches!(pr.checks, Some(ChecksStatus::Success) | None);
+        if !approved || !green {
+            return None;
+        }
+
+        match pr.merge_blocker {
+            Some(MergeBlocker::Conflicts) => Some(Attention::NeedsRebase),
+            Some(MergeBlocker::Blocked) => Some(Attention::Blocked),
+            Some(MergeBlocker::Behind) => Some(Attention::NeedsUpdate),
+            Some(MergeBlocker::Computing) => None,
+            None => Some(Attention::ReadyToMerge),
+        }
+    }
+
     pub fn pr_for(&self, issue: &Issue) -> Option<&PrStatus> {
-        let live = &self.live;
-        for link in &issue.github_pr_links {
-            if let Some(pr) = live.pr_statuses_by_number.get(&link.number) {
-                return Some(pr);
-            }
-            let found = live
-                .pr_statuses
-                .values()
-                .chain(live.user_prs.iter())
-                .chain(live.review_requested_prs.iter())
-                .find(|p| p.number == link.number);
-            if found.is_some() {
-                return found;
-            }
+        issue
+            .github_pr_links
+            .iter()
+            .find_map(|link| self.pr_by_number(link.number))
+            .or_else(|| {
+                self.branch_for(issue)
+                    .and_then(|branch| self.live.pr_statuses.get(branch))
+            })
+    }
+
+    /// Comments waiting on the owner: unresolved review threads on the issue's
+    /// open PRs, plus unposted tuicr drafts for its worktree or those PRs.
+    /// Done cards never count.
+    pub fn unresolved_comments(&self, issue: &Issue) -> u32 {
+        if issue.column == Column::Done {
+            return 0;
         }
-        if let Some(branch) = self.branch_for(issue) {
-            if let Some(pr) = live.pr_statuses.get(branch) {
-                return Some(pr);
-            }
+        let drafts = &self.live.tuicr_drafts;
+        let mut total = self
+            .worktree_for(issue)
+            .and_then(|wt| drafts.by_worktree.get(&self.id.join(wt)))
+            .copied()
+            .unwrap_or(0);
+        // Cached stack members, so a failed or loading stack refresh keeps the count.
+        let mut numbers = self.issue_pr_numbers(issue);
+        if numbers.is_empty() {
+            numbers.extend(self.pr_for(issue).map(|pr| pr.number));
         }
-        None
+        let open_prs = numbers
+            .into_iter()
+            .filter_map(|number| self.pr_by_number(number))
+            .filter(|pr| pr.state == PrState::Open);
+        for pr in open_prs {
+            total += pr.unresolved_threads + drafts.by_pr_url.get(&pr.url).copied().unwrap_or(0);
+        }
+        total
     }
 
     pub fn stack_for_pr(&self, number: u32) -> Option<&GithubStack> {
@@ -1044,12 +1161,7 @@ impl Project {
 
         let live_authored_numbers: HashSet<u32> =
             self.live.user_prs.iter().map(|pr| pr.number).collect();
-        let live_review_numbers: HashSet<u32> = self
-            .live
-            .review_requested_prs
-            .iter()
-            .map(|pr| pr.number)
-            .collect();
+        let live_review_numbers = self.pending_review_numbers();
 
         // Remove authored pr_imported issues whose PR is no longer in the live set
         // (closed, merged, or from a stale/wrong repo identity).
@@ -1476,6 +1588,18 @@ impl Project {
             .collect()
     }
 
+    pub fn filtered_linear_projects<'a>(
+        &'a self,
+        picker: &LinearPickerState,
+    ) -> Vec<&'a LinearProject> {
+        let query = picker.search.to_lowercase();
+        self.live
+            .linear_projects
+            .iter()
+            .filter(|p| query.is_empty() || p.name.to_lowercase().contains(&query))
+            .collect()
+    }
+
     pub fn filtered_github_prs<'a>(
         &'a self,
         picker: &LinearPickerState,
@@ -1521,6 +1645,30 @@ impl Project {
         crate::ops::next_issue_id_after(&self.issues, &self.config.project_name, offset)
     }
 
+    /// Apply a background refresh without moving the cursor off its card.
+    /// With the needs-you filter on, cards drop in and out on every poll, so
+    /// the selected card is found again by id; the filter turns itself off
+    /// once nothing needs you, rather than leave an empty board.
+    pub fn keep_selection<T>(&mut self, query: &str, refresh: impl FnOnce(&mut Self) -> T) -> T {
+        let selected = self.selected_issue(query).map(|issue| issue.id.clone());
+        let result = refresh(self);
+
+        if self.attention_filter && self.attention_count() == 0 {
+            self.attention_filter = false;
+        }
+
+        let row = Column::from_index(self.selected_column).and_then(|column| {
+            self.issues_in_column(column, query)
+                .iter()
+                .position(|(_, issue)| Some(&issue.id) == selected.as_ref())
+        });
+        if let Some(row) = row {
+            self.selected_row[self.selected_column] = row;
+        }
+        self.clamp_all_rows(query);
+        result
+    }
+
     pub fn clamp_all_rows(&mut self, query: &str) {
         for col in 0..4 {
             let count = self.column_count(col, query);
@@ -1562,6 +1710,14 @@ pub struct SidebarState {
     pub selected: usize,
     pub activity: HashMap<ProjectId, bool>,
     pub swimlanes: Vec<ProjectId>,
+    pub rename: Option<ProjectRename>,
+}
+
+/// Rename in progress. Holds the project id so a reload that shifts the
+/// list can't move the rename onto another row.
+pub struct ProjectRename {
+    pub project_id: ProjectId,
+    pub buffer: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1704,6 +1860,8 @@ pub enum ConfirmAction {
         /// Skip the teardown, which already ran, and discard uncommitted changes.
         force: bool,
     },
+    /// Unregister the project. Its files stay on disk.
+    RemoveProject { project_id: ProjectId },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1715,7 +1873,18 @@ pub enum LinearPickerContext {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportSource {
     Linear,
+    LinearProject,
     GitHub,
+}
+
+impl ImportSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Linear => "Linear",
+            Self::LinearProject => "Projects",
+            Self::GitHub => "GitHub",
+        }
+    }
 }
 
 pub use crate::dialog_state::{DialogField, DialogState};
@@ -1742,11 +1911,13 @@ fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
         agent_kind: _,
         agent_mode: _,
         prompt: _,
+        model: _,
         worktree: _,
         done_at: _,
         pruned_at: _,
         setup_ran: _,
         linear_links: _,
+        linear_projects: _,
         github_pr_links: _,
         github_stack: _,
         pr_import_baseline: _,
@@ -1782,11 +1953,17 @@ fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
     merge_field!(agent_kind);
     merge_field!(agent_mode);
     merge_field!(prompt);
+    // A file-side model was picked for the file's agent; don't pair it with
+    // an agent switch made in memory.
+    if memory.agent_kind == base.agent_kind {
+        merge_field!(model);
+    }
     merge_field!(worktree);
     merge_field!(done_at);
     merge_field!(pruned_at);
     merge_field!(setup_ran);
     merge_field!(linear_links);
+    merge_field!(linear_projects);
     merge_field!(github_pr_links);
     merge_field!(github_stack);
     merge_field!(pr_import_baseline);
@@ -1825,6 +2002,13 @@ fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
     if file_crossed_boundary && !memory_crossed_boundary && memory.kind == file.kind {
         memory.sessions = file.sessions.clone();
     }
+
+    // Kind and projects merge separately, so a kind change on one side and a
+    // project attach on the other could combine into projects on an issue
+    // that can't carry them.
+    if !memory.kind.links_linear_projects() {
+        memory.linear_projects.clear();
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1847,6 +2031,8 @@ pub struct App {
     /// Archives that stopped short and wait to be offered as a force archive
     /// once the board is back in Normal mode.
     pub queued_force_archives: Vec<(ProjectId, String, ForceRequired)>,
+    /// Mode to go back to when the confirm prompt closes.
+    confirm_return_mode: InputMode,
     pub dialog: Option<DialogState>,
     pub prune_dialog: Option<PruneDialogState>,
     pub should_quit: bool,
@@ -1892,6 +2078,7 @@ impl App {
             confirm_message: None,
             pending_confirm: None,
             queued_force_archives: Vec::new(),
+            confirm_return_mode: InputMode::Normal,
             dialog: None,
             prune_dialog: None,
             should_quit: false,
@@ -1927,6 +2114,7 @@ impl App {
                 selected: 0,
                 activity: HashMap::new(),
                 swimlanes: vec![self.focused_project.clone()],
+                rename: None,
             });
         }
     }
@@ -1935,19 +2123,86 @@ impl App {
         self.projects.iter().map(|p| p.id()).collect()
     }
 
-    pub fn apply_reload_result(&mut self, result: crate::global_config::ReloadResult) {
+    /// `registry` should be read on the main thread: the reload thread's
+    /// snapshot can predate a rename or move made while it ran.
+    pub fn apply_reload_result(
+        &mut self,
+        result: crate::global_config::ReloadResult,
+        registry: &[crate::global_config::ProjectEntry],
+    ) {
         self.remove_projects(&result.removed_projects);
         for (config, state) in result.new_projects {
             self.add_background_project(config, state);
         }
+        self.sync_with_registry(registry);
         if self.projects.len() > 1 && self.sidebar.is_none() {
             self.enable_sidebar();
         }
     }
 
+    /// Applies registry labels and order. Projects missing from the registry
+    /// lose their label and go last.
+    pub fn sync_with_registry(&mut self, entries: &[crate::global_config::ProjectEntry]) {
+        let paths: Vec<ProjectId> = entries
+            .iter()
+            .map(|entry| crate::global_config::normalize_path(&entry.path))
+            .collect();
+        let selected_id = self.sidebar_selected_id();
+
+        let mut ranked: Vec<(usize, Project)> = std::mem::take(&mut self.projects)
+            .into_iter()
+            .map(|mut project| {
+                let position = paths.iter().position(|path| *path == project.id);
+                project.label = position.and_then(|i| entries[i].label.clone());
+                (position.unwrap_or(usize::MAX), project)
+            })
+            .collect();
+        ranked.sort_by_key(|(position, _)| *position);
+        self.projects = ranked.into_iter().map(|(_, project)| project).collect();
+
+        if let Some(id) = selected_id {
+            self.select_sidebar_project(&id);
+        }
+    }
+
+    pub fn project_display_name(&self, id: &ProjectId) -> String {
+        self.find_project(id)
+            .map(|p| p.display_name().to_string())
+            .unwrap_or_default()
+    }
+
+    pub fn sidebar_selected_id(&self) -> Option<ProjectId> {
+        let sidebar = self.sidebar.as_ref()?;
+        self.projects.get(sidebar.selected).map(|p| p.id())
+    }
+
+    fn select_sidebar_project(&mut self, id: &ProjectId) {
+        let index = self.project_index(id);
+        if let (Some(sidebar), Some(index)) = (self.sidebar.as_mut(), index) {
+            sidebar.selected = index;
+        }
+    }
+
+    /// Swaps the selected sidebar project with its neighbour and returns the
+    /// new order, or `None` at the edge of the list.
+    pub fn move_sidebar_project(&mut self, up: bool) -> Option<Vec<ProjectId>> {
+        let selected = self.sidebar.as_ref()?.selected;
+        let target = if up {
+            selected.checked_sub(1)?
+        } else {
+            selected + 1
+        };
+        if target >= self.projects.len() {
+            return None;
+        }
+        self.projects.swap(selected, target);
+        self.sidebar.as_mut()?.selected = target;
+        Some(self.projects.iter().map(|p| p.id()).collect())
+    }
+
     /// Drops projects that left the registry. The focused project is kept so
     /// the board always has something to show.
-    fn remove_projects(&mut self, ids: &[ProjectId]) {
+    pub(crate) fn remove_projects(&mut self, ids: &[ProjectId]) {
         let to_remove: HashSet<&ProjectId> = ids
             .iter()
             .filter(|id| **id != self.focused_project)
@@ -1955,17 +2210,15 @@ impl App {
         // Selection and focused lane are indices, so remember what they point
         // at and re-find it after the lists shrink.
         let active_id = self.active_project_id();
-        let selected_id = self
-            .sidebar
-            .as_ref()
-            .and_then(|sidebar| self.projects.get(sidebar.selected))
-            .map(|p| p.id());
+        let old_selected = self.sidebar.as_ref().map_or(0, |sidebar| sidebar.selected);
+        let selected_id = self.sidebar_selected_id();
 
         self.projects.retain(|p| !to_remove.contains(&p.id()));
 
+        // A removed selection stays on the same row rather than jumping to the top.
         let selected = selected_id
             .and_then(|id| self.projects.iter().position(|p| p.id() == id))
-            .unwrap_or(0);
+            .unwrap_or_else(|| old_selected.min(self.projects.len().saturating_sub(1)));
         if let Some(ref mut sidebar) = self.sidebar {
             sidebar.swimlanes.retain(|id| !to_remove.contains(id));
             if sidebar.swimlanes.is_empty() {
@@ -1988,7 +2241,6 @@ impl App {
         self.projects.iter_mut().find(|p| p.id() == *id)
     }
 
-    #[allow(dead_code)] // Future sidebar/swimlane reordering
     pub(crate) fn project_index(&self, id: &ProjectId) -> Option<usize> {
         self.projects.iter().position(|p| p.id() == *id)
     }
@@ -2258,23 +2510,18 @@ impl App {
         context: LinearPickerContext,
         ctx: &ActionContext,
     ) {
-        let p = self.context_project(ctx);
-        let has_linear = !p.live.linear_issues.is_empty();
-        let has_github = p.can_browse_github();
-
-        if !has_linear && !has_github {
-            if p.linear_available {
+        let tabs = self.picker_tabs_for(self.context_project(ctx), context);
+        let Some(&first_tab) = tabs.first() else {
+            if self.context_project(ctx).linear_available {
                 self.set_warning("No issues loaded yet");
             } else {
                 self.set_warning("No import sources available");
             }
             return;
-        }
+        };
 
-        if self.picker_tab == ImportSource::Linear && !has_linear {
-            self.picker_tab = ImportSource::GitHub;
-        } else if self.picker_tab == ImportSource::GitHub && !has_github {
-            self.picker_tab = ImportSource::Linear;
+        if !tabs.contains(&self.picker_tab) {
+            self.picker_tab = first_tab;
         }
 
         self.message = None;
@@ -2314,6 +2561,45 @@ impl App {
             return Vec::new();
         };
         self.active_project().filtered_linear_issues(picker)
+    }
+
+    pub fn filtered_linear_projects(&self) -> Vec<&LinearProject> {
+        let Some(picker) = &self.linear_picker else {
+            return Vec::new();
+        };
+        self.active_project().filtered_linear_projects(picker)
+    }
+
+    /// Tabs the open picker can show, in display order.
+    pub fn picker_tabs(&self) -> Vec<ImportSource> {
+        self.picker_tabs_for(self.active_project(), self.linear_picker_context)
+    }
+
+    /// Sources with something to pick. Projects can only be attached from an
+    /// orchestrator's dialog, since only orchestrators carry project links.
+    fn picker_tabs_for(
+        &self,
+        project: &Project,
+        context: LinearPickerContext,
+    ) -> Vec<ImportSource> {
+        let projects_allowed = match context {
+            LinearPickerContext::Import => true,
+            LinearPickerContext::Attach => self
+                .dialog
+                .as_ref()
+                .is_some_and(|d| d.kind.links_linear_projects()),
+        };
+        let mut tabs = Vec::new();
+        if !project.live.linear_issues.is_empty() {
+            tabs.push(ImportSource::Linear);
+        }
+        if projects_allowed && !project.live.linear_projects.is_empty() {
+            tabs.push(ImportSource::LinearProject);
+        }
+        if project.can_browse_github() {
+            tabs.push(ImportSource::GitHub);
+        }
+        tabs
     }
 
     pub fn filtered_github_prs(&self) -> Vec<GithubPickerEntry<'_>> {
@@ -2380,19 +2666,20 @@ impl App {
     }
 
     pub fn start_confirm(&mut self, message: String, action: ConfirmAction) {
+        self.confirm_return_mode = self.input_mode;
         self.input_mode = InputMode::Confirm;
         self.confirm_message = Some(message);
         self.pending_confirm = Some(action);
     }
 
     pub fn cancel_confirm(&mut self) {
-        self.input_mode = InputMode::Normal;
+        self.input_mode = self.confirm_return_mode;
         self.confirm_message = None;
         self.pending_confirm = None;
     }
 
     pub fn take_confirm_action(&mut self) -> Option<ConfirmAction> {
-        self.input_mode = InputMode::Normal;
+        self.input_mode = self.confirm_return_mode;
         self.confirm_message = None;
         self.pending_confirm.take()
     }
@@ -2443,6 +2730,10 @@ impl App {
             self.clear_link_filter(ctx);
             return;
         }
+        if self.attention_filter_active() {
+            self.set_attention_filter(false);
+            return;
+        }
         if !self.search_query.is_empty() {
             self.search_query.clear();
             for project in &mut self.projects {
@@ -2474,6 +2765,47 @@ impl App {
         let project = self.context_project_mut(ctx);
         project.link_filter = Some(anchor);
         project.clamp_all_rows(&query);
+    }
+
+    /// Cards that need you across the visible swimlanes only.
+    pub fn visible_attention_count(&self) -> usize {
+        self.visible_swimlanes()
+            .iter()
+            .filter_map(|id| self.find_project(id))
+            .map(|project| project.attention_count())
+            .sum()
+    }
+
+    pub fn attention_filter_active(&self) -> bool {
+        self.visible_swimlanes().iter().any(|id| {
+            self.find_project(id)
+                .is_some_and(|project| project.attention_filter)
+        })
+    }
+
+    /// Toggle the board filter to cards that need you on every visible
+    /// swimlane. Refuses to switch on when nothing visible needs you: an
+    /// empty board reads as data loss.
+    pub fn toggle_attention_filter(&mut self, _ctx: &ActionContext) {
+        if self.attention_filter_active() {
+            self.set_attention_filter(false);
+            return;
+        }
+        if self.visible_attention_count() == 0 {
+            self.set_message("Nothing needs you right now");
+            return;
+        }
+        self.set_attention_filter(true);
+    }
+
+    fn set_attention_filter(&mut self, on: bool) {
+        let query = self.search_query.clone();
+        for id in self.visible_swimlanes() {
+            if let Some(project) = self.find_project_mut(&id) {
+                project.attention_filter = on;
+                project.clamp_all_rows(&query);
+            }
+        }
     }
 
     pub fn clear_link_filter(&mut self, ctx: &ActionContext) {
@@ -2566,7 +2898,7 @@ mod tests {
 
     use super::*;
     use crate::config::DEFAULT_DONE_SESSION_TTL;
-    use crate::types::{AgentKind, IssueKind, PrState, PrStatus};
+    use crate::types::{AgentKind, IssueKind, MergeQueueState, PrState, PrStatus};
 
     fn test_config() -> AppConfig {
         AppConfig {
@@ -2690,7 +3022,642 @@ mod tests {
             deletions: 5,
             head_branch: branch.into(),
             is_cross_repository: false,
+            merge_blocker: None,
+            merge_queue: None,
+            unresolved_threads: 0,
         }
+    }
+
+    fn issue_linked_to_pr(id: &str, number: u32, source: Option<PrImportSource>) -> Issue {
+        let mut issue = test_issue(id, Column::CodeReview);
+        issue.github_pr_links.push(LinkedGithubPr {
+            number,
+            imported: source.is_some(),
+            import_source: source,
+        });
+        issue
+    }
+
+    fn attention_of(app: &App) -> Option<Attention> {
+        app.project().attention_for(&app.project().issues[0])
+    }
+
+    #[test]
+    fn own_approved_green_pr_is_ready_to_merge() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        app.project_mut().live.user_prs = vec![test_pr(7, "feature")];
+
+        assert_eq!(attention_of(&app), Some(Attention::ReadyToMerge));
+    }
+
+    fn own_pr_in_queue(state: MergeQueueState) -> PrStatus {
+        let mut pr = test_pr(7, "feature");
+        pr.merge_queue = Some(state);
+        pr
+    }
+
+    #[test]
+    fn queue_state_shows_on_the_card_and_only_failures_need_you() {
+        for (state, count) in [
+            (MergeQueueState::Queued, 0),
+            (MergeQueueState::Testing, 0),
+            (MergeQueueState::Failed, 1),
+            (MergeQueueState::Cancelled, 1),
+        ] {
+            let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+            app.project_mut().live.user_prs = vec![own_pr_in_queue(state)];
+
+            assert_eq!(
+                attention_of(&app),
+                Some(Attention::Queue(state)),
+                "{state:?}"
+            );
+            assert_eq!(app.project().attention_count(), count, "{state:?}");
+        }
+    }
+
+    #[test]
+    fn queue_state_outranks_ci_review_and_merge_state() {
+        // Trunk's own check is in the rollup: pending while testing, red once
+        // the run fails. Neither is owner work while the queue holds the PR.
+        for state in [MergeQueueState::Testing, MergeQueueState::Failed] {
+            let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+            let mut pr = own_pr_in_queue(state);
+            pr.checks = Some(ChecksStatus::Failure);
+            pr.review = Some(ReviewDecision::ChangesRequested);
+            pr.merge_blocker = Some(MergeBlocker::Conflicts);
+            app.project_mut().live.user_prs = vec![pr];
+
+            assert_eq!(
+                attention_of(&app),
+                Some(Attention::Queue(state)),
+                "{state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_queue_run_passes_the_attention_filter() {
+        let mut app = test_app(vec![
+            issue_linked_to_pr("bork-1", 7, None),
+            test_issue("bork-2", Column::CodeReview),
+        ]);
+        app.project_mut().live.user_prs = vec![own_pr_in_queue(MergeQueueState::Failed)];
+        app.project_mut().attention_filter = true;
+
+        let visible = app.project().issues_in_column(Column::CodeReview, "");
+
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].1.id, "bork-1");
+    }
+
+    #[test]
+    fn queue_state_is_ignored_on_drafts_closed_and_merged_prs() {
+        for (is_draft, state) in [
+            (true, PrState::Open),
+            (false, PrState::Closed),
+            (false, PrState::Merged),
+        ] {
+            let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+            let mut pr = own_pr_in_queue(MergeQueueState::Failed);
+            pr.is_draft = is_draft;
+            pr.state = state;
+            app.project_mut().live.user_prs = vec![pr];
+
+            assert_eq!(attention_of(&app), None, "{state:?} draft={is_draft}");
+        }
+    }
+
+    #[test]
+    fn someone_elses_failed_queue_run_does_not_nag() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        app.project_mut()
+            .live
+            .pr_statuses_by_number
+            .insert(7, own_pr_in_queue(MergeQueueState::Failed));
+
+        assert_eq!(attention_of(&app), None);
+        assert_eq!(app.project().attention_count(), 0);
+    }
+
+    #[test]
+    fn a_blocked_agent_outranks_a_failed_queue_run() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        app.project_mut().live.user_prs = vec![own_pr_in_queue(MergeQueueState::Failed)];
+        set_agent_status(&mut app, "bork-bork-1", AgentStatus::WaitingPermission);
+
+        assert_eq!(attention_of(&app), Some(Attention::AgentBlocked));
+    }
+
+    #[test]
+    fn approval_with_pending_checks_is_not_actionable_yet() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let mut pr = test_pr(7, "feature");
+        pr.checks = Some(ChecksStatus::Pending);
+        app.project_mut().live.user_prs = vec![pr];
+
+        assert_eq!(attention_of(&app), None);
+    }
+
+    #[test]
+    fn red_checks_need_fixing_even_when_approved() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let mut pr = test_pr(7, "feature");
+        pr.checks = Some(ChecksStatus::Failure);
+        app.project_mut().live.user_prs = vec![pr];
+
+        assert_eq!(attention_of(&app), Some(Attention::ChecksFailing));
+    }
+
+    #[test]
+    fn changes_requested_need_changes() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let mut pr = test_pr(7, "feature");
+        pr.review = Some(ReviewDecision::ChangesRequested);
+        app.project_mut().live.user_prs = vec![pr];
+
+        assert_eq!(attention_of(&app), Some(Attention::ChangesRequested));
+    }
+
+    #[test]
+    fn changes_requested_with_erroring_checks_names_both() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let mut pr = test_pr(7, "feature");
+        pr.review = Some(ReviewDecision::ChangesRequested);
+        pr.checks = Some(ChecksStatus::Error);
+        app.project_mut().live.user_prs = vec![pr];
+
+        assert_eq!(attention_of(&app), Some(Attention::ChecksAndChanges));
+        assert_eq!(app.project().attention_count(), 1);
+    }
+
+    #[test]
+    fn a_draft_never_demands_attention() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let mut pr = test_pr(7, "feature");
+        pr.is_draft = true;
+        app.project_mut().live.user_prs = vec![pr];
+
+        assert_eq!(attention_of(&app), None);
+    }
+
+    #[test]
+    fn someone_elses_pr_is_not_my_merge_button() {
+        // Linked but not in user_prs: watching a colleague's PR must not nag.
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        app.project_mut()
+            .live
+            .pr_statuses_by_number
+            .insert(7, test_pr(7, "feature"));
+
+        assert_eq!(attention_of(&app), None);
+    }
+
+    #[test]
+    fn a_review_card_awaiting_first_review_is_ordinary_workload() {
+        let mut app = test_app(vec![issue_linked_to_pr(
+            "bork-1",
+            7,
+            Some(PrImportSource::ReviewRequested),
+        )]);
+        app.project_mut().live.review_requested_prs = vec![test_pr(7, "feature")];
+
+        assert_eq!(attention_of(&app), None);
+    }
+
+    #[test]
+    fn a_blocked_pr_without_a_review_decision_still_surfaces() {
+        // reviewDecision is null when no review is required, so the blocker
+        // (an unresolved conversation, say) is the owner's alone.
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let mut pr = test_pr(7, "feature");
+        pr.review = None;
+        pr.merge_blocker = Some(MergeBlocker::Blocked);
+        app.project_mut().live.user_prs = vec![pr];
+
+        assert_eq!(attention_of(&app), Some(Attention::Blocked));
+    }
+
+    #[test]
+    fn a_pr_awaiting_required_review_stays_quiet() {
+        // REVIEW_REQUIRED waits on reviewers, not on the owner.
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let mut pr = test_pr(7, "feature");
+        pr.review = Some(ReviewDecision::ReviewRequired);
+        pr.merge_blocker = Some(MergeBlocker::Blocked);
+        app.project_mut().live.user_prs = vec![pr];
+
+        assert_eq!(attention_of(&app), None);
+    }
+
+    #[test]
+    fn a_blocked_merge_is_not_ready() {
+        // Approved and green, yet the merge button is dead — an unresolved
+        // conversation, say. Calling that "ready" sends the user to a wall.
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let mut pr = test_pr(7, "feature");
+        pr.merge_blocker = Some(MergeBlocker::Blocked);
+        app.project_mut().live.user_prs = vec![pr];
+
+        assert_eq!(attention_of(&app), Some(Attention::Blocked));
+    }
+
+    #[test]
+    fn a_conflicting_branch_asks_for_a_rebase() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let mut pr = test_pr(7, "feature");
+        pr.merge_blocker = Some(MergeBlocker::Conflicts);
+        app.project_mut().live.user_prs = vec![pr];
+
+        assert_eq!(attention_of(&app), Some(Attention::NeedsRebase));
+    }
+
+    #[test]
+    fn a_conflict_surfaces_before_review_or_checks_settle() {
+        // Actions does not run pull_request workflows while a PR conflicts,
+        // so its checks can sit pending until the rebase.
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let mut pr = test_pr(7, "feature");
+        pr.review = Some(ReviewDecision::ReviewRequired);
+        pr.checks = Some(ChecksStatus::Pending);
+        pr.merge_blocker = Some(MergeBlocker::Conflicts);
+        app.project_mut().live.user_prs = vec![pr];
+
+        assert_eq!(attention_of(&app), Some(Attention::NeedsRebase));
+    }
+
+    #[test]
+    fn red_checks_outrank_a_conflict() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let mut pr = test_pr(7, "feature");
+        pr.checks = Some(ChecksStatus::Failure);
+        pr.merge_blocker = Some(MergeBlocker::Conflicts);
+        app.project_mut().live.user_prs = vec![pr];
+
+        assert_eq!(attention_of(&app), Some(Attention::ChecksFailing));
+    }
+
+    #[test]
+    fn a_branch_behind_its_base_without_a_merge_queue_needs_an_update() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let mut pr = test_pr(7, "feature");
+        pr.merge_blocker = Some(MergeBlocker::Behind);
+        app.project_mut().live.user_prs = vec![pr];
+
+        assert_eq!(attention_of(&app), Some(Attention::NeedsUpdate));
+    }
+
+    #[test]
+    fn a_merge_state_github_is_still_computing_stays_quiet() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let mut pr = test_pr(7, "feature");
+        pr.merge_blocker = Some(MergeBlocker::Computing);
+        app.project_mut().live.user_prs = vec![pr];
+
+        assert_eq!(attention_of(&app), None);
+    }
+
+    #[test]
+    fn attention_filter_hides_quiet_cards() {
+        let mut app = test_app(vec![
+            issue_linked_to_pr("bork-1", 7, None),
+            issue_linked_to_pr("bork-2", 8, None),
+        ]);
+        app.project_mut().live.user_prs = vec![test_pr(7, "feature")];
+        app.project_mut().attention_filter = true;
+
+        let visible = app.project().issues_in_column(Column::CodeReview, "");
+
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].1.id, "bork-1");
+    }
+
+    #[test]
+    fn attention_filter_refuses_an_all_quiet_board() {
+        // Turning it on with nothing actionable would blank the board, which
+        // reads as data loss rather than good news.
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let ctx = app.action_context();
+
+        app.toggle_attention_filter(&ctx);
+
+        assert!(!app.project().attention_filter);
+    }
+
+    #[test]
+    fn esc_peels_the_attention_filter() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        app.project_mut().live.user_prs = vec![test_pr(7, "feature")];
+        let ctx = app.action_context();
+        app.toggle_attention_filter(&ctx);
+        assert!(app.project().attention_filter);
+
+        app.clear_search(&ctx);
+
+        assert!(!app.project().attention_filter);
+    }
+
+    fn attention_app(names: &[&str]) -> (App, Vec<ProjectId>) {
+        let state = |name: &str| AppState {
+            last_prune_at: None,
+            issues: vec![issue_linked_to_pr(&format!("{name}-1"), 7, None)],
+        };
+        let mut app = App::new(test_config_named(names[0]), state(names[0]));
+        for name in &names[1..] {
+            app.add_background_project(test_config_named(name), state(name));
+        }
+        app.enable_sidebar();
+        let ids: Vec<ProjectId> = app.projects.iter().map(|project| project.id()).collect();
+        (app, ids)
+    }
+
+    #[test]
+    fn attention_count_and_filter_cover_only_visible_swimlanes() {
+        let (mut app, ids) = attention_app(&["alpha", "beta", "gamma"]);
+        for project in &mut app.projects {
+            project.live.user_prs = vec![test_pr(7, "feature")];
+        }
+        app.sidebar.as_mut().unwrap().swimlanes = vec![ids[0].clone(), ids[1].clone()];
+
+        assert_eq!(app.visible_attention_count(), 2);
+
+        let ctx = app.action_context();
+        app.toggle_attention_filter(&ctx);
+
+        assert!(app.find_project(&ids[0]).unwrap().attention_filter);
+        assert!(app.find_project(&ids[1]).unwrap().attention_filter);
+        assert!(!app.find_project(&ids[2]).unwrap().attention_filter);
+    }
+
+    #[test]
+    fn attention_filter_ignores_hidden_projects_that_need_you() {
+        let (mut app, ids) = attention_app(&["alpha", "beta"]);
+        app.find_project_mut(&ids[1]).unwrap().live.user_prs = vec![test_pr(7, "feature")];
+        app.sidebar.as_mut().unwrap().swimlanes = vec![ids[0].clone()];
+
+        assert_eq!(app.visible_attention_count(), 0);
+
+        let ctx = app.action_context();
+        app.toggle_attention_filter(&ctx);
+
+        assert!(!app.attention_filter_active());
+        assert!(!app.find_project(&ids[1]).unwrap().attention_filter);
+    }
+
+    fn footer_text(app: &App) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 1)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::status_bar::render_footer(frame, app, frame.area()))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn esc_peels_the_link_filter_before_the_attention_filter() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        app.project_mut().live.user_prs = vec![test_pr(7, "feature")];
+        app.project_mut().link_filter = Some("bork-1".into());
+        app.project_mut().attention_filter = true;
+        app.input_mode = InputMode::Normal;
+        let ctx = app.action_context();
+        assert!(footer_text(&app).contains("linked: bork-1"));
+
+        app.clear_search(&ctx);
+
+        assert_eq!(app.project().link_filter, None);
+        assert!(app.project().attention_filter);
+        assert!(footer_text(&app).contains("needs you"));
+
+        app.clear_search(&ctx);
+
+        assert!(!app.project().attention_filter);
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_cursor_on_its_card_when_another_drops_out() {
+        let mut app = test_app(vec![
+            issue_linked_to_pr("bork-1", 7, None),
+            issue_linked_to_pr("bork-2", 8, None),
+            issue_linked_to_pr("bork-3", 9, None),
+        ]);
+        app.project_mut().live.user_prs = vec![
+            test_pr(7, "first"),
+            test_pr(8, "second"),
+            test_pr(9, "third"),
+        ];
+        app.project_mut().attention_filter = true;
+        app.project_mut().selected_column = Column::CodeReview.index();
+        app.project_mut().selected_row[Column::CodeReview.index()] = 1;
+        assert_eq!(app.project().selected_issue("").unwrap().id, "bork-2");
+
+        app.project_mut().keep_selection("", |project| {
+            project.live.user_prs[0].checks = Some(ChecksStatus::Pending);
+        });
+
+        assert_eq!(app.project().selected_issue("").unwrap().id, "bork-2");
+    }
+
+    #[test]
+    fn a_refresh_that_leaves_nothing_needing_you_turns_the_filter_off() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        app.project_mut().live.user_prs = vec![test_pr(7, "feature")];
+        app.project_mut().attention_filter = true;
+        app.project_mut().selected_column = Column::CodeReview.index();
+
+        app.project_mut().keep_selection("", |project| {
+            project.live.user_prs[0].checks = Some(ChecksStatus::Pending);
+        });
+
+        assert!(!app.project().attention_filter);
+        assert_eq!(app.project().selected_issue("").unwrap().id, "bork-1");
+    }
+
+    #[test]
+    fn attention_count_sums_only_actionable_cards() {
+        let mut app = test_app(vec![
+            issue_linked_to_pr("bork-1", 7, None),
+            issue_linked_to_pr("bork-2", 8, None),
+        ]);
+        let mut pending = test_pr(8, "other");
+        pending.checks = Some(ChecksStatus::Pending);
+        app.project_mut().live.user_prs = vec![test_pr(7, "feature"), pending];
+
+        assert_eq!(app.project().attention_count(), 1);
+    }
+
+    fn comments_of(app: &App) -> u32 {
+        app.project().unresolved_comments(&app.project().issues[0])
+    }
+
+    #[test]
+    fn unresolved_comments_add_threads_and_tuicr_drafts() {
+        let mut issue = issue_linked_to_pr("bork-1", 7, None);
+        issue.worktree = Some("bork-1".into());
+        let mut app = test_app(vec![issue]);
+        let mut pr = test_pr(7, "feature");
+        pr.unresolved_threads = 2;
+        let worktree = app.project().id().join("bork-1");
+        let live = &mut app.project_mut().live;
+        live.pr_statuses_by_number.insert(7, pr.clone());
+        live.tuicr_drafts.by_pr_url.insert(pr.url.clone(), 3);
+        live.tuicr_drafts.by_worktree.insert(worktree, 1);
+
+        assert_eq!(comments_of(&app), 6);
+    }
+
+    #[test]
+    fn unresolved_comments_skip_closed_prs_and_done_cards() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let mut pr = test_pr(7, "feature");
+        pr.unresolved_threads = 2;
+        pr.state = PrState::Merged;
+        app.project_mut().live.pr_statuses_by_number.insert(7, pr);
+        assert_eq!(comments_of(&app), 0);
+
+        app.project_mut()
+            .live
+            .pr_statuses_by_number
+            .get_mut(&7)
+            .unwrap()
+            .state = PrState::Open;
+        assert_eq!(comments_of(&app), 2);
+        app.project_mut().issues[0].column = Column::Done;
+        assert_eq!(comments_of(&app), 0);
+    }
+
+    #[test]
+    fn stack_cards_keep_their_count_when_the_stack_refresh_fails() {
+        let mut issue = test_issue("bork-1", Column::CodeReview);
+        issue.github_stack = Some(42);
+        let mut app = test_app(vec![issue]);
+        let member = |number| crate::types::GithubStackPullRequest {
+            number,
+            state: PrState::Open,
+            is_draft: false,
+            head_branch: format!("member-{number}"),
+        };
+        let live = &mut app.project_mut().live;
+        live.stacks_available = true;
+        live.github_stacks = vec![GithubStack {
+            number: 42,
+            url: String::new(),
+            base_ref: "main".into(),
+            open: true,
+            pull_requests: vec![member(44), member(45)],
+        }];
+        for (number, threads) in [(44, 1), (45, 2)] {
+            let mut pr = test_pr(number, &format!("member-{number}"));
+            pr.unresolved_threads = threads;
+            live.pr_statuses_by_number.insert(number, pr);
+        }
+        live.stack_errors.insert(42, "offline".into());
+
+        assert_eq!(comments_of(&app), 3);
+    }
+
+    #[test]
+    fn unresolved_comments_need_you_on_top_of_attention() {
+        let mut app = test_app(vec![issue_linked_to_pr(
+            "bork-1",
+            7,
+            Some(PrImportSource::ReviewRequested),
+        )]);
+        let mut pr = test_pr(7, "feature");
+        pr.review = Some(crate::types::ReviewDecision::ReviewRequired);
+        app.project_mut().live.review_requested_prs = vec![pr];
+        assert_eq!(attention_of(&app), None);
+        assert_eq!(app.project().attention_count(), 0);
+
+        app.project_mut().live.review_requested_prs[0].unresolved_threads = 1;
+        assert_eq!(attention_of(&app), None);
+        assert_eq!(app.project().attention_count(), 1);
+    }
+
+    fn set_agent_status(app: &mut App, session: &str, status: AgentStatus) {
+        let live = &mut app.project_mut().live;
+        live.active_sessions.insert(session.to_string());
+        live.agent_statuses.insert(
+            session.to_string(),
+            AgentStatusInfo {
+                status,
+                activity: None,
+                updated_at: 0,
+            },
+        );
+    }
+
+    #[test]
+    fn an_agent_blocked_on_you_needs_you_and_passes_the_filter() {
+        for status in [AgentStatus::WaitingPermission, AgentStatus::WaitingApproval] {
+            let mut app = test_app(vec![
+                test_issue("bork-1", Column::InProgress),
+                test_issue("bork-2", Column::InProgress),
+            ]);
+            set_agent_status(&mut app, "bork-bork-1", status);
+            set_agent_status(&mut app, "bork-bork-2", AgentStatus::Busy);
+            app.project_mut().attention_filter = true;
+
+            let visible = app.project().issues_in_column(Column::InProgress, "");
+
+            assert_eq!(
+                attention_of(&app),
+                Some(Attention::AgentBlocked),
+                "{status}"
+            );
+            assert_eq!(app.project().attention_count(), 1, "{status}");
+            assert_eq!(visible.len(), 1, "{status}");
+            assert_eq!(visible[0].1.id, "bork-1", "{status}");
+        }
+    }
+
+    #[test]
+    fn an_agent_that_errored_needs_you() {
+        let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
+        set_agent_status(&mut app, "bork-bork-1", AgentStatus::Error);
+
+        assert_eq!(attention_of(&app), Some(Attention::AgentError));
+        assert_eq!(app.project().attention_count(), 1);
+    }
+
+    #[test]
+    fn a_working_or_finished_agent_is_quiet() {
+        // Claude's idle Notification also reports WaitingInput, so it means
+        // "finished and idle" as often as "asked you something".
+        for status in [
+            AgentStatus::Busy,
+            AgentStatus::Idle,
+            AgentStatus::WaitingInput,
+        ] {
+            let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
+            set_agent_status(&mut app, "bork-bork-1", status);
+
+            assert_eq!(attention_of(&app), None, "{status}");
+        }
+    }
+
+    #[test]
+    fn a_blocked_status_left_by_a_dead_session_is_quiet() {
+        let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
+        set_agent_status(&mut app, "bork-bork-1", AgentStatus::WaitingPermission);
+        app.project_mut().live.active_sessions.clear();
+
+        assert_eq!(attention_of(&app), None);
+    }
+
+    #[test]
+    fn a_blocked_agent_outranks_its_pr() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        app.project_mut().live.user_prs = vec![test_pr(7, "feature")];
+        set_agent_status(&mut app, "bork-bork-1", AgentStatus::WaitingPermission);
+
+        assert_eq!(attention_of(&app), Some(Attention::AgentBlocked));
     }
 
     // ================================================================
@@ -3681,6 +4648,23 @@ mod tests {
     }
 
     #[test]
+    fn sync_prs_keeps_review_open_while_changes_requested() {
+        let mut existing = test_issue("bork-1", Column::CodeReview);
+        existing.github_pr_links = vec![LinkedGithubPr {
+            number: 7,
+            imported: true,
+            import_source: Some(PrImportSource::ReviewRequested),
+        }];
+        let mut app = test_app(vec![existing]);
+        app.project_mut().live.review_requested_prs = vec![];
+        app.project_mut().live.changes_requested_prs = vec![7];
+        app.project_mut().live.pr_poll_done = true;
+
+        app.project_mut().sync_prs_as_issues();
+        assert_eq!(app.project().issues[0].column, Column::CodeReview);
+    }
+
+    #[test]
     fn sync_prs_skips_when_no_user_prs() {
         let mut app = test_app(vec![]);
         // user_prs is empty by default
@@ -4064,6 +5048,7 @@ mod tests {
             vec![
                 DialogField::Kind,
                 DialogField::Linear,
+                DialogField::LinearProject,
                 DialogField::Agent,
                 DialogField::Mode,
                 DialogField::Title,
@@ -5514,6 +6499,9 @@ mod tests {
             deletions: 0,
             head_branch: "bork-1/task".into(),
             is_cross_repository: false,
+            merge_blocker: None,
+            merge_queue: None,
+            unresolved_threads: 0,
         };
         app.project_mut()
             .live
@@ -6224,6 +7212,58 @@ mod tests {
 
     // --- apply_reload_result tests ---
 
+    fn registry_entry(label: &str, project: &str) -> crate::global_config::ProjectEntry {
+        crate::global_config::ProjectEntry {
+            name: project.into(),
+            path: PathBuf::from(format!("/tmp/test-{}", project)),
+            label: Some(label.into()),
+        }
+    }
+
+    #[test]
+    fn sync_with_registry_applies_names_and_order() {
+        let mut app = test_multi_app();
+        let beta_id = app.projects[1].id();
+        app.sidebar.as_mut().unwrap().selected = 1;
+
+        app.sync_with_registry(&[
+            registry_entry("Gamma!", "gamma"),
+            registry_entry("Beta!", "beta"),
+        ]);
+
+        let names: Vec<&str> = app.projects.iter().map(|p| p.display_name()).collect();
+        // alpha is missing from the registry, so it shows its config name and goes last.
+        assert_eq!(names, ["Gamma!", "Beta!", "alpha"]);
+        assert_eq!(app.sidebar_selected_id(), Some(beta_id));
+    }
+
+    #[test]
+    fn move_sidebar_project_swaps_and_stops_at_edges() {
+        let mut app = test_multi_app();
+        let alpha_id = app.projects[0].id();
+
+        assert!(app.move_sidebar_project(true).is_none());
+        let order = app.move_sidebar_project(false).unwrap();
+        assert_eq!(order[1], alpha_id);
+        assert_eq!(app.sidebar_selected_id(), Some(alpha_id.clone()));
+
+        app.move_sidebar_project(false).unwrap();
+        assert!(app.move_sidebar_project(false).is_none());
+        assert_eq!(app.projects[2].id(), alpha_id);
+    }
+
+    #[test]
+    fn removing_selected_project_keeps_cursor_row() {
+        let mut app = test_multi_app();
+        let beta_id = app.projects[1].id();
+        app.sidebar.as_mut().unwrap().selected = 1;
+
+        app.remove_projects(&[beta_id]);
+
+        assert_eq!(app.projects.len(), 2);
+        assert_eq!(app.sidebar.as_ref().unwrap().selected, 1);
+    }
+
     #[test]
     fn apply_reload_adds_new_projects() {
         let mut app = test_app(vec![]);
@@ -6234,7 +7274,7 @@ mod tests {
             new_projects: vec![(test_config_named("beta"), AppState::default())],
             ..Default::default()
         };
-        app.apply_reload_result(result);
+        app.apply_reload_result(result, &[]);
 
         assert_eq!(app.projects.len(), 2);
         assert_eq!(app.projects[1].config.project_name, "beta");
@@ -6245,7 +7285,7 @@ mod tests {
     fn apply_reload_empty_is_noop() {
         let mut app = test_app(vec![]);
         let result = crate::global_config::ReloadResult::default();
-        app.apply_reload_result(result);
+        app.apply_reload_result(result, &[]);
 
         assert_eq!(app.projects.len(), 1);
         assert!(app.sidebar.is_none());
@@ -6259,7 +7299,7 @@ mod tests {
         app.sidebar.as_mut().unwrap().selected = 1;
 
         let result = crate::global_config::ReloadResult::default();
-        app.apply_reload_result(result);
+        app.apply_reload_result(result, &[]);
 
         let sidebar = app.sidebar.as_ref().unwrap();
         assert_eq!(sidebar.swimlanes.len(), 2);
@@ -6279,7 +7319,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        app.apply_reload_result(result);
+        app.apply_reload_result(result, &[]);
 
         assert_eq!(app.projects.len(), 3);
         assert!(app.sidebar.is_some());
@@ -6293,14 +7333,14 @@ mod tests {
             new_projects: vec![(test_config_named("beta"), AppState::default())],
             ..Default::default()
         };
-        app.apply_reload_result(result1);
+        app.apply_reload_result(result1, &[]);
         assert_eq!(app.projects.len(), 2);
 
         let result2 = crate::global_config::ReloadResult {
             new_projects: vec![(test_config_named("gamma"), AppState::default())],
             ..Default::default()
         };
-        app.apply_reload_result(result2);
+        app.apply_reload_result(result2, &[]);
         assert_eq!(app.projects.len(), 3);
         assert_eq!(app.projects[2].config.project_name, "gamma");
     }
@@ -6319,7 +7359,7 @@ mod tests {
             new_projects: vec![],
             removed_projects: vec![beta_id.clone()],
         };
-        app.apply_reload_result(result);
+        app.apply_reload_result(result, &[]);
 
         assert_eq!(app.projects.len(), 2);
         assert!(app.find_project(&beta_id).is_none());
@@ -6345,7 +7385,7 @@ mod tests {
             removed_projects: vec![alpha_id],
             ..Default::default()
         };
-        app.apply_reload_result(result);
+        app.apply_reload_result(result, &[]);
 
         assert_eq!(app.sidebar.as_ref().unwrap().selected, 0);
         assert_eq!(app.focused_swimlane, 0);
@@ -6361,7 +7401,7 @@ mod tests {
             new_projects: vec![],
             removed_projects: vec![alpha_id.clone()],
         };
-        app.apply_reload_result(result);
+        app.apply_reload_result(result, &[]);
 
         assert_eq!(app.projects.len(), 3);
         assert!(app.find_project(&alpha_id).is_some());
@@ -6403,6 +7443,30 @@ mod tests {
 
         merge_issue_fields(&mut memory, &base, &file);
         assert_eq!(memory.title, "Local edit");
+    }
+
+    #[test]
+    fn merge_model_from_file() {
+        let base = test_issue_titled("a", "T", Column::Todo);
+        let mut memory = base.clone();
+        let mut file = base.clone();
+        file.model = Some("sonnet".to_string());
+
+        merge_issue_fields(&mut memory, &base, &file);
+        assert_eq!(memory.model.as_deref(), Some("sonnet"));
+    }
+
+    #[test]
+    fn merge_skips_file_model_after_memory_agent_switch() {
+        let base = test_issue_titled("a", "T", Column::Todo);
+        let mut memory = base.clone();
+        let _ = memory.set_agent_kind(AgentKind::Codex);
+        let mut file = base.clone();
+        file.model = Some("sonnet".to_string());
+
+        merge_issue_fields(&mut memory, &base, &file);
+        assert_eq!(memory.agent_kind, AgentKind::Codex);
+        assert_eq!(memory.model, None);
     }
 
     #[test]
@@ -6562,6 +7626,15 @@ mod tests {
             requested_prs: vec![42],
             generated_prompt: "review stack".into(),
         });
+        issue
+            .linear_projects
+            .push(crate::types::LinkedLinearProject {
+                id: "p".into(),
+                slug: "abc123".into(),
+                name: "Project".into(),
+                url: String::new(),
+                imported: false,
+            });
         let value = serde_json::to_value(&issue).expect("issue serializes");
         let object = value.as_object().expect("issue is a JSON object");
         let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
@@ -6581,6 +7654,7 @@ mod tests {
             "pruned_at",
             "setup_ran",
             "linear_links",
+            "linear_projects",
             "github_pr_links",
             "pr_import_baseline",
             "stack_review_import",

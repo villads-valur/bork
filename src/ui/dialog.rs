@@ -7,7 +7,6 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 use crate::app::{App, DialogField, DialogState};
-use crate::external::linear::LinearIssue;
 use crate::types::{AgentKind, AgentMode, IssueKind, LinkedGithubPr};
 use crate::ui::styles;
 
@@ -74,11 +73,36 @@ pub fn render_dialog(frame: &mut Frame, app: &App) {
 
     if dialog.linear_available {
         let linear_area = Rect::new(inner.x + 1, inner.y + next_row, inner.width - 2, 1);
-        render_linear_field(
+        let identifiers: Vec<&str> = dialog
+            .linear_issues
+            .iter()
+            .map(|li| li.identifier.as_str())
+            .collect();
+        render_tag_field(
             frame,
-            &dialog.linear_issues,
+            "Linear:",
+            &identifiers,
             linear_area,
             dialog.current_field() == DialogField::Linear,
+            label_width,
+        );
+        next_row += 2;
+    }
+
+    // Takes the PR row's place: orchestrators have projects instead of PRs.
+    if dialog.linear_available && dialog.kind.links_linear_projects() {
+        let project_area = Rect::new(inner.x + 1, inner.y + next_row, inner.width - 2, 1);
+        let names: Vec<&str> = dialog
+            .linear_projects
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        render_tag_field(
+            frame,
+            "Projects:",
+            &names,
+            project_area,
+            dialog.current_field() == DialogField::LinearProject,
             label_width,
         );
         next_row += 2;
@@ -482,9 +506,12 @@ fn render_agent_field(
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn render_linear_field(
+/// A labelled row of comma-separated tags that collapses the overflow into
+/// `+N`.
+fn render_tag_field(
     frame: &mut Frame,
-    linear_issues: &[LinearIssue],
+    label: &str,
+    tags: &[&str],
     area: Rect,
     focused: bool,
     label_width: usize,
@@ -495,20 +522,20 @@ fn render_linear_field(
         .add_modifier(Modifier::BOLD);
 
     let mut spans = vec![Span::styled(
-        format!("{:<width$}", "Linear:", width = label_width),
+        format!("{:<width$}", label, width = label_width),
         label_style,
     )];
 
-    if linear_issues.is_empty() {
+    if tags.is_empty() {
         spans.push(Span::styled("\u{2014}", styles::dim_style()));
     } else {
         let available = (area.width as usize).saturating_sub(label_width);
         let mut used = 0;
-        for (i, li) in linear_issues.iter().enumerate() {
+        for (i, tag) in tags.iter().enumerate() {
             let sep = if i > 0 { ", " } else { "" };
-            let text = format!("{}{}", sep, li.identifier);
+            let text = format!("{}{}", sep, tag);
             if used + text.len() > available && i > 0 {
-                let remaining_count = linear_issues.len() - i;
+                let remaining_count = tags.len() - i;
                 spans.push(Span::styled(
                     format!("+{}", remaining_count),
                     styles::dim_style(),
@@ -518,7 +545,7 @@ fn render_linear_field(
             if i > 0 {
                 spans.push(Span::styled(", ", styles::dim_style()));
             }
-            spans.push(Span::styled(li.identifier.clone(), accent_style));
+            spans.push(Span::styled(tag.to_string(), accent_style));
             used += text.len();
         }
     }

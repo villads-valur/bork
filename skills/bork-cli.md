@@ -35,6 +35,7 @@ Options:
 - `--mode`: plan (default), build, yolo
 - `--kind`: agentic (default), todo (non-agentic)
 - `--prompt`: agent prompt text
+- `--model`: model passed to the agent's `--model` flag (e.g. `sonnet`). Errors for opencode, which has no such flag. Changing the agent clears it.
 
 ### Start an issue agent
 
@@ -43,8 +44,10 @@ Use this when you want to spin off a new issue and have another agent work on it
 ```bash
 bork issue start "Implement search" --prompt "Add search using the existing indexing code"
 bork issue start "Fix auth bug" --agent claude --mode build --slug fix-auth-bug
+bork issue start "Review PR 42" --agent claude --model sonnet --prompt "Review the diff"
 bork issue start "Add API route" --project my-api --prompt "Implement this in my-api"
 bork issue start "Investigate flaky test" --no-worktree --prompt "Find the root cause"
+bork issue start "Fix login" --linear VIL-789 --prompt "Details..."  # link a ticket before launch
 ```
 
 This creates an agentic issue, creates a git worktree by default, moves the issue to In Progress, and starts the configured agent in a tmux session. If the project configures a `setup_script`, it runs inside the worktree before the agent starts.
@@ -53,6 +56,7 @@ Options:
 - `--prompt`: agent prompt text
 - `--agent`: opencode (default from project config), claude, codex
 - `--mode`: plan, build (default), yolo
+- `--model`: model passed to the agent's `--model` flag (e.g. `sonnet`). Errors for opencode, which has no such flag. Changing the agent clears it.
 - `--slug`: worktree/branch slug (generated from title by default)
 - `--no-worktree`: launch without creating a worktree
 - `--project`: registered project name or path (defaults to current project)
@@ -72,6 +76,8 @@ bork issue update bork-1 --column code-review
 bork issue update bork-1 --agent claude --mode build
 bork issue update bork-1 --prompt "Updated instructions for the agent"
 bork issue update bork-1 --prompt ""     # clear the prompt
+bork issue update bork-1 --model opus    # used from the next launch or resume
+bork issue update bork-1 --model ""      # clear the model
 ```
 
 Only provided fields are changed; others remain untouched.
@@ -113,19 +119,29 @@ bork integration attach-linear bork-1 VIL-123
 
 This sets the Linear identifier on the issue so the TUI can display the link and sync status.
 
+### Link a Linear project (orchestrators only)
+
+```bash
+bork integration attach-linear-project bork-1 https://linear.app/acme/project/auth-1a2b3c4d5e6f
+bork integration detach-linear-project bork-1 1a2b3c4d5e6f
+```
+
+Takes a project URL or slug. Fails on issues that aren't orchestrators.
+
 ### Link a GitHub PR
 
 ```bash
 bork integration attach-pr bork-1 42
+bork integration attach-pr 42          # inside an agent session: uses BORK_ISSUE_ID
 ```
 
-This sets the PR number on the issue so the TUI can display PR status (checks, reviews, etc.).
+This sets the PR number on the issue so the TUI can display PR status (checks, reviews, etc.). Always run it right after you open a PR for an issue, including stacked or follow-up PRs.
 
 ## Typical workflow
 
 1. Spin off work: `bork issue start "Implement feature X" --prompt "Details..."`
 2. The new agent works in the created worktree
-3. Link a PR when ready: `bork integration attach-pr bork-1 123`
+3. Open a PR and link it straight away: `bork integration attach-pr bork-1 123`
 4. Move to review: `bork issue move bork-1 code-review`
 5. When merged, clean up: `bork issue archive bork-1` (kills session, runs teardown, removes worktree, marks Done)
 

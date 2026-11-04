@@ -120,7 +120,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         details.selected,
         inner,
         &summary,
-        &stack.pull_requests,
+        &project.detail_members(issue),
     );
 }
 
@@ -165,7 +165,7 @@ fn render_members(
                 )]
             })
         };
-        if project.review_requested_for(member.number) {
+        if project.review_pending_for(member.number) {
             status_spans.push(Span::styled(
                 " · your review",
                 Style::default().fg(styles::ACCENT),
@@ -194,7 +194,7 @@ fn render_members(
         message.clone()
     } else {
         format!(
-            "j/k move  o open all  R review all  P refresh  Esc close  {}/{}",
+            "j/k move  o open  O open all  R review all  P refresh  Esc close  {}/{}",
             (offset + visible).min(members.len()),
             members.len()
         )

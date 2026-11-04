@@ -1,5 +1,5 @@
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
@@ -88,7 +88,7 @@ fn render_full(
     let title_line = Line::from(highlight_spans(&title_text, ctx.search_query, title_style));
     let status_line = format_status_line(ctx);
     let pr_lines = format_pr_rows(ctx, max_width, false);
-    let bottom_line = format_bottom_line(ctx.issue, ctx.ports, max_width);
+    let bottom_line = format_bottom_line(ctx, max_width);
 
     let mut lines = vec![title_line];
     if inner.height > 1 {
@@ -130,7 +130,7 @@ fn render_medium(
 
     frame.render_widget(Paragraph::new(lines), inner);
     if inner.height > 3 {
-        let footer = format_bottom_line(ctx.issue, ctx.ports, max_width);
+        let footer = format_bottom_line(ctx, max_width);
         let bottom = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
         frame.render_widget(Paragraph::new(footer), bottom);
     }
@@ -176,7 +176,7 @@ fn link_badge(issue: &Issue) -> Option<Span<'static>> {
 
 fn format_status_line(ctx: &CardContext) -> Line<'static> {
     if ctx.issue.kind == IssueKind::NonAgentic {
-        return Line::default();
+        return Line::from(attention_spans(ctx));
     }
 
     let status_color = styles::agent_status_color(&ctx.agent_status);
@@ -206,6 +206,8 @@ fn format_status_line(ctx: &CardContext) -> Line<'static> {
         spans.push(Span::styled("review", Style::default().fg(Color::Yellow)));
     }
 
+    spans.extend(attention_spans(ctx));
+
     let git_spans = format_git_status(ctx.git_status);
     if !git_spans.is_empty() {
         spans.push(Span::raw(" "));
@@ -215,12 +217,37 @@ fn format_status_line(ctx: &CardContext) -> Line<'static> {
     Line::from(spans)
 }
 
-fn format_bottom_line(issue: &Issue, ports: Option<&Vec<u16>>, max_width: usize) -> Line<'static> {
+fn attention_spans(ctx: &CardContext) -> Vec<Span<'static>> {
+    let Some(attention) = ctx.project.attention_for(ctx.issue) else {
+        return Vec::new();
+    };
+    let (badge, color) = styles::attention_badge(attention);
+    vec![
+        Span::raw(" "),
+        Span::styled(
+            badge,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+    ]
+}
+
+fn comments_badge(count: u32) -> Option<Span<'static>> {
+    if count == 0 {
+        return None;
+    }
+    Some(Span::styled(
+        format!("\u{270e}{count}"),
+        Style::default().fg(Color::Yellow),
+    ))
+}
+
+fn format_bottom_line(ctx: &CardContext, max_width: usize) -> Line<'static> {
+    let issue = ctx.issue;
     let mut right = Vec::new();
     if let Some(text) = pruned_indicator_text(issue) {
         right.push(text);
     }
-    if ports.is_some_and(|ports| !ports.is_empty()) {
+    if ctx.ports.is_some_and(|ports| !ports.is_empty()) {
         right.push("🔌".to_string());
     }
     // Drop secondary indicators first when the footer gets narrow.
@@ -234,13 +261,34 @@ fn format_bottom_line(issue: &Issue, ports: Option<&Vec<u16>>, max_width: usize)
         left.push(badge);
         left.push(Span::raw(" "));
     }
-    let used = left.iter().map(Span::width).sum::<usize>();
+    // Comments arrive after the first poll, so they go after the Linear IDs to
+    // avoid shifting them. Their width is reserved so the IDs truncate first.
+    let comments = comments_badge(ctx.project.unresolved_comments(issue));
+    let comments_width = comments.as_ref().map_or(0, |badge| badge.width() + 1);
+    let used = left.iter().map(Span::width).sum::<usize>() + comments_width;
     if issue.has_linear() && left_budget > used + 2 {
         let identifiers = issue.linear_identifiers().join(", ");
         left.push(Span::styled(
             styles::truncate(&format!("◈ {identifiers}"), left_budget - used),
             Style::default().fg(Color::Blue),
         ));
+        left.push(Span::raw(" "));
+    }
+    let used = left.iter().map(Span::width).sum::<usize>() + comments_width;
+    if !issue.linear_projects.is_empty() && left_budget > used + 2 {
+        let names: Vec<&str> = issue
+            .linear_projects
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        left.push(Span::styled(
+            styles::truncate(&format!("▤ {}", names.join(", ")), left_budget - used),
+            Style::default().fg(Color::Blue),
+        ));
+        left.push(Span::raw(" "));
+    }
+    if let Some(badge) = comments {
+        left.push(badge);
     }
     let used = left.iter().map(Span::width).sum::<usize>();
     if right.width() > 0 && used + right.width() < max_width {
@@ -342,8 +390,9 @@ fn format_pr_rows(ctx: &CardContext, width: usize, compact: bool) -> Vec<Line<'s
         };
         let count = stack.pull_requests.len();
         if !compact && count <= 2 && count > 0 && ctx.project.live.stacks_available {
-            return stack
-                .pull_requests
+            return ctx
+                .project
+                .detail_members(ctx.issue)
                 .iter()
                 .enumerate()
                 .map(|(index, member)| {
@@ -435,7 +484,12 @@ fn format_pr_rows(ctx: &CardContext, width: usize, compact: bool) -> Vec<Line<'s
         return vec![Line::from(header)];
     }
 
-    let mut numbers = ctx.issue.pr_numbers();
+    let mut numbers: Vec<_> = ctx
+        .project
+        .linked_pr_members(ctx.issue)
+        .into_iter()
+        .map(|member| member.number)
+        .collect();
     if numbers.is_empty() {
         if let Some(pr) = ctx.pr {
             numbers.push(pr.number);

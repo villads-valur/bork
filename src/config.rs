@@ -107,7 +107,6 @@ Break the goal into discrete issues and spawn each one with `bork issue start \"
 Issues you spawn are automatically linked back to you (pass `--link <your-issue-id>` explicitly if a spawned issue ends up unlinked), so you can review just your sub-issues with `bork issue list --linked <your-issue-id> --json`. \
 Monitor progress with `bork issue list --json` and `bork issue show <id> --json`. \
 Inspect a running agent's output with `tmux capture-pane -p -t <project>-<issue-id>`, and if an agent is heading in the wrong direction, nudge it with `tmux send-keys -t <project>-<issue-id> 'your message' Enter`. \
-If this issue has a Linear ticket linked, keep it updated as milestones complete. \
 Do not create a worktree for yourself; the issues you spawn get their own worktrees.";
 
 impl Default for AppConfig {
@@ -181,6 +180,30 @@ pub fn ensure_agent_status_dir(project_root: &Path) {
 
 fn state_path(project_root: &Path) -> PathBuf {
     config_dir(project_root).join("state.json")
+}
+
+fn error_log_path(project_root: &Path) -> PathBuf {
+    config_dir(project_root).join("errors.log")
+}
+
+/// Append timestamped lines to `.bork/errors.log` so failures that only
+/// flash by in the status bar can be looked at later. Best effort: a failed
+/// write is ignored rather than turning one error into two.
+pub fn append_error_log(project_root: &Path, lines: &[String]) {
+    if lines.is_empty() {
+        return;
+    }
+    let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(error_log_path(project_root))
+    else {
+        return;
+    };
+    let now = crate::app::unix_now();
+    for line in lines {
+        let _ = writeln!(file, "[{now}] {line}");
+    }
 }
 
 fn config_path(project_root: &Path) -> PathBuf {

@@ -4,6 +4,7 @@ use std::process::{Command, Stdio};
 use serde::Deserialize;
 
 use crate::error::AppError;
+use crate::types::LinkedLinearProject;
 
 const API_ENDPOINT: &str = "https://api.linear.app/graphql";
 const API_KEY_ENV: &str = "LINEAR_API_KEY";
@@ -21,9 +22,31 @@ pub struct LinearIssue {
     pub team_key: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct LinearProject {
+    pub id: String,
+    pub slug: String,
+    pub name: String,
+    pub url: String,
+    pub status_name: String,
+}
+
+impl LinearProject {
+    pub fn to_link(&self, imported: bool) -> LinkedLinearProject {
+        LinkedLinearProject {
+            id: self.id.clone(),
+            slug: self.slug.clone(),
+            name: self.name.clone(),
+            url: self.url.clone(),
+            imported,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct LinearPollResult {
     pub issues: Vec<LinearIssue>,
+    pub projects: Vec<LinearProject>,
     /// Why the poll returned nothing, when it failed. An empty list is
     /// otherwise indistinguishable from having no assigned issues, which sends
     /// the user looking at Linear instead of at their key.
@@ -75,17 +98,56 @@ pub fn check_available() -> bool {
     transport().is_some()
 }
 
-const QUERY: &str = concat!(
+/// Assigned issues and open projects in one request, so each poll costs a
+/// single round trip.
+const POLL_QUERY: &str = concat!(
     "{ viewer { assignedIssues(",
     "filter: { state: { type: { nin: [\"completed\", \"canceled\"] } } }, ",
     "first: 50, ",
     "orderBy: updatedAt",
     ") { nodes { id identifier title url branchName priority ",
-    "state { name } team { key } } } } }",
+    "state { name } team { key } } } } ",
+    "projects(",
+    "filter: { status: { type: { nin: [\"completed\", \"canceled\"] } } }, ",
+    "first: 100, ",
+    "orderBy: updatedAt",
+    ") { nodes { id name slugId url status { name } } } }",
 );
 
-pub fn fetch_assigned_issues() -> Result<Vec<LinearIssue>, AppError> {
-    parse_issues(&run_query(QUERY)?)
+pub fn fetch_poll() -> Result<(Vec<LinearIssue>, Vec<LinearProject>), AppError> {
+    let body = run_query(POLL_QUERY)?;
+    Ok((parse_issues(&body)?, parse_projects(&body)?))
+}
+
+/// Look up one project by its URL, `name-slug` path segment, or bare slug.
+pub fn fetch_project(reference: &str) -> Result<LinearProject, AppError> {
+    let slug = project_slug(reference).ok_or_else(|| {
+        AppError::Linear(format!("'{reference}' is not a Linear project URL or slug"))
+    })?;
+    let query = format!(
+        "{{ projects(filter: {{ slugId: {{ eq: \"{slug}\" }} }}, first: 1) \
+         {{ nodes {{ id name slugId url status {{ name }} }} }} }}"
+    );
+    parse_projects(&run_query(&query)?)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| AppError::Linear(format!("no Linear project with slug '{slug}'")))
+}
+
+/// Pull the `slugId` out of a project reference. Project URLs look like
+/// `https://linear.app/<ws>/project/<name>-<slugId>/overview`, so the slug is
+/// the part after the last `-` of the segment following `project`. Only
+/// alphanumeric slugs are accepted since the result is spliced into a query.
+pub fn project_slug(reference: &str) -> Option<String> {
+    let reference = reference.trim().trim_end_matches('/');
+    let segments: Vec<&str> = reference.split('/').collect();
+    let segment = match segments.iter().position(|s| *s == "project") {
+        Some(index) => segments.get(index + 1)?,
+        None => segments.last()?,
+    };
+    let slug = segment.rsplit('-').next()?;
+    let valid = !slug.is_empty() && slug.chars().all(|c| c.is_ascii_alphanumeric());
+    valid.then(|| slug.to_lowercase())
 }
 
 /// Run a GraphQL query, returning the raw response body.
@@ -203,11 +265,54 @@ fn escape_for_config(value: &str) -> String {
 }
 
 /// Read issues out of a response body.
+fn parse_issues(body: &str) -> Result<Vec<LinearIssue>, AppError> {
+    let response: GraphqlResponse = serde_json::from_value(checked_response(body)?)
+        .map_err(|e| AppError::Linear(format!("unexpected Linear response shape: {e}")))?;
+
+    Ok(response
+        .data
+        .viewer
+        .assigned_issues
+        .nodes
+        .into_iter()
+        .map(|node| LinearIssue {
+            id: node.id,
+            identifier: node.identifier,
+            title: node.title,
+            url: node.url,
+            branch_name: node.branch_name.unwrap_or_default(),
+            priority: node.priority,
+            state_name: node.state.name,
+            team_key: node.team.key,
+        })
+        .collect())
+}
+
+fn parse_projects(body: &str) -> Result<Vec<LinearProject>, AppError> {
+    let response: ProjectsResponse = serde_json::from_value(checked_response(body)?)
+        .map_err(|e| AppError::Linear(format!("unexpected Linear response shape: {e}")))?;
+
+    Ok(response
+        .data
+        .projects
+        .nodes
+        .into_iter()
+        .map(|node| LinearProject {
+            id: node.id,
+            slug: node.slug_id,
+            name: node.name,
+            url: node.url,
+            status_name: node.status.map(|s| s.name).unwrap_or_default(),
+        })
+        .collect())
+}
+
+/// Parse a response body, turning a GraphQL `errors` array into an error.
 ///
 /// GraphQL reports query and permission failures in the body — Linear returns
 /// some of them with a non-2xx status too — so a bare deserialize would show an
 /// expired token as a parse error.
-fn parse_issues(body: &str) -> Result<Vec<LinearIssue>, AppError> {
+fn checked_response(body: &str) -> Result<serde_json::Value, AppError> {
     let value: serde_json::Value = serde_json::from_str(body).map_err(|e| {
         AppError::Linear(format!(
             "could not parse the Linear response: {e} (body: {})",
@@ -233,26 +338,7 @@ fn parse_issues(body: &str) -> Result<Vec<LinearIssue>, AppError> {
         }
     }
 
-    let response: GraphqlResponse = serde_json::from_value(value)
-        .map_err(|e| AppError::Linear(format!("unexpected Linear response shape: {e}")))?;
-
-    Ok(response
-        .data
-        .viewer
-        .assigned_issues
-        .nodes
-        .into_iter()
-        .map(|node| LinearIssue {
-            id: node.id,
-            identifier: node.identifier,
-            title: node.title,
-            url: node.url,
-            branch_name: node.branch_name.unwrap_or_default(),
-            priority: node.priority,
-            state_name: node.state.name,
-            team_key: node.team.key,
-        })
-        .collect())
+    Ok(value)
 }
 
 fn truncate(value: &str, max: usize) -> String {
@@ -303,6 +389,36 @@ struct IssueState {
 #[derive(Deserialize)]
 struct IssueTeam {
     key: String,
+}
+
+#[derive(Deserialize)]
+struct ProjectsResponse {
+    data: ProjectsData,
+}
+
+#[derive(Deserialize)]
+struct ProjectsData {
+    projects: ProjectConnection,
+}
+
+#[derive(Deserialize)]
+struct ProjectConnection {
+    nodes: Vec<ProjectNode>,
+}
+
+#[derive(Deserialize)]
+struct ProjectNode {
+    id: String,
+    name: String,
+    #[serde(rename = "slugId")]
+    slug_id: String,
+    url: String,
+    status: Option<ProjectStatus>,
+}
+
+#[derive(Deserialize)]
+struct ProjectStatus {
+    name: String,
 }
 
 #[cfg(test)]
@@ -420,7 +536,7 @@ mod live_tests {
     #[ignore]
     fn linear_api_smoke() {
         let key = api_key().expect("LINEAR_API_KEY must be set for this test");
-        let body = run_via_api(&key, QUERY).expect("request should succeed");
+        let body = run_via_api(&key, POLL_QUERY).expect("request should succeed");
         let issues = parse_issues(&body).expect("response should parse");
         println!("fetched {} assigned issues", issues.len());
     }

@@ -26,6 +26,7 @@ pub fn map_key_to_action(
             KeyCode::Down | KeyCode::Char('j') => Action::StackDown,
             KeyCode::Up | KeyCode::Char('k') => Action::StackUp,
             KeyCode::Char('o') => Action::OpenPR,
+            KeyCode::Char('O') => Action::OpenAllPRs,
             KeyCode::Char('R') => Action::OpenReviewPR,
             KeyCode::Char('P') => Action::SyncPRs,
             _ => Action::Noop,
@@ -34,6 +35,8 @@ pub fn map_key_to_action(
         InputMode::Help => map_help_key(key),
         InputMode::DebugInspector => map_debug_inspector_key(key),
         InputMode::Sidebar => map_sidebar_key(key),
+        // Rename is a one-line text field, same as search.
+        InputMode::SidebarRename => map_search_key(key),
         InputMode::PruneDialog => map_prune_dialog_key(key),
     }
 }
@@ -121,6 +124,7 @@ fn map_normal_key(key: KeyEvent, swimlane_count: usize) -> Action {
         KeyCode::Char('I') => Action::OpenLinearPicker,
 
         KeyCode::Char('f') => Action::ToggleLinkFilter,
+        KeyCode::Char('!') => Action::ToggleAttentionFilter,
         KeyCode::Char('c') => Action::OpenLinkPicker,
 
         _ => Action::Noop,
@@ -142,6 +146,11 @@ fn map_sidebar_key(key: KeyEvent) -> Action {
         KeyCode::Char('k') | KeyCode::Up => Action::SidebarUp,
         KeyCode::Enter => Action::SidebarSelect,
         KeyCode::Char(' ') => Action::SidebarToggleSwimlane,
+        KeyCode::Char('K') => Action::SidebarMoveUp,
+        KeyCode::Char('J') => Action::SidebarMoveDown,
+        // Shifted so renaming or removing a project takes a deliberate combo.
+        KeyCode::Char('R') => Action::SidebarRename,
+        KeyCode::Char('D') => Action::SidebarRemove,
         KeyCode::Char('?') => Action::ShowHelp,
         _ => Action::Noop,
     }
@@ -320,6 +329,17 @@ fn map_dialog_key(key: KeyEvent) -> Action {
 mod tests {
     use super::*;
 
+    #[test]
+    fn sidebar_edits_need_shift() {
+        let map = |code| map_key_to_action(key(code), InputMode::Sidebar, None, 1);
+        assert_eq!(map(KeyCode::Char('R')), Action::SidebarRename);
+        assert_eq!(map(KeyCode::Char('D')), Action::SidebarRemove);
+        assert_eq!(map(KeyCode::Char('J')), Action::SidebarMoveDown);
+        assert_eq!(map(KeyCode::Char('K')), Action::SidebarMoveUp);
+        assert_eq!(map(KeyCode::Char('r')), Action::Noop);
+        assert_eq!(map(KeyCode::Char('d')), Action::Noop);
+    }
+
     // --- Normal mode ---
 
     #[test]
@@ -482,6 +502,14 @@ mod tests {
         assert_eq!(
             map_normal_key(key(KeyCode::Char('c')), 1),
             Action::OpenLinkPicker
+        );
+    }
+
+    #[test]
+    fn normal_attention_filter() {
+        assert_eq!(
+            map_normal_key(key(KeyCode::Char('!')), 1),
+            Action::ToggleAttentionFilter
         );
     }
 

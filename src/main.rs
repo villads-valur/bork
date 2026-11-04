@@ -1,5 +1,6 @@
 mod agent_config;
 mod app;
+mod attention;
 mod config;
 mod dialog_state;
 mod error;
@@ -79,6 +80,7 @@ struct PrPollResult {
     user_prs: Vec<PrStatus>,
     review_requested_prs: Vec<PrStatus>,
     review_stacks: Option<HashMap<u32, Option<u32>>>,
+    changes_requested_prs: Vec<u32>,
     github_user: Option<String>,
     loading_more: bool,
     error: Option<String>,
@@ -104,6 +106,7 @@ const GIT_STATUS_CONCURRENCY: usize = 4;
 // port poll runs at a slower cadence than the other pollers.
 const PORT_POLL_INTERVAL: Duration = Duration::from_secs(10);
 const LINEAR_POLL_INTERVAL: Duration = Duration::from_secs(45);
+const TUICR_POLL_INTERVAL: Duration = Duration::from_secs(10);
 const PR_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const STATE_POLL_TICKS: usize = 40; // 40 * 50ms = 2s
 /// Minimum interval between auto-prune checks (and thus toasts) for the same
@@ -197,6 +200,28 @@ fn spawn_port_poll_worker(
             break;
         }
         thread::sleep(PORT_POLL_INTERVAL);
+    });
+
+    rx
+}
+
+fn spawn_tuicr_draft_worker(
+    suspended: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
+) -> mpsc::Receiver<external::tuicr::DraftComments> {
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || loop {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+        wait_while_suspended(&suspended);
+        if let Some(drafts) = external::tuicr::poll_drafts() {
+            if tx.send(drafts).is_err() {
+                break;
+            }
+        }
+        thread::sleep(TUICR_POLL_INTERVAL);
     });
 
     rx
@@ -352,13 +377,15 @@ fn spawn_linear_worker(
 
     thread::spawn(move || loop {
         wait_while_suspended(&suspended);
-        let result = match external::linear::fetch_assigned_issues() {
-            Ok(issues) => LinearPollResult {
+        let result = match external::linear::fetch_poll() {
+            Ok((issues, projects)) => LinearPollResult {
                 issues,
+                projects,
                 error: None,
             },
             Err(e) => LinearPollResult {
                 issues: Vec::new(),
+                projects: Vec::new(),
                 error: Some(e.to_string()),
             },
         };
@@ -488,6 +515,9 @@ Start here (for AI agents):
                                  (--base <branch> to pick its base branch)
   bork issue archive <id>        Kill session + teardown + remove worktree
                                  (--force to discard uncommitted changes)
+  bork integration attach-pr <pr>
+                                 Link a PR you opened to your issue (run it
+                                 right after creating the PR)
 
   Agentic issues each run one coding agent. Pick which and how with:
     --agent   {agents}     # must be on your PATH
@@ -713,6 +743,10 @@ enum IssueCommand {
         #[arg(long)]
         prompt: Option<String>,
 
+        /// Model passed to the agent's --model flag (e.g. sonnet). Not supported by opencode.
+        #[arg(long)]
+        model: Option<String>,
+
         /// Issue kind (agentic, todo, orchestrator)
         #[arg(long, value_parser = parse_issue_kind)]
         kind: Option<IssueKind>,
@@ -735,6 +769,10 @@ enum IssueCommand {
         #[arg(long, value_parser = parse_agent_mode)]
         mode: Option<AgentMode>,
 
+        /// Model passed to the agent's --model flag (e.g. sonnet). Not supported by opencode.
+        #[arg(long)]
+        model: Option<String>,
+
         /// Branch/worktree slug. Defaults to a slug generated from the title.
         #[arg(long)]
         slug: Option<String>,
@@ -755,6 +793,10 @@ enum IssueCommand {
         /// to the spawning issue when run from inside an agent session.
         #[arg(long)]
         link: Option<String>,
+
+        /// Linear ticket to link before the agent starts (e.g. VIL-123)
+        #[arg(long)]
+        linear: Option<String>,
     },
 
     /// Update an existing issue
@@ -781,6 +823,10 @@ enum IssueCommand {
         /// Update prompt text (empty string clears it)
         #[arg(long)]
         prompt: Option<String>,
+
+        /// Change the model for the next launch (empty string clears it)
+        #[arg(long)]
+        model: Option<String>,
 
         /// Change issue kind (agentic, todo, orchestrator)
         #[arg(long, value_parser = parse_issue_kind)]
@@ -839,13 +885,13 @@ enum IntegrationCommand {
         linear_identifier: String,
     },
 
-    /// Link a GitHub PR to an issue
+    /// Link a GitHub PR to an issue. The issue ID can be left out inside an
+    /// agent session, where it defaults to `BORK_ISSUE_ID`.
+    #[command(override_usage = "bork integration attach-pr [ISSUE_ID] <PR_NUMBER>")]
     AttachPr {
-        /// Issue ID (e.g. bork-1)
-        issue_id: String,
-
-        /// GitHub PR number
-        pr_number: u32,
+        /// Optional issue ID (e.g. bork-1), then the GitHub PR number
+        #[arg(num_args = 1..=2, value_names = ["ISSUE_ID", "PR_NUMBER"], required = true)]
+        args: Vec<String>,
     },
 
     /// Unlink a Linear ticket from an issue
@@ -864,6 +910,24 @@ enum IntegrationCommand {
 
         /// GitHub PR number
         pr_number: u32,
+    },
+
+    /// Link a Linear project to an orchestrator issue
+    AttachLinearProject {
+        /// Issue ID (e.g. bork-1)
+        issue_id: String,
+
+        /// Linear project URL or slug (e.g. https://linear.app/acme/project/auth-1a2b3c4d5e6f)
+        project: String,
+    },
+
+    /// Unlink a Linear project from an issue
+    DetachLinearProject {
+        /// Issue ID (e.g. bork-1)
+        issue_id: String,
+
+        /// Linear project URL or slug
+        project: String,
     },
 
     /// Remove all Linear links from an issue
@@ -1049,10 +1113,9 @@ fn run_prune_command(
     let (to_remove, dirty_names) = partition_selection(&candidates);
     if !dirty_names.is_empty() {
         eprintln!(
-            "Refusing: dirty worktrees can't be pruned: {}",
+            "Skipping dirty worktrees (commit or stash first): {}",
             dirty_names.join(", ")
         );
-        anyhow::bail!("aborting; clean or stash these worktrees first");
     }
 
     if dry_run {
@@ -1083,7 +1146,7 @@ fn run_prune_command(
         }
     }
 
-    let outcome = execute_removals(&config.project_root, &to_remove);
+    let outcome = execute_removals(&config.project_root, &to_remove, &dirty_names);
 
     for result in &outcome.results {
         match &result.outcome {
@@ -1098,6 +1161,12 @@ fn run_prune_command(
     config::save_state(&state, &config.project_root)?;
 
     println!("\nDone. Pruned {} worktree(s).", outcome.removed_count());
+    if outcome.failed_count() > 0 {
+        anyhow::bail!(
+            "{} worktree(s) failed, see .bork/errors.log",
+            outcome.failed_count()
+        );
+    }
     Ok(())
 }
 
@@ -1111,7 +1180,12 @@ fn run_project_command(command: ProjectCommand) -> anyhow::Result<()> {
                 println!("Run 'bork init' or 'bork project add' to register a project.");
             } else {
                 for entry in &projects {
-                    println!("  {} ({})", entry.name, entry.path.display());
+                    match &entry.label {
+                        Some(label) => {
+                            println!("  {} [{}] ({})", label, entry.name, entry.path.display())
+                        }
+                        None => println!("  {} ({})", entry.name, entry.path.display()),
+                    }
                 }
             }
             Ok(())
@@ -1302,6 +1376,7 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
             agent,
             mode,
             prompt,
+            model,
             kind,
         } => {
             let issue = ops::create_issue(
@@ -1312,6 +1387,7 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
                     agent_kind: agent,
                     agent_mode: mode,
                     prompt,
+                    model,
                     kind,
                 },
             )?;
@@ -1323,11 +1399,13 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
             prompt,
             agent,
             mode,
+            model,
             slug,
             no_worktree,
             base,
             project,
             link,
+            linear,
         } => {
             let project_root = resolve_start_project_root(project.as_deref())?;
             let report = start_issue(
@@ -1337,10 +1415,12 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
                     prompt,
                     agent_kind: agent,
                     agent_mode: mode,
+                    model,
                     slug,
                     no_worktree,
                     base_branch: base,
                     link,
+                    linear,
                 },
             )?;
             println!("Started {}: \"{}\"", report.issue_id, report.title);
@@ -1361,6 +1441,7 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
             agent,
             mode,
             prompt,
+            model,
             kind,
         } => {
             let issue = ops::update_issue(
@@ -1372,6 +1453,7 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
                     agent_kind: agent,
                     agent_mode: mode,
                     prompt,
+                    model,
                     kind,
                 },
             )?;
@@ -1428,17 +1510,52 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
     }
 }
 
+/// The issue the current agent session works on, from `BORK_ISSUE_ID`.
+fn session_issue_id() -> Option<String> {
+    std::env::var(external::process::BORK_ISSUE_ID_VAR)
+        .ok()
+        .filter(|id| !id.is_empty())
+}
+
+/// Split `attach-pr` args into (issue id, PR number). A lone PR number uses
+/// the session's issue id.
+fn resolve_attach_pr_args(
+    args: &[impl AsRef<str>],
+    session_issue_id: Option<String>,
+) -> anyhow::Result<(String, u32)> {
+    let (issue_id, pr_number) = match args {
+        [pr] => {
+            let Some(id) = session_issue_id else {
+                anyhow::bail!(
+                    "no issue id given and BORK_ISSUE_ID is not set; use `bork integration attach-pr <issue-id> <pr-number>`"
+                );
+            };
+            (id, pr.as_ref())
+        }
+        [id, pr] => (id.as_ref().to_string(), pr.as_ref()),
+        _ => anyhow::bail!("expected `[issue-id] <pr-number>`"),
+    };
+    let pr_number = pr_number
+        .trim_start_matches('#')
+        .parse::<u32>()
+        .map_err(|_| anyhow::anyhow!("invalid PR number: {pr_number}"))?;
+    Ok((issue_id, pr_number))
+}
+
 struct StartIssueOptions {
     title: String,
     prompt: Option<String>,
     agent_kind: Option<AgentKind>,
     agent_mode: Option<AgentMode>,
+    model: Option<String>,
     slug: Option<String>,
     no_worktree: bool,
     base_branch: Option<String>,
     /// Explicit issue id to link the new issue to. Falls back to `BORK_ISSUE_ID`
     /// (the spawning agent's issue) when None.
     link: Option<String>,
+    /// Linear ticket identifier to link before launch.
+    linear: Option<String>,
 }
 
 struct StartIssueReport {
@@ -1464,7 +1581,7 @@ fn resolve_start_project_root(project: Option<&str>) -> anyhow::Result<PathBuf> 
     global_config::prune_stale_projects();
     global_config::list_projects()
         .into_iter()
-        .find(|entry| entry.name == project)
+        .find(|entry| entry.name == project || entry.label.as_deref() == Some(project))
         .map(|entry| entry.path)
         .ok_or_else(|| anyhow::anyhow!("Project '{}' not found", project))
 }
@@ -1490,9 +1607,14 @@ fn start_issue(project_root: &Path, opts: StartIssueOptions) -> anyhow::Result<S
             agent_kind: opts.agent_kind,
             agent_mode: opts.agent_mode,
             prompt: opts.prompt,
+            model: opts.model,
             kind: Some(IssueKind::Agentic),
         },
     )?;
+    // Linked before launch so the ticket lands in the agent's prompt.
+    if let Some(identifier) = opts.linear.as_deref() {
+        issue = ops::attach_linear(project_root, &issue.id, identifier)?;
+    }
 
     let worktree_dir = if opts.no_worktree {
         None
@@ -1522,7 +1644,7 @@ fn start_issue(project_root: &Path, opts: StartIssueOptions) -> anyhow::Result<S
     let explicit_link = opts.link.is_some();
     let link_target = opts
         .link
-        .or_else(|| std::env::var("BORK_ISSUE_ID").ok())
+        .or_else(session_issue_id)
         .filter(|id| !id.is_empty() && !id.eq_ignore_ascii_case(&issue.id));
 
     // Reload state so we don't clobber concurrent updates that happened during launch
@@ -1591,14 +1713,26 @@ fn run_integration_command(command: IntegrationCommand) -> anyhow::Result<()> {
             println!(
                 "Linked {} to Linear {}",
                 issue.id,
-                issue.linear_identifier.as_deref().unwrap_or("?")
+                linear_identifier.to_uppercase()
             );
             Ok(())
         }
-        IntegrationCommand::AttachPr {
-            issue_id,
-            pr_number,
-        } => {
+        IntegrationCommand::AttachLinearProject { issue_id, project } => {
+            let found = external::linear::fetch_project(&project)?;
+            let issue = ops::attach_linear_project(&project_root, &issue_id, found.to_link(false))?;
+            println!("Linked {} to Linear project {}", issue.id, found.name);
+            Ok(())
+        }
+        IntegrationCommand::DetachLinearProject { issue_id, project } => {
+            let slug = external::linear::project_slug(&project).ok_or_else(|| {
+                anyhow::anyhow!("'{project}' is not a Linear project URL or slug")
+            })?;
+            let issue = ops::detach_linear_project(&project_root, &issue_id, &slug)?;
+            println!("Unlinked Linear project {} from {}", slug, issue.id);
+            Ok(())
+        }
+        IntegrationCommand::AttachPr { args } => {
+            let (issue_id, pr_number) = resolve_attach_pr_args(&args, session_issue_id())?;
             let issue = ops::attach_pr(&project_root, &issue_id, pr_number)?;
             println!("Linked {} to PR #{}", issue.id, pr_number);
             Ok(())
@@ -1654,6 +1788,7 @@ struct SharedWorkers {
     linear_rx: Option<mpsc::Receiver<LinearPollResult>>,
     linear_wake_tx: mpsc::Sender<()>,
     linear_wake_rx: Option<mpsc::Receiver<()>>,
+    tuicr_rx: Option<mpsc::Receiver<external::tuicr::DraftComments>>,
     shutdown: Arc<AtomicBool>,
     /// While set, all pollers idle instead of spawning subprocesses. Used when
     /// the terminal is handed over to a tmux popup or external editor.
@@ -1695,6 +1830,7 @@ fn spawn_shared_workers() -> SharedWorkers {
         linear_rx: None,
         linear_wake_tx,
         linear_wake_rx: Some(linear_wake_rx),
+        tuicr_rx: None,
         shutdown,
         poll_suspended,
     }
@@ -1862,7 +1998,8 @@ fn drain_project_workers(
                 .is_some_and(|stacks| live.github_stacks != *stacks)
             || live.user_prs != pr_result.user_prs
             || live.review_requested_prs != pr_result.review_requested_prs
-            || live.review_stacks != pr_result.review_stacks;
+            || live.review_stacks != pr_result.review_stacks
+            || live.changes_requested_prs != pr_result.changes_requested_prs;
         if pr_result.github_user.is_some() && live.github_user != pr_result.github_user {
             live.github_user = pr_result.github_user;
             needs_redraw = true;
@@ -1889,6 +2026,7 @@ fn drain_project_workers(
         live.user_prs = pr_result.user_prs;
         live.review_requested_prs = pr_result.review_requested_prs;
         live.review_stacks = pr_result.review_stacks;
+        live.changes_requested_prs = pr_result.changes_requested_prs;
         live.pr_poll_done = true;
 
         // Rewrite imported issue titles from the fresh PR titles.
@@ -2099,7 +2237,8 @@ fn run_tui() -> anyhow::Result<()> {
     let _ = global_config::register_if_absent(&app.project().config.project_name, &current_root);
     let current_canonical =
         std::fs::canonicalize(&current_root).unwrap_or_else(|_| current_root.clone());
-    for entry in &global_config::load_global_config().projects {
+    let registry = global_config::list_projects();
+    for entry in &registry {
         let canonical = std::fs::canonicalize(&entry.path).unwrap_or_else(|_| entry.path.clone());
         if canonical == current_canonical || !entry.path.join(".bork").join("config.toml").exists()
         {
@@ -2109,7 +2248,12 @@ fn run_tui() -> anyhow::Result<()> {
         let proj_state = config::load_state(&entry.path);
         app.add_background_project(proj_config, proj_state);
     }
+    app.sync_with_registry(&registry);
     app.enable_sidebar();
+    let _ = execute!(
+        terminal.backend_mut(),
+        SetTitle(format!("bork: {}", app.project().display_name()))
+    );
 
     // Clean up tmp files left behind by writers that crashed mid-save.
     for project in &app.projects {
@@ -2250,7 +2394,7 @@ fn run_tui() -> anyhow::Result<()> {
                                     &mut terminal,
                                     &session_name,
                                     &popup_title,
-                                    &app.project().config.project_name,
+                                    app.project().display_name(),
                                     &shared.poll_suspended,
                                 )?;
                                 app.message = None;
@@ -2270,7 +2414,7 @@ fn run_tui() -> anyhow::Result<()> {
                                 if let Some(edited) = open_external_editor(
                                     &mut terminal,
                                     &initial_content,
-                                    &app.project().config.project_name,
+                                    app.project().display_name(),
                                     &shared.poll_suspended,
                                 )? {
                                     if let Some(dialog) = app.dialog.as_mut() {
@@ -2318,14 +2462,11 @@ fn run_tui() -> anyhow::Result<()> {
                                     }
                                     let _ = execute!(
                                         terminal.backend_mut(),
-                                        SetTitle(format!(
-                                            "bork: {}",
-                                            app.project().config.project_name
-                                        ))
+                                        SetTitle(format!("bork: {}", app.project().display_name()))
                                     );
                                     app.set_message(format!(
                                         "Switched to {}",
-                                        app.project().config.project_name
+                                        app.project().display_name()
                                     ));
                                 }
                             }
@@ -2445,7 +2586,7 @@ fn run_tui() -> anyhow::Result<()> {
                 &mut terminal,
                 &session_name,
                 &popup_title,
-                &app.project().config.project_name,
+                app.project().display_name(),
                 &shared.poll_suspended,
             )?;
             app.message = None;
@@ -2519,14 +2660,17 @@ fn run_tui() -> anyhow::Result<()> {
         {
             protected_imports.insert(id.clone());
         }
-        let outcome = drain_project_workers(
-            app.project_mut(),
-            &workers,
-            &action_tx,
-            now,
-            picker,
-            &protected_imports,
-        );
+        let query = app.search_query.clone();
+        let outcome = app.project_mut().keep_selection(&query, |project| {
+            drain_project_workers(
+                project,
+                &workers,
+                &action_tx,
+                now,
+                picker,
+                &protected_imports,
+            )
+        });
         needs_redraw |= apply_drain_outcome(&mut app, outcome);
 
         // --- Update check (periodic worker results) ---
@@ -2547,6 +2691,20 @@ fn run_tui() -> anyhow::Result<()> {
         if let Ok(true) = tuicr_check_rx.try_recv() {
             for p in &mut app.projects {
                 p.tuicr_available = true;
+            }
+            shared.tuicr_rx = Some(spawn_tuicr_draft_worker(
+                shared.poll_suspended.clone(),
+                shared.shutdown.clone(),
+            ));
+        }
+        if let Some(rx) = &shared.tuicr_rx {
+            while let Ok(drafts) = rx.try_recv() {
+                for project in &mut app.projects {
+                    if project.live.tuicr_drafts != drafts {
+                        project.live.tuicr_drafts = drafts.clone();
+                        needs_redraw = true;
+                    }
+                }
             }
         }
 
@@ -2593,7 +2751,16 @@ fn run_tui() -> anyhow::Result<()> {
                                 }
                             }
                         }
+                        let imported_project = issue
+                            .linear_projects
+                            .iter()
+                            .find(|p| p.imported)
+                            .and_then(|link| result.projects.iter().find(|p| p.id == link.id));
+                        if let Some(linear_project) = imported_project {
+                            issue.title = linear_project.name.clone();
+                        }
                     }
+                    project.live.linear_projects = result.projects.clone();
                 }
             }
         }
@@ -2607,14 +2774,17 @@ fn run_tui() -> anyhow::Result<()> {
             let Some(proj_pos) = app.projects.iter().position(|p| p.id() == *proj_id) else {
                 continue;
             };
-            let outcome = drain_project_workers(
-                &mut app.projects[proj_pos],
-                sw,
-                &action_tx,
-                now,
-                picker_project.as_ref() == Some(proj_id),
-                &protected_imports,
-            );
+            let query = app.search_query.clone();
+            let outcome = app.projects[proj_pos].keep_selection(&query, |project| {
+                drain_project_workers(
+                    project,
+                    sw,
+                    &action_tx,
+                    now,
+                    picker_project.as_ref() == Some(proj_id),
+                    &protected_imports,
+                )
+            });
             needs_redraw |= apply_drain_outcome(&mut app, outcome);
         }
 
@@ -2644,7 +2814,7 @@ fn run_tui() -> anyhow::Result<()> {
 
         while let Ok(result) = reload_rx.try_recv() {
             if !result.is_empty() {
-                app.apply_reload_result(result);
+                app.apply_reload_result(result, &global_config::list_projects());
                 needs_redraw = true;
             }
         }
@@ -2809,7 +2979,7 @@ fn open_tmux_popup(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     session_name: &str,
     title: &str,
-    project_name: &str,
+    display_name: &str,
     suspended: &AtomicBool,
 ) -> anyhow::Result<()> {
     let _guard = SuspendGuard::new(suspended);
@@ -2823,7 +2993,7 @@ fn open_tmux_popup(
     execute!(
         terminal.backend_mut(),
         EnterAlternateScreen,
-        SetTitle(format!("bork: {}", project_name))
+        SetTitle(format!("bork: {}", display_name))
     )?;
     push_kitty_flags(terminal.backend_mut());
     terminal.clear()?;
@@ -2834,7 +3004,7 @@ fn open_tmux_popup(
 fn open_external_editor(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     initial_content: &str,
-    project_name: &str,
+    display_name: &str,
     suspended: &AtomicBool,
 ) -> anyhow::Result<Option<String>> {
     let _guard = SuspendGuard::new(suspended);
@@ -2858,7 +3028,7 @@ fn open_external_editor(
     execute!(
         terminal.backend_mut(),
         EnterAlternateScreen,
-        SetTitle(format!("bork: {}", project_name))
+        SetTitle(format!("bork: {}", display_name))
     )?;
     push_kitty_flags(terminal.backend_mut());
     terminal.clear()?;
@@ -2936,6 +3106,25 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn project_flag_resolves_by_name_or_label() {
+        global_config::tests::with_temp_config("resolve-label", || {
+            let dir =
+                std::env::temp_dir().join(format!("bork-resolve-label-{}", std::process::id()));
+            std::fs::create_dir_all(dir.join(".bork")).unwrap();
+            std::fs::write(dir.join(".bork/config.toml"), "project_name = \"api\"\n").unwrap();
+            global_config::register_project("api", &dir).unwrap();
+            global_config::set_project_label(&dir, Some("Backend")).unwrap();
+            let root = std::fs::canonicalize(&dir).unwrap();
+
+            assert_eq!(resolve_start_project_root(Some("api")).unwrap(), root);
+            assert_eq!(resolve_start_project_root(Some("Backend")).unwrap(), root);
+            assert!(resolve_start_project_root(Some("nope")).is_err());
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
 
     #[test]
     fn toml_literal_escapes_control_chars_for_roundtrip() {
@@ -3134,5 +3323,27 @@ mod tests {
         let (wake_tx, wake_rx) = mpsc::channel::<()>();
         drop(wake_tx);
         assert!(!sleep_with_wake(&wake_rx, Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn attach_pr_uses_explicit_issue_id() {
+        let (id, pr) = resolve_attach_pr_args(&["bork-1", "42"], Some("bork-9".into())).unwrap();
+        assert_eq!((id.as_str(), pr), ("bork-1", 42));
+    }
+
+    #[test]
+    fn attach_pr_falls_back_to_session_issue_id() {
+        let (id, pr) = resolve_attach_pr_args(&["#42"], Some("bork-9".into())).unwrap();
+        assert_eq!((id.as_str(), pr), ("bork-9", 42));
+    }
+
+    #[test]
+    fn attach_pr_without_issue_id_or_session_errors() {
+        assert!(resolve_attach_pr_args(&["42"], None).is_err());
+    }
+
+    #[test]
+    fn attach_pr_rejects_bad_pr_number() {
+        assert!(resolve_attach_pr_args(&["bork-1", "abc"], None).is_err());
     }
 }
