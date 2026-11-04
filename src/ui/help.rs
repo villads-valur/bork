@@ -30,9 +30,9 @@ const PROJECTS_SECTION: Section = Section {
     bindings: &[
         ("Ctrl+P", "Toggle project sidebar"),
         ("Space", "Toggle swimlane (sidebar)"),
-        ("J / K", "Move project (sidebar)"),
-        ("r", "Rename project (sidebar)"),
-        ("d", "Remove from list (sidebar)"),
+        ("Shift+J / K", "Move project (sidebar)"),
+        ("Shift+R", "Rename project (sidebar)"),
+        ("Shift+D", "Remove from list (sidebar)"),
         ("Tab / S-Tab", "Switch swimlane focus"),
     ],
 };

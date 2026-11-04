@@ -148,8 +148,9 @@ fn map_sidebar_key(key: KeyEvent) -> Action {
         KeyCode::Char(' ') => Action::SidebarToggleSwimlane,
         KeyCode::Char('K') => Action::SidebarMoveUp,
         KeyCode::Char('J') => Action::SidebarMoveDown,
-        KeyCode::Char('r') => Action::SidebarRename,
-        KeyCode::Char('d') => Action::SidebarRemove,
+        // Shifted so renaming or removing a project takes a deliberate combo.
+        KeyCode::Char('R') => Action::SidebarRename,
+        KeyCode::Char('D') => Action::SidebarRemove,
         KeyCode::Char('?') => Action::ShowHelp,
         _ => Action::Noop,
     }
@@ -327,6 +328,17 @@ fn map_dialog_key(key: KeyEvent) -> Action {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sidebar_edits_need_shift() {
+        let map = |code| map_key_to_action(key(code), InputMode::Sidebar, None, 1);
+        assert_eq!(map(KeyCode::Char('R')), Action::SidebarRename);
+        assert_eq!(map(KeyCode::Char('D')), Action::SidebarRemove);
+        assert_eq!(map(KeyCode::Char('J')), Action::SidebarMoveDown);
+        assert_eq!(map(KeyCode::Char('K')), Action::SidebarMoveUp);
+        assert_eq!(map(KeyCode::Char('r')), Action::Noop);
+        assert_eq!(map(KeyCode::Char('d')), Action::Noop);
+    }
 
     // --- Normal mode ---
 
