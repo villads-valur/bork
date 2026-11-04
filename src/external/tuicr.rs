@@ -24,32 +24,30 @@ const SHELLS: &[&str] = &[
 ];
 
 /// Show tuicr in `session`, reusing its tuicr window when there is one.
-pub fn open_in_session(session: &str, cwd: &Path, pr_mode: bool) -> Result<(), AppError> {
+pub fn open_in_session(session: &str, cwd: &Path, pr: Option<u32>) -> Result<(), AppError> {
     let Some(window) = tmux::window_ids(session, TUICR_WINDOW)?.into_iter().next() else {
         tmux::create_window(session, TUICR_WINDOW, cwd)?;
-        start_tuicr(&format!("{session}:{TUICR_WINDOW}"), pr_mode)?;
+        start_tuicr(&format!("{session}:{TUICR_WINDOW}"), pr)?;
         return tmux::select_window(session, TUICR_WINDOW);
     };
 
-    resume_tuicr(&format!("{session}:{window}"), cwd, pr_mode)?;
+    resume_tuicr(&format!("{session}:{window}"), cwd, pr)?;
     tmux::select_window(session, &window)
 }
 
-/// tuicr is started only at a shell prompt, and restarted when it runs in
-/// the other mode. Any other program in the window is left alone rather than
+/// tuicr is started only at a shell prompt, and restarted when it reviews
+/// something else. Any other program in the window is left alone rather than
 /// typed into.
-fn resume_tuicr(target: &str, cwd: &Path, pr_mode: bool) -> Result<(), AppError> {
-    let wanted = mode(pr_mode);
+fn resume_tuicr(target: &str, cwd: &Path, pr: Option<u32>) -> Result<(), AppError> {
+    let wanted = mode(pr);
     match tmux::pane_current_command(target).as_deref() {
-        Some("tuicr") if tmux::window_option(target, MODE_OPTION).as_deref() == Some(wanted) => {
-            Ok(())
-        }
+        Some("tuicr") if tmux::window_option(target, MODE_OPTION) == Some(wanted) => Ok(()),
         Some("tuicr") => {
             tmux::respawn_pane(target, cwd)?;
-            start_tuicr(target, pr_mode)
+            start_tuicr(target, pr)
         }
         Some(command) if SHELLS.contains(&command.trim_start_matches('-')) => {
-            start_tuicr(target, pr_mode)
+            start_tuicr(target, pr)
         }
         _ => Ok(()),
     }
@@ -57,32 +55,31 @@ fn resume_tuicr(target: &str, cwd: &Path, pr_mode: bool) -> Result<(), AppError>
 
 /// Create a fresh tmux session whose first window runs tuicr.
 /// Used when there is no agent session for the issue but the user wants to review.
-pub fn launch_review_session(session: &str, cwd: &Path, pr_mode: bool) -> Result<(), AppError> {
+pub fn launch_review_session(session: &str, cwd: &Path, pr: Option<u32>) -> Result<(), AppError> {
     tmux::create_session(session, cwd)?;
     tmux::rename_window(session, TUICR_WINDOW)?;
-    start_tuicr(session, pr_mode)?;
+    start_tuicr(session, pr)?;
     tmux::create_window(session, "terminal", cwd)?;
     Ok(())
 }
 
-fn start_tuicr(target: &str, pr_mode: bool) -> Result<(), AppError> {
-    tmux::set_window_option(target, MODE_OPTION, mode(pr_mode))?;
-    tmux::send_keys(target, &tuicr_cmd(pr_mode))
+fn start_tuicr(target: &str, pr: Option<u32>) -> Result<(), AppError> {
+    tmux::set_window_option(target, MODE_OPTION, &mode(pr))?;
+    tmux::send_keys(target, &tuicr_cmd(pr))
 }
 
-fn mode(pr_mode: bool) -> &'static str {
-    if pr_mode {
-        "pr"
-    } else {
-        "local"
+fn mode(pr: Option<u32>) -> String {
+    match pr {
+        Some(number) => format!("pr:{number}"),
+        None => "local".to_string(),
     }
 }
 
-fn tuicr_cmd(pr_mode: bool) -> String {
-    if pr_mode {
-        "tuicr --pr || tuicr".to_string()
-    } else {
-        "tuicr".to_string()
+/// Falls back to the local review when tuicr can't load the PR.
+fn tuicr_cmd(pr: Option<u32>) -> String {
+    match pr {
+        Some(number) => format!("tuicr pr {number} || tuicr"),
+        None => "tuicr".to_string(),
     }
 }
 
@@ -332,8 +329,8 @@ mod tests {
         let cwd = std::env::temp_dir();
         tmux::create_session(&session, &cwd).unwrap();
 
-        let first = open_in_session(&session, &cwd, false);
-        let second = open_in_session(&session, &cwd, false);
+        let first = open_in_session(&session, &cwd, None);
+        let second = open_in_session(&session, &cwd, None);
         let windows = tuicr_windows(&session);
         let _ = tmux::kill_session(&session);
 
@@ -442,11 +439,11 @@ fn main() {
         }
         let session = FakeTuicrSession::start("running");
 
-        open_in_session(&session.name, session.cwd(), false).unwrap();
+        open_in_session(&session.name, session.cwd(), None).unwrap();
         // The pane reports tuicr before it has logged its launch.
         wait_until(|| tuicr_is_running(&session.name));
         session.wait_for_launches(1);
-        open_in_session(&session.name, session.cwd(), false).unwrap();
+        open_in_session(&session.name, session.cwd(), None).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(300));
 
         assert_eq!(session.launches(), [""]);
@@ -460,14 +457,37 @@ fn main() {
         }
         let session = FakeTuicrSession::start("mode");
 
-        open_in_session(&session.name, session.cwd(), false).unwrap();
+        open_in_session(&session.name, session.cwd(), None).unwrap();
         // The pane reports tuicr before it has logged its launch.
         wait_until(|| tuicr_is_running(&session.name));
         session.wait_for_launches(1);
-        open_in_session(&session.name, session.cwd(), true).unwrap();
+        open_in_session(&session.name, session.cwd(), Some(12)).unwrap();
         session.wait_for_launches(2);
 
-        assert_eq!(session.launches(), ["", "--pr"]);
+        assert_eq!(session.launches(), ["", "pr 12"]);
+        assert_eq!(tuicr_windows(&session.name), 1);
+    }
+
+    #[test]
+    fn reopening_a_review_restarts_tuicr_only_for_a_different_pr() {
+        if !tmux::tmux_available() {
+            eprintln!("skipping: tmux is not installed");
+            return;
+        }
+        let session = FakeTuicrSession::start("switch");
+
+        open_in_session(&session.name, session.cwd(), Some(12)).unwrap();
+        // The pane reports tuicr before it has logged its launch.
+        wait_until(|| tuicr_is_running(&session.name));
+        session.wait_for_launches(1);
+        open_in_session(&session.name, session.cwd(), Some(12)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(session.launches(), ["pr 12"]);
+
+        open_in_session(&session.name, session.cwd(), Some(13)).unwrap();
+        session.wait_for_launches(2);
+
+        assert_eq!(session.launches(), ["pr 12", "pr 13"]);
         assert_eq!(tuicr_windows(&session.name), 1);
     }
 
@@ -483,7 +503,7 @@ fn main() {
         tmux::send_keys(&target, "cat").unwrap();
         wait_until(|| tmux::pane_current_command(&target).as_deref() == Some("cat"));
 
-        open_in_session(&session.name, session.cwd(), false).unwrap();
+        open_in_session(&session.name, session.cwd(), None).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(300));
 
         assert_eq!(tmux::pane_current_command(&target).as_deref(), Some("cat"));
@@ -504,7 +524,7 @@ fn main() {
         tmux::create_window(&session.name, "tuicr", session.cwd()).unwrap();
         tmux::create_window(&session.name, "tuicr", session.cwd()).unwrap();
 
-        open_in_session(&session.name, session.cwd(), false).unwrap();
+        open_in_session(&session.name, session.cwd(), None).unwrap();
         session.wait_for_launches(1);
 
         assert_eq!(session.launches(), [""]);
@@ -524,8 +544,8 @@ fn main() {
         let session = format!("bork-tuicr-review-session-{}", std::process::id());
         let cwd = std::env::temp_dir();
 
-        let launched = launch_review_session(&session, &cwd, false);
-        let opened = open_in_session(&session, &cwd, false);
+        let launched = launch_review_session(&session, &cwd, None);
+        let opened = open_in_session(&session, &cwd, None);
         let windows = tmux::window_names(&session);
         let _ = tmux::kill_session(&session);
 
@@ -546,7 +566,7 @@ fn main() {
         tmux::create_session(&session, &cwd).unwrap();
         tmux::create_window(&session, "terminal", &cwd).unwrap();
 
-        let opened = open_in_session(&session, &cwd, false);
+        let opened = open_in_session(&session, &cwd, None);
         let active = tmux::active_window_name(&session);
         let _ = tmux::kill_session(&session);
 
