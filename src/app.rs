@@ -24,8 +24,8 @@ use crate::external::linear::LinearIssue;
 use crate::prune::{PruneAction, PruneCandidate};
 use crate::types::{
     AgentKind, AgentStatus, AgentStatusInfo, ChecksStatus, Column, GithubStack, Issue, IssueKind,
-    LinkedGithubPr, MergeBlocker, MergeQueueState, PrImportBaseline, PrImportSource, PrState,
-    PrStatus, ReviewDecision, WorktreeStatus,
+    LinkedGithubPr, MergeBlocker, PrImportBaseline, PrImportSource, PrState, PrStatus,
+    ReviewDecision, WorktreeStatus,
 };
 use crate::undo::UndoEntry;
 
@@ -1001,12 +1001,8 @@ impl Project {
         // While the queue holds the PR, its checks and merge-state describe
         // the queue's work, not the owner's. Trunk's own check is part of the
         // rollup, so a failed queue run would otherwise read as failing CI.
-        match pr.merge_queue {
-            Some(MergeQueueState::Queued) => return Some(Attention::Queued),
-            Some(MergeQueueState::Testing) => return Some(Attention::QueueTesting),
-            Some(MergeQueueState::Failed) => return Some(Attention::QueueFailed),
-            Some(MergeQueueState::Cancelled) => return Some(Attention::QueueCancelled),
-            None => {}
+        if let Some(state) = pr.merge_queue {
+            return Some(Attention::Queue(state));
         }
 
         let changes_requested = pr.review == Some(ReviewDecision::ChangesRequested);
@@ -2707,7 +2703,7 @@ mod tests {
 
     use super::*;
     use crate::config::DEFAULT_DONE_SESSION_TTL;
-    use crate::types::{AgentKind, IssueKind, PrState, PrStatus};
+    use crate::types::{AgentKind, IssueKind, MergeQueueState, PrState, PrStatus};
 
     fn test_config() -> AppConfig {
         AppConfig {
@@ -2859,96 +2855,65 @@ mod tests {
         assert_eq!(attention_of(&app), Some(Attention::ReadyToMerge));
     }
 
-    #[test]
-    fn queued_pr_shows_queued_but_needs_nothing() {
-        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
-        let mut pr = test_pr(7, "feature");
-        pr.merge_queue = Some(MergeQueueState::Queued);
-        // Queue-side state must not surface as owner work while queued.
-        pr.merge_blocker = Some(MergeBlocker::Blocked);
-        app.project_mut().live.user_prs = vec![pr];
-
-        assert_eq!(attention_of(&app), Some(Attention::Queued));
-        assert_eq!(app.project().attention_count(), 0);
-    }
-
-    fn own_queued_pr(state: MergeQueueState) -> PrStatus {
+    fn own_pr_in_queue(state: MergeQueueState) -> PrStatus {
         let mut pr = test_pr(7, "feature");
         pr.merge_queue = Some(state);
         pr
     }
 
     #[test]
-    fn each_queue_state_has_its_own_attention() {
-        for (state, expected) in [
-            (MergeQueueState::Queued, Attention::Queued),
-            (MergeQueueState::Testing, Attention::QueueTesting),
-            (MergeQueueState::Failed, Attention::QueueFailed),
-            (MergeQueueState::Cancelled, Attention::QueueCancelled),
+    fn queue_state_shows_on_the_card_and_only_failures_need_you() {
+        for (state, count) in [
+            (MergeQueueState::Queued, 0),
+            (MergeQueueState::Testing, 0),
+            (MergeQueueState::Failed, 1),
+            (MergeQueueState::Cancelled, 1),
         ] {
             let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
-            app.project_mut().live.user_prs = vec![own_queued_pr(state)];
+            app.project_mut().live.user_prs = vec![own_pr_in_queue(state)];
 
-            assert_eq!(attention_of(&app), Some(expected), "{state:?}");
+            assert_eq!(
+                attention_of(&app),
+                Some(Attention::Queue(state)),
+                "{state:?}"
+            );
+            assert_eq!(app.project().attention_count(), count, "{state:?}");
         }
     }
 
     #[test]
-    fn a_pr_being_tested_by_the_queue_needs_nothing() {
-        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
-        let mut pr = own_queued_pr(MergeQueueState::Testing);
-        // Trunk's own in-flight check holds the rollup at pending.
-        pr.checks = Some(ChecksStatus::Pending);
-        app.project_mut().live.user_prs = vec![pr];
+    fn queue_state_outranks_ci_review_and_merge_state() {
+        // Trunk's own check is in the rollup: pending while testing, red once
+        // the run fails. Neither is owner work while the queue holds the PR.
+        for state in [MergeQueueState::Testing, MergeQueueState::Failed] {
+            let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+            let mut pr = own_pr_in_queue(state);
+            pr.checks = Some(ChecksStatus::Failure);
+            pr.review = Some(ReviewDecision::ChangesRequested);
+            pr.merge_blocker = Some(MergeBlocker::Conflicts);
+            app.project_mut().live.user_prs = vec![pr];
 
-        assert_eq!(attention_of(&app), Some(Attention::QueueTesting));
-        assert_eq!(app.project().attention_count(), 0);
+            assert_eq!(
+                attention_of(&app),
+                Some(Attention::Queue(state)),
+                "{state:?}"
+            );
+        }
     }
 
     #[test]
-    fn a_failed_queue_run_needs_you_and_passes_the_filter() {
+    fn a_failed_queue_run_passes_the_attention_filter() {
         let mut app = test_app(vec![
             issue_linked_to_pr("bork-1", 7, None),
             test_issue("bork-2", Column::CodeReview),
         ]);
-        app.project_mut().live.user_prs = vec![own_queued_pr(MergeQueueState::Failed)];
+        app.project_mut().live.user_prs = vec![own_pr_in_queue(MergeQueueState::Failed)];
         app.project_mut().attention_filter = true;
 
         let visible = app.project().issues_in_column(Column::CodeReview, "");
 
-        assert_eq!(app.project().attention_count(), 1);
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].1.id, "bork-1");
-    }
-
-    #[test]
-    fn a_dequeued_pr_needs_you() {
-        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
-        app.project_mut().live.user_prs = vec![own_queued_pr(MergeQueueState::Cancelled)];
-
-        assert_eq!(app.project().attention_count(), 1);
-    }
-
-    #[test]
-    fn a_failed_queue_run_is_not_reported_as_failing_ci() {
-        // Trunk's failed check turns the rollup red; the queue badge says why.
-        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
-        let mut pr = own_queued_pr(MergeQueueState::Failed);
-        pr.checks = Some(ChecksStatus::Failure);
-        app.project_mut().live.user_prs = vec![pr];
-
-        assert_eq!(attention_of(&app), Some(Attention::QueueFailed));
-    }
-
-    #[test]
-    fn queue_state_outranks_review_and_merge_state() {
-        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
-        let mut pr = own_queued_pr(MergeQueueState::Testing);
-        pr.review = Some(ReviewDecision::ChangesRequested);
-        pr.merge_blocker = Some(MergeBlocker::Conflicts);
-        app.project_mut().live.user_prs = vec![pr];
-
-        assert_eq!(attention_of(&app), Some(Attention::QueueTesting));
     }
 
     #[test]
@@ -2959,7 +2924,7 @@ mod tests {
             (false, PrState::Merged),
         ] {
             let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
-            let mut pr = own_queued_pr(MergeQueueState::Failed);
+            let mut pr = own_pr_in_queue(MergeQueueState::Failed);
             pr.is_draft = is_draft;
             pr.state = state;
             app.project_mut().live.user_prs = vec![pr];
@@ -2974,7 +2939,7 @@ mod tests {
         app.project_mut()
             .live
             .pr_statuses_by_number
-            .insert(7, own_queued_pr(MergeQueueState::Failed));
+            .insert(7, own_pr_in_queue(MergeQueueState::Failed));
 
         assert_eq!(attention_of(&app), None);
         assert_eq!(app.project().attention_count(), 0);
@@ -2983,7 +2948,7 @@ mod tests {
     #[test]
     fn a_blocked_agent_outranks_a_failed_queue_run() {
         let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
-        app.project_mut().live.user_prs = vec![own_queued_pr(MergeQueueState::Failed)];
+        app.project_mut().live.user_prs = vec![own_pr_in_queue(MergeQueueState::Failed)];
         set_agent_status(&mut app, "bork-bork-1", AgentStatus::WaitingPermission);
 
         assert_eq!(attention_of(&app), Some(Attention::AgentBlocked));

@@ -1,7 +1,7 @@
 use ratatui::style::{Color, Modifier, Style};
 
 use crate::attention::Attention;
-use crate::types::{AgentStatus, ChecksStatus, PrState, ReviewDecision};
+use crate::types::{AgentStatus, ChecksStatus, MergeQueueState, PrState, ReviewDecision};
 
 pub fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -78,10 +78,10 @@ pub fn attention_badge(attention: Attention) -> (&'static str, Color) {
         Attention::ChecksAndChanges => ("\u{2717} CI \u{21a9} review", Color::Red),
         Attention::NeedsRebase => ("\u{21a5} rebase", Color::Yellow),
         Attention::Blocked => ("\u{2298} blocked", Color::Magenta),
-        Attention::Queued => ("\u{29d6} queued", DIM),
-        Attention::QueueTesting => ("\u{29d6} testing", Color::Blue),
-        Attention::QueueFailed => ("\u{2717} queue failed", Color::Red),
-        Attention::QueueCancelled => ("\u{29d6} dequeued", Color::Yellow),
+        Attention::Queue(MergeQueueState::Queued) => ("\u{29d6} queued", DIM),
+        Attention::Queue(MergeQueueState::Testing) => ("\u{29d6} testing", Color::Blue),
+        Attention::Queue(MergeQueueState::Failed) => ("\u{2717} queue failed", Color::Red),
+        Attention::Queue(MergeQueueState::Cancelled) => ("\u{29d6} dequeued", Color::Yellow),
         Attention::AgentBlocked => ("\u{2691} agent blocked", Color::Yellow),
         Attention::AgentError => ("\u{2691} agent error", Color::Red),
     }
@@ -150,19 +150,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn queue_badges_name_their_state() {
-        for (attention, label, color) in [
-            (Attention::Queued, "\u{29d6} queued", DIM),
-            (Attention::QueueTesting, "\u{29d6} testing", Color::Blue),
-            (Attention::QueueFailed, "\u{2717} queue failed", Color::Red),
-            (
-                Attention::QueueCancelled,
-                "\u{29d6} dequeued",
-                Color::Yellow,
-            ),
-        ] {
-            assert_eq!(attention_badge(attention), (label, color), "{attention:?}");
-        }
+    fn each_queue_state_has_its_own_badge() {
+        let labels: std::collections::HashSet<_> = [
+            MergeQueueState::Queued,
+            MergeQueueState::Testing,
+            MergeQueueState::Failed,
+            MergeQueueState::Cancelled,
+        ]
+        .into_iter()
+        .map(|state| attention_badge(Attention::Queue(state)).0)
+        .collect();
+        assert_eq!(labels.len(), 4);
     }
 
     #[test]

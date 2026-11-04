@@ -541,9 +541,9 @@ Your own PRs show where they are in a merge queue. Bork reads GitHub's native me
 | `⧖ queued` (dim) | Waiting its turn, or passed and about to merge | No |
 | `⧖ testing` (blue) | The queue is running checks on it | No |
 | `✗ queue failed` (red) | The queue removed it after a failed run | Yes |
-| `⧖ dequeued` (yellow) | Cancelled before it merged | Yes |
+| `⧖ dequeued` (yellow) | Cancelled before it merged (Trunk only) | Yes |
 
-While a PR is queued, the queue badge replaces the CI, review and merge badges. Pushing a new commit clears a failed or dequeued badge, since Trunk's check stays on the old commit. A PR Trunk hasn't admitted yet (not ready) has no check, so it shows its normal status.
+While a PR is in a queue, its queue badge takes the place of the status badge (`✗ CI`, `↩ review`, `✓ merge`). The PR line's CI and review icons stay, so a failed Trunk run also shows a red CI `✗`, since Trunk's check is part of the CI result. GitHub clears its queue entry once it removes a PR, so a PR dropped from GitHub's queue goes back to its normal badges. Trunk's check stays on the commit, so its failed and dequeued badges last until you push a new commit or re-queue. A PR Trunk hasn't admitted yet (not ready) has no check, so it shows its normal status.
 
 ### Attached PR stacks
 

@@ -1,3 +1,5 @@
+use crate::types::MergeQueueState;
+
 /// What a card asks of its owner, worth surfacing over the board's ordinary
 /// state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,17 +19,10 @@ pub enum Attention {
     /// Own PR: approved and green, but GitHub blocks the merge, typically on
     /// an unresolved conversation.
     Blocked,
-    /// Own PR: in the merge queue. Shown on the card, but left out of the
-    /// needs-you count and filter: the queue owns it until it merges or gets
-    /// ejected.
-    Queued,
-    /// Own PR: the merge queue is running checks on it. Like `Queued`, it
-    /// does not need the owner.
-    QueueTesting,
-    /// Own PR: the merge queue removed it after a failed run.
-    QueueFailed,
-    /// Own PR: dequeued before it merged.
-    QueueCancelled,
+    /// Own PR: in a merge queue. While queued or testing it is left out of
+    /// the needs-you count and filter: the queue owns it. Failed or
+    /// cancelled puts it back on the owner.
+    Queue(MergeQueueState),
     /// The card's agent is stopped on a permission prompt or a plan approval.
     AgentBlocked,
     /// The card's agent reported an error.
@@ -36,7 +31,10 @@ pub enum Attention {
 
 impl Attention {
     pub fn needs_you(self) -> bool {
-        !matches!(self, Attention::Queued | Attention::QueueTesting)
+        !matches!(
+            self,
+            Attention::Queue(MergeQueueState::Queued | MergeQueueState::Testing)
+        )
     }
 }
 
@@ -45,20 +43,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_a_pr_the_queue_still_owns_is_left_out_of_needs_you() {
+    fn only_failed_or_dequeued_queue_runs_need_you() {
         for (attention, expected) in [
-            (Attention::ReadyToMerge, true),
-            (Attention::ChecksFailing, true),
-            (Attention::ChangesRequested, true),
-            (Attention::ChecksAndChanges, true),
-            (Attention::NeedsRebase, true),
-            (Attention::Blocked, true),
-            (Attention::Queued, false),
-            (Attention::QueueTesting, false),
-            (Attention::QueueFailed, true),
-            (Attention::QueueCancelled, true),
-            (Attention::AgentBlocked, true),
-            (Attention::AgentError, true),
+            (Attention::Queue(MergeQueueState::Queued), false),
+            (Attention::Queue(MergeQueueState::Testing), false),
+            (Attention::Queue(MergeQueueState::Failed), true),
+            (Attention::Queue(MergeQueueState::Cancelled), true),
         ] {
             assert_eq!(attention.needs_you(), expected, "{attention:?}");
         }

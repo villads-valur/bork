@@ -205,8 +205,8 @@ Issues can be tied to other issues in the same project via a symmetric `linked_i
 
 ## Merge queue status
 
-- `PrStatus.merge_queue` comes from GitHub's `mergeQueueEntry`/`isInMergeQueue` first, then Trunk's `Trunk Merge Queue (<branch>)` check run on the head commit. `PR_FIELDS` asks only for check suites from Trunk's GitHub App (id 120106), so the query stays small in repos with many checks.
-- Trunk's check is part of `statusCheckRollup`, so `pr_attention` checks the queue state before CI and review. Queued/testing stay out of the needs-you count; failed/dequeued count.
+- `PrStatus.merge_queue` comes from GitHub's `mergeQueueEntry`/`isInMergeQueue` first, then Trunk's `Trunk Merge Queue (<branch>)` check run on the head commit. `PR_FIELDS_WITH_QUEUE` asks only for the check suite of Trunk's GitHub App (id 120106), so the query stays small in repos with many checks. Review searches use plain `PR_FIELDS`, since queue state only matters on your own PRs; anything that can feed `pr_for` for your own PR must use the queue version.
+- Trunk's check is part of `statusCheckRollup`, so `pr_attention` checks the queue state before CI and review. `Attention::Queue(state)` carries the state; queued/testing stay out of the needs-you count, failed/dequeued count.
 
 ## Automatic stack review imports
 
