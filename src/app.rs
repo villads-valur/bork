@@ -28,6 +28,7 @@ use crate::types::{
     ReviewDecision, WorktreeStatus,
 };
 use crate::undo::UndoEntry;
+use crate::worktree::ForceRequired;
 
 pub type ProjectId = PathBuf;
 
@@ -1856,6 +1857,8 @@ pub enum ConfirmAction {
     ArchiveIssue {
         issue_ids: Vec<String>,
         project_id: ProjectId,
+        /// Skip the teardown, which already ran, and discard uncommitted changes.
+        force: bool,
     },
     /// Unregister the project. Its files stay on disk.
     RemoveProject { project_id: ProjectId },
@@ -2025,6 +2028,9 @@ pub struct App {
     pub search_query: String,
     pub confirm_message: Option<String>,
     pub pending_confirm: Option<ConfirmAction>,
+    /// Archives that stopped short and wait to be offered as a force archive
+    /// once the board is back in Normal mode.
+    pub queued_force_archives: Vec<(ProjectId, String, ForceRequired)>,
     /// Mode to go back to when the confirm prompt closes.
     confirm_return_mode: InputMode,
     pub dialog: Option<DialogState>,
@@ -2071,6 +2077,7 @@ impl App {
             search_query: String::new(),
             confirm_message: None,
             pending_confirm: None,
+            queued_force_archives: Vec::new(),
             confirm_return_mode: InputMode::Normal,
             dialog: None,
             prune_dialog: None,
