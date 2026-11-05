@@ -70,6 +70,10 @@ impl AgentProvider for Codex {
         detect_session_id(&root, ctx.before)
     }
 
+    fn has_session(&self, _project_root: &Path, session_id: &str) -> bool {
+        sessions_root().is_none_or(|root| session_in(&root, session_id))
+    }
+
     fn install_hooks(&self) -> anyhow::Result<()> {
         hooks::install_codex_hooks()
     }
@@ -82,6 +86,12 @@ impl AgentProvider for Codex {
 pub(super) fn sessions_root() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     Some(PathBuf::from(home).join(".codex").join("sessions"))
+}
+
+/// Rollouts are filed by date, so look the id up among all of them. A
+/// missing root means Codex was never run here; keep the session.
+fn session_in(root: &Path, session_id: &str) -> bool {
+    !root.is_dir() || collect_session_ids(root).contains(session_id)
 }
 
 fn detect_session_id(root: &Path, before: &HashSet<String>) -> Option<String> {
@@ -155,6 +165,26 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
         assert!(before.contains(old));
         assert_eq!(detected.as_deref(), Some(new));
+    }
+
+    #[test]
+    fn session_in_finds_dated_rollout() {
+        let root = tempfile::TempDir::new().unwrap();
+        let day = root.path().join("2026").join("11").join("05");
+        fs::create_dir_all(&day).unwrap();
+        let sid = "019d76ad-9734-77c0-8169-a727a5524013";
+        fs::write(
+            day.join(format!("rollout-2026-11-05T09-00-00-{sid}.jsonl")),
+            "",
+        )
+        .unwrap();
+
+        assert!(session_in(root.path(), sid));
+        assert!(!session_in(
+            root.path(),
+            "019d76ad-9734-77c0-8169-a727a5524099"
+        ));
+        assert!(session_in(&root.path().join("missing"), sid));
     }
 
     #[test]

@@ -1,10 +1,12 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 #[cfg(not(test))]
 use std::process::Command;
 
 use crate::types::AgentMode;
 
-use super::{is_uuid_like, shell_escape_single_quotes, AgentProvider, LaunchContext};
+use super::{
+    exists_in_any_subdir, is_uuid_like, shell_escape_single_quotes, AgentProvider, LaunchContext,
+};
 
 pub struct Cursor;
 
@@ -47,6 +49,24 @@ impl AgentProvider for Cursor {
     fn build_cmd(&self, ctx: &LaunchContext) -> (String, Option<String>, Option<String>) {
         build_cmd_with_minter(ctx, mint_chat_id)
     }
+
+    fn has_session(&self, _project_root: &Path, session_id: &str) -> bool {
+        chats_dir()
+            .and_then(|dir| chat_exists(&dir, session_id))
+            .unwrap_or(true)
+    }
+}
+
+fn chats_dir() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(".cursor").join("chats"))
+}
+
+/// Chats live in `~/.cursor/chats/<workspace hash>/<chat id>/`. The folder only
+/// appears after the first message, so a minted chat that was never used reads
+/// as gone; launching fresh loses nothing there.
+fn chat_exists(chats_dir: &Path, chat_id: &str) -> Option<bool> {
+    exists_in_any_subdir(chats_dir, chat_id)
 }
 
 fn build_cmd_with_minter(
@@ -120,6 +140,19 @@ mod tests {
     use super::*;
 
     const CHAT_ID: &str = "a506b8cb-b2ea-4b22-b0bb-7c449eb14606";
+
+    #[test]
+    fn chat_exists_under_any_workspace() {
+        let root = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(root.path().join("5bb498be").join(CHAT_ID)).unwrap();
+
+        assert_eq!(chat_exists(root.path(), CHAT_ID), Some(true));
+        assert_eq!(
+            chat_exists(root.path(), "00000000-0000-4000-8000-000000000000"),
+            Some(false)
+        );
+        assert_eq!(chat_exists(&root.path().join("missing"), CHAT_ID), None);
+    }
 
     fn command(
         current_session: Option<&str>,

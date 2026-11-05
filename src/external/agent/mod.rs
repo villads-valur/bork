@@ -69,8 +69,9 @@ pub trait AgentProvider {
     }
 
     /// Whether the agent can still resume `session_id`. Harnesses that can't
-    /// tell return `true` so the stored session is kept.
-    fn has_session(&self, _session_id: &str) -> bool {
+    /// tell (or whose storage can't be read) return `true` so the stored
+    /// session is kept.
+    fn has_session(&self, _project_root: &Path, _session_id: &str) -> bool {
         true
     }
 
@@ -117,6 +118,18 @@ pub struct DetectContext<'a> {
     pub project_root: &'a Path,
     /// Session ids visible before launch, excluded from post-launch detection.
     pub before: &'a HashSet<String>,
+}
+
+/// Whether any direct subdir of `root` contains `name`. For harnesses that
+/// group sessions by a workspace key bork doesn't derive itself. `None` when
+/// `root` can't be read, so callers keep the session.
+fn exists_in_any_subdir(root: &Path, name: &str) -> Option<bool> {
+    let entries = fs::read_dir(root).ok()?;
+    Some(
+        entries
+            .flatten()
+            .any(|entry| entry.path().join(name).exists()),
+    )
 }
 
 /// Map an `AgentKind` to its provider. The one dispatch point — a match here is
@@ -211,7 +224,7 @@ pub fn launch_session(issue: &Issue, config: &AppConfig) -> Result<LaunchOutcome
     // transcript) would fail to resume, so launch fresh instead.
     let resume_session = issue
         .current_session_id()
-        .filter(|sid| provider.has_session(sid));
+        .filter(|sid| provider.has_session(cwd, sid));
     let replaced_lost_session = issue.current_session_id().is_some() && resume_session.is_none();
 
     tmux::create_session(&session_name, cwd)?;

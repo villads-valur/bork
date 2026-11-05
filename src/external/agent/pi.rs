@@ -71,6 +71,10 @@ impl AgentProvider for Pi {
         detect_session_id(&dir, ctx.before)
     }
 
+    fn has_session(&self, project_root: &Path, session_id: &str) -> bool {
+        sessions_dir(project_root).is_none_or(|dir| session_in(&dir, session_id))
+    }
+
     fn install_hooks(&self) -> anyhow::Result<()> {
         hooks::install_pi_extension()
     }
@@ -78,6 +82,11 @@ impl AgentProvider for Pi {
     fn uninstall_hooks(&self) -> anyhow::Result<()> {
         hooks::uninstall_pi_extension()
     }
+}
+
+/// A missing session dir means Pi never ran for this cwd; keep the session.
+fn session_in(dir: &Path, session_id: &str) -> bool {
+    !dir.is_dir() || collect_session_ids(dir).contains(session_id)
 }
 
 fn detect_session_id(dir: &Path, before: &HashSet<String>) -> Option<String> {
@@ -157,6 +166,24 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
         assert!(before.contains(old));
         assert_eq!(detected.as_deref(), Some(new));
+    }
+
+    #[test]
+    fn session_in_matches_session_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sid = "019d76ad-9734-77c0-8169-a727a5524013";
+        fs::write(
+            dir.path().join(format!("2026-11-05T09-00-00_{sid}.jsonl")),
+            "",
+        )
+        .unwrap();
+
+        assert!(session_in(dir.path(), sid));
+        assert!(!session_in(
+            dir.path(),
+            "019d76ad-9734-77c0-8169-a727a5524099"
+        ));
+        assert!(session_in(&dir.path().join("missing"), sid));
     }
 
     #[test]

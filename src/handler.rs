@@ -4181,7 +4181,8 @@ mod tests {
         issue
             .sessions
             .insert(issue.agent_kind, "ses_old".to_string());
-        // Codex, not Claude: Claude's has_session reads the real ~/.claude.
+        // The second agent's has_session reads its real session dir, so these
+        // tests never assert on its resume marker.
         issue
             .sessions
             .insert(AgentKind::Codex, "ses_other".to_string());

@@ -2481,7 +2481,9 @@ impl App {
         dialog.lost_sessions = issue
             .sessions
             .iter()
-            .filter(|(agent, sid)| !crate::external::agent::provider(**agent).has_session(sid))
+            .filter(|(agent, sid)| {
+                !crate::external::agent::provider(**agent).has_session(&p.config.project_root, sid)
+            })
             .map(|(agent, _)| *agent)
             .collect();
         self.dialog = Some(dialog);

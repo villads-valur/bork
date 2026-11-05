@@ -1,10 +1,11 @@
-use std::fs;
 use std::path::Path;
 
 use crate::external::hooks;
 use crate::types::AgentMode;
 
-use super::{generate_uuid, shell_escape_single_quotes, AgentProvider, LaunchContext};
+use super::{
+    exists_in_any_subdir, generate_uuid, shell_escape_single_quotes, AgentProvider, LaunchContext,
+};
 
 pub struct Claude;
 
@@ -79,9 +80,8 @@ impl AgentProvider for Claude {
         }
     }
 
-    fn has_session(&self, session_id: &str) -> bool {
-        let projects_dir = hooks::claude_config_dir().join("projects");
-        transcript_exists(&projects_dir, session_id).unwrap_or(true)
+    fn has_session(&self, _project_root: &Path, session_id: &str) -> bool {
+        transcript_exists(&hooks::claude_config_dir().join("projects"), session_id).unwrap_or(true)
     }
 
     fn install_hooks(&self) -> anyhow::Result<()> {
@@ -93,22 +93,17 @@ impl AgentProvider for Claude {
     }
 }
 
-/// Whether any project dir holds the transcript. Claude keeps them in
-/// `<config dir>/projects/<encoded cwd>/<id>.jsonl`. Searches every dir rather
-/// than re-deriving Claude's cwd encoding, which truncates long paths.
-/// `None` when the projects dir can't be read, so callers keep resuming.
+/// Claude keeps transcripts in `<config dir>/projects/<encoded cwd>/<id>.jsonl`.
+/// Searches every project dir rather than re-deriving Claude's cwd encoding,
+/// which truncates long paths.
 fn transcript_exists(projects_dir: &Path, session_id: &str) -> Option<bool> {
-    let file_name = format!("{session_id}.jsonl");
-    let entries = fs::read_dir(projects_dir).ok()?;
-    Some(
-        entries
-            .flatten()
-            .any(|entry| entry.path().join(&file_name).is_file()),
-    )
+    exists_in_any_subdir(projects_dir, &format!("{session_id}.jsonl"))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     const SID: &str = "cb2f9a52-8df5-4b17-8088-883ed5edcec6";
