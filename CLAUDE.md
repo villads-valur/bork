@@ -77,7 +77,7 @@ src/
 │   │   ├── codex.rs    # Codex provider
 │   │   ├── pi.rs       # Pi provider
 │   │   ├── cursor.rs   # Cursor provider (`cursor-agent`; chat id via `create-chat`; no status hooks)
-│   │   └── setup.rs    # Worktree setup-script runner
+│   │   └── handoff.rs  # Files passed between `launch_session` and the `bork issue launch` command it types into the pane
 │   ├── git.rs        # Git worktree status polling
 │   ├── github.rs     # GitHub PR polling via gh api graphql (per-repo identity cache)
 │   ├── linear.rs     # Linear CLI integration (assigned issues and projects via graphql)
@@ -168,7 +168,7 @@ The binary is symlinked to `/opt/homebrew/bin/bork`.
 
 ## Agent Sessions
 
-Each `Issue` stores agent session IDs in `sessions: BTreeMap<AgentKind, String>`, keyed by the agent that created them; launch/resume only reads the current agent's entry, so switching agents starts fresh while other agents' sessions stay resumable on switch-back. Agent changes go through `Issue::set_agent_kind()`, which (like `set_kind()`) tells the caller to kill the live tmux session but never clears the map. The worktree setup script runs once per worktree: `Issue::setup_ran` is set only after the tmux shell acknowledges a successful setup exit (independent of session-id capture, which can miss), cleared by `attach_worktree()` so a fresh checkout re-runs setup, and seeded from any recorded session id when migrating legacy states. Failed or interrupted setup returns a launch error and remains eligible for retry. The edit dialog marks resumable agents with `↺`, derived live from the issue's sessions map. Session teardown (kill + status-file removal) goes through `agent::terminate_session()`, which reports whether a live session actually died.
+Each `Issue` stores agent session IDs in `sessions: BTreeMap<AgentKind, String>`, keyed by the agent that created them; launch/resume only reads the current agent's entry, so switching agents starts fresh while other agents' sessions stay resumable on switch-back. Agent changes go through `Issue::set_agent_kind()`, which (like `set_kind()`) tells the caller to kill the live tmux session but never clears the map. `launch_session()` types only `'<current_exe>' issue launch <id>` into the pane; that command (`agent::exec_launch()`) reads the issue staged by the caller in `.bork/agent-status/launch-<id>/` (falling back to state.json when run by hand), runs setup, drops a stored session the agent no longer has (`AgentProvider::has_session()`), builds the agent command and execs it. It reports the session id and setup result back through the same dir; the caller still snapshots and detects OpenCode/Codex/Pi ids, so sequential bulk launches can't swap ids. The worktree setup script runs once per worktree: `Issue::setup_ran` is set only after the launch command reports a successful setup exit (independent of session-id capture, which can miss), cleared by `attach_worktree()` so a fresh checkout re-runs setup, and seeded from any recorded session id when migrating legacy states. Failed or interrupted setup returns a launch error and remains eligible for retry. The edit dialog marks resumable agents with `↺`, derived live from the issue's sessions map. Session teardown (kill + status-file removal) goes through `agent::terminate_session()`, which reports whether a live session actually died.
 
 ## Integration Data Model
 

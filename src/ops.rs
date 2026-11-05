@@ -298,6 +298,21 @@ pub fn update_issue(
     Ok(updated)
 }
 
+/// Store a launch's result for `bork issue launch` run by hand, when no TUI
+/// or `bork issue start` is waiting to do it.
+pub fn record_launch(
+    project_root: &Path,
+    launched: &Issue,
+    session_id: Option<String>,
+    setup_ran: bool,
+) -> anyhow::Result<()> {
+    let mut state = config::load_state(project_root);
+    let idx = find_issue_index(&state.issues, &launched.id)
+        .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", launched.id))?;
+    state.issues[idx].record_launch(launched.kind, launched.agent_kind, session_id, setup_ran);
+    config::save_state(&state, project_root)
+}
+
 pub fn delete_issue(project_root: &Path, issue_id: &str) -> anyhow::Result<Issue> {
     let mut state = config::load_state(project_root);
 

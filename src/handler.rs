@@ -2437,18 +2437,35 @@ pub fn delete_issue_from_app(app: &mut App, project_id: &ProjectId, issue_id: &s
 
 fn launch_and_report(issue: Issue, config: AppConfig) -> ActionResult {
     match agent::launch_session(&issue, &config) {
-        Ok((session_name, agent_sid, setup_ran)) => ActionResult {
-            launched_setup_ran: setup_ran,
-            message: format!("Session '{}' started", session_name),
-            session_to_open: Some(session_name),
-            launched_session: agent_sid.map(|sid| LaunchedSession {
-                agent: issue.agent_kind,
-                kind: issue.kind,
-                session_id: sid,
-            }),
-            launched_issue_id: Some(issue.id),
-            ..Default::default()
-        },
+        Ok(outcome) => {
+            let (message, message_kind) = if outcome.replaced_lost_session {
+                (
+                    format!(
+                        "Previous {} session for {} was gone, started a new one",
+                        issue.agent_kind, issue.id
+                    ),
+                    MessageKind::Warning,
+                )
+            } else {
+                (
+                    format!("Session '{}' started", outcome.session_name),
+                    MessageKind::Info,
+                )
+            };
+            ActionResult {
+                launched_setup_ran: outcome.setup_ran,
+                message,
+                message_kind,
+                session_to_open: Some(outcome.session_name),
+                launched_session: outcome.agent_session_id.map(|sid| LaunchedSession {
+                    agent: issue.agent_kind,
+                    kind: issue.kind,
+                    session_id: sid,
+                }),
+                launched_issue_id: Some(issue.id),
+                ..Default::default()
+            }
+        }
         Err(e) => ActionResult {
             message: format!("Failed to launch: {e}"),
             message_kind: MessageKind::Error,

@@ -103,6 +103,14 @@ bork issue archive bork-1 --force    # proceed past a failing teardown, discard 
 
 Without `--force`, the archive aborts if the teardown script fails or the worktree has uncommitted changes.
 
+### Run an issue's agent in the current terminal
+
+bork types this into each issue's tmux pane. It runs the setup script if it's due, then replaces itself with the agent (resuming the stored session when there is one). Don't run it from inside an agent session; use `bork issue start` to spin off work.
+
+```bash
+bork issue launch bork-1
+```
+
 ### Delete an issue
 
 ```bash

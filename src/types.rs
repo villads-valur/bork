@@ -527,6 +527,26 @@ impl Issue {
         self.kind == launched_kind && self.agent_kind == launched_agent
     }
 
+    /// Store what a launch produced. A kind change during the launch detached
+    /// all of it (see `accepts_launch_result`); `setup_ran` ignores agent
+    /// changes since the setup script is agent-independent.
+    pub fn record_launch(
+        &mut self,
+        launched_kind: IssueKind,
+        launched_agent: AgentKind,
+        session_id: Option<String>,
+        setup_ran: bool,
+    ) {
+        if setup_ran && self.kind == launched_kind {
+            self.setup_ran = true;
+        }
+        if let Some(sid) =
+            session_id.filter(|_| self.accepts_launch_result(launched_kind, launched_agent))
+        {
+            self.sessions.insert(launched_agent, sid);
+        }
+    }
+
     /// Attach a worktree to this issue. Clears the `pruned_at` marker so the
     /// "pruned" card indicator disappears, and `setup_ran` because the setup
     /// script is scoped to a worktree — a fresh checkout (re-attach after a
