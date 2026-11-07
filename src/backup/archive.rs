@@ -6,7 +6,8 @@
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::ErrorKind;
-use std::os::unix::fs::PermissionsExt;
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -157,6 +158,12 @@ fn read_source(entry: &ArchiveEntry) -> anyhow::Result<Source> {
 
 /// `staging/<path>` with its parent directories created. Rejects paths that
 /// could leave the staging directory.
+///
+/// Never follows or reuses an existing entry: every parent must be a real
+/// directory created for this archive, and the target must not exist yet.
+/// Two archive paths that the staging filesystem treats as the same entry
+/// (case or Unicode-normalization variants) therefore fail the backup
+/// instead of overwriting each other or writing through a staged symlink.
 fn staged_path(staging: &Path, path: &str) -> anyhow::Result<PathBuf> {
     let rel = Path::new(path);
     let plain = rel
@@ -165,16 +172,34 @@ fn staged_path(staging: &Path, path: &str) -> anyhow::Result<PathBuf> {
     if !plain || path.is_empty() {
         bail!("invalid archive path {path:?}");
     }
+    let mut dir = staging.to_path_buf();
+    if let Some(parent) = rel.parent() {
+        for part in parent.components() {
+            dir.push(part);
+            match fs::symlink_metadata(&dir) {
+                Ok(meta) if meta.is_dir() => {}
+                Ok(_) => bail!("archive path {path:?} collides with another entry"),
+                Err(err) if err.kind() == ErrorKind::NotFound => fs::create_dir(&dir)?,
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
     let full = staging.join(rel);
-    if let Some(parent) = full.parent() {
-        fs::create_dir_all(parent)?;
+    if fs::symlink_metadata(&full).is_ok() {
+        bail!("archive path {path:?} collides with another entry");
     }
     Ok(full)
 }
 
 fn stage_file(staging: &Path, path: &str, bytes: &[u8], mode: u32) -> anyhow::Result<()> {
     let full = staged_path(staging, path)?;
-    fs::write(&full, bytes)?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(&full)
+        .with_context(|| format!("staging {path}"))?;
+    file.write_all(bytes)?;
     fs::set_permissions(&full, fs::Permissions::from_mode(mode))?;
     Ok(())
 }
@@ -332,6 +357,31 @@ mod tests {
         if !readable {
             assert!(result.is_err());
         }
+    }
+
+    #[test]
+    fn colliding_paths_fail_instead_of_writing_through_symlinks() {
+        let staging = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        write_file(&outside.path().join("demo-1/planning.md"), "outside");
+        std::os::unix::fs::symlink(outside.path(), staging.path().join("_ISSUES")).unwrap();
+        // Exact spelling of the symlink, and (on case-insensitive disks) a
+        // case variant: both must refuse rather than follow it.
+        for path in ["_ISSUES/demo-1/planning.md", "_issues/demo-1/planning.md"] {
+            let result = stage_file(staging.path(), path, b"live", 0o644);
+            let case_insensitive = staging.path().join("_issues").exists();
+            if path.starts_with("_ISSUES") || case_insensitive {
+                assert!(result.is_err(), "{path}");
+            }
+        }
+        assert_eq!(
+            fs::read_to_string(outside.path().join("demo-1/planning.md")).unwrap(),
+            "outside"
+        );
+
+        stage_file(staging.path(), "a/b.md", b"1", 0o644).unwrap();
+        assert!(stage_file(staging.path(), "a/b.md", b"2", 0o644).is_err());
+        assert!(stage_file(staging.path(), "a/b.md/c", b"3", 0o644).is_err());
     }
 
     #[test]
