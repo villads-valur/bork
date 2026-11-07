@@ -133,6 +133,15 @@ mod tests {
     }
 
     #[test]
+    fn stray_file_in_projects_dir_is_ignored() {
+        let root = tempfile::TempDir::new().unwrap();
+        fs::create_dir(root.path().join("-Users-x-code-bork")).unwrap();
+        fs::write(root.path().join(".DS_Store"), "").unwrap();
+
+        assert_eq!(transcript_exists(root.path(), SID), Some(false));
+    }
+
+    #[test]
     fn unreadable_project_subdir_is_unknown() {
         use std::os::unix::fs::PermissionsExt;
 

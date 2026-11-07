@@ -131,7 +131,13 @@ fn exists_in_any_subdir(root: &Path, name: &str) -> Option<bool> {
             unreadable = true;
             continue;
         };
-        match entry.path().join(name).try_exists() {
+        // Skip stray files like `.DS_Store`: probing below them fails with
+        // NotADirectory, which would read as unreadable storage.
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        match path.join(name).try_exists() {
             Ok(true) => return Some(true),
             Ok(false) => {}
             Err(_) => unreadable = true,
