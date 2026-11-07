@@ -2660,8 +2660,15 @@ fn finish_backup_before_quit(terminal: &mut Terminal<CrosstermBackend<io::Stdout
         // The terminal may already be gone (SIGHUP); keep waiting anyway.
         let _ = terminal.draw(|frame| ui::render(frame, app));
         // Doubles as the tick; input is ignored while finishing.
-        if matches!(event::poll(TICK_RATE), Ok(true)) {
-            let _ = event::read();
+        // Without a terminal (SIGHUP) poll/read fail at once; wait a tick
+        // anyway so the loop doesn't spin.
+        let ticked = match event::poll(TICK_RATE) {
+            Ok(true) => event::read().is_ok(),
+            Ok(false) => true,
+            Err(_) => false,
+        };
+        if !ticked {
+            thread::sleep(TICK_RATE);
         }
     }
 }

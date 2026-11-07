@@ -294,11 +294,13 @@ pub fn plan(selection: &Selection) -> anyhow::Result<Option<Plan>> {
 /// removed first ([`archive::remove_stale`]).
 pub fn run(selection: &Selection) -> anyhow::Result<Option<Outcome>> {
     let _lock = lock_backups()?;
+    // Until the result is recorded: quitting waits for it (see `archive`).
+    let _running = archive::RunGuard::new()?;
     let backup_dir = config::load_settings()
         .path
         .filter(|dir| dir.is_absolute())
         .map(|dir| resolve_through_existing(&dir));
-    archive::remove_stale(backup_dir.as_deref(), &std::env::temp_dir());
+    archive::remove_stale(backup_dir.as_deref(), &host_name(), &std::env::temp_dir());
 
     let plan = match plan(selection) {
         Ok(Some(plan)) => plan,
@@ -332,7 +334,7 @@ pub fn run(selection: &Selection) -> anyhow::Result<Option<Outcome>> {
             Ok(Some(outcome))
         }
         // Stopped because bork quit: not a broken backup, so not recorded.
-        Err(err) if archive::aborted() => Err(err),
+        Err(err) if archive::stopped() => Err(err),
         Err(err) => Err(with_status_warning(err, Some(&plan.file))),
     }
 }
