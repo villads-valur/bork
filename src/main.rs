@@ -2336,6 +2336,7 @@ fn run_tui() -> anyhow::Result<()> {
 
     // --- Main event loop ---
     loop {
+        needs_redraw |= handler::show_queued_force_archive(&mut app);
         if needs_redraw {
             terminal.draw(|frame| {
                 ui::render(frame, &app);
@@ -2510,6 +2511,7 @@ fn run_tui() -> anyhow::Result<()> {
             for (project_id, issue_id) in result.issues_to_archive {
                 handler::archive_issue_in_app(&mut app, &project_id, &issue_id);
             }
+            handler::queue_force_archive(&mut app, result.force_archive_offers);
 
             if let Some(launch_id) = result.launched_issue_id {
                 // A kill during the detection window (x kill, done-TTL)
@@ -2660,14 +2662,17 @@ fn run_tui() -> anyhow::Result<()> {
         {
             protected_imports.insert(id.clone());
         }
-        let outcome = drain_project_workers(
-            app.project_mut(),
-            &workers,
-            &action_tx,
-            now,
-            picker,
-            &protected_imports,
-        );
+        let query = app.search_query.clone();
+        let outcome = app.project_mut().keep_selection(&query, |project| {
+            drain_project_workers(
+                project,
+                &workers,
+                &action_tx,
+                now,
+                picker,
+                &protected_imports,
+            )
+        });
         needs_redraw |= apply_drain_outcome(&mut app, outcome);
 
         // --- Update check (periodic worker results) ---
@@ -2771,14 +2776,17 @@ fn run_tui() -> anyhow::Result<()> {
             let Some(proj_pos) = app.projects.iter().position(|p| p.id() == *proj_id) else {
                 continue;
             };
-            let outcome = drain_project_workers(
-                &mut app.projects[proj_pos],
-                sw,
-                &action_tx,
-                now,
-                picker_project.as_ref() == Some(proj_id),
-                &protected_imports,
-            );
+            let query = app.search_query.clone();
+            let outcome = app.projects[proj_pos].keep_selection(&query, |project| {
+                drain_project_workers(
+                    project,
+                    sw,
+                    &action_tx,
+                    now,
+                    picker_project.as_ref() == Some(proj_id),
+                    &protected_imports,
+                )
+            });
             needs_redraw |= apply_drain_outcome(&mut app, outcome);
         }
 
