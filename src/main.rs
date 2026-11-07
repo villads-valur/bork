@@ -644,17 +644,17 @@ enum Command {
         check: bool,
     },
 
-    /// Back up board state, container files and issue plans of opted-in projects
+    /// Write boards, container docs and issue plans of opted-in projects to one backup file
     #[command(args_conflicts_with_subcommands = true)]
     Backup {
         #[command(subcommand)]
         command: Option<BackupCommand>,
 
-        /// Only back up this project (name, label or path); skips the global files
+        /// Write a separate file with only this project (name, label or path)
         #[arg(long)]
         project: Option<String>,
 
-        /// Print the resolved destination and file list without writing anything
+        /// Print the backup file path and its contents without writing anything
         #[arg(long)]
         dry_run: bool,
     },
@@ -686,7 +686,7 @@ enum Command {
 
 #[derive(Subcommand)]
 enum BackupCommand {
-    /// Show backup settings and the last result per registered project
+    /// Show backup settings, opted-in projects and the last result per file
     Status,
 }
 
@@ -1237,133 +1237,90 @@ fn run_prune_command(
     Ok(())
 }
 
+const NOTHING_TO_BACK_UP: &str = "Nothing to back up. Opt a project in with `enabled = true` under [backup] in its .bork/config.toml.";
+
 fn run_backup_command(project: Option<&str>, dry_run: bool) -> anyhow::Result<()> {
+    let selection = match project {
+        Some(name) => backup::Selection::Project(lookup_project_root(name)?),
+        None => backup::Selection::All,
+    };
+
     if dry_run {
-        let plans = match project {
-            Some(name) => vec![backup::plan_project(&lookup_project_root(name)?)?],
-            None => backup_targets()
-                .into_iter()
-                .map(|(name, path)| (name, backup::plan_project(&path)))
-                .chain(backup::plan_global().map(|plan| (backup::GLOBAL_SCOPE.to_string(), plan)))
-                .filter_map(|(name, plan)| match plan {
-                    Ok(plan) => Some(plan),
-                    Err(err) => {
-                        eprintln!("{name}: {err:#}");
-                        None
-                    }
-                })
-                .collect(),
+        let Some(plan) = backup::plan(&selection)? else {
+            println!("{NOTHING_TO_BACK_UP}");
+            return Ok(());
         };
-        if plans.is_empty() {
-            println!("Nothing to back up. Opt a project in with `enabled = true` and a `path` under [backup] in .bork/config.toml.");
-        }
-        for plan in &plans {
-            println!("{} -> {}", plan.scope, plan.target().display());
-            for entry in &plan.entries {
-                println!("  {}", entry.rel.display());
-            }
+        println!("{}", plan.file.display());
+        println!("  {}", backup::manifest::MANIFEST_FILE);
+        for entry in &plan.entries {
+            println!("  {}", entry.path);
         }
         return Ok(());
     }
 
-    if let Some(name) = project {
-        let root = lookup_project_root(name)?;
-        let report = backup::run_project(&root)?;
-        print_backup_report(name, &report);
+    let Some(outcome) = backup::run(&selection)? else {
+        println!("{NOTHING_TO_BACK_UP}");
         return Ok(());
-    }
-
-    let (projects, global) = backup::run_all();
-    if projects.is_empty() && global.is_none() {
-        println!("Nothing to back up. Opt a project in with `enabled = true` and a `path` under [backup] in .bork/config.toml.");
-        return Ok(());
-    }
-    let mut failures = 0;
-    let results = projects
-        .into_iter()
-        .map(|run| (run.name, run.result))
-        .chain(global.map(|result| (backup::GLOBAL_SCOPE.to_string(), result)));
-    for (name, result) in results {
-        match result {
-            Ok(report) => print_backup_report(&name, &report),
-            Err(err) => {
-                failures += 1;
-                eprintln!("{name}: failed: {err:#}");
-            }
-        }
-    }
-    if failures > 0 {
-        anyhow::bail!("{failures} backup(s) failed");
-    }
+    };
+    let what = if outcome.written {
+        "wrote"
+    } else {
+        "unchanged"
+    };
+    println!(
+        "{what} {} ({}, {})",
+        outcome.file.display(),
+        format_size(outcome.size),
+        outcome.projects.join(", ")
+    );
     Ok(())
 }
 
-/// Registered projects that opted in to backups, as (name, path).
-fn backup_targets() -> Vec<(String, PathBuf)> {
-    global_config::list_projects()
-        .into_iter()
-        .filter(|p| backup::config::load_for_project(&p.path).enabled)
-        .map(|p| (p.name, p.path))
-        .collect()
-}
-
-fn print_backup_report(name: &str, report: &backup::mirror::MirrorReport) {
-    if report.changed() {
-        println!(
-            "{name}: {} written, {} removed, {} unchanged",
-            report.written.len(),
-            report.removed.len(),
-            report.unchanged
-        );
-    } else {
-        println!("{name}: up to date ({} files)", report.unchanged);
-    }
-}
-
 fn run_backup_status() -> anyhow::Result<()> {
-    let now = app::unix_now();
-    let rows = global_config::list_projects()
-        .into_iter()
-        .map(|p| {
-            let cfg = backup::config::load_for_project(&p.path);
-            let last = backup::status::read(&backup::status::project_status_path(&p.path));
-            (p.name, cfg, last)
-        })
-        .chain(
-            Some(backup::global_config())
-                .filter(|cfg| cfg.enabled)
-                .map(|cfg| {
-                    let last = backup::status::read(&backup::status::global_status_path());
-                    (backup::GLOBAL_SCOPE.to_string(), cfg, last)
-                }),
-        );
+    let settings = backup::config::load_settings();
+    match &settings.path {
+        Some(path) => println!(
+            "path: {} (every {} min once the TUI worker lands)",
+            path.display(),
+            settings.interval_minutes
+        ),
+        None => println!("path: not set (set `path` under [backup] in ~/.config/bork/config.toml)"),
+    }
 
-    for (name, cfg, last) in rows {
-        if !cfg.enabled {
-            println!("{name}: off");
-            continue;
-        }
-        let dest = cfg
-            .path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "no path configured".to_string());
-        let result = match last {
-            None => "never run".to_string(),
-            Some(s) if s.ok => format!("ok {} ago", format_age(now.saturating_sub(s.last_run_at))),
-            Some(s) => {
-                let since = s
-                    .last_success_at
-                    .map(|t| format!(", last success {} ago", format_age(now.saturating_sub(t))))
-                    .unwrap_or_default();
-                format!(
-                    "FAILED {} ago: {}{since}",
-                    format_age(now.saturating_sub(s.last_run_at)),
-                    s.error.unwrap_or_default()
-                )
-            }
+    println!("projects:");
+    for entry in global_config::list_projects() {
+        let state = if backup::config::project_enabled(&entry.path) {
+            "on"
+        } else {
+            "off"
         };
-        println!("{name}: {dest}, {result}");
+        println!("  {}: {state}", entry.name);
+    }
+
+    let records = backup::status::read(&backup::status::status_path()).archives;
+    if records.is_empty() {
+        println!("no backups yet");
+        return Ok(());
+    }
+    let now = app::unix_now();
+    println!("files:");
+    for (file, s) in records {
+        let ago = format_age(now.saturating_sub(s.last_run_at));
+        let result = if s.ok {
+            format!("ok {ago} ago")
+        } else {
+            let since = s
+                .last_success_at
+                .map(|t| format!(", last success {} ago", format_age(now.saturating_sub(t))))
+                .unwrap_or_default();
+            format!("FAILED {ago} ago: {}{since}", s.error.unwrap_or_default())
+        };
+        let size = if s.last_success_at.is_some() {
+            format!(", {} ({})", format_size(s.size), s.projects.join(", "))
+        } else {
+            String::new()
+        };
+        println!("  {}: {result}{size}", file.display());
     }
     Ok(())
 }
@@ -1374,6 +1331,14 @@ fn format_age(secs: u64) -> String {
         60..3600 => format!("{}m", secs / 60),
         3600..86_400 => format!("{}h", secs / 3600),
         _ => format!("{}d", secs / 86_400),
+    }
+}
+
+fn format_size(bytes: u64) -> String {
+    match bytes {
+        0..1024 => format!("{bytes} B"),
+        1024..1_048_576 => format!("{:.1} KB", bytes as f64 / 1024.0),
+        _ => format!("{:.1} MB", bytes as f64 / 1_048_576.0),
     }
 }
 

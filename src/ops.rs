@@ -1558,9 +1558,8 @@ mod tests {
     #[test]
     fn delete_removes_the_saved_plans_and_archive_keeps_them() {
         let dir = setup_project();
-        let dest = TempDir::new().unwrap();
         let root = dir.path();
-        crate::issue_plan::test_support::enable_backups(root, dest.path());
+        crate::issue_plan::test_support::enable_backups(root);
         for title in ["Delete me", "Archive me"] {
             create_issue(
                 root,

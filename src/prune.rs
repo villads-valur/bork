@@ -558,15 +558,14 @@ mod tests {
     #[test]
     fn prune_saves_the_plan_before_removing() {
         let project = project_with_planned_worktree();
-        let dest = tempfile::TempDir::new().unwrap();
         let root = project.path();
-        enable_backups(root, dest.path());
+        enable_backups(root);
 
         let outcome = execute_removals(root, &[of_issue("demo-1-x", "demo-1")], &[], false);
 
         assert_eq!(outcome.results[0].outcome, RemoveOutcome::Removed);
         assert!(!root.join("demo-1-x").exists());
-        let saved = saved_plan(root, dest.path(), "demo-1");
+        let saved = saved_plan(root, "demo-1");
         assert_eq!(std::fs::read_to_string(saved).unwrap(), "the plan");
     }
 

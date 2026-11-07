@@ -39,7 +39,7 @@ pub fn log_dropped_plan(project_root: &Path, worktree_dir: &str, error: &str) {
 /// pruned issues keep theirs. Only touches projects with backups on, and
 /// only that one directory.
 pub fn remove_saved_plans(project_root: &Path, issue_id: &str) -> anyhow::Result<()> {
-    if !crate::backup::config::load_for_project(project_root).enabled {
+    if !crate::backup::config::project_enabled(project_root) {
         return Ok(());
     }
     if !crate::backup::select::is_plain_component(issue_id) {
@@ -59,24 +59,19 @@ pub mod test_support {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    /// Turn backups on for the project at `root`, writing into `dest`.
-    pub fn enable_backups(root: &Path, dest: &Path) {
-        append_config(
-            root,
-            &format!("[backup]\nenabled = true\npath = \"{}\"\n", dest.display()),
-        );
-    }
-
-    /// Turn backups on with a destination `save_issue_plan` refuses.
-    pub fn enable_broken_backups(root: &Path) {
-        append_config(root, "[backup]\nenabled = true\npath = \"relative/dest\"\n");
-    }
-
-    fn append_config(root: &Path, section: &str) {
+    /// Turn backups on for the project at `root`.
+    pub fn enable_backups(root: &Path) {
         let path = root.join(".bork/config.toml");
         let existing = fs::read_to_string(&path).unwrap_or_default();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, format!("{existing}\n{section}")).unwrap();
+        fs::write(&path, format!("{existing}\n[backup]\nenabled = true\n")).unwrap();
+    }
+
+    /// Turn backups on, with a file where `plans/` should be so no plan can
+    /// be saved.
+    pub fn enable_broken_backups(root: &Path) {
+        enable_backups(root);
+        fs::write(root.join(super::PLANS_DIR), "not a dir").unwrap();
     }
 
     pub fn write_plan(root: &Path, worktree_dir: &str, contents: &str) {
@@ -86,10 +81,10 @@ pub mod test_support {
     }
 
     /// Where a saved plan for `issue_id` ends up.
-    pub fn saved_plan(root: &Path, dest: &Path, issue_id: &str) -> PathBuf {
-        let project_name = crate::config::load_config_from(root).project_name;
-        dest.join(project_name)
-            .join(crate::backup::issue_plan_rel(issue_id))
+    pub fn saved_plan(root: &Path, issue_id: &str) -> PathBuf {
+        root.join(super::PLANS_DIR)
+            .join(issue_id)
+            .join("planning.md")
     }
 }
 
@@ -113,13 +108,13 @@ mod tests {
 
     #[test]
     fn saves_the_plan_when_backups_are_on() {
-        let (root, dest) = (project(), tempfile::tempdir().unwrap());
-        enable_backups(root.path(), dest.path());
+        let root = project();
+        enable_backups(root.path());
         write_plan(root.path(), "demo-1-x", "plan");
 
         save_before_removal(root.path(), "demo-1", "demo-1-x").unwrap();
 
-        let saved = saved_plan(root.path(), dest.path(), "demo-1");
+        let saved = saved_plan(root.path(), "demo-1");
         assert_eq!(fs::read_to_string(saved).unwrap(), "plan");
     }
 
@@ -140,7 +135,7 @@ mod tests {
         write_plan(root.path(), "demo-1-x", "plan");
 
         let err = save_before_removal(root.path(), "demo-1", "demo-1-x").unwrap_err();
-        assert!(err.contains("absolute"), "{err}");
+        assert!(err.contains("plans"), "{err}");
     }
 
     #[test]
@@ -156,8 +151,8 @@ mod tests {
 
     #[test]
     fn delete_removes_only_that_issues_plans() {
-        let (root, dest) = (project(), tempfile::tempdir().unwrap());
-        enable_backups(root.path(), dest.path());
+        let root = project();
+        enable_backups(root.path());
         let plans = root.path().join(PLANS_DIR);
         fs::create_dir_all(plans.join("demo-1")).unwrap();
         fs::write(plans.join("demo-1/planning.md"), "1").unwrap();

@@ -868,14 +868,13 @@ mod tests {
     #[test]
     fn test_remove_worktree_saves_the_plan_first() {
         let (tmp, project, cfg) = setup_test_project();
-        let dest = tmp.join("backups");
-        enable_backups(&project, &dest);
+        enable_backups(&project);
         worktree_with_plan(&cfg);
 
         remove_worktree_in(&cfg, "bork-1", "bork-1-fix-bug", Removal::Safe).unwrap();
 
         assert!(!project.join("bork-1-fix-bug").exists());
-        let saved = saved_plan(&project, &dest, "bork-1");
+        let saved = saved_plan(&project, "bork-1");
         assert_eq!(fs::read_to_string(saved).unwrap(), "the plan");
 
         let _ = fs::remove_dir_all(&tmp);
