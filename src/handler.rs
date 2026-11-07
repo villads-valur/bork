@@ -952,9 +952,13 @@ fn handle_normal(
         }
 
         Action::BackupNow => {
-            if !app.backup_manual_pending && ch.backup_wake_tx.send(()).is_ok() {
-                app.backup_manual_pending = true;
-                app.begin_busy();
+            if !app.backup_manual_pending {
+                if ch.backup_wake_tx.send(()).is_ok() {
+                    app.backup_manual_pending = true;
+                    app.begin_busy();
+                } else {
+                    app.set_error(crate::backup::schedule::WORKER_STOPPED);
+                }
             }
             PostAction::None
         }
@@ -4416,6 +4420,22 @@ mod tests {
         let ctx = app.action_context();
         let ch = test_channels();
         handle_action(app, action, &ctx, &ch)
+    }
+
+    #[test]
+    fn backup_now_without_a_worker_says_so() {
+        // `test_channels` drops the receivers, like a crashed worker.
+        let mut app = app_with_issues();
+        act(&mut app, Action::BackupNow);
+        assert!(!app.backup_manual_pending);
+        assert_eq!(app.busy_count, 0);
+        assert_eq!(
+            app.message,
+            Some((
+                crate::backup::schedule::WORKER_STOPPED.to_string(),
+                MessageKind::Error
+            ))
+        );
     }
 
     #[test]

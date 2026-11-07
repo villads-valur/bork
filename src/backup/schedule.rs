@@ -72,6 +72,27 @@ pub fn blocked(path_configured: bool, enabled: Result<bool, String>) -> Option<C
     }
 }
 
+/// What a worker check does: nothing when backups can't run (`blocked`),
+/// otherwise `run` when forced by "back up now" or when `due` says so.
+pub fn decide(
+    blocked: Option<Check>,
+    manual: bool,
+    due: impl FnOnce() -> bool,
+    run: impl FnOnce() -> Result<Option<bool>, String>,
+) -> Check {
+    if let Some(check) = blocked {
+        return check;
+    }
+    if manual || due() {
+        Check::Ran(run())
+    } else {
+        Check::Skipped
+    }
+}
+
+/// Error shown when the worker thread is gone and `B` can't reach it.
+pub const WORKER_STOPPED: &str = "Automatic backups stopped (worker crashed); restart bork";
+
 /// The report sent at startup, before the first check: the recorded status,
 /// unless backups can't run. Only a failure already in `backup.json` is a
 /// silent baseline; a config or registry error found now is reported like
@@ -151,9 +172,32 @@ pub fn failure_to_report<'a>(prev: &BackupIndicator, next: &'a BackupIndicator) 
         return None;
     };
     match prev {
-        BackupIndicator::Failed { error: old, .. } if old == new => None,
+        BackupIndicator::Failed { error: old, .. } if same_error(old, new) => None,
         _ => Some(new),
     }
+}
+
+/// Error messages compared with digit runs masked: temp and staging names
+/// carry a pid or timestamp (`.bork-backup.tar.gz.tmp.<pid>`), which would
+/// otherwise make the same failure look new after a restart or every run.
+fn same_error(a: &str, b: &str) -> bool {
+    fn mask(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut in_digits = false;
+        for c in s.chars() {
+            if c.is_ascii_digit() {
+                if !in_digits {
+                    out.push('#');
+                }
+                in_digits = true;
+            } else {
+                out.push(c);
+                in_digits = false;
+            }
+        }
+        out
+    }
+    mask(a) == mask(b)
 }
 
 /// Short warning text for the header, `None` when nothing should show.
@@ -161,7 +205,7 @@ pub fn warning_text(indicator: &BackupIndicator, now: u64) -> Option<String> {
     let stale_age = |at: &Option<u64>| {
         at.map(|at| now.saturating_sub(at))
             .filter(|age| *age > STALE_AFTER_SECS)
-            .map(format_age)
+            .map(format_days)
     };
     match indicator {
         BackupIndicator::Failed {
@@ -191,22 +235,16 @@ pub fn manual_message(check: &Check) -> (String, bool) {
             true,
         ),
         Check::Ran(Ok(Some(true))) => ("Backup written".to_string(), false),
-        Check::Ran(Ok(Some(false))) | Check::Skipped => {
-            ("Backup up to date (nothing changed)".to_string(), false)
-        }
+        Check::Ran(Ok(Some(false))) => ("Backup up to date (nothing changed)".to_string(), false),
+        // A manual check always runs (see `decide`); kept for exhaustiveness.
+        Check::Skipped => ("Backup not due".to_string(), false),
         Check::Ran(Err(err)) => (format!("Backup failed: {err}"), true),
     }
 }
 
-/// Compact age: `5m`, `3h`, `2d`.
-pub fn format_age(secs: u64) -> String {
-    if secs < 60 * 60 {
-        format!("{}m", secs / 60)
-    } else if secs < 24 * 60 * 60 {
-        format!("{}h", secs / (60 * 60))
-    } else {
-        format!("{}d", secs / (24 * 60 * 60))
-    }
+/// Age in whole days (`2d`); only used past [`STALE_AFTER_SECS`].
+fn format_days(secs: u64) -> String {
+    format!("{}d", secs / (24 * 60 * 60))
 }
 
 #[cfg(test)]
@@ -403,10 +441,55 @@ mod tests {
     }
 
     #[test]
-    fn formats_ages() {
-        assert_eq!(format_age(59), "0m");
-        assert_eq!(format_age(5 * 60), "5m");
-        assert_eq!(format_age(3 * HOUR), "3h");
-        assert_eq!(format_age(50 * HOUR), "2d");
+    fn formats_days() {
+        assert_eq!(format_days(50 * HOUR), "2d");
+        assert_eq!(format_days(72 * HOUR), "3d");
+    }
+
+    #[test]
+    fn decide_checks_blocked_then_manual_then_due() {
+        let ran = || Ok(Some(true));
+        let never_due = || false;
+        let never_run = || -> Result<Option<bool>, String> { panic!("must not run") };
+
+        // Blocked wins, even over `B`.
+        assert_eq!(
+            decide(Some(Check::NoPath), true, || true, never_run),
+            Check::NoPath
+        );
+        assert_eq!(
+            decide(Some(Check::NoProjects), true, || true, never_run),
+            Check::NoProjects
+        );
+        // `B` runs even when not due.
+        assert_eq!(
+            decide(None, true, never_due, ran),
+            Check::Ran(Ok(Some(true)))
+        );
+        // Scheduled: run only when due.
+        assert_eq!(
+            decide(None, false, || true, ran),
+            Check::Ran(Ok(Some(true)))
+        );
+        assert_eq!(decide(None, false, never_due, never_run), Check::Skipped);
+        assert_eq!(
+            decide(None, false, || true, || Err("tar failed".into())),
+            Check::Ran(Err("tar failed".into()))
+        );
+    }
+
+    #[test]
+    fn errors_differing_only_in_pids_are_the_same_failure() {
+        let a = failure(
+            "tar: /b/.bork-backup.tar.gz.tmp.4123: Permission denied",
+            None,
+        );
+        let b = failure(
+            "tar: /b/.bork-backup.tar.gz.tmp.98: Permission denied",
+            None,
+        );
+        assert_eq!(failure_to_report(&a, &b), None);
+        let other = failure("tar: /b/.bork-backup.tar.gz.tmp.98: No space left", None);
+        assert!(failure_to_report(&a, &other).is_some());
     }
 }

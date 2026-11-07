@@ -414,7 +414,7 @@ fn spawn_backup_worker(
     suspended: Arc<AtomicBool>,
     wake_rx: mpsc::Receiver<()>,
 ) -> mpsc::Receiver<backup::schedule::Report> {
-    use backup::schedule::{self, Check, Report};
+    use backup::schedule::{self, Report};
 
     let (tx, rx) = mpsc::channel();
 
@@ -458,16 +458,16 @@ fn spawn_backup_worker(
             wait_while_suspended(&suspended);
 
             let file = backup::full_backup_file();
-            let check = if let Some(check) = schedule::blocked(file.is_some(), enabled()) {
-                check
-            } else if manual || backup::is_due(app::unix_now()) {
-                let result = backup::run(&backup::Selection::All)
-                    .map(|outcome| outcome.map(|o| o.written))
-                    .map_err(|err| format!("{err:#}"));
-                Check::Ran(result)
-            } else {
-                Check::Skipped
-            };
+            let check = schedule::decide(
+                schedule::blocked(file.is_some(), enabled()),
+                manual,
+                || backup::is_due(app::unix_now()),
+                || {
+                    backup::run(&backup::Selection::All)
+                        .map(|outcome| outcome.map(|o| o.written))
+                        .map_err(|err| format!("{err:#}"))
+                },
+            );
             let record = file.as_deref().and_then(record_for);
             let indicator = schedule::indicator(&check, record.as_ref());
             let report = Report {

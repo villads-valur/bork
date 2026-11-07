@@ -2435,7 +2435,7 @@ impl App {
             self.backup_manual_pending = false;
             self.busy_count = self.busy_count.saturating_sub(1);
         }
-        self.set_error("Automatic backups stopped (worker crashed); restart bork");
+        self.set_error(crate::backup::schedule::WORKER_STOPPED);
     }
 
     pub fn set_message(&mut self, msg: impl Into<String>) {
