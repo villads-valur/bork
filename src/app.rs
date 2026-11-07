@@ -1886,8 +1886,19 @@ pub enum ConfirmAction {
     ArchiveIssue {
         issue_ids: Vec<String>,
         project_id: ProjectId,
-        /// Skip the teardown, which already ran, and discard uncommitted changes.
+        /// Go past what stopped the first attempt and discard uncommitted
+        /// changes. The teardown is skipped, since it already ran, except
+        /// for `teardown_due`.
         force: bool,
+        /// Forced issues whose first attempt stopped before the teardown (an
+        /// unsaved plan), so the forced archive still runs it.
+        teardown_due: Vec<String>,
+    },
+    /// Remove worktrees a prune kept because their issue plan couldn't be
+    /// saved, losing the plans.
+    ForcePrune {
+        project_id: ProjectId,
+        targets: Vec<crate::prune::PruneTarget>,
     },
     /// Unregister the project. Its files stay on disk.
     RemoveProject { project_id: ProjectId },
@@ -2060,6 +2071,9 @@ pub struct App {
     /// Archives that stopped short and wait to be offered as a force archive
     /// once the board is back in Normal mode.
     pub queued_force_archives: Vec<(ProjectId, String, ForceRequired)>,
+    /// Worktrees a prune kept because their plan couldn't be saved, waiting
+    /// to be offered for removal anyway, like `queued_force_archives`.
+    pub queued_force_prunes: Vec<(ProjectId, Vec<crate::prune::PruneTarget>)>,
     /// Mode to go back to when the confirm prompt closes.
     confirm_return_mode: InputMode,
     pub dialog: Option<DialogState>,
@@ -2107,6 +2121,7 @@ impl App {
             confirm_message: None,
             pending_confirm: None,
             queued_force_archives: Vec::new(),
+            queued_force_prunes: Vec::new(),
             confirm_return_mode: InputMode::Normal,
             dialog: None,
             prune_dialog: None,
