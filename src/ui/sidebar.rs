@@ -35,13 +35,13 @@ pub fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
             let proj_id = project.id();
             let is_focused = proj_id == app.focused_project;
             let is_swimlane = sidebar.swimlanes.contains(&proj_id);
-            let has_activity = sidebar.activity.get(&proj_id).copied().unwrap_or(false);
+            let needs_you = project.attention_count() > 0;
 
             let marker = if is_focused {
                 "◆"
             } else if is_swimlane {
                 "▪"
-            } else if has_activity {
+            } else if needs_you {
                 "●"
             } else {
                 " "
@@ -49,7 +49,7 @@ pub fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
 
             let marker_style = if is_focused || is_swimlane {
                 Style::default().fg(styles::ACCENT)
-            } else if has_activity {
+            } else if needs_you {
                 Style::default().fg(Color::Yellow)
             } else {
                 Style::default().fg(Color::DarkGray)

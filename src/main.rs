@@ -2122,11 +2122,13 @@ fn apply_drain_outcome(app: &mut app::App, outcome: DrainOutcome) -> bool {
 
 const ACTIVITY_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Reads every registered project's agent status files so the sidebar's
+/// needs-you dot stays current for projects without their own workers.
 fn spawn_activity_poller(
     projects: Vec<(ProjectId, PathBuf)>,
     suspended: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
-) -> mpsc::Receiver<HashMap<ProjectId, bool>> {
+) -> mpsc::Receiver<HashMap<ProjectId, HashMap<String, AgentStatusInfo>>> {
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || {
@@ -2136,23 +2138,11 @@ fn spawn_activity_poller(
                 break;
             }
             wait_while_suspended(&suspended);
-            let mut activity: HashMap<ProjectId, bool> = HashMap::new();
-            for (id, root) in &projects {
-                let status_dir = root.join(".bork").join("agent-status");
-                let statuses = cache.read(&status_dir);
-                let has_activity = statuses.values().any(|info| {
-                    matches!(
-                        info.status,
-                        types::AgentStatus::Busy
-                            | types::AgentStatus::WaitingInput
-                            | types::AgentStatus::WaitingPermission
-                            | types::AgentStatus::WaitingApproval
-                            | types::AgentStatus::Error
-                    )
-                });
-                activity.insert(id.clone(), has_activity);
-            }
-            if tx.send(activity).is_err() {
+            let statuses = projects
+                .iter()
+                .map(|(id, root)| (id.clone(), cache.read(&config::agent_status_dir(root))))
+                .collect();
+            if tx.send(statuses).is_err() {
                 break;
             }
             thread::sleep(ACTIVITY_POLL_INTERVAL);
@@ -2270,7 +2260,7 @@ fn run_tui() -> anyhow::Result<()> {
     let mut workers = spawn_project_workers(app.project(), &shared.poll_suspended, &git_pool);
     let mut swimlane_workers: HashMap<ProjectId, ProjectWorkers> = HashMap::new();
 
-    // --- Activity poller for sidebar markers ---
+    // --- Agent status poller for the sidebar's needs-you dots ---
     let activity_rx = if app.sidebar.is_some() {
         let project_paths: Vec<(ProjectId, PathBuf)> = app
             .projects
@@ -2802,10 +2792,13 @@ fn run_tui() -> anyhow::Result<()> {
         }
 
         if let Some(ref rx) = activity_rx {
-            while let Ok(activity) = rx.try_recv() {
-                if let Some(ref mut sidebar) = app.sidebar {
-                    if sidebar.activity != activity {
-                        sidebar.activity = activity;
+            while let Ok(mut statuses) = rx.try_recv() {
+                for project in &mut app.projects {
+                    let Some(project_statuses) = statuses.remove(&project.id()) else {
+                        continue;
+                    };
+                    if project.live.agent_statuses != project_statuses {
+                        project.live.agent_statuses = project_statuses;
                         needs_redraw = true;
                     }
                 }

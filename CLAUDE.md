@@ -17,7 +17,7 @@ Main Thread (50ms tick event loop)
 │   ├── Port Poll Worker (polls every 10s - listening TCP ports via lsof/ps)
 │   ├── Linear Worker (polls every 45s - assigned Linear issues + open projects, conditional on `linear` CLI)
 │   ├── tuicr Draft Worker (polls every 10s - unposted tuicr comments, conditional on `tuicr`)
-│   ├── Activity Poller (polls every 5s - agent status dirs for all registered projects)
+│   ├── Activity Poller (polls every 5s - agent status dirs for all registered projects, feeds the sidebar's needs-you dots)
 │   └── Update Check Worker (every 6h - new-version banner, plus cache mtime poll every 2s)
 ├── Primary ProjectWorkers (for focused project)
 │   ├── Agent Status Worker (polls every 2s - agent status files)
@@ -86,7 +86,7 @@ src/
     ├── mod.rs         # Root render, layout composition, swimlane splitting
     ├── board.rs       # 4-column kanban board with adaptive card sizes
     ├── card.rs        # Issue card widget (Full/Medium/Compact sizes)
-    ├── sidebar.rs     # Project sidebar with activity markers
+    ├── sidebar.rs     # Project sidebar with needs-you markers
     ├── dialog.rs      # New/edit issue dialog overlay
     ├── help.rs        # Help overlay (keybinding reference popup)
     ├── linear_picker.rs # Import picker for Linear issues, Linear projects, and GitHub PRs

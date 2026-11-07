@@ -1708,7 +1708,6 @@ pub struct SidebarState {
     pub visible: bool,
     pub focused: bool,
     pub selected: usize,
-    pub activity: HashMap<ProjectId, bool>,
     pub swimlanes: Vec<ProjectId>,
     pub rename: Option<ProjectRename>,
 }
@@ -2112,7 +2111,6 @@ impl App {
                 visible: false,
                 focused: false,
                 selected: 0,
-                activity: HashMap::new(),
                 swimlanes: vec![self.focused_project.clone()],
                 rename: None,
             });
