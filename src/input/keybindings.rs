@@ -112,6 +112,7 @@ fn map_normal_key(key: KeyEvent, swimlane_count: usize) -> Action {
         KeyCode::Char('R') => Action::OpenReviewPR,
 
         KeyCode::Char('P') => Action::SyncPRs,
+        KeyCode::Char('B') => Action::BackupNow,
         KeyCode::Char('o') => Action::OpenPR,
         KeyCode::Char('s') => Action::ExpandStack,
         KeyCode::Char('O') => Action::OpenLinear,
@@ -474,6 +475,10 @@ mod tests {
     #[test]
     fn normal_external() {
         assert_eq!(map_normal_key(key(KeyCode::Char('P')), 1), Action::SyncPRs);
+        assert_eq!(
+            map_normal_key(key(KeyCode::Char('B')), 1),
+            Action::BackupNow
+        );
         assert_eq!(map_normal_key(key(KeyCode::Char('o')), 1), Action::OpenPR);
         assert_eq!(
             map_normal_key(key(KeyCode::Char('O')), 1),

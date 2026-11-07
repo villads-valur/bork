@@ -21,6 +21,7 @@ pub struct ActionChannels<'a> {
     pub action_tx: &'a mpsc::Sender<ActionResult>,
     pub pr_wake_tx: &'a mpsc::Sender<crate::github_poll::Wake>,
     pub linear_wake_tx: &'a mpsc::Sender<()>,
+    pub backup_wake_tx: &'a mpsc::Sender<()>,
     pub git_wake_tx: &'a mpsc::Sender<()>,
     pub reload_tx: &'a mpsc::Sender<ReloadResult>,
 }
@@ -955,6 +956,18 @@ fn handle_normal(
         Action::SyncPRs => {
             let _ = ch.pr_wake_tx.send(crate::github_poll::Wake::Refresh);
             app.set_message("Syncing PRs...");
+            PostAction::None
+        }
+
+        Action::BackupNow => {
+            if !app.backup_manual_pending {
+                if ch.backup_wake_tx.send(()).is_ok() {
+                    app.backup_manual_pending = true;
+                    app.begin_busy();
+                } else {
+                    app.set_error(crate::backup::schedule::WORKER_STOPPED);
+                }
+            }
             PostAction::None
         }
 
@@ -4528,6 +4541,7 @@ mod tests {
             action_tx: Box::leak(Box::new(mpsc::channel().0)),
             pr_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
             linear_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
+            backup_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
             git_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
             reload_tx: Box::leak(Box::new(mpsc::channel().0)),
         }
@@ -4537,6 +4551,41 @@ mod tests {
         let ctx = app.action_context();
         let ch = test_channels();
         handle_action(app, action, &ctx, &ch)
+    }
+
+    #[test]
+    fn backup_now_wakes_the_worker_once_while_pending() {
+        let (wake_tx, wake_rx) = mpsc::channel();
+        let ch = ActionChannels {
+            backup_wake_tx: Box::leak(Box::new(wake_tx)),
+            ..test_channels()
+        };
+        let mut app = app_with_issues();
+
+        for _ in 0..2 {
+            let ctx = app.action_context();
+            handle_action(&mut app, Action::BackupNow, &ctx, &ch);
+        }
+
+        assert!(app.backup_manual_pending);
+        assert_eq!(app.busy_count, 1);
+        assert_eq!(wake_rx.try_iter().count(), 1);
+    }
+
+    #[test]
+    fn backup_now_without_a_worker_says_so() {
+        // `test_channels` drops the receivers, like a crashed worker.
+        let mut app = app_with_issues();
+        act(&mut app, Action::BackupNow);
+        assert!(!app.backup_manual_pending);
+        assert_eq!(app.busy_count, 0);
+        assert_eq!(
+            app.message,
+            Some((
+                crate::backup::schedule::WORKER_STOPPED.to_string(),
+                MessageKind::Error
+            ))
+        );
     }
 
     #[test]
@@ -5592,6 +5641,7 @@ mod tests {
                 action_tx: Box::leak(Box::new(mpsc::channel().0)),
                 pr_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
                 linear_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
+                backup_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
                 git_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
                 reload_tx: &reload_tx,
             };
