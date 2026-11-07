@@ -14,6 +14,7 @@
 pub mod archive;
 pub mod config;
 pub mod manifest;
+pub mod schedule;
 pub mod select;
 pub mod status;
 

@@ -21,6 +21,7 @@ pub struct ActionChannels<'a> {
     pub action_tx: &'a mpsc::Sender<ActionResult>,
     pub pr_wake_tx: &'a mpsc::Sender<crate::github_poll::Wake>,
     pub linear_wake_tx: &'a mpsc::Sender<()>,
+    pub backup_wake_tx: &'a mpsc::Sender<()>,
     pub git_wake_tx: &'a mpsc::Sender<()>,
     pub reload_tx: &'a mpsc::Sender<ReloadResult>,
 }
@@ -947,6 +948,14 @@ fn handle_normal(
         Action::SyncPRs => {
             let _ = ch.pr_wake_tx.send(crate::github_poll::Wake::Refresh);
             app.set_message("Syncing PRs...");
+            PostAction::None
+        }
+
+        Action::BackupNow => {
+            if !app.backup_manual_pending && ch.backup_wake_tx.send(()).is_ok() {
+                app.backup_manual_pending = true;
+                app.begin_busy();
+            }
             PostAction::None
         }
 
@@ -4397,6 +4406,7 @@ mod tests {
             action_tx: Box::leak(Box::new(mpsc::channel().0)),
             pr_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
             linear_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
+            backup_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
             git_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
             reload_tx: Box::leak(Box::new(mpsc::channel().0)),
         }
@@ -5281,6 +5291,7 @@ mod tests {
                 action_tx: Box::leak(Box::new(mpsc::channel().0)),
                 pr_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
                 linear_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
+                backup_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
                 git_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
                 reload_tx: &reload_tx,
             };

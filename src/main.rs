@@ -405,6 +405,131 @@ fn spawn_linear_worker(
     rx
 }
 
+/// One backup worker check, sent to the main loop.
+struct BackupReport {
+    indicator: backup::schedule::BackupIndicator,
+    /// Set when the check was forced by "back up now"; `None` for scheduled
+    /// checks and the startup snapshot.
+    manual: Option<backup::schedule::Check>,
+}
+
+/// Fold a backup worker report into the app. New failures go to the status
+/// bar and to `.bork/errors.log` of every loaded project with backups on;
+/// routine successes stay silent. Returns whether to redraw.
+fn apply_backup_report(app: &mut App, report: BackupReport) -> bool {
+    use backup::schedule;
+
+    let mut redraw = false;
+    if let Some(check) = &report.manual {
+        if app.backup_manual_pending {
+            app.backup_manual_pending = false;
+            app.busy_count = app.busy_count.saturating_sub(1);
+        }
+        let (message, is_error) = schedule::manual_message(check);
+        if is_error {
+            app.set_error(message);
+        } else {
+            app.set_message(message);
+        }
+        redraw = true;
+    }
+    if let Some(error) = schedule::failure_to_report(&app.backup, &report.indicator) {
+        let line = format!("backup failed: {error}");
+        for project in &app.projects {
+            let root = &project.config.project_root;
+            if backup::config::project_enabled(root) {
+                config::append_error_log(root, std::slice::from_ref(&line));
+            }
+        }
+        if report.manual.is_none() {
+            app.set_error(format!("Backup failed: {error}"));
+        }
+        redraw = true;
+    }
+    if app.backup != report.indicator {
+        app.backup = report.indicator;
+        redraw = true;
+    }
+    redraw
+}
+
+/// Daily backup of every opted-in project. Sends the recorded status right
+/// away, checks `STARTUP_DELAY` after startup and then hourly whether a
+/// backup is due, and runs one when it is (or when woken by "back up now").
+/// `backup::run` holds the backup flock, so a concurrent `bork backup`
+/// serializes with it.
+fn spawn_backup_worker(
+    suspended: Arc<AtomicBool>,
+    wake_rx: mpsc::Receiver<()>,
+) -> mpsc::Receiver<BackupReport> {
+    use backup::schedule::{self, Check};
+
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let record_for = |file: &Path| {
+            backup::status::read(&backup::status::status_path())
+                .archives
+                .get(file)
+                .cloned()
+        };
+
+        if let Some(dir) = backup::config::load_settings().path {
+            let record = record_for(&dir.join(backup::BACKUP_FILE));
+            let indicator = schedule::from_record(record.as_ref(), app::unix_now());
+            if tx
+                .send(BackupReport {
+                    indicator,
+                    manual: None,
+                })
+                .is_err()
+            {
+                return;
+            }
+        }
+
+        let mut wait = schedule::STARTUP_DELAY;
+        loop {
+            let manual = match sleep_until_wake(&wake_rx, wait) {
+                WakeReason::Disconnected => break,
+                WakeReason::Woken => true,
+                WakeReason::Timeout => false,
+            };
+            wait = schedule::CHECK_INTERVAL;
+            wait_while_suspended(&suspended);
+
+            let file = backup::config::load_settings()
+                .path
+                .map(|dir| dir.join(backup::BACKUP_FILE));
+            let check = match &file {
+                None => Check::NoPath,
+                Some(file) => {
+                    let record = record_for(file);
+                    if manual || schedule::is_due(record.as_ref(), app::unix_now()) {
+                        let result = backup::run(&backup::Selection::All)
+                            .map(|outcome| outcome.map(|o| o.written))
+                            .map_err(|err| format!("{err:#}"));
+                        Check::Ran(result)
+                    } else {
+                        Check::Skipped
+                    }
+                }
+            };
+            let record = file.as_deref().and_then(record_for);
+            let indicator = schedule::indicator(&check, record.as_ref(), app::unix_now());
+            let report = BackupReport {
+                indicator,
+                manual: manual.then_some(check),
+            };
+            if tx.send(report).is_err() {
+                break;
+            }
+        }
+    });
+
+    rx
+}
+
 fn spawn_pr_poll_worker(
     main_worktree: PathBuf,
     targets: Arc<Mutex<github_poll::Targets>>,
@@ -1960,6 +2085,8 @@ struct SharedWorkers {
     linear_wake_tx: mpsc::Sender<()>,
     linear_wake_rx: Option<mpsc::Receiver<()>>,
     tuicr_rx: Option<mpsc::Receiver<external::tuicr::DraftComments>>,
+    backup_rx: mpsc::Receiver<BackupReport>,
+    backup_wake_tx: mpsc::Sender<()>,
     shutdown: Arc<AtomicBool>,
     /// While set, all pollers idle instead of spawning subprocesses. Used when
     /// the terminal is handed over to a tmux popup or external editor.
@@ -1993,6 +2120,9 @@ fn spawn_shared_workers() -> SharedWorkers {
 
     let (linear_wake_tx, linear_wake_rx) = mpsc::channel::<()>();
 
+    let (backup_wake_tx, backup_wake_rx) = mpsc::channel::<()>();
+    let backup_rx = spawn_backup_worker(poll_suspended.clone(), backup_wake_rx);
+
     SharedWorkers {
         tmux_rx,
         tmux_wake_tx,
@@ -2002,6 +2132,8 @@ fn spawn_shared_workers() -> SharedWorkers {
         linear_wake_tx,
         linear_wake_rx: Some(linear_wake_rx),
         tuicr_rx: None,
+        backup_rx,
+        backup_wake_tx,
         shutdown,
         poll_suspended,
     }
@@ -2638,6 +2770,7 @@ fn run_tui() -> anyhow::Result<()> {
                             action_tx: &action_tx,
                             pr_wake_tx: &active_workers.pr_wake_tx,
                             linear_wake_tx: &shared.linear_wake_tx,
+                            backup_wake_tx: &shared.backup_wake_tx,
                             git_wake_tx: &active_workers.git_wake_tx,
                             reload_tx: &reload_tx,
                         };
@@ -2989,6 +3122,11 @@ fn run_tui() -> anyhow::Result<()> {
                 app.update_available = available;
                 needs_redraw = true;
             }
+        }
+
+        // --- Backup worker ---
+        while let Ok(report) = shared.backup_rx.try_recv() {
+            needs_redraw |= apply_backup_report(&mut app, report);
         }
 
         // --- tuicr: check availability ---

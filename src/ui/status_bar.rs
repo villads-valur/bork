@@ -55,6 +55,26 @@ pub fn render_header(frame: &mut Frame, app: &App, area: Rect) {
 
     let title = Line::from(title_spans);
     frame.render_widget(Paragraph::new(title), area);
+
+    if let Some(warning) = backup_warning_span(app) {
+        let right = Paragraph::new(Line::from(warning)).alignment(Alignment::Right);
+        frame.render_widget(right, area);
+    }
+}
+
+/// Header warning when the last backup failed or is too old; nothing otherwise.
+fn backup_warning_span(app: &App) -> Option<Span<'static>> {
+    use crate::backup::schedule::{warning_text, BackupIndicator};
+
+    let text = warning_text(&app.backup, crate::app::unix_now())?;
+    let (color, hint) = match app.backup {
+        BackupIndicator::Failed(_) => (ratatui::style::Color::Red, "B to retry"),
+        _ => (ratatui::style::Color::Yellow, "B to back up"),
+    };
+    Some(Span::styled(
+        format!("\u{26a0} {text} ({hint}) "),
+        Style::default().fg(color),
+    ))
 }
 
 pub const SPINNER_WIDTH: u16 = 8;

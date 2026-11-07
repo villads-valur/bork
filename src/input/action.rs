@@ -29,6 +29,7 @@ pub enum Action {
     ScrollToTop,
     ScrollToBottom,
     SyncPRs,
+    BackupNow,
     OpenPR,
     OpenAllPRs,
     OpenLinear,

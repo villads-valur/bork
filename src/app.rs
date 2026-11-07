@@ -2091,6 +2091,10 @@ pub struct App {
     pub debug_inspector_json: Option<String>,
     pub debug_inspector_scroll: usize,
     pub update_available: bool,
+    /// Latest backup worker status; only warnings render.
+    pub backup: crate::backup::schedule::BackupIndicator,
+    /// A "back up now" is in flight (owns one `busy_count`).
+    pub backup_manual_pending: bool,
 }
 
 impl App {
@@ -2128,6 +2132,8 @@ impl App {
             debug_inspector_json: None,
             debug_inspector_scroll: 0,
             update_available: false,
+            backup: Default::default(),
+            backup_manual_pending: false,
         }
     }
 
@@ -3439,6 +3445,42 @@ mod tests {
 
         assert!(!app.attention_filter_active());
         assert!(!app.find_project(&ids[1]).unwrap().attention_filter);
+    }
+
+    fn header_text(app: &App) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 1)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::status_bar::render_header(frame, app, frame.area()))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn header_shows_backup_warnings_only() {
+        use crate::backup::schedule::{BackupIndicator, OffReason};
+
+        let mut app = test_app(Vec::new());
+        for quiet in [
+            BackupIndicator::Unknown,
+            BackupIndicator::Off(OffReason::NoPath),
+            BackupIndicator::Healthy,
+        ] {
+            app.backup = quiet;
+            assert!(!header_text(&app).contains("backup"));
+        }
+
+        app.backup = BackupIndicator::Failed("tar failed".into());
+        assert!(header_text(&app).contains("backup failed (B to retry)"));
+
+        app.backup = BackupIndicator::Stale(unix_now() - 3 * 24 * 60 * 60);
+        assert!(header_text(&app).contains("no backup in 3d (B to back up)"));
     }
 
     fn footer_text(app: &App) -> String {
