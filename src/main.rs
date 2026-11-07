@@ -2713,6 +2713,16 @@ fn run_tui() -> anyhow::Result<()> {
     let mut last_backup_status_mtime = fs::metadata(backup::status::status_path())
         .and_then(|meta| meta.modified())
         .ok();
+    // The full backup's record as last seen by that poll, so writes for
+    // other archives (`bork backup --project`) are ignored.
+    let full_backup_record = || {
+        backup::full_backup_file().and_then(|file| {
+            backup::status::read(&backup::status::status_path())
+                .archives
+                .remove(&file)
+        })
+    };
+    let mut last_full_backup_record = full_backup_record();
 
     // --- Main event loop ---
     loop {
@@ -3303,16 +3313,20 @@ fn run_tui() -> anyhow::Result<()> {
                 .ok();
             if status_mtime != last_backup_status_mtime {
                 last_backup_status_mtime = status_mtime;
-                if let Some(file) = backup::full_backup_file() {
-                    let records = backup::status::read(&backup::status::status_path());
-                    let record = records.archives.get(&file);
-                    if let Some(indicator) = backup::schedule::on_status_change(&app.backup, record)
-                    {
-                        needs_redraw |= app.apply_backup_report(backup::schedule::Report::new(
-                            indicator, None, false, record,
-                        ));
-                    }
+                let record = full_backup_record();
+                if let Some(indicator) = backup::schedule::on_status_change(
+                    &app.backup,
+                    last_full_backup_record.as_ref(),
+                    record.as_ref(),
+                ) {
+                    needs_redraw |= app.apply_backup_report(backup::schedule::Report::new(
+                        indicator,
+                        None,
+                        false,
+                        record.as_ref(),
+                    ));
                 }
+                last_full_backup_record = record;
             }
 
             // Pick up `bork update --check` runs from other terminals.

@@ -224,13 +224,20 @@ pub fn from_record(record: Option<&ArchiveStatus>) -> BackupIndicator {
 }
 
 /// The indicator after `backup.json` changed outside the worker (e.g. a CLI
-/// `bork backup`), so the header doesn't wait for the hourly check. `None`
-/// while backups are off or before the first report, which only a worker
-/// check can decide.
+/// `bork backup`), so the header doesn't wait for the hourly check. Only a
+/// changed full-backup record counts (`seen` is the last one looked at): a
+/// write for another archive, like `bork backup --project A`, must not
+/// replace a failure the worker found but couldn't record (a config
+/// error). `None` while backups are off or before the first report, which
+/// only a worker check can decide.
 pub fn on_status_change(
     current: &BackupIndicator,
+    seen: Option<&ArchiveStatus>,
     record: Option<&ArchiveStatus>,
 ) -> Option<BackupIndicator> {
+    if seen == record {
+        return None;
+    }
     match current {
         BackupIndicator::Ok { .. } | BackupIndicator::Failed { .. } => Some(from_record(record)),
         BackupIndicator::Unknown | BackupIndicator::Off(_) => None,
@@ -418,20 +425,41 @@ mod tests {
 
     #[test]
     fn a_cli_run_updates_the_header_without_waiting_for_the_worker() {
+        let before = ok_at(NOW - HOUR);
         let failed_now = failed(Some(NOW - HOUR), "no dir");
         assert_eq!(
-            on_status_change(&healthy(Some(NOW - HOUR)), Some(&failed_now)),
+            on_status_change(&healthy(Some(NOW - HOUR)), Some(&before), Some(&failed_now)),
             Some(failure("no dir", Some(NOW - HOUR)))
         );
         assert_eq!(
-            on_status_change(&failure("no dir", Some(NOW - HOUR)), Some(&ok_at(NOW))),
+            on_status_change(
+                &failure("no dir", Some(NOW - HOUR)),
+                Some(&failed_now),
+                Some(&ok_at(NOW))
+            ),
             Some(healthy(Some(NOW)))
         );
         // Off and not-yet-known stay for the worker to decide.
         let off = BackupIndicator::Off(OffReason::NoProjects);
-        assert_eq!(on_status_change(&off, Some(&failed_now)), None);
         assert_eq!(
-            on_status_change(&BackupIndicator::Unknown, Some(&failed_now)),
+            on_status_change(&off, Some(&before), Some(&failed_now)),
+            None
+        );
+        assert_eq!(
+            on_status_change(&BackupIndicator::Unknown, Some(&before), Some(&failed_now)),
+            None
+        );
+    }
+
+    #[test]
+    fn another_archive_changing_keeps_an_unrecorded_failure() {
+        // The worker found a config error (not recorded); then a
+        // `bork backup --project A` rewrote backup.json, but the full
+        // backup's record is unchanged.
+        let config_error = failure("reading /b/.bork/config.toml: denied", Some(NOW - HOUR));
+        let full = ok_at(NOW - HOUR);
+        assert_eq!(
+            on_status_change(&config_error, Some(&full), Some(&full)),
             None
         );
     }

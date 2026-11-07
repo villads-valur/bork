@@ -2095,8 +2095,9 @@ pub struct App {
     pub backup: crate::backup::schedule::BackupIndicator,
     /// A "back up now" is in flight (owns one `busy_count`).
     pub backup_manual_pending: bool,
-    /// Skipped no-remote repos from the last report, so the warning about
-    /// them shows once per change.
+    /// Skipped no-remote repos from the last successful report, so the
+    /// warning about them shows once per change (and once per TUI session,
+    /// since this starts empty).
     pub backup_local_only: Vec<std::path::PathBuf>,
     /// Header warning derived from `backup` and the clock; refreshed by
     /// `refresh_backup_warning` so rendering stays pure.
@@ -2399,9 +2400,12 @@ impl App {
         use crate::backup::schedule;
 
         let mut redraw = false;
-        let skipped_warning =
-            schedule::local_only_warning(&self.backup_local_only, &report.local_only_repos);
-        if self.backup_local_only != report.local_only_repos {
+        // Only a working backup says what it skipped; a failure or Off
+        // period keeps the last list, so the next success doesn't re-warn.
+        let mut skipped_warning = None;
+        if matches!(report.indicator, schedule::BackupIndicator::Ok { .. }) {
+            skipped_warning =
+                schedule::local_only_warning(&self.backup_local_only, &report.local_only_repos);
             self.backup_local_only = report.local_only_repos.clone();
         }
         if let Some(check) = &report.manual {
@@ -3713,6 +3717,22 @@ mod tests {
         );
 
         // The hourly check with the same list stays quiet.
+        app.message = None;
+        app.apply_backup_report(Report {
+            indicator: ok.clone(),
+            local_only_repos: skipped.clone(),
+            ..Default::default()
+        });
+        assert_eq!(app.message, None);
+
+        // A failure in between doesn't make the next success warn again.
+        app.apply_backup_report(Report {
+            indicator: BackupIndicator::Failed {
+                error: "tar failed".into(),
+                last_success_at: Some(1),
+            },
+            ..Default::default()
+        });
         app.message = None;
         app.apply_backup_report(Report {
             indicator: ok.clone(),
