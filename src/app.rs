@@ -81,10 +81,11 @@ pub struct LiveState {
     pub stacks_available: bool,
     pub frozen_worktree_statuses: HashMap<String, WorktreeStatus>,
     pub frozen_worktree_branches: HashMap<String, String>,
-    /// Branches from a hidden project's background poll. Only `branch_for`
-    /// reads them, never worktree assignment or stale cleanup, and they are
-    /// cleared once the project's full workers take over.
-    pub background_branches: HashMap<String, String>,
+    /// Branches from a hidden project's background poll. While set they
+    /// replace `worktree_branches` for attention (`resolved_worktree`,
+    /// `branch_for`), but never drive worktree assignment or stale cleanup.
+    /// Reset to `None` once the project's full workers take over.
+    pub background_branches: Option<HashMap<String, String>>,
     pub linear_issues: Vec<LinearIssue>,
     pub linear_projects: Vec<LinearProject>,
     pub user_prs: Vec<PrStatus>,
@@ -910,25 +911,34 @@ impl Project {
         live.worktree_statuses.get(wt)
     }
 
+    /// The issue's worktree, or for a hidden project a matching directory
+    /// from its background poll: a read-only stand-in for
+    /// `auto_assign_worktrees`, which only runs once the project is shown.
+    fn resolved_worktree<'a>(&'a self, issue: &'a Issue) -> Option<&'a str> {
+        if let Some(wt) = self.worktree_for(issue) {
+            return Some(wt);
+        }
+        if issue.kind == IssueKind::Orchestrator {
+            return None;
+        }
+        let branches = self.live.background_branches.as_ref()?;
+        match_worktree(&issue.id, branches.keys())
+    }
+
     pub fn branch_for(&self, issue: &Issue) -> Option<&str> {
         let live = &self.live;
-        if let Some(wt) = self.worktree_for(issue) {
+        if let Some(wt) = self.resolved_worktree(issue) {
             if issue.column == Column::Done {
                 if let Some(frozen) = live.frozen_worktree_branches.get(wt) {
                     return Some(frozen.as_str());
                 }
             }
-            if let Some(branch) = live.worktree_branches.get(wt) {
+            let branches = live
+                .background_branches
+                .as_ref()
+                .unwrap_or(&live.worktree_branches);
+            if let Some(branch) = branches.get(wt) {
                 return Some(branch.as_str());
-            }
-            if let Some(branch) = live.background_branches.get(wt) {
-                return Some(branch.as_str());
-            }
-        } else if issue.kind != IssueKind::Orchestrator {
-            // Read-only stand-in for `auto_assign_worktrees`, which only runs
-            // once the project is shown.
-            if let Some(wt) = match_worktree(&issue.id, live.background_branches.keys()) {
-                return live.background_branches.get(wt).map(String::as_str);
             }
         }
 
@@ -1066,7 +1076,7 @@ impl Project {
         }
         let drafts = &self.live.tuicr_drafts;
         let mut total = self
-            .worktree_for(issue)
+            .resolved_worktree(issue)
             .and_then(|wt| drafts.by_worktree.get(&self.id.join(wt)))
             .copied()
             .unwrap_or(0);
@@ -3515,8 +3525,10 @@ mod tests {
         let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
         let pr = test_pr(7, "bork-1/task");
         let live = &mut app.project_mut().live;
-        live.background_branches
-            .insert("bork-1-task".into(), "bork-1/task".into());
+        live.background_branches = Some(HashMap::from([(
+            "bork-1-task".to_string(),
+            "bork-1/task".to_string(),
+        )]));
         live.pr_statuses.insert("bork-1/task".into(), pr.clone());
         live.user_prs = vec![pr];
 
@@ -3531,17 +3543,40 @@ mod tests {
     }
 
     #[test]
-    fn hidden_project_resolves_an_assigned_worktree_from_background_branches() {
+    fn hidden_project_follows_a_branch_switched_while_hidden() {
         let mut issue = test_issue("bork-1", Column::InProgress);
-        issue.worktree = Some("bork-1-clone".into());
+        issue.worktree = Some("bork-1-task".into());
         let mut app = test_app(vec![issue]);
-        app.project_mut()
-            .live
-            .background_branches
-            .insert("bork-1-clone".into(), "bork-1/clone".into());
+        let pr = test_pr(7, "bork-1/new");
+        let live = &mut app.project_mut().live;
+        // Left over from the last full poll before the project was hidden.
+        live.worktree_branches
+            .insert("bork-1-task".into(), "bork-1/old".into());
+        live.background_branches = Some(HashMap::from([(
+            "bork-1-task".to_string(),
+            "bork-1/new".to_string(),
+        )]));
+        live.pr_statuses.insert("bork-1/new".into(), pr.clone());
+        live.user_prs = vec![pr];
 
         let project = app.project();
-        assert_eq!(project.branch_for(&project.issues[0]), Some("bork-1/clone"));
+        assert_eq!(project.branch_for(&project.issues[0]), Some("bork-1/new"));
+        assert_eq!(project.attention_count(), 1);
+    }
+
+    #[test]
+    fn hidden_project_counts_drafts_on_an_unassigned_matching_worktree() {
+        let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
+        let worktree = app.project().id().join("bork-1-task");
+        let live = &mut app.project_mut().live;
+        live.background_branches = Some(HashMap::from([(
+            "bork-1-task".to_string(),
+            "bork-1/task".to_string(),
+        )]));
+        live.tuicr_drafts.by_worktree.insert(worktree, 1);
+
+        assert_eq!(app.project().attention_count(), 1);
+        assert_eq!(app.project().issues[0].worktree, None);
     }
 
     #[test]
@@ -3553,8 +3588,10 @@ mod tests {
         // Left over from the last full poll before the project was hidden.
         live.worktree_branches
             .insert("bork-1-clone".into(), "bork-1/clone".into());
-        live.background_branches
-            .insert("bork-2-task".into(), "bork-2/task".into());
+        live.background_branches = Some(HashMap::from([(
+            "bork-2-task".to_string(),
+            "bork-2/task".to_string(),
+        )]));
 
         assert!(!app.project_mut().auto_assign_worktrees());
         assert!(!app.project_mut().clear_stale_worktrees());

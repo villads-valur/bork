@@ -1895,8 +1895,8 @@ fn spawn_background_pr_worker(
 fn drain_background_pr_worker(project: &mut app::Project, worker: &BackgroundPrWorker) -> bool {
     let mut needs_redraw = false;
     while let Ok(branches) = worker.branch_rx.try_recv() {
-        if project.live.background_branches != branches {
-            project.live.background_branches = branches;
+        if project.live.background_branches.as_ref() != Some(&branches) {
+            project.live.background_branches = Some(branches);
             needs_redraw = true;
         }
     }
@@ -2728,7 +2728,7 @@ fn run_tui() -> anyhow::Result<()> {
             for id in shown {
                 background_pr_workers.remove(&id);
                 if let Some(project) = app.find_project_mut(&id) {
-                    project.live.background_branches.clear();
+                    project.live.background_branches = None;
                 }
             }
             for project in &app.projects {
@@ -2743,7 +2743,7 @@ fn run_tui() -> anyhow::Result<()> {
         } else if !background_pr_workers.is_empty() {
             background_pr_workers.clear();
             for project in &mut app.projects {
-                project.live.background_branches.clear();
+                project.live.background_branches = None;
             }
         }
 
@@ -3329,7 +3329,7 @@ mod tests {
         pr_tx.send(PrPollResult::default()).unwrap();
 
         assert!(drain_background_pr_worker(&mut project, &worker));
-        assert_eq!(project.live.background_branches, branches);
+        assert_eq!(project.live.background_branches, Some(branches));
         assert_eq!(
             project.live.worktree_branches,
             HashMap::from([("bork-1-clone".to_string(), "bork-1/clone".to_string())])
