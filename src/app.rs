@@ -2095,6 +2095,9 @@ pub struct App {
     pub backup: crate::backup::schedule::BackupIndicator,
     /// A "back up now" is in flight (owns one `busy_count`).
     pub backup_manual_pending: bool,
+    /// Header warning derived from `backup` and the clock; refreshed by
+    /// `refresh_backup_warning` so rendering stays pure.
+    pub backup_warning: Option<String>,
 }
 
 impl App {
@@ -2134,6 +2137,7 @@ impl App {
             update_available: false,
             backup: Default::default(),
             backup_manual_pending: false,
+            backup_warning: None,
         }
     }
 
@@ -2424,7 +2428,19 @@ impl App {
             self.backup = report.indicator;
             redraw = true;
         }
+        redraw |= self.refresh_backup_warning(unix_now());
         redraw
+    }
+
+    /// Recompute the header's backup warning for `now` (the 48h warning
+    /// depends on the clock). Returns whether it changed.
+    pub fn refresh_backup_warning(&mut self, now: u64) -> bool {
+        let warning = crate::backup::schedule::warning_text(&self.backup, now);
+        if warning == self.backup_warning {
+            return false;
+        }
+        self.backup_warning = warning;
+        true
     }
 
     /// Release a pending "back up now" and its spinner, if any.
@@ -3543,24 +3559,28 @@ mod tests {
             },
         ] {
             app.backup = quiet;
+            app.refresh_backup_warning(unix_now());
             assert!(!header_text(&app).contains("backup"));
         }
 
         app.backup = BackupIndicator::Ok {
             last_success_at: Some(unix_now() - 3 * 24 * 60 * 60),
         };
+        app.refresh_backup_warning(unix_now());
         assert!(header_text(&app).contains("no backup in 3d (B to back up)"));
 
         app.backup = BackupIndicator::Failed {
             error: "tar failed".into(),
             last_success_at: Some(unix_now()),
         };
+        app.refresh_backup_warning(unix_now());
         assert!(header_text(&app).contains("backup failed (B to retry)"));
 
         app.backup = BackupIndicator::Failed {
             error: "tar failed".into(),
             last_success_at: Some(unix_now() - 3 * 24 * 60 * 60),
         };
+        app.refresh_backup_warning(unix_now());
         assert!(header_text(&app).contains("backup failed, none in 3d (B to retry)"));
     }
 
@@ -3707,6 +3727,7 @@ mod tests {
             error: "x".into(),
             last_success_at: Some(unix_now()),
         };
+        app.refresh_backup_warning(unix_now());
         let title = format!(" BORK - {} ", app.active_project().display_name());
         let full = " \u{26a0} backup failed (B to retry) ";
         let compact = " \u{26a0} backup failed ";

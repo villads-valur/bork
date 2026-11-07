@@ -10,6 +10,7 @@
 
 use std::time::Duration;
 
+use super::archive::{STAGING_PREFIX, TMP_INFIX};
 use super::status::ArchiveStatus;
 
 /// How long after startup the first check runs.
@@ -185,12 +186,13 @@ pub fn failure_to_report<'a>(prev: &BackupIndicator, next: &'a BackupIndicator) 
 }
 
 /// Error messages compared with the generated parts of temp and staging
-/// names masked (`.<backup file>.tmp.<pid>`, staging dir `bork-backup-<pid>-<nanos>`
-/// in `archive.rs`), which would otherwise make the same failure look new
+/// names masked ([`TMP_INFIX`] + pid, [`STAGING_PREFIX`] + pid-nanos, from
+/// `archive.rs`), which would otherwise make the same failure look new
 /// after a restart or every run. Other numbers, like `project-2` in a path,
 /// still count.
 fn same_error(a: &str, b: &str) -> bool {
     fn mask(s: &str) -> String {
+        let staging_nanos = format!("{STAGING_PREFIX}#-");
         let chars: Vec<char> = s.chars().collect();
         let digits_from = |start: usize| {
             chars[start..]
@@ -202,14 +204,14 @@ fn same_error(a: &str, b: &str) -> bool {
         let mut i = 0;
         while i < chars.len() {
             let run = digits_from(i);
-            // `.tmp.<pid>`, and the staging dir's `bork-backup-<pid>-<nanos>`
-            // (both runs), but not a backup file named after a host that
+            // `<TMP_INFIX><pid>`, and the staging dir's
+            // `<STAGING_PREFIX><pid>-<nanos>` (both runs), but not a backup file named after a host that
             // starts with a digit.
-            let staging_pid = out.ends_with("bork-backup-")
+            let staging_pid = out.ends_with(STAGING_PREFIX)
                 && chars.get(i + run) == Some(&'-')
                 && digits_from(i + run + 1) > 0;
             let generated =
-                out.ends_with(".tmp.") || out.ends_with("bork-backup-#-") || staging_pid;
+                out.ends_with(TMP_INFIX) || out.ends_with(&staging_nanos) || staging_pid;
             if run > 0 && generated {
                 out.push('#');
                 i += run;

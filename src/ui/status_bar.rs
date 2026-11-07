@@ -74,9 +74,9 @@ pub fn render_header(frame: &mut Frame, app: &App, area: Rect) {
 /// Header warning when the last backup failed or is too old; nothing
 /// otherwise. `compact` drops the key hint.
 fn backup_warning_span(app: &App, compact: bool) -> Option<Span<'static>> {
-    use crate::backup::schedule::{warning_text, BackupIndicator};
+    use crate::backup::schedule::BackupIndicator;
 
-    let text = warning_text(&app.backup, crate::app::unix_now())?;
+    let text = app.backup_warning.as_deref()?;
     let (color, hint) = match app.backup {
         BackupIndicator::Failed { .. } => (ratatui::style::Color::Red, "B to retry"),
         _ => (ratatui::style::Color::Yellow, "B to back up"),

@@ -91,7 +91,7 @@ pub fn write(dest: &Path, manifest: &[u8], contents: &Contents) -> anyhow::Resul
         .file_name()
         .and_then(|n| n.to_str())
         .context("invalid backup file name")?;
-    let tmp = dir.join(format!(".{name}.tmp.{}", std::process::id()));
+    let tmp = dir.join(format!(".{name}{TMP_INFIX}{}", std::process::id()));
 
     let result = (|| {
         let mut top: Vec<String> = fs::read_dir(&staging.0)?
@@ -229,13 +229,19 @@ fn stage_file(staging: &Path, path: &str, bytes: &[u8], mode: u32) -> anyhow::Re
 /// Private temp directory, removed on drop.
 struct Staging(PathBuf);
 
+/// The in-progress backup file is `.<file name>{TMP_INFIX}<pid>`.
+pub const TMP_INFIX: &str = ".tmp.";
+/// The staging dir is `{STAGING_PREFIX}<pid>-<nanos>` under the temp dir.
+pub const STAGING_PREFIX: &str = "bork-backup-";
+
 impl Staging {
     fn new() -> anyhow::Result<Self> {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("bork-backup-{}-{nanos}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("{STAGING_PREFIX}{}-{nanos}", std::process::id()));
         fs::create_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
         Ok(Self(dir))
