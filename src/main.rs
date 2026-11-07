@@ -1873,7 +1873,7 @@ fn spawn_background_pr_worker(
     let suspended = suspended.clone();
     thread::spawn(move || loop {
         wait_while_suspended(&suspended);
-        let branches = external::git::list_worktree_branches(&project_root);
+        let branches = external::git::list_project_branches(&project_root);
         if branch_tx.send(branches).is_err() {
             break;
         }
@@ -1895,8 +1895,8 @@ fn spawn_background_pr_worker(
 fn drain_background_pr_worker(project: &mut app::Project, worker: &BackgroundPrWorker) -> bool {
     let mut needs_redraw = false;
     while let Ok(branches) = worker.branch_rx.try_recv() {
-        if project.live.worktree_branches != branches {
-            project.live.worktree_branches = branches;
+        if project.live.background_branches != branches {
+            project.live.background_branches = branches;
             needs_redraw = true;
         }
     }
@@ -2720,7 +2720,17 @@ fn run_tui() -> anyhow::Result<()> {
                 .map(|project| project.id())
                 .filter(|id| *id != app.focused_project && !swimlane_workers.contains_key(id))
                 .collect();
-            background_pr_workers.retain(|id, _| hidden.contains(id));
+            let shown: Vec<ProjectId> = background_pr_workers
+                .keys()
+                .filter(|id| !hidden.contains(*id))
+                .cloned()
+                .collect();
+            for id in shown {
+                background_pr_workers.remove(&id);
+                if let Some(project) = app.find_project_mut(&id) {
+                    project.live.background_branches.clear();
+                }
+            }
             for project in &app.projects {
                 let id = project.id();
                 if hidden.contains(&id) && !background_pr_workers.contains_key(&id) {
@@ -2730,8 +2740,11 @@ fn run_tui() -> anyhow::Result<()> {
                     );
                 }
             }
-        } else {
+        } else if !background_pr_workers.is_empty() {
             background_pr_workers.clear();
+            for project in &mut app.projects {
+                project.live.background_branches.clear();
+            }
         }
 
         // Drain all queued poll results but only redraw when data changed:

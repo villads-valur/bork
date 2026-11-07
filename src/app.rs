@@ -81,6 +81,10 @@ pub struct LiveState {
     pub stacks_available: bool,
     pub frozen_worktree_statuses: HashMap<String, WorktreeStatus>,
     pub frozen_worktree_branches: HashMap<String, String>,
+    /// Branches from a hidden project's background poll. Only `branch_for`
+    /// reads them, never worktree assignment or stale cleanup, and they are
+    /// cleared once the project's full workers take over.
+    pub background_branches: HashMap<String, String>,
     pub linear_issues: Vec<LinearIssue>,
     pub linear_projects: Vec<LinearProject>,
     pub user_prs: Vec<PrStatus>,
@@ -837,28 +841,12 @@ impl Project {
     /// Finds a worktree directory by dash-bounded substring match of the issue ID.
     /// Shortest match wins (e.g. `bork-1` preferred over `bork-1-extended`).
     pub(crate) fn detect_worktree(&self, issue: &Issue) -> Option<String> {
-        let issue_id_lower = issue.id.to_lowercase();
         let live = &self.live;
-
-        let mut best: Option<&str> = None;
         let all_keys = live
             .worktree_branches
             .keys()
             .chain(live.frozen_worktree_branches.keys());
-
-        for dir_name in all_keys {
-            let dir_lower = dir_name.to_lowercase();
-            let Some(pos) = dir_lower.find(&issue_id_lower) else {
-                continue;
-            };
-            let before_ok = pos == 0 || dir_lower.as_bytes()[pos - 1] == b'-';
-            let end = pos + issue_id_lower.len();
-            let after_ok = end == dir_lower.len() || dir_lower.as_bytes()[end] == b'-';
-            if before_ok && after_ok && best.is_none_or(|b| dir_name.len() < b.len()) {
-                best = Some(dir_name.as_str());
-            }
-        }
-        best.map(|s| s.to_string())
+        match_worktree(&issue.id, all_keys).map(|s| s.to_string())
     }
 
     pub fn auto_assign_worktrees(&mut self) -> bool {
@@ -932,6 +920,15 @@ impl Project {
             }
             if let Some(branch) = live.worktree_branches.get(wt) {
                 return Some(branch.as_str());
+            }
+            if let Some(branch) = live.background_branches.get(wt) {
+                return Some(branch.as_str());
+            }
+        } else if issue.kind != IssueKind::Orchestrator {
+            // Read-only stand-in for `auto_assign_worktrees`, which only runs
+            // once the project is shown.
+            if let Some(wt) = match_worktree(&issue.id, live.background_branches.keys()) {
+                return live.background_branches.get(wt).map(String::as_str);
             }
         }
 
@@ -1702,6 +1699,29 @@ impl Project {
             }
         }
     }
+}
+
+/// Finds a worktree directory by dash-bounded substring match of the issue ID.
+/// Shortest match wins (e.g. `bork-1` preferred over `bork-1-extended`).
+fn match_worktree<'a>(
+    issue_id: &str,
+    dir_names: impl Iterator<Item = &'a String>,
+) -> Option<&'a str> {
+    let issue_id_lower = issue_id.to_lowercase();
+    let mut best: Option<&str> = None;
+    for dir_name in dir_names {
+        let dir_lower = dir_name.to_lowercase();
+        let Some(pos) = dir_lower.find(&issue_id_lower) else {
+            continue;
+        };
+        let before_ok = pos == 0 || dir_lower.as_bytes()[pos - 1] == b'-';
+        let end = pos + issue_id_lower.len();
+        let after_ok = end == dir_lower.len() || dir_lower.as_bytes()[end] == b'-';
+        if before_ok && after_ok && best.is_none_or(|b| dir_name.len() < b.len()) {
+            best = Some(dir_name.as_str());
+        }
+    }
+    best
 }
 
 pub struct SidebarState {

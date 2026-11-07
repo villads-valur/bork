@@ -275,12 +275,37 @@ pub fn poll_all_worktrees(project_root: &Path, skip: &HashSet<String>) -> GitPol
     poller.poll(&classify, true)
 }
 
-pub fn list_worktree_branches(project_root: &Path) -> HashMap<String, String> {
+fn list_worktree_branches(project_root: &Path) -> HashMap<String, String> {
     let main_dir = project_root.join("main");
     let Some(stdout) = git_output(&main_dir, &["worktree", "list", "--porcelain"]) else {
         return HashMap::new();
     };
     parse_worktree_list(&stdout)
+}
+
+/// Every issue directory's branch, resolved the same way as `GitPoller::poll`
+/// (batched worktree list, `rev-parse` for independent clones) but without
+/// statuses. Used for hidden projects, which don't run a full git poller.
+pub fn list_project_branches(project_root: &Path) -> HashMap<String, String> {
+    let mut batched = list_worktree_branches(project_root);
+    let mut branches = HashMap::new();
+    let Ok(entries) = std::fs::read_dir(project_root) else {
+        return branches;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(dir_name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if dir_name.starts_with('.') || !path.is_dir() || !path.join(".git").exists() {
+            continue;
+        }
+        let branch = batched.remove(&dir_name).or_else(|| get_branch_name(&path));
+        if let Some(branch) = branch {
+            branches.insert(dir_name, branch);
+        }
+    }
+    branches
 }
 
 /// Parse `git worktree list --porcelain` into dir-name -> branch-name.
