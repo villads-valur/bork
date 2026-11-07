@@ -8,6 +8,7 @@
 //! is older than [`STALE_AFTER_SECS`] (TUI closed for days, a run stuck on
 //! the backup lock); the age is checked at render time.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use super::archive::{STAGING_PREFIX, TMP_INFIX};
@@ -29,14 +30,15 @@ pub enum Check {
     NoProjects,
     /// Not due yet; nothing ran.
     Skipped,
-    /// `backup::run` ran, or reading a project's config before it failed.
-    /// `Ok(None)` when no project has backups enabled, `Ok(Some(written))`
-    /// on success (`written` is false when unchanged).
+    /// The registry or a project config couldn't be read; nothing ran.
+    ConfigError(String),
+    /// `backup::run` ran. `Ok(None)` when no project has backups enabled,
+    /// `Ok(Some(written))` on success (`written` is false when unchanged).
     Ran(Result<Option<bool>, String>),
 }
 
 /// One worker message to the main loop.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Report {
     pub indicator: BackupIndicator,
     /// The check forced by "back up now"; `None` for scheduled checks and
@@ -45,6 +47,31 @@ pub struct Report {
     /// The startup snapshot of the recorded status: it sets the baseline
     /// and never re-reports a failure the user has already seen.
     pub baseline: bool,
+    /// Skipped git repos with no remote in the last successful backup (see
+    /// `backup::Outcome::local_only_repos`); empty unless backups are `Ok`.
+    pub local_only_repos: Vec<PathBuf>,
+}
+
+impl Report {
+    /// A report for `indicator`, taking the skipped no-remote repos from
+    /// the status record while backups work.
+    pub fn new(
+        indicator: BackupIndicator,
+        manual: Option<Check>,
+        baseline: bool,
+        record: Option<&ArchiveStatus>,
+    ) -> Self {
+        let local_only_repos = match (&indicator, record) {
+            (BackupIndicator::Ok { .. }, Some(record)) => record.local_only_repos.clone(),
+            _ => Vec::new(),
+        };
+        Self {
+            indicator,
+            manual,
+            baseline,
+            local_only_repos,
+        }
+    }
 }
 
 /// Whether any registered project has backups enabled. An unreadable
@@ -69,7 +96,7 @@ pub fn blocked(path_configured: bool, enabled: Result<bool, String>) -> Option<C
     match enabled {
         Ok(true) => None,
         Ok(false) => Some(Check::NoProjects),
-        Err(err) => Some(Check::Ran(Err(err))),
+        Err(err) => Some(Check::ConfigError(err)),
     }
 }
 
@@ -92,10 +119,38 @@ pub fn decide(
 }
 
 /// Whether a scheduled check should run: due by [`super::is_due`], or the
-/// last run failed (e.g. a CLI `bork backup` hours after a good one), so a
-/// failure is retried hourly instead of waiting out the 24h.
-pub fn retry_or_due(record: Option<&ArchiveStatus>, due: bool) -> bool {
-    due || record.is_some_and(|r| !r.ok)
+/// last run failed, so a failure is retried hourly instead of waiting out
+/// the 24h. The failure is either recorded (e.g. a CLI `bork backup` hours
+/// after a good one) or the worker's own last attempt (`worker_failed`),
+/// since some failures (like an unusable `backup.lock`) aren't recorded.
+pub fn retry_or_due(record: Option<&ArchiveStatus>, due: bool, worker_failed: bool) -> bool {
+    due || worker_failed || record.is_some_and(|r| !r.ok)
+}
+
+/// Status bar warning when the skipped no-remote repos changed and aren't
+/// empty, so the TUI says it once like `bork backup` does on every run.
+pub fn local_only_warning(prev: &[PathBuf], next: &[PathBuf]) -> Option<String> {
+    if next.is_empty() || prev == next {
+        return None;
+    }
+    Some(local_only_summary(next))
+}
+
+/// `Backup skips 2 git repos with no remote: /a/plans/x (+1 more)`.
+pub fn local_only_summary(repos: &[PathBuf]) -> String {
+    let first = repos
+        .first()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let more = match repos.len() {
+        0 | 1 => String::new(),
+        n => format!(" (+{} more, see `bork backup status`)", n - 1),
+    };
+    let noun = if repos.len() == 1 { "repo" } else { "repos" };
+    format!(
+        "Backup skips {} git {noun} with no remote: {first}{more}",
+        repos.len()
+    )
 }
 
 /// Error shown when the worker thread is gone and `B` can't reach it.
@@ -106,16 +161,12 @@ pub const WORKER_STOPPED: &str = "Automatic backups stopped (worker crashed); re
 /// silent baseline; a config or registry error found now is reported like
 /// any check's.
 pub fn startup_report(blocked: Option<Check>, record: Option<&ArchiveStatus>) -> Report {
-    let baseline = !matches!(blocked, Some(Check::Ran(Err(_))));
+    let baseline = !matches!(blocked, Some(Check::ConfigError(_)));
     let indicator = match &blocked {
         Some(check) => indicator(check, record),
         None => from_record(record),
     };
-    Report {
-        indicator,
-        manual: None,
-        baseline,
-    }
+    Report::new(indicator, None, baseline, record)
 }
 
 /// Why backups are off.
@@ -148,7 +199,7 @@ pub fn indicator(check: &Check, record: Option<&ArchiveStatus>) -> BackupIndicat
     match check {
         Check::NoPath => BackupIndicator::Off(OffReason::NoPath),
         Check::NoProjects | Check::Ran(Ok(None)) => BackupIndicator::Off(OffReason::NoProjects),
-        Check::Ran(Err(err)) => BackupIndicator::Failed {
+        Check::ConfigError(err) | Check::Ran(Err(err)) => BackupIndicator::Failed {
             error: err.clone(),
             last_success_at: record.and_then(|r| r.last_success_at),
         },
@@ -169,6 +220,20 @@ pub fn from_record(record: Option<&ArchiveStatus>) -> BackupIndicator {
         _ => BackupIndicator::Ok {
             last_success_at: record.and_then(|r| r.last_success_at),
         },
+    }
+}
+
+/// The indicator after `backup.json` changed outside the worker (e.g. a CLI
+/// `bork backup`), so the header doesn't wait for the hourly check. `None`
+/// while backups are off or before the first report, which only a worker
+/// check can decide.
+pub fn on_status_change(
+    current: &BackupIndicator,
+    record: Option<&ArchiveStatus>,
+) -> Option<BackupIndicator> {
+    match current {
+        BackupIndicator::Ok { .. } | BackupIndicator::Failed { .. } => Some(from_record(record)),
+        BackupIndicator::Unknown | BackupIndicator::Off(_) => None,
     }
 }
 
@@ -204,9 +269,9 @@ fn same_error(a: &str, b: &str) -> bool {
         let mut i = 0;
         while i < chars.len() {
             let run = digits_from(i);
-            // `<TMP_INFIX><pid>`, and the staging dir's
-            // `<STAGING_PREFIX><pid>-<nanos>` (both runs), but not a backup file named after a host that
-            // starts with a digit.
+            // `<TMP_INFIX><pid>` and both runs of the staging dir's
+            // `<STAGING_PREFIX><pid>-<nanos>`, but not a backup file named
+            // after a host that starts with a digit.
             let staging_pid = out.ends_with(STAGING_PREFIX)
                 && chars.get(i + run) == Some(&'-')
                 && digits_from(i + run + 1) > 0;
@@ -263,7 +328,7 @@ pub fn manual_message(check: &Check) -> (String, bool) {
         Check::Ran(Ok(Some(false))) => ("Backup up to date (nothing changed)".to_string(), false),
         // A manual check always runs (see `decide`); kept for exhaustiveness.
         Check::Skipped => ("Backup not due".to_string(), false),
-        Check::Ran(Err(err)) => (format!("Backup failed: {err}"), true),
+        Check::ConfigError(err) | Check::Ran(Err(err)) => (format!("Backup failed: {err}"), true),
     }
 }
 
@@ -327,7 +392,7 @@ mod tests {
         assert_eq!(blocked(true, Ok(false)), Some(Check::NoProjects));
         assert_eq!(
             blocked(true, Err("reading config".into())),
-            Some(Check::Ran(Err("reading config".into())))
+            Some(Check::ConfigError("reading config".into()))
         );
         assert_eq!(blocked(true, Ok(true)), None);
     }
@@ -340,12 +405,48 @@ mod tests {
         assert!(recorded.baseline);
         assert_eq!(recorded.indicator, failure("tar failed", Some(NOW - HOUR)));
 
-        let config = startup_report(Some(Check::Ran(Err("bad registry".into()))), Some(&record));
+        let config = startup_report(
+            Some(Check::ConfigError("bad registry".into())),
+            Some(&record),
+        );
         assert!(!config.baseline);
         assert_eq!(config.indicator, failure("bad registry", Some(NOW - HOUR)));
 
         let off = startup_report(Some(Check::NoProjects), Some(&record));
         assert_eq!(off.indicator, BackupIndicator::Off(OffReason::NoProjects));
+    }
+
+    #[test]
+    fn a_cli_run_updates_the_header_without_waiting_for_the_worker() {
+        let failed_now = failed(Some(NOW - HOUR), "no dir");
+        assert_eq!(
+            on_status_change(&healthy(Some(NOW - HOUR)), Some(&failed_now)),
+            Some(failure("no dir", Some(NOW - HOUR)))
+        );
+        assert_eq!(
+            on_status_change(&failure("no dir", Some(NOW - HOUR)), Some(&ok_at(NOW))),
+            Some(healthy(Some(NOW)))
+        );
+        // Off and not-yet-known stay for the worker to decide.
+        let off = BackupIndicator::Off(OffReason::NoProjects);
+        assert_eq!(on_status_change(&off, Some(&failed_now)), None);
+        assert_eq!(
+            on_status_change(&BackupIndicator::Unknown, Some(&failed_now)),
+            None
+        );
+    }
+
+    #[test]
+    fn config_errors_fail_with_a_message() {
+        let check = Check::ConfigError("reading projects.json".into());
+        assert_eq!(
+            manual_message(&check),
+            ("Backup failed: reading projects.json".to_string(), true)
+        );
+        assert_eq!(
+            indicator(&check, None),
+            failure("reading projects.json", None)
+        );
     }
 
     #[test]
@@ -475,11 +576,50 @@ mod tests {
     fn a_failed_last_run_is_retried_before_the_24h_mark() {
         assert!(retry_or_due(
             Some(&failed(Some(NOW - HOUR), "no dir")),
+            false,
             false
         ));
-        assert!(!retry_or_due(Some(&ok_at(NOW - HOUR)), false));
-        assert!(!retry_or_due(None, false));
-        assert!(retry_or_due(Some(&ok_at(NOW - 25 * HOUR)), true));
+        assert!(!retry_or_due(Some(&ok_at(NOW - HOUR)), false, false));
+        assert!(!retry_or_due(None, false, false));
+        assert!(retry_or_due(Some(&ok_at(NOW - 25 * HOUR)), true, false));
+        // An unrecorded failure (e.g. backup.lock unusable) still retries,
+        // even though backup.json says the last run succeeded.
+        assert!(retry_or_due(Some(&ok_at(NOW - HOUR)), false, true));
+    }
+
+    #[test]
+    fn warns_once_about_skipped_repos_without_a_remote() {
+        let a = vec![PathBuf::from("/p/plans/scratch")];
+        let ab = vec![PathBuf::from("/p/plans/scratch"), PathBuf::from("/q/x")];
+        assert_eq!(
+            local_only_warning(&[], &a).as_deref(),
+            Some("Backup skips 1 git repo with no remote: /p/plans/scratch")
+        );
+        assert_eq!(local_only_warning(&a, &a), None);
+        assert_eq!(local_only_warning(&a, &[]), None);
+        assert_eq!(
+            local_only_warning(&a, &ab).as_deref(),
+            Some(
+                "Backup skips 2 git repos with no remote: /p/plans/scratch (+1 more, see `bork backup status`)"
+            )
+        );
+    }
+
+    #[test]
+    fn reports_carry_skipped_repos_only_while_backups_work() {
+        let record = ArchiveStatus {
+            local_only_repos: vec![PathBuf::from("/p/plans/scratch")],
+            ..ok_at(NOW)
+        };
+        let ok = Report::new(healthy(Some(NOW)), None, false, Some(&record));
+        assert_eq!(ok.local_only_repos, record.local_only_repos);
+        let off = Report::new(
+            BackupIndicator::Off(OffReason::NoProjects),
+            None,
+            false,
+            Some(&record),
+        );
+        assert!(off.local_only_repos.is_empty());
     }
 
     #[test]

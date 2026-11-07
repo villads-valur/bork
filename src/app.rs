@@ -2095,6 +2095,9 @@ pub struct App {
     pub backup: crate::backup::schedule::BackupIndicator,
     /// A "back up now" is in flight (owns one `busy_count`).
     pub backup_manual_pending: bool,
+    /// Skipped no-remote repos from the last report, so the warning about
+    /// them shows once per change.
+    pub backup_local_only: Vec<std::path::PathBuf>,
     /// Header warning derived from `backup` and the clock; refreshed by
     /// `refresh_backup_warning` so rendering stays pure.
     pub backup_warning: Option<String>,
@@ -2138,6 +2141,7 @@ impl App {
             backup: Default::default(),
             backup_manual_pending: false,
             backup_warning: None,
+            backup_local_only: Vec::new(),
         }
     }
 
@@ -2388,20 +2392,32 @@ impl App {
     /// Fold a backup worker report in. A new failure from a real check goes
     /// to the status bar (unless the manual result already says so) and to
     /// `.bork/errors.log` of every loaded project not opted out; the
-    /// startup baseline and routine successes stay silent. Returns whether
-    /// to redraw.
+    /// startup baseline and routine successes stay silent. A changed list of
+    /// skipped no-remote repos is warned about once (and always in a manual
+    /// result). Returns whether to redraw.
     pub fn apply_backup_report(&mut self, report: crate::backup::schedule::Report) -> bool {
         use crate::backup::schedule;
 
         let mut redraw = false;
+        let skipped_warning =
+            schedule::local_only_warning(&self.backup_local_only, &report.local_only_repos);
+        if self.backup_local_only != report.local_only_repos {
+            self.backup_local_only = report.local_only_repos.clone();
+        }
         if let Some(check) = &report.manual {
             self.finish_manual_backup();
             let (message, is_error) = schedule::manual_message(check);
             if is_error {
                 self.set_error(message);
-            } else {
+            } else if report.local_only_repos.is_empty() {
                 self.set_message(message);
+            } else {
+                let skipped = schedule::local_only_summary(&report.local_only_repos);
+                self.set_warning(format!("{message}. {skipped}"));
             }
+            redraw = true;
+        } else if let Some(warning) = skipped_warning {
+            self.set_warning(warning);
             redraw = true;
         }
         let failure = if report.baseline {
@@ -3593,6 +3609,7 @@ mod tests {
             indicator,
             manual,
             baseline,
+            ..Default::default()
         }
     }
 
@@ -3670,6 +3687,54 @@ mod tests {
         app.apply_backup_report(backup_report(backup_failure("old"), None, false));
         assert_eq!(app.message, None);
         assert_eq!(error_log(dir.path()), "");
+    }
+
+    #[test]
+    fn skipped_repos_warn_once_per_change_and_in_manual_results() {
+        use crate::backup::schedule::{BackupIndicator, Check, Report};
+
+        let ok = BackupIndicator::Ok {
+            last_success_at: Some(1),
+        };
+        let skipped = vec![std::path::PathBuf::from("/p/plans/scratch")];
+        let mut app = test_app(Vec::new());
+
+        app.apply_backup_report(Report {
+            indicator: ok.clone(),
+            local_only_repos: skipped.clone(),
+            ..Default::default()
+        });
+        assert_eq!(
+            app.message,
+            Some((
+                "Backup skips 1 git repo with no remote: /p/plans/scratch".into(),
+                MessageKind::Warning
+            ))
+        );
+
+        // The hourly check with the same list stays quiet.
+        app.message = None;
+        app.apply_backup_report(Report {
+            indicator: ok.clone(),
+            local_only_repos: skipped.clone(),
+            ..Default::default()
+        });
+        assert_eq!(app.message, None);
+
+        // `B` always says it.
+        app.apply_backup_report(Report {
+            indicator: ok,
+            manual: Some(Check::Ran(Ok(Some(true)))),
+            local_only_repos: skipped,
+            ..Default::default()
+        });
+        assert_eq!(
+            app.message,
+            Some((
+                "Backup written. Backup skips 1 git repo with no remote: /p/plans/scratch".into(),
+                MessageKind::Warning
+            ))
+        );
     }
 
     #[test]

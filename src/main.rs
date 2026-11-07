@@ -447,6 +447,9 @@ fn spawn_backup_worker(
             }
         }
 
+        // A failed attempt `backup::run` couldn't record (e.g. an unusable
+        // backup.lock) still needs the hourly retry.
+        let mut last_attempt_failed = false;
         let mut wait = schedule::STARTUP_DELAY;
         loop {
             let manual = match sleep_until_wake(&wake_rx, wait) {
@@ -463,7 +466,11 @@ fn spawn_backup_worker(
                 manual,
                 || {
                     let last = file.as_deref().and_then(record_for);
-                    schedule::retry_or_due(last.as_ref(), backup::is_due(app::unix_now()))
+                    schedule::retry_or_due(
+                        last.as_ref(),
+                        backup::is_due(app::unix_now()),
+                        last_attempt_failed,
+                    )
                 },
                 || {
                     backup::run(&backup::Selection::All)
@@ -471,13 +478,10 @@ fn spawn_backup_worker(
                         .map_err(|err| format!("{err:#}"))
                 },
             );
+            last_attempt_failed = matches!(check, schedule::Check::Ran(Err(_)));
             let record = file.as_deref().and_then(record_for);
             let indicator = schedule::indicator(&check, record.as_ref());
-            let report = Report {
-                indicator,
-                manual: manual.then_some(check),
-                baseline: false,
-            };
+            let report = Report::new(indicator, manual.then_some(check), false, record.as_ref());
             if tx.send(report).is_err() {
                 break;
             }
@@ -2706,6 +2710,9 @@ fn run_tui() -> anyhow::Result<()> {
     // Cleared if the backup worker thread dies (a panic), so a pending
     // "back up now" doesn't spin forever.
     let mut backup_worker_alive = true;
+    let mut last_backup_status_mtime = fs::metadata(backup::status::status_path())
+        .and_then(|meta| meta.modified())
+        .ok();
 
     // --- Main event loop ---
     loop {
@@ -3288,6 +3295,25 @@ fn run_tui() -> anyhow::Result<()> {
             // The 48h backup warning depends on the clock, not on a worker
             // report (the worker may be blocked on the backup lock).
             needs_redraw |= app.refresh_backup_warning(app::unix_now());
+
+            // Pick up `bork backup` runs from the CLI without waiting for
+            // the hourly check.
+            let status_mtime = fs::metadata(backup::status::status_path())
+                .and_then(|meta| meta.modified())
+                .ok();
+            if status_mtime != last_backup_status_mtime {
+                last_backup_status_mtime = status_mtime;
+                if let Some(file) = backup::full_backup_file() {
+                    let records = backup::status::read(&backup::status::status_path());
+                    let record = records.archives.get(&file);
+                    if let Some(indicator) = backup::schedule::on_status_change(&app.backup, record)
+                    {
+                        needs_redraw |= app.apply_backup_report(backup::schedule::Report::new(
+                            indicator, None, false, record,
+                        ));
+                    }
+                }
+            }
 
             // Pick up `bork update --check` runs from other terminals.
             let mtime = update::cache_mtime_secs();
