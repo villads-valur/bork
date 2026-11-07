@@ -1221,9 +1221,7 @@ fn run_prune_command(
 fn run_backup_command(project: Option<&str>, dry_run: bool) -> anyhow::Result<()> {
     if dry_run {
         let plans = match project {
-            Some(name) => vec![backup::plan_project(&resolve_start_project_root(Some(
-                name,
-            ))?)?],
+            Some(name) => vec![backup::plan_project(&lookup_project_root(name)?)?],
             None => backup_targets()
                 .into_iter()
                 .filter_map(|(name, path)| match backup::plan_project(&path) {
@@ -1249,7 +1247,7 @@ fn run_backup_command(project: Option<&str>, dry_run: bool) -> anyhow::Result<()
     }
 
     if let Some(name) = project {
-        let root = resolve_start_project_root(Some(name))?;
+        let root = lookup_project_root(name)?;
         let report = backup::run_project(&root)?;
         print_backup_report(name, &report);
         return Ok(());
@@ -1769,6 +1767,12 @@ fn resolve_start_project_root(project: Option<&str>) -> anyhow::Result<PathBuf> 
         return Ok(config::find_project_root());
     };
 
+    global_config::prune_stale_projects();
+    lookup_project_root(project)
+}
+
+/// Resolve a project path, name or label without touching the registry.
+fn lookup_project_root(project: &str) -> anyhow::Result<PathBuf> {
     let project_path = Path::new(project);
     if project_path.exists() {
         if let Some(root) = find_project_root_from(project_path) {
@@ -1776,9 +1780,9 @@ fn resolve_start_project_root(project: Option<&str>) -> anyhow::Result<PathBuf> 
         }
     }
 
-    global_config::prune_stale_projects();
     global_config::list_projects()
         .into_iter()
+        .filter(|entry| entry.path.exists())
         .find(|entry| entry.name == project || entry.label.as_deref() == Some(project))
         .map(|entry| entry.path)
         .ok_or_else(|| anyhow::anyhow!("Project '{}' not found", project))

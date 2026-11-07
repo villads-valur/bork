@@ -155,6 +155,7 @@ Legacy: `~/.config/bork/agents.toml` is no longer read (bork-119). A one-line st
 - Worktrees are excluded by union of `git worktree list` paths, `issue.worktree` names and child dirs with a `.git` entry. From `.bork/` only `state.json` and `config.toml` are copied.
 - Issue plans: each worktree's `.claude/planning.md` goes to `_issues/<issue-id>/planning.md`. The mirror removes stale files, except plans of issues still on the board (archived/pruned keep theirs); a plan is dropped only once its issue is deleted. If `state.json` can't be read, no plan is dropped.
 - `backup::save_issue_plan(root, issue_id, worktree_dir)` saves one plan; the worktree removal paths (archive/delete/prune) should call it before removing a worktree. It is a no-op when backups are off.
+- Safety: `resolve_project` rejects targets overlapping the project and targets shared with another registered project; selection and copy propagate read errors (only NotFound counts as gone); `mirror::prepare_parent` checks every path component from the scope dir down so stale backup symlinks can't redirect writes.
 - Restore is a manual copy-back (README). There is no manifest or restore command.
 - Runs are serialized machine-wide with a flock on `~/.config/bork/backup.lock`.
 

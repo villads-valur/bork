@@ -3,8 +3,11 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::io::ErrorKind;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+
+use anyhow::{bail, Context};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
@@ -40,7 +43,7 @@ pub fn mirror(
     let mut keep: HashSet<PathBuf> = HashSet::new();
 
     for entry in entries {
-        let Some(wrote) = sync_path(&entry.source, &dest.join(&entry.rel))? else {
+        let Some(wrote) = sync_path(&entry.source, dest, &entry.rel)? else {
             continue;
         };
         keep.insert(entry.rel.clone());
@@ -56,22 +59,57 @@ pub fn mirror(
     Ok(report)
 }
 
-/// Copy one file or symlink to `target` if it differs. `Ok(None)` when the
-/// source is missing or not a file; otherwise whether it wrote.
-pub fn sync_path(src: &Path, target: &Path) -> anyhow::Result<Option<bool>> {
-    let Ok(meta) = fs::symlink_metadata(src) else {
-        return Ok(None);
+/// Copy one file or symlink to `dest/rel` if it differs. `Ok(None)` when
+/// the source is gone or not a file; otherwise whether it wrote. Read errors
+/// other than "not found" fail, so an unreadable source never looks deleted.
+pub fn sync_path(src: &Path, dest: &Path, rel: &Path) -> anyhow::Result<Option<bool>> {
+    let meta = match fs::symlink_metadata(src) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("reading {}", src.display())),
     };
+    if !meta.file_type().is_symlink() && !meta.is_file() {
+        return Ok(None);
+    }
+    let target = prepare_parent(dest, rel)?;
     if meta.file_type().is_symlink() {
-        return sync_symlink(&fs::read_link(src)?, target).map(Some);
+        let link = fs::read_link(src).with_context(|| format!("reading {}", src.display()))?;
+        return sync_symlink(&link, &target).map(Some);
     }
-    if !meta.is_file() {
-        return Ok(None);
-    }
-    let Ok(bytes) = fs::read(src) else {
-        return Ok(None);
+    let bytes = match fs::read(src) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("reading {}", src.display())),
     };
-    sync_bytes(&bytes, meta.permissions().mode() & 0o777, target).map(Some)
+    sync_bytes(&bytes, meta.permissions().mode() & 0o777, &target).map(Some)
+}
+
+/// Make every directory between `dest` and `dest/rel` a real directory,
+/// replacing files or symlinks in the way, and return `dest/rel`. Checking
+/// each component from `dest` down means a symlink left in the backup can
+/// never redirect a write outside it.
+fn prepare_parent(dest: &Path, rel: &Path) -> anyhow::Result<PathBuf> {
+    fs::create_dir_all(dest)?;
+    let mut dir = dest.to_path_buf();
+    if let Some(parent) = rel.parent() {
+        for component in parent.components() {
+            let Component::Normal(name) = component else {
+                bail!("invalid backup path {}", rel.display());
+            };
+            dir.push(name);
+            match fs::symlink_metadata(&dir) {
+                Ok(meta) if meta.is_dir() => continue,
+                Ok(_) => fs::remove_file(&dir)?,
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+            fs::create_dir(&dir)?;
+        }
+    }
+    let Some(Component::Normal(name)) = rel.components().next_back() else {
+        bail!("invalid backup path {}", rel.display());
+    };
+    Ok(dir.join(name))
 }
 
 /// Write `bytes` to `target` (atomically) if content or mode differ.
@@ -86,9 +124,6 @@ fn sync_bytes(bytes: &[u8], mode: u32, target: &Path) -> anyhow::Result<bool> {
             remove_any(target)?;
         }
     }
-    if let Some(parent) = target.parent() {
-        ensure_dir(parent)?;
-    }
     crate::config::atomic_write(target, bytes)?;
     fs::set_permissions(target, fs::Permissions::from_mode(mode))?;
     Ok(true)
@@ -101,26 +136,8 @@ fn sync_symlink(link: &Path, target: &Path) -> anyhow::Result<bool> {
         }
         remove_any(target)?;
     }
-    if let Some(parent) = target.parent() {
-        ensure_dir(parent)?;
-    }
     std::os::unix::fs::symlink(link, target)?;
     Ok(true)
-}
-
-/// `create_dir_all`, replacing a file or symlink that sits where a directory
-/// now has to be.
-fn ensure_dir(dir: &Path) -> anyhow::Result<()> {
-    if let Ok(meta) = fs::symlink_metadata(dir) {
-        if meta.is_dir() {
-            return Ok(());
-        }
-        fs::remove_file(dir)?;
-    } else if let Some(parent) = dir.parent() {
-        ensure_dir(parent)?;
-    }
-    fs::create_dir_all(dir)?;
-    Ok(())
 }
 
 fn remove_any(path: &Path) -> anyhow::Result<()> {
@@ -253,6 +270,57 @@ mod tests {
         fs::set_permissions(&script, fs::Permissions::from_mode(0o644)).unwrap();
         let report = mirror(&entries, dest.path(), NO_RETAIN).unwrap();
         assert_eq!(report.written, vec![PathBuf::from("hook.sh")]);
+    }
+
+    #[test]
+    fn stale_symlink_in_backup_never_redirects_writes() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        write(&outside.path().join("sub/note.md"), "outside");
+        std::os::unix::fs::symlink(outside.path(), dest.path().join("plans")).unwrap();
+        write(&src.path().join("plans/sub/note.md"), "backup");
+
+        let report = mirror(
+            &[entry(src.path(), "plans/sub/note.md")],
+            dest.path(),
+            NO_RETAIN,
+        )
+        .unwrap();
+
+        assert_eq!(report.written, vec![PathBuf::from("plans/sub/note.md")]);
+        assert_eq!(
+            fs::read_to_string(outside.path().join("sub/note.md")).unwrap(),
+            "outside"
+        );
+        assert!(fs::symlink_metadata(dest.path().join("plans"))
+            .unwrap()
+            .is_dir());
+        assert_eq!(
+            fs::read_to_string(dest.path().join("plans/sub/note.md")).unwrap(),
+            "backup"
+        );
+    }
+
+    #[test]
+    fn unreadable_source_fails_instead_of_deleting_the_backup() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let file = src.path().join("private.md");
+        write(&file, "v1");
+        let entries = vec![entry(src.path(), "private.md")];
+        mirror(&entries, dest.path(), NO_RETAIN).unwrap();
+
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&file).is_ok() {
+            return; // Running as root: permissions don't apply.
+        }
+        assert!(mirror(&entries, dest.path(), NO_RETAIN).is_err());
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            fs::read_to_string(dest.path().join("private.md")).unwrap(),
+            "v1"
+        );
     }
 
     #[test]

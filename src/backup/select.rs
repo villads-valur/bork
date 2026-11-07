@@ -7,7 +7,10 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+
+use anyhow::Context;
 
 use crate::config::AppState;
 
@@ -129,7 +132,10 @@ pub fn is_ephemeral(name: &str) -> bool {
 
 /// Relative paths (files and symlinks) under `project_root` to back up,
 /// sorted. Directories are implied by their contents; empty ones are dropped.
-pub fn select_files(project_root: &Path, worktrees: &HashSet<String>) -> Vec<PathBuf> {
+pub fn select_files(
+    project_root: &Path,
+    worktrees: &HashSet<String>,
+) -> anyhow::Result<Vec<PathBuf>> {
     let mut out: BTreeSet<PathBuf> = BTreeSet::new();
 
     for name in BORK_FILES {
@@ -139,48 +145,59 @@ pub fn select_files(project_root: &Path, worktrees: &HashSet<String>) -> Vec<Pat
         }
     }
 
-    let Ok(entries) = fs::read_dir(project_root) else {
-        return out.into_iter().collect();
-    };
-    for entry in entries.flatten() {
-        let Some(name) = entry.file_name().to_str().map(String::from) else {
-            continue;
-        };
+    for name in list_dir(project_root)? {
         if name == ".bork" || name == ISSUES_DIR || worktrees.contains(&name) || is_ephemeral(&name)
         {
             continue;
         }
-        walk(project_root, Path::new(&name), &mut out);
+        walk(project_root, Path::new(&name), &mut out)?;
     }
 
-    out.into_iter().collect()
+    Ok(out.into_iter().collect())
 }
 
-fn walk(root: &Path, rel: &Path, out: &mut BTreeSet<PathBuf>) {
-    let Ok(meta) = fs::symlink_metadata(root.join(rel)) else {
-        return;
+/// Any error other than "not found" fails the selection, since a partial
+/// file list would make the mirror delete the missing files' backups.
+fn walk(root: &Path, rel: &Path, out: &mut BTreeSet<PathBuf>) -> anyhow::Result<()> {
+    let path = root.join(rel);
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
     };
     let file_type = meta.file_type();
     if file_type.is_file() || file_type.is_symlink() {
         out.insert(rel.to_path_buf());
-        return;
+        return Ok(());
     }
     if !file_type.is_dir() {
-        return;
+        return Ok(());
     }
-    let Ok(entries) = fs::read_dir(root.join(rel)) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let Some(name) = entry.file_name().to_str().map(String::from) else {
-            continue;
-        };
+    for name in list_dir(&path)? {
         // A nested repo's object store is not ours to copy.
         if name == ".git" || is_ephemeral(&name) {
             continue;
         }
-        walk(root, &rel.join(&name), out);
+        walk(root, &rel.join(&name), out)?;
     }
+    Ok(())
+}
+
+/// UTF-8 entry names of `dir`; empty if it vanished.
+fn list_dir(dir: &Path) -> anyhow::Result<Vec<String>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err).with_context(|| format!("reading {}", dir.display())),
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
+        if let Some(name) = entry.file_name().to_str() {
+            names.push(name.to_string());
+        }
+    }
+    Ok(names)
 }
 
 #[cfg(test)]
@@ -256,7 +273,7 @@ mod tests {
             ],
             &state,
         );
-        let selected = select_files(root, &worktrees);
+        let selected = select_files(root, &worktrees).unwrap();
 
         assert_eq!(
             selected,
@@ -310,8 +327,24 @@ mod tests {
         );
         // `_issues` in the container is never picked up as a container entry.
         assert!(select_files(root, &HashSet::new())
+            .unwrap()
             .iter()
             .all(|p| !p.starts_with(ISSUES_DIR)));
+    }
+
+    #[test]
+    fn unreadable_dir_fails_the_selection() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "plans/a.md");
+        let plans = dir.path().join("plans");
+        fs::set_permissions(&plans, fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = fs::read_dir(&plans).is_ok(); // true when running as root
+        let result = select_files(dir.path(), &HashSet::new());
+        fs::set_permissions(&plans, fs::Permissions::from_mode(0o755)).unwrap();
+        if !readable {
+            assert!(result.is_err());
+        }
     }
 
     #[test]
@@ -320,7 +353,7 @@ mod tests {
         let root = dir.path();
         touch(root, "AGENTS.md");
         std::os::unix::fs::symlink("AGENTS.md", root.join("CLAUDE.md")).unwrap();
-        let selected = select_files(root, &HashSet::new());
+        let selected = select_files(root, &HashSet::new()).unwrap();
         assert_eq!(selected, paths(&["AGENTS.md", "CLAUDE.md"]));
     }
 }

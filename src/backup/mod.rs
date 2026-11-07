@@ -43,7 +43,8 @@ pub struct Plan {
     pub entries: Vec<Entry>,
     /// Issue plans to keep in the backup even without a live source: every
     /// issue still on the board (archived and pruned ones included). `None`
-    /// keeps all of them, used when the board can't be read.
+    /// means the board is missing or unreadable: keep every plan, and keep the
+    /// backed-up board too.
     pub board_issue_ids: Option<HashSet<String>>,
 }
 
@@ -55,6 +56,9 @@ impl Plan {
     /// Whether a stale destination file must survive the mirror. Only issue
     /// plans are retained, and only while their issue is on the board.
     fn retains(&self, rel: &Path) -> bool {
+        if self.board_issue_ids.is_none() && rel == Path::new(".bork/state.json") {
+            return true;
+        }
         let mut parts = rel.components();
         if parts.next() != Some(Component::Normal(ISSUES_DIR.as_ref())) {
             return false;
@@ -75,12 +79,18 @@ pub fn plan_project(project_root: &Path) -> anyhow::Result<Plan> {
     let root = crate::global_config::normalize_path(project_root);
     let (backup, dest_root, scope) = resolve_project(&root)?;
 
-    let state = crate::config::try_load_state(&root);
+    // A missing board loads as an empty one, which must not read as "every
+    // issue was deleted".
+    let state = if crate::config::state_mtime(&root).is_some() {
+        crate::config::try_load_state(&root)
+    } else {
+        None
+    };
     let board = state.clone().unwrap_or_default();
     let git_paths = select::git_worktree_paths(&root);
     let worktrees = select::worktree_dirs(&root, &git_paths, &board);
 
-    let mut entries: Vec<Entry> = select::select_files(&root, &worktrees)
+    let mut entries: Vec<Entry> = select::select_files(&root, &worktrees)?
         .into_iter()
         .map(|rel| Entry {
             source: root.join(&rel),
@@ -198,9 +208,8 @@ pub fn save_issue_plan(
     }
     let (_, dest_root, scope) = resolve_project(&root)?;
     let source = root.join(worktree_dir).join(PLAN_FILE);
-    let target = dest_root.join(scope).join(issue_plan_rel(issue_id));
     let _lock = lock_backups();
-    Ok(mirror::sync_path(&source, &target)?.is_some())
+    Ok(mirror::sync_path(&source, &dest_root.join(scope), &issue_plan_rel(issue_id))?.is_some())
 }
 
 /// Relative destination path of an issue's plan.
@@ -224,7 +233,65 @@ fn resolve_project(root: &Path) -> anyhow::Result<(BackupConfig, PathBuf, String
     if !select::is_plain_component(&scope) || scope == GLOBAL_SCOPE {
         bail!("project name {scope:?} can't be used as a backup directory name");
     }
+
+    // The mirror deletes stale files under the target, so it must never be
+    // the project itself, sit inside it, or contain it.
+    let target = resolve_through_existing(&dest_root.join(&scope));
+    if target.starts_with(root) || root.starts_with(&target) {
+        bail!(
+            "backup target {} overlaps the project at {}; pick a path outside the project",
+            target.display(),
+            root.display()
+        );
+    }
+    if let Some(other) = other_project_with_target(root, &target) {
+        bail!(
+            "{} also backs up to {}; give one of them a different project_name or backup path",
+            other.display(),
+            target.display()
+        );
+    }
     Ok((backup, dest_root, scope))
+}
+
+/// Another registered, opted-in project whose backup lands in `target`.
+/// Registered projects may share a `project_name`, and the second mirror
+/// would erase the first one's backup.
+fn other_project_with_target(root: &Path, target: &Path) -> Option<PathBuf> {
+    crate::global_config::list_projects()
+        .into_iter()
+        .map(|p| crate::global_config::normalize_path(&p.path))
+        .filter(|path| path != root)
+        .find(|path| {
+            let backup = config::load_for_project(path);
+            let Some(dest_root) = backup.path.filter(|_| backup.enabled) else {
+                return false;
+            };
+            let name = crate::config::load_config_from(path).project_name;
+            resolve_through_existing(&dest_root.join(name)) == target
+        })
+}
+
+/// Canonicalize the deepest existing ancestor of `path` and append the rest,
+/// so symlinks and `..` resolve even before the target exists.
+fn resolve_through_existing(path: &Path) -> PathBuf {
+    let mut existing = path;
+    let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
+    loop {
+        if let Ok(canonical) = existing.canonicalize() {
+            return rest
+                .iter()
+                .rev()
+                .fold(canonical, |acc, part| acc.join(part));
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name);
+                existing = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
 }
 
 fn finish(
@@ -394,6 +461,70 @@ mod tests {
             run_project(root).unwrap();
             assert!(!plan_path.exists());
         });
+    }
+
+    #[test]
+    fn missing_board_keeps_plans_and_backed_up_board() {
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let project = project(dest.path());
+        let root = project.path();
+        let backup = dest.path().join("demo");
+        save_board(root, &[("demo-1", None)]);
+        write(&backup.join("_issues/demo-1/planning.md"), "archived plan");
+
+        crate::global_config::with_test_config_home(home.path(), || {
+            run_project(root).unwrap();
+            fs::remove_file(root.join(".bork/state.json")).unwrap();
+            run_project(root).unwrap();
+            assert!(backup.join("_issues/demo-1/planning.md").exists());
+            assert!(backup.join(".bork/state.json").exists());
+        });
+    }
+
+    #[test]
+    fn refuses_targets_overlapping_the_project() {
+        let home = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("demo");
+        write(&root.join("main/src.rs"), "code");
+        for path in [parent.path().to_path_buf(), root.join("backups")] {
+            write(
+                &root.join(".bork/config.toml"),
+                &format!(
+                    "project_name = \"demo\"\n[backup]\nenabled = true\npath = \"{}\"\n",
+                    path.display()
+                ),
+            );
+            crate::global_config::with_test_config_home(home.path(), || {
+                let err = run_project(&root).unwrap_err();
+                assert!(format!("{err:#}").contains("overlaps"), "{err:#}");
+            });
+        }
+        assert!(root.join("main/src.rs").exists());
+    }
+
+    #[test]
+    fn refuses_two_projects_sharing_a_target() {
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let first = project(dest.path());
+        let second = project(dest.path());
+        write(&first.path().join("first.md"), "1");
+        write(&second.path().join("second.md"), "2");
+
+        crate::global_config::with_test_config_home(home.path(), || {
+            crate::global_config::register_project("demo", first.path()).unwrap();
+            run_project(first.path()).unwrap();
+
+            crate::global_config::register_project("demo", second.path()).unwrap();
+            for root in [first.path(), second.path()] {
+                let err = run_project(root).unwrap_err();
+                assert!(format!("{err:#}").contains("also backs up"), "{err:#}");
+            }
+        });
+        assert!(dest.path().join("demo/first.md").exists());
+        assert!(!dest.path().join("demo/second.md").exists());
     }
 
     #[test]

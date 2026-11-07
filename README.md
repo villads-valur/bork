@@ -498,6 +498,8 @@ What lands in `<path>/<project_name>/`:
 
 The folder mirrors the project: files removed from the project are removed from the backup. Issue plans are the exception. An archived or pruned issue keeps its plan in the backup, which is only dropped once the issue is deleted from the board.
 
+A backup refuses to run when `path` overlaps the project itself, or when another registered project with the same `project_name` backs up to the same folder. A file it can't read fails the run instead of being dropped from the backup, and a missing `.bork/state.json` never removes saved issue plans.
+
 ```bash
 bork backup                     # all opted-in projects + global files
 bork backup --project bork      # one project
