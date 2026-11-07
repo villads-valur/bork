@@ -108,6 +108,9 @@ const PORT_POLL_INTERVAL: Duration = Duration::from_secs(10);
 const LINEAR_POLL_INTERVAL: Duration = Duration::from_secs(45);
 const TUICR_POLL_INTERVAL: Duration = Duration::from_secs(10);
 const PR_POLL_INTERVAL: Duration = Duration::from_secs(60);
+/// PR polling for projects that are neither focused nor a swimlane. Only
+/// feeds the sidebar's needs-you dot, so it can run slower.
+const BACKGROUND_PR_POLL_INTERVAL: Duration = Duration::from_secs(180);
 const STATE_POLL_TICKS: usize = 40; // 40 * 50ms = 2s
 /// Minimum interval between auto-prune checks (and thus toasts) for the same
 /// project. Keeps the tick loop from counting worktrees constantly and the
@@ -405,6 +408,7 @@ fn spawn_pr_poll_worker(
     targets: Arc<Mutex<github_poll::Targets>>,
     suspended: Arc<AtomicBool>,
     wake_rx: mpsc::Receiver<github_poll::Wake>,
+    interval: Duration,
 ) -> mpsc::Receiver<PrPollResult> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
@@ -479,7 +483,7 @@ fn spawn_pr_poll_worker(
                 let _ = tx.send(cache.result.clone());
             }
             force = false;
-            let wait = PR_POLL_INTERVAL
+            let wait = interval
                 .saturating_sub(cycle_started.elapsed())
                 .max(Duration::from_secs(1));
             match wake_rx.recv_timeout(wait) {
@@ -1836,6 +1840,55 @@ fn spawn_shared_workers() -> SharedWorkers {
     }
 }
 
+/// PR-only poller for a project that is neither focused nor a swimlane, so
+/// its sidebar dot reflects PR attention without git or agent-status workers.
+struct BackgroundPrWorker {
+    pr_rx: mpsc::Receiver<PrPollResult>,
+    pr_wake_tx: mpsc::Sender<github_poll::Wake>,
+    targets: Arc<Mutex<github_poll::Targets>>,
+}
+
+fn spawn_background_pr_worker(
+    project: &app::Project,
+    suspended: &Arc<AtomicBool>,
+) -> BackgroundPrWorker {
+    let targets = Arc::new(Mutex::new(github_poll::Targets::for_project(project)));
+    let (pr_wake_tx, pr_wake_rx) = mpsc::channel();
+    let pr_rx = spawn_pr_poll_worker(
+        project.config.project_root.join("main"),
+        targets.clone(),
+        suspended.clone(),
+        pr_wake_rx,
+        BACKGROUND_PR_POLL_INTERVAL,
+    );
+    BackgroundPrWorker {
+        pr_rx,
+        pr_wake_tx,
+        targets,
+    }
+}
+
+/// Only stores the PR data: imports and title rewrites wait until the project
+/// is shown and gets its full workers.
+fn drain_background_pr_worker(project: &mut app::Project, worker: &BackgroundPrWorker) -> bool {
+    let requested = github_poll::Targets::for_project(project);
+    let mut targets = worker
+        .targets
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if *targets != requested {
+        *targets = requested;
+        let _ = worker.pr_wake_tx.send(github_poll::Wake::TargetsChanged);
+    }
+    drop(targets);
+
+    let mut needs_redraw = false;
+    while let Ok(pr_result) = worker.pr_rx.try_recv() {
+        needs_redraw |= apply_pr_result(project, pr_result) != PrApplied::Unchanged;
+    }
+    needs_redraw
+}
+
 fn spawn_project_workers(
     project: &app::Project,
     suspended: &Arc<AtomicBool>,
@@ -1865,6 +1918,7 @@ fn spawn_project_workers(
         linked_prs.clone(),
         suspended.clone(),
         pr_wake_rx,
+        PR_POLL_INTERVAL,
     );
 
     ProjectWorkers {
@@ -1877,6 +1931,79 @@ fn spawn_project_workers(
         pr_wake_tx,
         linked_prs,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrApplied {
+    Unchanged,
+    /// Only loading state or the GitHub user changed.
+    Redraw,
+    /// PR data changed, so imports and title rewrites should run.
+    DataChanged,
+}
+
+/// Store one PR poll result in the project's live state. Shared by the full
+/// project workers and the PR-only background poller.
+fn apply_pr_result(project: &mut app::Project, pr_result: PrPollResult) -> PrApplied {
+    project.github_available = !pr_result.gh_missing;
+    let live = &mut project.live;
+    if pr_result.started {
+        live.gh_missing = false;
+        live.pr_refreshing = true;
+        return PrApplied::Redraw;
+    }
+    let changed = !pr_result.refreshed_stacks.is_empty()
+        || live.gh_missing != pr_result.gh_missing
+        || live.stacks_unsupported != pr_result.stacks_unsupported
+        || live.pr_refreshing
+        || live.authored_prs_ready != Some(pr_result.authored_ready)
+        || live.review_prs_ready != Some(pr_result.reviews_ready)
+        || live.stack_errors != pr_result.stack_errors
+        || !live.pr_poll_done
+        || live.pr_loading_more != pr_result.loading_more
+        || live.github_error != pr_result.error
+        || live.stacks_available != pr_result.stacks.is_some()
+        || live.pr_statuses != pr_result.prs
+        || live.pr_statuses_by_number != pr_result.prs_by_number
+        || pr_result
+            .stacks
+            .as_ref()
+            .is_some_and(|stacks| live.github_stacks != *stacks)
+        || live.user_prs != pr_result.user_prs
+        || live.review_requested_prs != pr_result.review_requested_prs
+        || live.review_stacks != pr_result.review_stacks
+        || live.changes_requested_prs != pr_result.changes_requested_prs;
+    let mut user_changed = false;
+    if pr_result.github_user.is_some() && live.github_user != pr_result.github_user {
+        live.github_user = pr_result.github_user;
+        user_changed = true;
+    }
+    if !changed {
+        if user_changed {
+            return PrApplied::Redraw;
+        }
+        return PrApplied::Unchanged;
+    }
+    live.pr_refreshing = false;
+    live.authored_prs_ready = Some(pr_result.authored_ready);
+    live.review_prs_ready = Some(pr_result.reviews_ready);
+    live.stack_errors = pr_result.stack_errors;
+    live.gh_missing = pr_result.gh_missing;
+    live.stacks_unsupported = pr_result.stacks_unsupported;
+    live.github_error = pr_result.error;
+    live.pr_loading_more = pr_result.loading_more;
+    live.pr_statuses = pr_result.prs;
+    live.pr_statuses_by_number = pr_result.prs_by_number;
+    live.stacks_available = pr_result.stacks.is_some();
+    if let Some(stacks) = pr_result.stacks {
+        live.github_stacks = stacks;
+    }
+    live.user_prs = pr_result.user_prs;
+    live.review_requested_prs = pr_result.review_requested_prs;
+    live.review_stacks = pr_result.review_stacks;
+    live.changes_requested_prs = pr_result.changes_requested_prs;
+    live.pr_poll_done = true;
+    PrApplied::DataChanged
 }
 
 /// Outcome of draining one project's worker channels for a single tick.
@@ -1970,64 +2097,13 @@ fn drain_project_workers(
     let mut pr_data_changed = false;
     let mut refreshed_stacks = HashSet::new();
     while let Ok(pr_result) = workers.pr_rx.try_recv() {
-        project.github_available = !pr_result.gh_missing;
-        let live = &mut project.live;
-        if pr_result.started {
-            live.gh_missing = false;
-            live.pr_refreshing = true;
-            needs_redraw = true;
-            continue;
-        }
         refreshed_stacks.extend(&pr_result.refreshed_stacks);
-        let changed = !pr_result.refreshed_stacks.is_empty()
-            || live.gh_missing != pr_result.gh_missing
-            || live.stacks_unsupported != pr_result.stacks_unsupported
-            || live.pr_refreshing
-            || live.authored_prs_ready != Some(pr_result.authored_ready)
-            || live.review_prs_ready != Some(pr_result.reviews_ready)
-            || live.stack_errors != pr_result.stack_errors
-            || !live.pr_poll_done
-            || live.pr_loading_more != pr_result.loading_more
-            || live.github_error != pr_result.error
-            || live.stacks_available != pr_result.stacks.is_some()
-            || live.pr_statuses != pr_result.prs
-            || live.pr_statuses_by_number != pr_result.prs_by_number
-            || pr_result
-                .stacks
-                .as_ref()
-                .is_some_and(|stacks| live.github_stacks != *stacks)
-            || live.user_prs != pr_result.user_prs
-            || live.review_requested_prs != pr_result.review_requested_prs
-            || live.review_stacks != pr_result.review_stacks
-            || live.changes_requested_prs != pr_result.changes_requested_prs;
-        if pr_result.github_user.is_some() && live.github_user != pr_result.github_user {
-            live.github_user = pr_result.github_user;
-            needs_redraw = true;
-        }
-        if !changed {
+        let applied = apply_pr_result(project, pr_result);
+        needs_redraw |= applied != PrApplied::Unchanged;
+        if applied != PrApplied::DataChanged {
             continue;
         }
-        needs_redraw = true;
         pr_data_changed = true;
-        live.pr_refreshing = false;
-        live.authored_prs_ready = Some(pr_result.authored_ready);
-        live.review_prs_ready = Some(pr_result.reviews_ready);
-        live.stack_errors = pr_result.stack_errors;
-        live.gh_missing = pr_result.gh_missing;
-        live.stacks_unsupported = pr_result.stacks_unsupported;
-        live.github_error = pr_result.error;
-        live.pr_loading_more = pr_result.loading_more;
-        live.pr_statuses = pr_result.prs;
-        live.pr_statuses_by_number = pr_result.prs_by_number;
-        live.stacks_available = pr_result.stacks.is_some();
-        if let Some(stacks) = pr_result.stacks {
-            live.github_stacks = stacks;
-        }
-        live.user_prs = pr_result.user_prs;
-        live.review_requested_prs = pr_result.review_requested_prs;
-        live.review_stacks = pr_result.review_stacks;
-        live.changes_requested_prs = pr_result.changes_requested_prs;
-        live.pr_poll_done = true;
 
         // Rewrite imported issue titles from the fresh PR titles.
         let pr_titles: Vec<(u32, String)> = project
@@ -2259,6 +2335,7 @@ fn run_tui() -> anyhow::Result<()> {
     let git_pool = GitStatusPool::new(GIT_STATUS_CONCURRENCY);
     let mut workers = spawn_project_workers(app.project(), &shared.poll_suspended, &git_pool);
     let mut swimlane_workers: HashMap<ProjectId, ProjectWorkers> = HashMap::new();
+    let mut background_pr_workers: HashMap<ProjectId, BackgroundPrWorker> = HashMap::new();
 
     // --- Agent status poller for the sidebar's needs-you dots ---
     let activity_rx = if app.sidebar.is_some() {
@@ -2606,6 +2683,28 @@ fn run_tui() -> anyhow::Result<()> {
             swimlane_workers.clear();
         }
 
+        // --- Sync background PR workers (sidebar dots for hidden projects) ---
+        if app.sidebar.is_some() {
+            let hidden: HashSet<ProjectId> = app
+                .projects
+                .iter()
+                .map(|project| project.id())
+                .filter(|id| *id != app.focused_project && !swimlane_workers.contains_key(id))
+                .collect();
+            background_pr_workers.retain(|id, _| hidden.contains(id));
+            for project in &app.projects {
+                let id = project.id();
+                if hidden.contains(&id) && !background_pr_workers.contains_key(&id) {
+                    background_pr_workers.insert(
+                        id,
+                        spawn_background_pr_worker(project, &shared.poll_suspended),
+                    );
+                }
+            }
+        } else {
+            background_pr_workers.clear();
+        }
+
         // Drain all queued poll results but only redraw when data changed:
         // workers send every interval regardless, and undiffed assignment
         // would rebuild the whole widget tree every 2s while idle.
@@ -2788,6 +2887,12 @@ fn run_tui() -> anyhow::Result<()> {
             port_sess.clear();
             for project in &app.projects {
                 port_sess.extend(project.live.active_sessions.iter().cloned());
+            }
+        }
+
+        for project in &mut app.projects {
+            if let Some(worker) = background_pr_workers.get(&project.id()) {
+                needs_redraw |= drain_background_pr_worker(project, worker);
             }
         }
 
@@ -3081,6 +3186,7 @@ mod tests {
             })),
             Arc::new(AtomicBool::new(false)),
             wake_rx,
+            PR_POLL_INTERVAL,
         );
         let start = std::time::Instant::now();
         let mut updates = 0;
