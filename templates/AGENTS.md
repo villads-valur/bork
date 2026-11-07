@@ -20,7 +20,7 @@ Managed with bork across git worktrees and tmux.
 - If your issue has a worktree, `cd` into `{issue-id}-{slug}/` and do everything there: reading, edits, git, builds and tests. Use absolute paths, since each shell call may start back in the container.
 - If `bork issue show` lists a `PR:`, push to that PR's head branch instead of opening a new PR. Check `git branch --show-current` first, because the worktree branch may be named `{issue-id}/{slug}`.
 - `main/` tracks the default branch. Read it for reference, but never edit, commit or switch branches there.
-- Issues without a worktree (orchestrators, status checks) are read-only. Spin off code changes with `bork issue start`.
+- Issues without a worktree (like orchestrators) don't change code directly. Spin off code changes with `bork issue start`.
 - Project instructions are in `CLAUDE.md` at the repo root. Read the copy in your worktree, since it may differ from `main/`.
 - Don't edit `.bork/state.json` by hand. Use the `bork issue` and `bork integration` commands.
 
