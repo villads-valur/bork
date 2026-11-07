@@ -24,15 +24,30 @@ pub struct ArchiveEntry {
     pub follow: bool,
 }
 
+/// Every entry's content, read once. The fingerprint and the archive are
+/// both built from this snapshot, so a file edited mid-run can't leave the
+/// archive and its recorded fingerprint out of step.
+pub struct Contents(Vec<(String, Source)>);
+
+/// Read every entry. Read errors other than "not found" fail; a source that
+/// vanished is left out.
+pub fn load(entries: &[ArchiveEntry]) -> anyhow::Result<Contents> {
+    let mut contents = Vec::with_capacity(entries.len());
+    for entry in entries {
+        contents.push((entry.path.clone(), read_source(entry)?));
+    }
+    Ok(Contents(contents))
+}
+
 /// Content fingerprint of `manifest` plus every entry (path, mode, bytes or
 /// link target). Equal fingerprints mean the archive would be identical, so
-/// the write can be skipped. Read errors other than "not found" fail.
-pub fn fingerprint(manifest: &[u8], entries: &[ArchiveEntry]) -> anyhow::Result<String> {
+/// the write can be skipped.
+pub fn fingerprint(manifest: &[u8], contents: &Contents) -> String {
     let mut hasher = DefaultHasher::new();
     manifest.hash(&mut hasher);
-    for entry in entries {
-        entry.path.hash(&mut hasher);
-        match read_source(entry)? {
+    for (path, source) in &contents.0 {
+        path.hash(&mut hasher);
+        match source {
             Source::Missing => 0u8.hash(&mut hasher),
             Source::Link(target) => {
                 1u8.hash(&mut hasher);
@@ -45,22 +60,22 @@ pub fn fingerprint(manifest: &[u8], entries: &[ArchiveEntry]) -> anyhow::Result<
             }
         }
     }
-    Ok(format!("{:016x}", hasher.finish()))
+    format!("{:016x}", hasher.finish())
 }
 
-/// Write `manifest.json` plus `entries` to `dest` as a gzipped tarball,
+/// Write `manifest.json` plus `contents` to `dest` as a gzipped tarball,
 /// atomically. Returns the archive size in bytes.
-pub fn write(dest: &Path, manifest: &[u8], entries: &[ArchiveEntry]) -> anyhow::Result<u64> {
+pub fn write(dest: &Path, manifest: &[u8], contents: &Contents) -> anyhow::Result<u64> {
     let staging = Staging::new()?;
     stage_file(&staging.0, super::manifest::MANIFEST_FILE, manifest, 0o644)?;
-    for entry in entries {
-        match read_source(entry)? {
+    for (path, source) in &contents.0 {
+        match source {
             Source::Missing => {}
             Source::Link(target) => {
-                let path = staged_path(&staging.0, &entry.path)?;
-                std::os::unix::fs::symlink(target, path)?;
+                let staged = staged_path(&staging.0, path)?;
+                std::os::unix::fs::symlink(target, staged)?;
             }
-            Source::File(bytes, mode) => stage_file(&staging.0, &entry.path, &bytes, mode)?,
+            Source::File(bytes, mode) => stage_file(&staging.0, path, bytes, *mode)?,
         }
     }
 
@@ -124,7 +139,7 @@ pub fn read_manifest(file: &Path) -> anyhow::Result<super::manifest::Manifest> {
         .with_context(|| format!("parsing the manifest of {}", file.display()))
 }
 
-enum Source {
+pub(crate) enum Source {
     Missing,
     Link(PathBuf),
     File(Vec<u8>, u32),
@@ -284,7 +299,7 @@ mod tests {
             entry(src.path(), "gone.md", "projects/p/gone.md"),
         ];
 
-        let size = write(&dest, b"{}", &entries).unwrap();
+        let size = write(&dest, b"{}", &load(&entries).unwrap()).unwrap();
 
         assert_eq!(size, fs::metadata(&dest).unwrap().len());
         assert_eq!(
@@ -318,7 +333,7 @@ mod tests {
             .unwrap();
         let mut e = entry(src.path(), "state.json", "projects/p/.bork/state.json");
         e.follow = true;
-        write(&dest, b"{}", &[e]).unwrap();
+        write(&dest, b"{}", &load(&[e]).unwrap()).unwrap();
         assert_eq!(
             extract(&dest, "projects/p/.bork/state.json"),
             "{\"issues\":[]}"
@@ -331,16 +346,17 @@ mod tests {
         let file = src.path().join("a.md");
         write_file(&file, "v1");
         let entries = vec![entry(src.path(), "a.md", "projects/p/a.md")];
-        let base = fingerprint(b"m", &entries).unwrap();
-        assert_eq!(base, fingerprint(b"m", &entries).unwrap());
-        assert_ne!(base, fingerprint(b"other", &entries).unwrap());
+        let fp = |manifest: &[u8]| fingerprint(manifest, &load(&entries).unwrap());
+        let base = fp(b"m");
+        assert_eq!(base, fp(b"m"));
+        assert_ne!(base, fp(b"other"));
 
         write_file(&file, "v2");
-        let changed = fingerprint(b"m", &entries).unwrap();
+        let changed = fp(b"m");
         assert_ne!(base, changed);
 
         fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).unwrap();
-        assert_ne!(changed, fingerprint(b"m", &entries).unwrap());
+        assert_ne!(changed, fp(b"m"));
     }
 
     #[test]
@@ -351,7 +367,7 @@ mod tests {
         fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
         let readable = fs::read(&file).is_ok(); // true when running as root
         let entries = vec![entry(src.path(), "private.md", "projects/p/private.md")];
-        let result = fingerprint(b"m", &entries);
+        let result = load(&entries);
         fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
         if !readable {
             assert!(result.is_err());
