@@ -104,11 +104,13 @@ pub fn plan(selection: &Selection) -> anyhow::Result<Option<Plan>> {
     let (roots, file_name) = match selection {
         Selection::All => {
             let mut seen = HashSet::new();
-            let roots: Vec<PathBuf> = registry
-                .iter()
-                .map(|p| crate::global_config::normalize_path(&p.path))
-                .filter(|root| seen.insert(root.clone()) && config::project_enabled(root))
-                .collect();
+            let mut roots: Vec<PathBuf> = Vec::new();
+            for entry in &registry {
+                let root = crate::global_config::normalize_path(&entry.path);
+                if seen.insert(root.clone()) && config::project_enabled(&root)? {
+                    roots.push(root);
+                }
+            }
             if roots.is_empty() {
                 return Ok(None);
             }
@@ -116,7 +118,7 @@ pub fn plan(selection: &Selection) -> anyhow::Result<Option<Plan>> {
         }
         Selection::Project(root) => {
             let root = crate::global_config::normalize_path(root);
-            if !config::project_enabled(&root) {
+            if !config::project_enabled(&root)? {
                 bail!(
                     "backups are not enabled for {} (set `enabled = true` under [backup] in .bork/config.toml)",
                     root.display()
@@ -125,6 +127,23 @@ pub fn plan(selection: &Selection) -> anyhow::Result<Option<Plan>> {
             let name = crate::config::load_config_from(&root).project_name;
             if !select::is_plain_component(&name) {
                 bail!("project name {name:?} can't be used in a file name");
+            }
+            // Same-named projects share a file name; never let one replace
+            // another's single-project backup.
+            let file = dir.join(format!("bork-backup-{name}.tar.gz"));
+            let records = status::read(&status::status_path());
+            if let Some(owner) = records
+                .archives
+                .get(&file)
+                .and_then(|record| record.paths.first())
+                .filter(|owner| **owner != root)
+            {
+                bail!(
+                    "{} holds the backup of {}; give {} a different project_name",
+                    file.display(),
+                    owner.display(),
+                    root.display()
+                );
             }
             (vec![root], format!("bork-backup-{name}.tar.gz"))
         }
@@ -158,7 +177,7 @@ pub fn plan(selection: &Selection) -> anyhow::Result<Option<Plan>> {
         let global_dir = crate::global_config::global_config_dir();
         for name in GLOBAL_FILES {
             let source = global_dir.join(name);
-            if fs::metadata(&source).is_ok_and(|m| m.is_file()) {
+            if select::is_existing_file(&source)? {
                 let path = format!("{GLOBAL_DIR}/{name}");
                 global_files.push(path.clone());
                 entries.push(ArchiveEntry {
@@ -206,6 +225,12 @@ pub fn run(selection: &Selection) -> anyhow::Result<Option<Outcome>> {
                 ok: true,
                 size: outcome.size,
                 projects: outcome.projects.clone(),
+                paths: plan
+                    .manifest
+                    .projects
+                    .iter()
+                    .map(|p| p.path.clone())
+                    .collect(),
                 fingerprint: Some(fingerprint.clone()),
                 changed: outcome.written,
                 ..ArchiveStatus::default()
@@ -254,7 +279,7 @@ pub fn save_issue_plan(
     issue_id: &str,
     worktree_dir: &str,
 ) -> anyhow::Result<bool> {
-    if !config::project_enabled(project_root) {
+    if !config::project_enabled(project_root)? {
         return Ok(false);
     }
     if !select::is_plain_component(issue_id) || !select::is_plain_component(worktree_dir) {
@@ -314,7 +339,7 @@ fn project_part(
     }
 
     let mut plans = HashMap::new();
-    for (issue_id, source) in select::issue_plans(root, &board) {
+    for (issue_id, source) in select::issue_plans(root, &board)? {
         let rel = format!("{ISSUES_DIR}/{issue_id}/{PLAN_NAME}");
         let path = format!("{prefix}/{rel}");
         plans.insert(issue_id, path.clone());
@@ -761,6 +786,92 @@ mod tests {
             assert!(!is_due(success));
             assert!(!is_due(success + BACKUP_MAX_AGE_SECS - 1));
             assert!(is_due(success + BACKUP_MAX_AGE_SECS));
+        });
+    }
+
+    /// Make `path` unreadable for the duration of `check`, restoring it
+    /// after. Skips the check when permissions don't apply (root).
+    fn with_unreadable(path: &Path, check: impl FnOnce()) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path).unwrap().permissions().mode();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+        let blocked = if path.is_dir() {
+            fs::read_dir(path).is_err()
+        } else {
+            fs::read(path).is_err()
+        };
+        if blocked {
+            check();
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn unreadable_inputs_fail_instead_of_shrinking_the_backup() {
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            set_global_path(dest.path());
+            let alpha = project("alpha", true);
+            let beta = project("beta", true);
+            let root = alpha.path();
+            save_board(root, &[("alpha-1", Some("alpha-1-task"))]);
+            write(&root.join("alpha-1-task/.git"), "gitdir: x");
+            write(&root.join("alpha-1-task/.claude/planning.md"), "plan");
+            write(&beta.path().join("AGENTS.md"), "b");
+            let first = run(&Selection::All).unwrap().unwrap();
+            let keeps_previous = |result: anyhow::Result<Option<Outcome>>| {
+                assert!(result.is_err());
+                assert_eq!(fs::metadata(&first.file).unwrap().len(), first.size);
+            };
+
+            with_unreadable(&root.join(".bork/config.toml"), || {
+                keeps_previous(run(&Selection::All));
+            });
+            with_unreadable(&root.join("alpha-1-task/.claude"), || {
+                keeps_previous(run(&Selection::All));
+            });
+
+            // A symlink loop is an error, not a missing board.
+            let state = root.join(".bork/state.json");
+            fs::rename(&state, root.join(".bork/state.json.bak")).unwrap();
+            std::os::unix::fs::symlink(&state, &state).unwrap();
+            keeps_previous(run(&Selection::All));
+        });
+    }
+
+    #[test]
+    fn single_project_file_is_not_taken_over_by_a_same_named_project() {
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            set_global_path(dest.path());
+            let first = project("demo", true);
+            let second = project("demo", true);
+            write(&first.path().join("AGENTS.md"), "1");
+            write(&second.path().join("AGENTS.md"), "2");
+
+            let outcome = run(&Selection::Project(first.path().to_path_buf()))
+                .unwrap()
+                .unwrap();
+            let err = run(&Selection::Project(second.path().to_path_buf())).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("holds the backup of"),
+                "{err:#}"
+            );
+            let manifest = read_manifest(&outcome.file);
+            assert_eq!(
+                manifest.projects[0].path,
+                crate::global_config::normalize_path(first.path())
+            );
+            // The owner can still update it.
+            write(&first.path().join("AGENTS.md"), "1b");
+            assert!(
+                run(&Selection::Project(first.path().to_path_buf()))
+                    .unwrap()
+                    .unwrap()
+                    .written
+            );
         });
     }
 

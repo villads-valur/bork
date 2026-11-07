@@ -1274,12 +1274,11 @@ fn run_backup_status() -> anyhow::Result<()> {
 
     println!("projects:");
     for entry in global_config::list_projects() {
-        let state = if backup::config::project_enabled(&entry.path) {
-            "on"
-        } else {
-            "off"
-        };
-        println!("  {}: {state}", entry.name);
+        match backup::config::project_enabled(&entry.path) {
+            Ok(true) => println!("  {}: on", entry.name),
+            Ok(false) => println!("  {}: off", entry.name),
+            Err(err) => println!("  {}: unknown ({err:#})", entry.name),
+        }
     }
 
     let records = backup::status::read(&backup::status::status_path()).archives;

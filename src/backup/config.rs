@@ -5,7 +5,10 @@
 //! `bork backup`.
 
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+
+use anyhow::Context;
 
 use crate::toml_lite::{self, Table};
 
@@ -30,10 +33,19 @@ impl BackupLayer {
     }
 
     pub fn from_file(path: &Path) -> Self {
-        let Ok(contents) = fs::read_to_string(path) else {
-            return Self::default();
-        };
-        Self::from_table(&toml_lite::parse_with_warnings(&contents).0)
+        Self::try_from_file(path).unwrap_or_default()
+    }
+
+    /// Like [`from_file`](Self::from_file), but only a missing file counts
+    /// as empty; any other read error is returned.
+    pub fn try_from_file(path: &Path) -> anyhow::Result<Self> {
+        match fs::read_to_string(path) {
+            Ok(contents) => Ok(Self::from_table(
+                &toml_lite::parse_with_warnings(&contents).0,
+            )),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(Self::default()),
+            Err(err) => Err(err).with_context(|| format!("reading {}", path.display())),
+        }
     }
 }
 
@@ -57,10 +69,11 @@ pub fn load_settings() -> BackupSettings {
 }
 
 /// Whether the project opted in to backups (project file only, default off).
-pub fn project_enabled(project_root: &Path) -> bool {
-    BackupLayer::from_file(&crate::config::config_path(project_root))
-        .enabled
-        .unwrap_or(false)
+/// An unreadable config is an error, not "off": treating it as off would
+/// silently drop the project from the next backup.
+pub fn project_enabled(project_root: &Path) -> anyhow::Result<bool> {
+    let layer = BackupLayer::try_from_file(&crate::config::config_path(project_root))?;
+    Ok(layer.enabled.unwrap_or(false))
 }
 
 pub fn expand_tilde(path: &str) -> PathBuf {
@@ -125,14 +138,24 @@ path = "~/Backups"
     #[test]
     fn project_opt_in_is_project_file_only() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(!project_enabled(dir.path()));
+        assert!(!project_enabled(dir.path()).unwrap());
         std::fs::create_dir_all(dir.path().join(".bork")).unwrap();
         std::fs::write(
             dir.path().join(".bork/config.toml"),
             "[backup]\nenabled = true\n",
         )
         .unwrap();
-        assert!(project_enabled(dir.path()));
+        assert!(project_enabled(dir.path()).unwrap());
+
+        use std::os::unix::fs::PermissionsExt;
+        let config = dir.path().join(".bork/config.toml");
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = std::fs::read(&config).is_ok(); // true when running as root
+        let result = project_enabled(dir.path());
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644)).unwrap();
+        if !readable {
+            assert!(result.is_err());
+        }
     }
 
     #[test]
