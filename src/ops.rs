@@ -312,9 +312,11 @@ pub fn record_launch(
     let idx = find_issue_index(&state.issues, &launched.id)
         .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", launched.id))?;
     let issue = &mut state.issues[idx];
+    // Only drop the id this launch found dead, not one a later launch stored.
     let forget_lost = replaced_lost_session
         && session_id.is_none()
-        && issue.accepts_launch_result(launched.kind, launched.agent_kind);
+        && issue.accepts_launch_result(launched.kind, launched.agent_kind)
+        && issue.current_session_id() == launched.current_session_id();
     issue.record_launch(launched.kind, launched.agent_kind, session_id, setup_ran);
     if forget_lost {
         issue.forget_session(launched.agent_kind);
@@ -1259,6 +1261,25 @@ mod tests {
         assert_eq!(
             config::load_state(root).issues[0].current_session_id(),
             None
+        );
+    }
+
+    #[test]
+    fn record_launch_keeps_a_session_stored_after_the_launch_began() {
+        let dir = setup_project();
+        let root = dir.path();
+        let launched = issue_with_session(root, AgentKind::OpenCode, "ses_dead");
+
+        let mut state = config::load_state(root);
+        state.issues[0]
+            .sessions
+            .insert(AgentKind::OpenCode, "ses_newer".into());
+        config::save_state(&state, root).unwrap();
+
+        record_launch(root, &launched, None, false, true).unwrap();
+        assert_eq!(
+            config::load_state(root).issues[0].current_session_id(),
+            Some("ses_newer")
         );
     }
 
