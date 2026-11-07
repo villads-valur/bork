@@ -364,14 +364,22 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         write_file(&outside.path().join("demo-1/planning.md"), "outside");
         std::os::unix::fs::symlink(outside.path(), staging.path().join("_ISSUES")).unwrap();
-        // Exact spelling of the symlink, and (on case-insensitive disks) a
-        // case variant: both must refuse rather than follow it.
-        for path in ["_ISSUES/demo-1/planning.md", "_issues/demo-1/planning.md"] {
-            let result = stage_file(staging.path(), path, b"live", 0o644);
-            let case_insensitive = staging.path().join("_issues").exists();
-            if path.starts_with("_ISSUES") || case_insensitive {
-                assert!(result.is_err(), "{path}");
-            }
+        // Probe before writing anything: on a case-insensitive disk `_issues`
+        // resolves to the `_ISSUES` symlink.
+        let case_insensitive = fs::symlink_metadata(staging.path().join("_issues")).is_ok();
+
+        // The symlink's own spelling must never be followed.
+        assert!(stage_file(staging.path(), "_ISSUES/demo-1/planning.md", b"live", 0o644).is_err());
+        // A case variant collides on case-insensitive disks and is a separate,
+        // real directory on case-sensitive ones.
+        let variant = stage_file(staging.path(), "_issues/demo-1/planning.md", b"live", 0o644);
+        if case_insensitive {
+            assert!(variant.is_err());
+        } else {
+            variant.unwrap();
+            assert!(fs::symlink_metadata(staging.path().join("_issues"))
+                .unwrap()
+                .is_dir());
         }
         assert_eq!(
             fs::read_to_string(outside.path().join("demo-1/planning.md")).unwrap(),
