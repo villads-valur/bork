@@ -93,6 +93,14 @@ impl Report {
                     previous.display()
                 );
             }
+            if let Some(previous) = &p.previous_config {
+                let _ = writeln!(
+                    out,
+                    "  config:   old .bork/config.toml {} {}",
+                    would("saved to", "would be saved to"),
+                    previous.display()
+                );
+            }
             if !p.cleared_worktrees.is_empty() {
                 let list: Vec<String> = p
                     .cleared_worktrees
