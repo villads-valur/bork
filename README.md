@@ -129,6 +129,7 @@ bork --help
 |---------|-------------|
 | `bork` | Launch the TUI kanban board |
 | `bork init <repo>` | Set up a new bork project from a git repo |
+| `bork import <file>` | Restore projects, boards and plans from a backup file |
 | `bork install` | Install agent status hooks |
 | `bork worktree <id> [slug]` | Create a git worktree for an issue |
 | `bork uninstall` | Remove agent status hooks |
@@ -506,7 +507,20 @@ The TUI checks shortly after startup and then hourly, and runs a backup when non
 
 #### Restoring
 
-`bork import <file>` (coming) restores from the backup file: it clones each project's repo, puts the board and container files back, and registers the projects. To look inside a backup by hand:
+After a wipe, install bork and run `bork import` with the path of a backup file from your synced folder (any name works, so another Mac's file is fine too). Without a path it uses this Mac's `bork-backup-<host>.tar.gz` in the configured backup `path`:
+
+```bash
+bork import <backup-file>                    # every project, back to its recorded path
+bork import                                  # this Mac's backup file in the configured path
+bork import <backup-file> --root ~/code      # restore to ~/code/<name> instead
+bork import <backup-file> --project bork     # just one project
+bork import <backup-file> --dry-run          # print what would be cloned, written and registered
+bork import <backup-file> --force            # restore over existing directories
+```
+
+For each project it clones the repo into `main/` (on the default branch, with your other remotes added back), restores the board and container files, moves each worktree plan to `plans/<issue-id>/planning.md` (it wins over an older copy saved there) and registers the project (with its sidebar label). Worktrees aren't recreated: issues that had one keep their prompt, column and links but lose the worktree, and the summary lists their branches so you can reopen them from the pushed branch. Agent sessions are dropped, since transcripts aren't in the backup, except ones the board you're restoring over still has. Without a clone URL, or when the clone fails, the board and docs are still restored and the summary says so. If one project fails part-way, the others still run and the command exits with an error after the summary. Your global `config.toml` is restored only when you don't have one yet; `--project` leaves it alone. The global agent hooks are installed like `bork init` does (project skills come back from the backup).
+
+Import refuses to touch an existing project directory unless you pass `--force`, and refuses a project whose name is already registered at another path (both would share issue ids and tmux sessions). Even then it never deletes `main/` or worktrees and never replaces a plan that already exists in `plans/`, so re-running it is safe. It does overwrite the other restored files, so the board goes back to the backup's version: the old board is kept as `.bork/state.json.pre-import-<time>` (a re-run that changes nothing saves nothing) and the summary names any issues that weren't in the backup. A replaced global `config.toml` is kept the same way. Files are never restored into a git checkout (`main/`, worktrees, any nested repo), and a target that is a symlink, a repo itself, or an existing directory inside a repo is refused. A failed clone or project makes the command exit non-zero after the summary. To look inside a backup by hand:
 
 ```bash
 tar -tzf bork-backup-<host>.tar.gz                       # list the contents

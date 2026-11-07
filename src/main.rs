@@ -750,6 +750,30 @@ enum Command {
         dry_run: bool,
     },
 
+    /// Restore projects, boards and plans from a `bork backup` file
+    Import {
+        /// Path to a backup file written by `bork backup` (any name). Defaults
+        /// to this Mac's backup file in the configured backup path.
+        file: Option<PathBuf>,
+
+        /// Only restore this project (name or label in the backup)
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Restore each project to <root>/<name> instead of its recorded path
+        #[arg(long)]
+        root: Option<PathBuf>,
+
+        /// Restore over existing directories and the global config. Never
+        /// deletes main/ or worktrees, only overwrites the restored files.
+        #[arg(long)]
+        force: bool,
+
+        /// Print what would be cloned, written and registered without changing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Prune stale worktrees from the project on disk.
     Prune {
         /// Print what would be removed without touching anything
@@ -1185,6 +1209,13 @@ fn main() -> anyhow::Result<()> {
             project,
             dry_run,
         }) => run_backup_command(project.as_deref(), dry_run),
+        Some(Command::Import {
+            file,
+            project,
+            root,
+            force,
+            dry_run,
+        }) => run_import_command(file.as_deref(), project, root, force, dry_run),
         Some(Command::Prune {
             dry_run,
             yes,
@@ -1366,6 +1397,42 @@ fn run_backup_command(project: Option<&str>, dry_run: bool) -> anyhow::Result<()
         outcome.projects.join(", ")
     );
     warn_local_only_repos(&outcome.local_only_repos);
+    Ok(())
+}
+
+fn run_import_command(
+    file: Option<&Path>,
+    project: Option<String>,
+    root: Option<PathBuf>,
+    force: bool,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir()?;
+    let opts = backup::import::Options {
+        project,
+        root: root.map(|r| cwd.join(r)),
+        force,
+        dry_run,
+    };
+    let file = match file {
+        Some(file) => cwd.join(file),
+        None => backup::full_backup_file().ok_or_else(|| {
+            anyhow::anyhow!("no backup path configured; pass the backup file: bork import <file>")
+        })?,
+    };
+    let report = backup::import::import(&file, &opts)?;
+    println!("{}", report.render());
+    if !dry_run && report.any_restored() {
+        // Like `bork init`, a fresh machine needs the agent hooks. Project
+        // skills came back with the restored files, so they're left alone.
+        if let Err(err) = external::hooks::install_agent_hooks() {
+            eprintln!("Warning: hook installation failed: {err}");
+            eprintln!("You can run 'bork install' later to set up hooks.");
+        }
+    }
+    if report.failed() {
+        anyhow::bail!("some projects were not fully restored, see above");
+    }
     Ok(())
 }
 

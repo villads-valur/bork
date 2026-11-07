@@ -8,6 +8,8 @@
 //! layout and manifest are documented in [`manifest`]. A run whose content
 //! matches the last archive leaves the file untouched.
 //!
+//! `bork import <file>` ([`import`]) restores an archive.
+//!
 //! Backups run once a day automatically (the TUI worker checks [`is_due`])
 //! and whenever `bork backup` is called. The CLI is a thin layer over
 //! [`plan`] and [`run`]; the worker and the worktree removal paths
@@ -15,6 +17,7 @@
 
 pub mod archive;
 pub mod config;
+pub mod import;
 pub mod manifest;
 pub mod schedule;
 pub mod select;
