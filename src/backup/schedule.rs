@@ -50,6 +50,9 @@ pub struct Report {
     /// Skipped git repos with no remote in the last successful backup (see
     /// `backup::Outcome::local_only_repos`); empty unless backups are `Ok`.
     pub local_only_repos: Vec<PathBuf>,
+    /// The run worked but `backup.json` couldn't record it (see
+    /// `backup::Outcome::status_warning`).
+    pub status_warning: Option<String>,
 }
 
 impl Report {
@@ -58,7 +61,6 @@ impl Report {
     pub fn new(
         indicator: BackupIndicator,
         manual: Option<Check>,
-        baseline: bool,
         record: Option<&ArchiveStatus>,
     ) -> Self {
         let local_only_repos = match (&indicator, record) {
@@ -68,8 +70,9 @@ impl Report {
         Self {
             indicator,
             manual,
-            baseline,
+            baseline: false,
             local_only_repos,
+            status_warning: None,
         }
     }
 }
@@ -166,8 +169,39 @@ pub fn startup_report(blocked: Option<Check>, record: Option<&ArchiveStatus>) ->
         Some(check) => indicator(check, record),
         None => from_record(record),
     };
-    Report::new(indicator, None, baseline, record)
+    Report {
+        baseline,
+        ..Report::new(indicator, None, record)
+    }
 }
+
+/// How long quitting waits for a backup that's being written.
+pub const QUIT_WAIT: Duration = Duration::from_secs(10);
+
+/// What quitting does about a backup write in progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuitStep {
+    /// Nothing is being written: quit now.
+    Exit,
+    /// Keep showing "Finishing backup…" and check again.
+    Wait,
+    /// Waited [`QUIT_WAIT`]: stop the write (`backup::abort_in_flight`), then quit.
+    Abort,
+}
+
+/// The next quit step after `waited` with a write `in_flight` or not.
+pub fn quit_step(in_flight: bool, waited: Duration) -> QuitStep {
+    if !in_flight {
+        QuitStep::Exit
+    } else if waited >= QUIT_WAIT {
+        QuitStep::Abort
+    } else {
+        QuitStep::Wait
+    }
+}
+
+/// Status bar text while quitting waits for a backup.
+pub const FINISHING_BACKUP: &str = "Finishing backup…";
 
 /// Why backups are off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -639,12 +673,11 @@ mod tests {
             local_only_repos: vec![PathBuf::from("/p/plans/scratch")],
             ..ok_at(NOW)
         };
-        let ok = Report::new(healthy(Some(NOW)), None, false, Some(&record));
+        let ok = Report::new(healthy(Some(NOW)), None, Some(&record));
         assert_eq!(ok.local_only_repos, record.local_only_repos);
         let off = Report::new(
             BackupIndicator::Off(OffReason::NoProjects),
             None,
-            false,
             Some(&record),
         );
         assert!(off.local_only_repos.is_empty());
@@ -706,5 +739,17 @@ mod tests {
             failure_to_report(&one, &two),
             Some("reading /work/project-2/.bork/config.toml: denied")
         );
+    }
+
+    #[test]
+    fn quit_waits_for_a_write_then_aborts() {
+        assert_eq!(quit_step(false, Duration::ZERO), QuitStep::Exit);
+        assert_eq!(quit_step(false, QUIT_WAIT * 2), QuitStep::Exit);
+        assert_eq!(quit_step(true, Duration::ZERO), QuitStep::Wait);
+        assert_eq!(
+            quit_step(true, QUIT_WAIT - Duration::from_millis(1)),
+            QuitStep::Wait
+        );
+        assert_eq!(quit_step(true, QUIT_WAIT), QuitStep::Abort);
     }
 }

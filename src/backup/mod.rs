@@ -23,6 +23,8 @@ pub mod schedule;
 pub mod select;
 pub mod status;
 
+pub use archive::{abort_in_flight, in_flight, stop_new_runs};
+
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::ErrorKind;
@@ -158,6 +160,8 @@ pub struct Outcome {
     pub projects: Vec<String>,
     /// See [`Plan::local_only_repos`].
     pub local_only_repos: Vec<PathBuf>,
+    /// The backup was written but `backup.json` couldn't record it.
+    pub status_warning: Option<String>,
 }
 
 /// Resolve what a run would write. `Ok(None)` when [`Selection::All`] finds
@@ -283,21 +287,31 @@ pub fn plan(selection: &Selection) -> anyhow::Result<Option<Plan>> {
 
 /// Write the backup for `selection` and record the result in
 /// `~/.config/bork/backup.json`. `Ok(None)` when there is nothing to back up.
+///
+/// Prints nothing (the TUI calls it from a worker): a status record that
+/// couldn't be written is [`Outcome::status_warning`], or appended to the
+/// error. Temp files and staging dirs left by dead bork processes are
+/// removed first ([`archive::remove_stale`]).
 pub fn run(selection: &Selection) -> anyhow::Result<Option<Outcome>> {
     let _lock = lock_backups()?;
+    // Until the result is recorded: quitting waits for it (see `archive`).
+    let _running = archive::RunGuard::new()?;
+    let backup_dir = config::load_settings()
+        .path
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| resolve_through_existing(&dir));
+    archive::remove_stale(backup_dir.as_deref(), &host_name(), &std::env::temp_dir());
+
     let plan = match plan(selection) {
         Ok(Some(plan)) => plan,
         Ok(None) => return Ok(None),
         Err(err) => {
-            if let Some(file) = failure_file(selection) {
-                record_failure(&file, &err);
-            }
-            return Err(err);
+            let file = failure_file(selection);
+            return Err(with_status_warning(err, file.as_deref()));
         }
     };
-    let result = write_plan(&plan);
-    match &result {
-        Ok((outcome, fingerprint)) => {
+    match write_plan(&plan) {
+        Ok((mut outcome, fingerprint)) => {
             let record = ArchiveStatus {
                 last_run_at: crate::app::unix_now(),
                 ok: true,
@@ -310,17 +324,32 @@ pub fn run(selection: &Selection) -> anyhow::Result<Option<Outcome>> {
                     .iter()
                     .map(|p| p.path.clone())
                     .collect(),
-                fingerprint: Some(fingerprint.clone()),
+                fingerprint: Some(fingerprint),
                 changed: outcome.written,
                 ..ArchiveStatus::default()
             };
-            if let Err(err) = status::record(&status::status_path(), &plan.file, record) {
-                eprintln!("bork: warning: could not record backup status: {err:#}");
-            }
+            outcome.status_warning = status::record(&status::status_path(), &plan.file, record)
+                .err()
+                .map(|err| status_warning(&err));
+            Ok(Some(outcome))
         }
-        Err(err) => record_failure(&plan.file, err),
+        // Stopped because bork quit: not a broken backup, so not recorded.
+        Err(err) if archive::aborted() => Err(err),
+        Err(err) => Err(with_status_warning(err, Some(&plan.file))),
     }
-    result.map(|(outcome, _)| Some(outcome))
+}
+
+/// Record `err` as the last result of `file` (when there is one); a record
+/// that can't be written is appended to the error.
+fn with_status_warning(err: anyhow::Error, file: Option<&Path>) -> anyhow::Error {
+    match file.and_then(|file| record_failure(file, &err).err()) {
+        Some(write_err) => anyhow::anyhow!("{err:#}; {}", status_warning(&write_err)),
+        None => err,
+    }
+}
+
+fn status_warning(err: &anyhow::Error) -> String {
+    format!("could not record backup status: {err:#}")
 }
 
 /// Whether the daily automatic backup should run at `now` (unix seconds):
@@ -577,6 +606,7 @@ fn write_plan(plan: &Plan) -> anyhow::Result<(Outcome, String)> {
                 written: false,
                 projects,
                 local_only_repos: plan.local_only_repos.clone(),
+                status_warning: None,
             };
             return Ok((outcome, fingerprint));
         }
@@ -593,6 +623,7 @@ fn write_plan(plan: &Plan) -> anyhow::Result<(Outcome, String)> {
         written: true,
         projects,
         local_only_repos: plan.local_only_repos.clone(),
+        status_warning: None,
     };
     Ok((outcome, fingerprint))
 }
@@ -665,16 +696,21 @@ pub fn full_backup_file() -> Option<PathBuf> {
     Some(resolve_through_existing(&dir).join(backup_file_name()))
 }
 
-fn record_failure(file: &Path, err: &anyhow::Error) {
+/// The status record of [`full_backup_file`], when the path is configured
+/// and a run has been recorded.
+pub fn full_backup_record() -> Option<ArchiveStatus> {
+    let file = full_backup_file()?;
+    status::read(&status::status_path()).archives.remove(&file)
+}
+
+fn record_failure(file: &Path, err: &anyhow::Error) -> anyhow::Result<()> {
     let record = ArchiveStatus {
         last_run_at: crate::app::unix_now(),
         ok: false,
         error: Some(format!("{err:#}")),
         ..ArchiveStatus::default()
     };
-    if let Err(write_err) = status::record(&status::status_path(), file, record) {
-        eprintln!("bork: warning: could not record backup status: {write_err:#}");
-    }
+    status::record(&status::status_path(), file, record).map(|_| ())
 }
 
 /// Canonicalize the longest existing prefix of `path` and apply the rest
@@ -1535,6 +1571,52 @@ mod tests {
             write(&off.path().join("wt/.claude/planning.md"), "p");
             assert!(!save_issue_plan(off.path(), "off-1", "wt").unwrap());
             assert!(!off.path().join("plans").exists());
+        });
+    }
+
+    #[test]
+    fn run_removes_temp_files_of_dead_processes() {
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            set_global_path(dest.path());
+            let _demo = project("demo", true);
+            let dead = archive::tests::dead_pid();
+            let stale = dest
+                .path()
+                .join(format!(".{}.tmp.{dead}", backup_file_name()));
+            // A live process's temp file (this test's pid, another file).
+            let live = dest.path().join(format!(
+                ".bork-backup-other.tar.gz.tmp.{}",
+                std::process::id()
+            ));
+            write(&stale, "partial");
+            write(&live, "in progress");
+
+            run(&Selection::All).unwrap().unwrap();
+
+            assert!(!stale.exists());
+            assert!(live.exists());
+        });
+    }
+
+    #[test]
+    fn unrecorded_status_is_returned_instead_of_printed() {
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            set_global_path(dest.path());
+            let _demo = project("demo", true);
+            // A directory where backup.json should be: it can't be replaced.
+            fs::create_dir_all(status::status_path().join("x")).unwrap();
+
+            let outcome = run(&Selection::All).unwrap().unwrap();
+            assert!(outcome.written);
+            let warning = outcome.status_warning.unwrap();
+            assert!(
+                warning.starts_with("could not record backup status"),
+                "{warning}"
+            );
         });
     }
 }

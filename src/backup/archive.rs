@@ -7,9 +7,12 @@ use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::ErrorKind;
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use anyhow::{bail, Context};
 
@@ -69,59 +72,328 @@ pub fn fingerprint(manifest: &[u8], contents: &Contents) -> String {
 
 /// Write `manifest.json` plus `contents` to `dest` as a gzipped tarball,
 /// atomically. Returns the archive size in bytes.
+///
+/// The staging dir, temp file and `tar` child are registered while this
+/// runs, so a quitting TUI can stop it and clean up ([`abort_in_flight`]).
 pub fn write(dest: &Path, manifest: &[u8], contents: &Contents) -> anyhow::Result<u64> {
-    let staging = Staging::new()?;
-    stage_file(&staging.0, super::manifest::MANIFEST_FILE, manifest, 0o644)?;
-    for (path, source) in &contents.0 {
-        match source {
-            Source::Missing => {}
-            Source::Link(target) => {
-                let staged = staged_path(&staging.0, path)?;
-                std::os::unix::fs::symlink(target, staged)?;
-            }
-            Source::File(bytes, mode) => stage_file(&staging.0, path, bytes, *mode)?,
-        }
-    }
-
     let dir = dest
         .parent()
         .context("backup file has no parent directory")?;
-    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let name = dest
         .file_name()
         .and_then(|n| n.to_str())
         .context("invalid backup file name")?;
     let tmp = dir.join(format!(".{name}{TMP_INFIX}{}", std::process::id()));
 
+    let staging = Staging::new()?;
+    let registered = Registered::new(&staging.0, &tmp)?;
+    let result = write_staged(&staging.0, &tmp, dest, manifest, contents);
+    // Still registered while the staging dir goes, so an abort can finish
+    // removing it.
+    drop(staging);
+    drop(registered);
+    result
+}
+
+fn write_staged(
+    staging: &Path,
+    tmp: &Path,
+    dest: &Path,
+    manifest: &[u8],
+    contents: &Contents,
+) -> anyhow::Result<u64> {
+    let dir = dest
+        .parent()
+        .context("backup file has no parent directory")?;
+    stage_file(staging, super::manifest::MANIFEST_FILE, manifest, 0o644)?;
+    for (path, source) in &contents.0 {
+        if aborted() {
+            bail!(ABORTED);
+        }
+        match source {
+            Source::Missing => {}
+            Source::Link(target) => {
+                let staged = staged_path(staging, path)?;
+                std::os::unix::fs::symlink(target, staged)?;
+            }
+            Source::File(bytes, mode) => stage_file(staging, path, bytes, *mode)?,
+        }
+    }
+
+    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+
     let result = (|| {
-        let mut top: Vec<String> = fs::read_dir(&staging.0)?
+        let mut top: Vec<String> = fs::read_dir(staging)?
             .filter_map(|e| e.ok()?.file_name().into_string().ok())
             .collect();
         top.sort();
-        let output = Command::new("tar")
+        let mut command = Command::new("tar");
+        command
             // Keep macOS from adding `._*` AppleDouble files for xattrs.
             .env("COPYFILE_DISABLE", "1")
             .arg("-czf")
-            .arg(&tmp)
+            .arg(tmp)
             .arg("-C")
-            .arg(&staging.0)
+            .arg(staging)
             .args(&top)
-            .output()
-            .context("running tar")?;
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            // Its own group, so an abort also stops a `gzip` it spawns.
+            .process_group(0);
+        let child = spawn_registered(staging, &mut command)?;
+        let output = child.wait_with_output();
+        // Reaped: its pid may be reused, so an abort must not signal it.
+        forget_tar(staging);
+        let output = output.context("running tar")?;
+        if aborted() {
+            bail!(ABORTED);
+        }
         if !output.status.success() {
             bail!(
                 "tar failed: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        fs::File::open(&tmp)?.sync_all()?;
-        fs::rename(&tmp, dest)?;
+        fs::File::open(tmp)?.sync_all()?;
+        fs::rename(tmp, dest)?;
         Ok(fs::metadata(dest)?.len())
     })();
     if result.is_err() {
-        let _ = fs::remove_file(&tmp);
+        let _ = fs::remove_file(tmp);
     }
     result
+}
+
+/// Error of a write stopped by [`abort_in_flight`].
+const ABORTED: &str = "backup stopped because bork quit";
+
+/// A `write` in progress: what to clean up if it has to be stopped.
+struct InFlight {
+    staging: PathBuf,
+    tmp: PathBuf,
+    tar: Option<u32>,
+}
+
+/// Every `write` in progress in this process (one at a time under the
+/// backup lock; tests write concurrently).
+static IN_FLIGHT: Mutex<Vec<InFlight>> = Mutex::new(Vec::new());
+/// `backup::run` calls holding a [`RunGuard`].
+static RUNNING: AtomicUsize = AtomicUsize::new(0);
+/// Set by [`stop_new_runs`]: no new run may start.
+static STOPPING: AtomicBool = AtomicBool::new(false);
+/// Set by [`abort_in_flight`]: running writes stop at the next step.
+static ABORT: AtomicBool = AtomicBool::new(false);
+
+fn in_flight_list() -> std::sync::MutexGuard<'static, Vec<InFlight>> {
+    IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Counts a `backup::run` as in flight from taking the backup lock until it
+/// has recorded its result, so quitting also waits for planning, cleanup
+/// and the status write, not just the archive write.
+pub(super) struct RunGuard(());
+
+impl RunGuard {
+    /// Fails with [`ABORTED`] once bork is quitting ([`stop_new_runs`]).
+    pub(super) fn new() -> anyhow::Result<Self> {
+        let _list = in_flight_list();
+        if STOPPING.load(Ordering::SeqCst) {
+            bail!(ABORTED);
+        }
+        RUNNING.fetch_add(1, Ordering::SeqCst);
+        Ok(Self(()))
+    }
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        RUNNING.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Registers a write in [`IN_FLIGHT`] until dropped.
+struct Registered(PathBuf);
+
+impl Registered {
+    /// A run that started before quitting still writes (quit waits for
+    /// it; [`RunGuard`] refuses new runs); only an abort refuses.
+    fn new(staging: &Path, tmp: &Path) -> anyhow::Result<Self> {
+        let mut list = in_flight_list();
+        if ABORT.load(Ordering::SeqCst) {
+            bail!(ABORTED);
+        }
+        list.push(InFlight {
+            staging: staging.to_path_buf(),
+            tmp: tmp.to_path_buf(),
+            tar: None,
+        });
+        Ok(Self(staging.to_path_buf()))
+    }
+}
+
+impl Drop for Registered {
+    fn drop(&mut self) {
+        in_flight_list().retain(|w| w.staging != self.0);
+    }
+}
+
+/// Spawn `tar` and record its pid under the registry lock, so an abort
+/// either sees the pid or stops the spawn.
+fn spawn_registered(staging: &Path, command: &mut Command) -> anyhow::Result<Child> {
+    let mut list = in_flight_list();
+    if ABORT.load(Ordering::SeqCst) {
+        bail!(ABORTED);
+    }
+    let child = command.spawn().context("running tar")?;
+    if let Some(write) = list.iter_mut().find(|w| w.staging == staging) {
+        write.tar = Some(child.id());
+    }
+    Ok(child)
+}
+
+fn forget_tar(staging: &Path) {
+    if let Some(write) = in_flight_list().iter_mut().find(|w| w.staging == staging) {
+        write.tar = None;
+    }
+}
+
+/// Whether [`abort_in_flight`] stopped the writes. A write that failed
+/// because of it isn't recorded: bork quit, the backup isn't broken. Any
+/// other failure, even while quitting waits, is recorded as usual.
+pub fn aborted() -> bool {
+    ABORT.load(Ordering::SeqCst)
+}
+
+/// Whether a backup run or file write is underway in this process.
+pub fn in_flight() -> bool {
+    let list = in_flight_list();
+    RUNNING.load(Ordering::SeqCst) > 0 || !list.is_empty()
+}
+
+/// Refuse new runs from now on (bork is quitting). A run already going,
+/// including its write, carries on.
+pub fn stop_new_runs() {
+    let _list = in_flight_list();
+    STOPPING.store(true, Ordering::SeqCst);
+}
+
+/// Stop every running write: kill its `tar` and remove its temp file and
+/// staging dir. Implies [`stop_new_runs`]. The writer thread sees the
+/// abort and fails without recording it.
+pub fn abort_in_flight() {
+    let list = in_flight_list();
+    STOPPING.store(true, Ordering::SeqCst);
+    ABORT.store(true, Ordering::SeqCst);
+    for write in list.iter() {
+        if let Some(pid) = write.tar.and_then(|pid| libc::pid_t::try_from(pid).ok()) {
+            // SAFETY: plain syscall; the group is the tar child's own
+            // (`process_group(0)`). Its pid is cleared right after the reap
+            // (`forget_tar`); only a pid reused within those few
+            // instructions could be hit.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+        // Removing the temp file races a rename only if tar just finished:
+        // either the backup is in place or the rename fails. Both are fine.
+        let _ = fs::remove_file(&write.tmp);
+        let _ = fs::remove_dir_all(&write.staging);
+    }
+}
+
+/// Remove temp files and staging dirs that crashed or killed bork
+/// processes left behind: this host's `.bork-backup-<host>…{TMP_INFIX}<pid>`
+/// files in `backup_dir` and `{STAGING_PREFIX}<pid>-<digits>` dirs in
+/// `temp_dir`, when `<pid>` is no longer running. Other hosts' temp files
+/// are never touched: the backup folder may be synced between Macs (iCloud
+/// Drive), and their pids mean nothing here. Anything else, symlinks,
+/// entries of other users and those of live processes (including this one)
+/// are left alone. Best effort: errors are ignored. Call it under the
+/// backup lock.
+pub fn remove_stale(backup_dir: Option<&Path>, host: &str, temp_dir: &Path) {
+    let stale = |dir: &Path, owner_pid: &dyn Fn(&str) -> Option<u32>, want_dir: bool| {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let pid = owner_pid(entry.file_name().to_str()?)?;
+                let meta = fs::symlink_metadata(entry.path()).ok()?;
+                let kind_ok = if want_dir {
+                    meta.file_type().is_dir()
+                } else {
+                    meta.file_type().is_file()
+                };
+                // SAFETY: geteuid has no preconditions.
+                let mine = meta.uid() == unsafe { libc::geteuid() };
+                (kind_ok && mine && !pid_alive(pid)).then(|| entry.path())
+            })
+            .collect::<Vec<_>>()
+    };
+    if let Some(dir) = backup_dir {
+        for file in stale(dir, &|name| tmp_file_pid(name, host), false) {
+            let _ = fs::remove_file(file);
+        }
+    }
+    for dir in stale(temp_dir, &staging_dir_pid, true) {
+        let _ = fs::remove_dir_all(dir);
+    }
+}
+
+/// The pid in a temp file name of `host`'s full backup
+/// (`.bork-backup-<host>.tar.gz{TMP_INFIX}<pid>`) or one of its project
+/// backups (`.bork-backup-<host>--<name>.tar.gz{TMP_INFIX}<pid>`; host names
+/// never contain `--`, so another host can't match).
+fn tmp_file_pid(name: &str, host: &str) -> Option<u32> {
+    let (file, pid) = name.strip_prefix('.')?.rsplit_once(TMP_INFIX)?;
+    let rest = file.strip_prefix("bork-backup-")?.strip_prefix(host)?;
+    let ours = rest == ".tar.gz"
+        || rest
+            .strip_prefix("--")
+            .and_then(|project| project.strip_suffix(".tar.gz"))
+            .is_some_and(|project| !project.is_empty());
+    if host.is_empty() || !ours {
+        return None;
+    }
+    digits(pid)
+}
+
+/// The pid in a staging dir name `{STAGING_PREFIX}<pid>-<digits>`.
+fn staging_dir_pid(name: &str) -> Option<u32> {
+    let (pid, suffix) = name.strip_prefix(STAGING_PREFIX)?.split_once('-')?;
+    // Nanos plus a counter: any length, so only check it's digits.
+    if suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits(pid)
+}
+
+fn digits(s: &str) -> Option<u32> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+/// Whether `pid` may still be running. Only "no such process" counts as
+/// dead; this process and anything unparseable count as alive.
+fn pid_alive(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return true;
+    };
+    if pid <= 0 {
+        return true;
+    }
+    // SAFETY: signal 0 only checks that the process exists.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 /// Read `manifest.json` from an existing backup archive.
@@ -263,7 +535,7 @@ impl Drop for Staging {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn write_file(path: &Path, contents: &str) {
@@ -450,5 +722,111 @@ mod tests {
         for bad in ["", "../x", "/abs", "a/../../x"] {
             assert!(staged_path(staging.path(), bad).is_err(), "{bad:?}");
         }
+    }
+
+    /// A pid that just exited (its child was reaped), so nothing runs as it.
+    pub(crate) fn dead_pid() -> u32 {
+        let mut child = Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    #[test]
+    fn parses_owner_pids_from_generated_names_only() {
+        let pid = |name| tmp_file_pid(name, "mac");
+        assert_eq!(pid(".bork-backup-mac.tar.gz.tmp.42"), Some(42));
+        assert_eq!(pid(".bork-backup-mac--p.tar.gz.tmp.7"), Some(7));
+        assert_eq!(pid("bork-backup-mac.tar.gz.tmp.42"), None);
+        assert_eq!(pid(".notes.tar.gz.tmp.42"), None);
+        assert_eq!(pid(".bork-backup-mac.tar.gz.tmp.4x"), None);
+        assert_eq!(pid(".bork-backup-.tmp.42"), None);
+        assert_eq!(pid(".bork-backup-mac--.tar.gz.tmp.42"), None);
+        // Other Macs syncing into the same folder.
+        assert_eq!(pid(".bork-backup-other.tar.gz.tmp.42"), None);
+        assert_eq!(pid(".bork-backup-macbook.tar.gz.tmp.42"), None);
+        assert_eq!(pid(".bork-backup-macbook--p.tar.gz.tmp.42"), None);
+        assert_eq!(staging_dir_pid("bork-backup-42-0000012340"), Some(42));
+        // Nanos 900_000_000 with counter 0: past u32, still a staging dir.
+        assert_eq!(staging_dir_pid("bork-backup-42-9000000000"), Some(42));
+        assert_eq!(staging_dir_pid("bork-backup-42-900000000012"), Some(42));
+        assert_eq!(staging_dir_pid("bork-backup-42-"), None);
+        assert_eq!(staging_dir_pid("bork-backup-mac.tar.gz"), None);
+        assert_eq!(staging_dir_pid("bork-backup-42-12-3"), None);
+    }
+
+    #[test]
+    fn removes_only_stale_temp_files_and_staging_dirs() {
+        let backup = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let dead = dead_pid();
+        let me = std::process::id();
+        let b = backup.path();
+        let t = tmp.path();
+
+        let stale_file = b.join(format!(".bork-backup-mac.tar.gz.tmp.{dead}"));
+        let live_file = b.join(format!(".bork-backup-mac.tar.gz.tmp.{me}"));
+        let other_file = b.join(format!(".notes.tar.gz.tmp.{dead}"));
+        let other_host = b.join(format!(".bork-backup-other.tar.gz.tmp.{dead}"));
+        let backup_file = b.join("bork-backup-mac.tar.gz");
+        let file_dir = b.join(format!(".bork-backup-x.tar.gz.tmp.{dead}"));
+        let file_link = b.join(format!(".bork-backup-y.tar.gz.tmp.{dead}"));
+        for file in [
+            &stale_file,
+            &live_file,
+            &other_file,
+            &other_host,
+            &backup_file,
+        ] {
+            write_file(file, "x");
+        }
+        fs::create_dir(&file_dir).unwrap();
+        write_file(&elsewhere.path().join("keep"), "x");
+        std::os::unix::fs::symlink(elsewhere.path().join("keep"), &file_link).unwrap();
+
+        let stale_dir = t.join(format!("bork-backup-{dead}-0000012340"));
+        let stale_long = t.join(format!("bork-backup-{dead}-9000000000"));
+        let live_dir = t.join(format!("bork-backup-{me}-0000012340"));
+        let odd_dir = t.join(format!("bork-backup-{dead}-abc"));
+        let dir_file = t.join(format!("bork-backup-{dead}-1"));
+        let dir_link = t.join(format!("bork-backup-{dead}-2"));
+        write_file(&stale_dir.join("projects/p/AGENTS.md"), "x");
+        fs::create_dir(&stale_long).unwrap();
+        write_file(&live_dir.join("manifest.json"), "x");
+        fs::create_dir(&odd_dir).unwrap();
+        write_file(&dir_file, "x");
+        std::os::unix::fs::symlink(elsewhere.path(), &dir_link).unwrap();
+
+        remove_stale(Some(b), "mac", t);
+
+        assert!(!stale_file.exists());
+        assert!(!stale_dir.exists());
+        assert!(!stale_long.exists());
+        for kept in [
+            &live_file,
+            &other_file,
+            &other_host,
+            &backup_file,
+            &file_dir,
+            &live_dir,
+            &odd_dir,
+            &dir_file,
+        ] {
+            assert!(kept.exists(), "{} was removed", kept.display());
+        }
+        assert!(fs::symlink_metadata(&file_link).is_ok());
+        assert!(fs::symlink_metadata(&dir_link).is_ok());
+        assert!(elsewhere.path().join("keep").exists());
+    }
+
+    #[test]
+    fn missing_backup_folder_still_cleans_the_temp_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stale = tmp.path().join(format!("bork-backup-{}-1", dead_pid()));
+        fs::create_dir(&stale).unwrap();
+
+        remove_stale(Some(&tmp.path().join("missing")), "mac", tmp.path());
+        assert!(!stale.exists());
     }
 }
