@@ -124,10 +124,18 @@ pub fn build_candidates(project: &Project, names: Vec<String>) -> Vec<PruneCandi
         .collect()
 }
 
+/// A worktree selected for removal, with the issue whose plan it may hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PruneTarget {
+    pub worktree: String,
+    /// `None` for orphans, whose issue is gone.
+    pub issue_id: Option<String>,
+}
+
 /// Split the current selection into worktrees that are safe to remove and
 /// dirty ones the caller must refuse. Both the dialog and the CLI make this
 /// same decision, so the policy lives here.
-pub fn partition_selection(candidates: &[PruneCandidate]) -> (Vec<String>, Vec<String>) {
+pub fn partition_selection(candidates: &[PruneCandidate]) -> (Vec<PruneTarget>, Vec<String>) {
     let mut safe = Vec::new();
     let mut dirty = Vec::new();
     for c in candidates {
@@ -137,7 +145,10 @@ pub fn partition_selection(candidates: &[PruneCandidate]) -> (Vec<String>, Vec<S
         if c.is_dirty() {
             dirty.push(c.worktree.clone());
         } else {
-            safe.push(c.worktree.clone());
+            safe.push(PruneTarget {
+                worktree: c.worktree.clone(),
+                issue_id: c.issue_id.clone(),
+            });
         }
     }
     (safe, dirty)
@@ -148,6 +159,12 @@ pub fn partition_selection(candidates: &[PruneCandidate]) -> (Vec<String>, Vec<S
 pub enum RemoveOutcome {
     Removed,
     Failed(String),
+    /// Kept because its issue's plan couldn't be saved. Removing it anyway
+    /// takes `force_plans`.
+    PlanNotSaved {
+        issue_id: String,
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -172,8 +189,23 @@ impl PruneOutcome {
     pub fn failed_count(&self) -> usize {
         self.results
             .iter()
-            .filter(|r| matches!(r.outcome, RemoveOutcome::Failed(_)))
+            .filter(|r| r.outcome != RemoveOutcome::Removed)
             .count()
+    }
+
+    /// Worktrees kept only because their plan couldn't be saved, to offer
+    /// removing them anyway.
+    pub fn plan_not_saved(&self) -> Vec<PruneTarget> {
+        self.results
+            .iter()
+            .filter_map(|r| match &r.outcome {
+                RemoveOutcome::PlanNotSaved { issue_id, .. } => Some(PruneTarget {
+                    worktree: r.worktree.clone(),
+                    issue_id: Some(issue_id.clone()),
+                }),
+                _ => None,
+            })
+            .collect()
     }
 
     pub fn removed_worktrees(&self) -> Vec<&str> {
@@ -190,17 +222,22 @@ impl PruneOutcome {
 /// We deliberately never pass `--force`, so git itself refuses unsafe
 /// removals at execute time and we surface its stderr. Failures are also
 /// appended to the project's error log.
+///
+/// Each worktree's issue plan is saved first. A failed save keeps the
+/// worktree (`RemoveOutcome::PlanNotSaved`) unless `force_plans` is set, in
+/// which case the dropped plan is logged and the worktree removed.
 pub fn execute_removals(
     project_root: &Path,
-    worktrees: &[String],
+    targets: &[PruneTarget],
     dirty: &[String],
+    force_plans: bool,
 ) -> PruneOutcome {
     let main_dir = project_root.join("main");
-    let mut results: Vec<PruneResult> = worktrees
+    let mut results: Vec<PruneResult> = targets
         .iter()
-        .map(|name| PruneResult {
-            worktree: name.clone(),
-            outcome: remove_worktree(&main_dir, &project_root.join(name)),
+        .map(|target| PruneResult {
+            worktree: target.worktree.clone(),
+            outcome: remove_worktree(project_root, &main_dir, target, force_plans),
         })
         .collect();
     results.extend(dirty.iter().map(|name| PruneResult {
@@ -212,13 +249,35 @@ pub fn execute_removals(
     outcome
 }
 
-/// Remove one worktree. If git doesn't recognise it (typically because the
-/// project folder was moved, which breaks the `.git` links in both
-/// directions), run `git worktree repair` on it and try once more.
-fn remove_worktree(main_dir: &Path, worktree_path: &Path) -> RemoveOutcome {
-    let result = run_git_worktree(main_dir, "remove", worktree_path).or_else(|first_err| {
-        run_git_worktree(main_dir, "repair", worktree_path).map_err(|_| first_err)?;
-        run_git_worktree(main_dir, "remove", worktree_path)
+/// Save the plan, then remove one worktree. If git doesn't recognise it
+/// (typically because the project folder was moved, which breaks the `.git`
+/// links in both directions), run `git worktree repair` on it and try once
+/// more.
+fn remove_worktree(
+    project_root: &Path,
+    main_dir: &Path,
+    target: &PruneTarget,
+    force_plans: bool,
+) -> RemoveOutcome {
+    // Orphans have nothing to save: their issue was deleted with its plans.
+    if let Some(issue_id) = target.issue_id.as_deref() {
+        if let Err(error) =
+            crate::issue_plan::save_before_removal(project_root, issue_id, &target.worktree)
+        {
+            if !force_plans {
+                return RemoveOutcome::PlanNotSaved {
+                    issue_id: issue_id.to_string(),
+                    error,
+                };
+            }
+            crate::issue_plan::log_dropped_plan(project_root, &target.worktree, &error);
+        }
+    }
+
+    let worktree_path = project_root.join(&target.worktree);
+    let result = run_git_worktree(main_dir, "remove", &worktree_path).or_else(|first_err| {
+        run_git_worktree(main_dir, "repair", &worktree_path).map_err(|_| first_err)?;
+        run_git_worktree(main_dir, "remove", &worktree_path)
     });
     match result {
         Ok(()) => RemoveOutcome::Removed,
@@ -251,6 +310,10 @@ fn log_failures(project_root: &Path, outcome: &PruneOutcome) {
         .iter()
         .filter_map(|r| match &r.outcome {
             RemoveOutcome::Failed(msg) => Some(format!("prune {}: {}", r.worktree, msg)),
+            RemoveOutcome::PlanNotSaved { error, .. } => Some(format!(
+                "prune {}: kept, its plan couldn't be saved: {}",
+                r.worktree, error
+            )),
             RemoveOutcome::Removed => None,
         })
         .collect();
@@ -382,7 +445,13 @@ mod tests {
         kept.action = PruneAction::Keep;
 
         let (safe, dirty_names) = partition_selection(&[clean, dirty, kept]);
-        assert_eq!(safe, vec!["clean-wt".to_string()]);
+        assert_eq!(
+            safe,
+            vec![PruneTarget {
+                worktree: "clean-wt".into(),
+                issue_id: Some("bork-1".into()),
+            }]
+        );
         assert_eq!(dirty_names, vec!["dirty-wt".to_string()]);
     }
 
@@ -423,7 +492,7 @@ mod tests {
         let new_root = tmp.path().join("new");
         std::fs::rename(&old_root, &new_root).unwrap();
 
-        let outcome = execute_removals(&new_root, &["wt-1".into()], &["wt-dirty".into()]);
+        let outcome = execute_removals(&new_root, &[orphan("wt-1")], &["wt-dirty".into()], false);
         assert_eq!(outcome.results[0].outcome, RemoveOutcome::Removed);
         assert!(!new_root.join("wt-1").exists());
         assert!(matches!(
@@ -434,6 +503,120 @@ mod tests {
         let log = std::fs::read_to_string(new_root.join(".bork").join("errors.log")).unwrap();
         assert!(log.contains("prune wt-dirty: uncommitted changes"));
         assert!(!log.contains("wt-1"));
+    }
+
+    fn orphan(worktree: &str) -> PruneTarget {
+        PruneTarget {
+            worktree: worktree.into(),
+            issue_id: None,
+        }
+    }
+
+    fn of_issue(worktree: &str, issue_id: &str) -> PruneTarget {
+        PruneTarget {
+            worktree: worktree.into(),
+            issue_id: Some(issue_id.into()),
+        }
+    }
+
+    /// A project with worktree `demo-1-x` holding a plan that git ignores.
+    fn project_with_planned_worktree() -> tempfile::TempDir {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let main = root.join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        git(&main, &["init", "-q"]);
+        git(
+            &main,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        );
+        std::fs::write(main.join(".git/info/exclude"), ".claude/\n").unwrap();
+        git(
+            &main,
+            &["worktree", "add", "-q", "../demo-1-x", "-b", "demo-1-x"],
+        );
+        std::fs::create_dir_all(root.join(".bork")).unwrap();
+        std::fs::write(root.join(".bork/config.toml"), "project_name = \"demo\"\n").unwrap();
+        write_plan(root, "demo-1-x", "the plan");
+        tmp
+    }
+
+    use crate::issue_plan::test_support::{
+        enable_backups, enable_broken_backups, saved_plan, write_plan,
+    };
+
+    #[test]
+    fn prune_saves_the_plan_before_removing() {
+        let project = project_with_planned_worktree();
+        let dest = tempfile::TempDir::new().unwrap();
+        let root = project.path();
+        enable_backups(root, dest.path());
+
+        let outcome = execute_removals(root, &[of_issue("demo-1-x", "demo-1")], &[], false);
+
+        assert_eq!(outcome.results[0].outcome, RemoveOutcome::Removed);
+        assert!(!root.join("demo-1-x").exists());
+        let saved = saved_plan(root, dest.path(), "demo-1");
+        assert_eq!(std::fs::read_to_string(saved).unwrap(), "the plan");
+    }
+
+    #[test]
+    fn prune_with_backups_off_removes_without_saving() {
+        let project = project_with_planned_worktree();
+        let root = project.path();
+
+        let outcome = execute_removals(root, &[of_issue("demo-1-x", "demo-1")], &[], false);
+
+        assert_eq!(outcome.results[0].outcome, RemoveOutcome::Removed);
+        assert!(!root.join("plans").exists());
+    }
+
+    #[test]
+    fn prune_keeps_the_worktree_when_the_plan_cant_be_saved() {
+        let project = project_with_planned_worktree();
+        let root = project.path();
+        enable_broken_backups(root);
+
+        let outcome = execute_removals(root, &[of_issue("demo-1-x", "demo-1")], &[], false);
+
+        assert!(matches!(
+            &outcome.results[0].outcome,
+            RemoveOutcome::PlanNotSaved { issue_id, .. } if issue_id == "demo-1"
+        ));
+        assert_eq!(outcome.failed_count(), 1);
+        assert_eq!(
+            outcome.plan_not_saved(),
+            vec![of_issue("demo-1-x", "demo-1")]
+        );
+        assert!(root.join("demo-1-x/.claude/planning.md").exists());
+
+        let forced = execute_removals(root, &outcome.plan_not_saved(), &[], true);
+
+        assert_eq!(forced.results[0].outcome, RemoveOutcome::Removed);
+        assert!(!root.join("demo-1-x").exists());
+        let log = std::fs::read_to_string(root.join(".bork/errors.log")).unwrap();
+        assert!(log.contains("demo-1-x without saving its plan"), "{log}");
+    }
+
+    #[test]
+    fn prune_removes_orphans_without_a_plan_save() {
+        let project = project_with_planned_worktree();
+        let root = project.path();
+        enable_broken_backups(root);
+
+        let outcome = execute_removals(root, &[orphan("demo-1-x")], &[], false);
+
+        assert_eq!(outcome.results[0].outcome, RemoveOutcome::Removed);
     }
 
     fn make_issue(id: &str, worktree: Option<&str>) -> Issue {

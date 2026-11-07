@@ -377,6 +377,12 @@ pub fn delete_issue(project_root: &Path, issue_id: &str) -> anyhow::Result<Issue
     let removed = state.issues.remove(idx);
     remove_link_references(&mut state.issues, &removed.id);
     config::save_state(&state, project_root)?;
+    crate::issue_plan::remove_saved_plans(project_root, &removed.id).map_err(|e| {
+        e.context(format!(
+            "Deleted {} but couldn't remove its saved plans",
+            removed.id
+        ))
+    })?;
 
     Ok(removed)
 }
@@ -772,7 +778,7 @@ pub fn archive_issue(
             } else {
                 worktree::Removal::Safe
             };
-            worktree::remove_worktree_in(&app_config, dir, removal)?;
+            worktree::remove_worktree_in(&app_config, &issue.id, dir, removal)?;
             Some(dir.to_string())
         }
         None => None,
@@ -1547,6 +1553,39 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output, "No issues found.");
+    }
+
+    #[test]
+    fn delete_removes_the_saved_plans_and_archive_keeps_them() {
+        let dir = setup_project();
+        let dest = TempDir::new().unwrap();
+        let root = dir.path();
+        crate::issue_plan::test_support::enable_backups(root, dest.path());
+        for title in ["Delete me", "Archive me"] {
+            create_issue(
+                root,
+                CreateOptions {
+                    title: title.into(),
+                    column: None,
+                    agent_kind: None,
+                    agent_mode: None,
+                    prompt: None,
+                    model: None,
+                    kind: None,
+                },
+            )
+            .unwrap();
+        }
+        for id in ["test-1", "test-2"] {
+            fs::create_dir_all(root.join("plans").join(id)).unwrap();
+            fs::write(root.join("plans").join(id).join("planning.md"), id).unwrap();
+        }
+
+        delete_issue(root, "test-1").unwrap();
+        archive_issue(root, "test-2", false).unwrap();
+
+        assert!(!root.join("plans/test-1").exists());
+        assert!(root.join("plans/test-2/planning.md").exists());
     }
 
     #[test]

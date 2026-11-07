@@ -152,7 +152,7 @@ bork --help
 | `bork config set <key> <value>` | Set a config value (`--global` for the global file) |
 | `bork update` | Pull latest from `main` and rebuild |
 | `bork update --check` | Check whether a new version is available without pulling |
-| `bork prune` | Prune stale worktrees (interactive; `--dry-run`, `--yes`, `--include`, `--exclude`) |
+| `bork prune` | Prune stale worktrees (interactive; `--dry-run`, `--yes`, `--include`, `--exclude`, `--force`) |
 
 ### `bork init`
 
@@ -225,7 +225,7 @@ bork issue delete bork-3
 
 **Lost sessions:** if an issue's conversation is gone (Claude cleans up old transcripts after `cleanupPeriodDays`; Codex, Pi and Cursor sessions go when you delete them), bork notices on launch, starts a new session with the issue's prompt, and says so in the popup title and status bar. To start fresh on purpose, run `bork issue reset-session <id> [--agent <kind>]`, or edit the issue, focus the Agent field, press Backspace and save. If that agent's session is running, it's killed. The old conversation isn't deleted. OpenCode keeps sessions in a database bork doesn't read, so its sessions are always resumed.
 
-**Archive options:** `bork issue archive <id> [--force]` kills the issue's tmux session, runs the configured `teardown_script` inside the worktree, removes the worktree, and moves the issue to Done. `--force` proceeds past a failing teardown and discards uncommitted changes.
+**Archive options:** `bork issue archive <id> [--force]` kills the issue's tmux session, runs the configured `teardown_script` inside the worktree, removes the worktree, and moves the issue to Done. `--force` proceeds past a failing teardown or an issue plan that couldn't be saved (see [Backups](#backups)), and discards uncommitted changes.
 
 **Integration commands** link external tickets and PRs to existing issues. You can attach multiple Linear issues and/or GitHub PRs to a single bork issue:
 
@@ -497,6 +497,8 @@ What lands in `<path>/<project_name>/`:
 - `_issues/<issue-id>/planning.md`, copied from each issue worktree's `.claude/planning.md`
 
 The folder mirrors the project: files removed from the project are removed from the backup. Issue plans are the exception. An archived or pruned issue keeps its plan in the backup, which is only dropped once the issue is deleted from the board.
+
+Archive, delete and prune save the issue's plan before they remove its worktree. If the save fails, the worktree is kept: the TUI asks whether to remove it anyway, and `bork issue archive` / `bork prune` need `--force` (a plan lost that way is noted in `.bork/errors.log`). Deleting an issue also removes its `plans/<issue-id>/` folder.
 
 For now backups only run when you call `bork backup`; a later version runs them automatically in the TUI every `interval_minutes`.
 

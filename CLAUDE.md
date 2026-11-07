@@ -63,6 +63,7 @@ src/
 ├── init.rs           # `bork init` subcommand (clone repo, scaffold .bork/ directory)
 ├── lock.rs           # Single-instance PID file lock + signal handlers (SIGTERM, SIGHUP)
 ├── worktree.rs       # `bork worktree` subcommand (create git worktree, register with state)
+├── issue_plan.rs     # Save an issue's plan before its worktree is removed; drop `plans/<id>/` on delete
 ├── backup/           # Project backups (library; `bork backup` CLI in main.rs is a thin layer)
 │   ├── mod.rs        # plan_project/plan_global/execute/run_project/run_global/run_all, save_issue_plan, retention
 │   ├── config.rs     # `[backup]` section (enabled is project-only; path/interval_minutes layered global → project)
@@ -154,7 +155,8 @@ Legacy: `~/.config/bork/agents.toml` is no longer read (bork-119). A one-line st
 - Each project writes to `<path>/<project_name>/`, global files (`projects.json`, `config.toml`) to `<path>/_global/` when the global `[backup]` has a path.
 - Worktrees are excluded by union of `git worktree list` paths, `issue.worktree` names and child dirs with a `.git` entry. From `.bork/` only `state.json` and `config.toml` are copied.
 - Issue plans: each worktree's `.claude/planning.md` goes to `_issues/<issue-id>/planning.md`. The mirror removes stale files, except plans of issues still on the board (archived/pruned keep theirs); a plan is dropped only once its issue is deleted. If `state.json` can't be read, no plan is dropped.
-- `backup::save_issue_plan(root, issue_id, worktree_dir)` saves one plan; the worktree removal paths (archive/delete/prune) should call it before removing a worktree. It is a no-op when backups are off.
+- `backup::save_issue_plan(root, issue_id, worktree_dir)` saves one plan. It is a no-op when backups are off.
+- Removal paths save plans through `issue_plan::save_before_removal`, called inside both removal primitives: `worktree::remove_worktree_in` (archive, takes the issue id) and `prune::execute_removals` (`PruneTarget` carries the issue id; orphans have none and save nothing). Don't add a removal path that bypasses them. The plan is saved before the teardown; a failed save keeps the worktree (`ForceRequired::PlanNotSaved`, `RemoveOutcome::PlanNotSaved`) until forced (TUI y/n prompt, `--force` on `bork issue archive` / `bork prune`), and a forced loss is logged to `.bork/errors.log`. Deleting an issue removes `plans/<issue-id>/` (`issue_plan::remove_saved_plans`, backups-on projects only).
 - Safety: every backup folder holds a `.bork-backup-source` marker naming its source; `mirror::claim` only writes into an empty folder or one marked with the same source (refuses symlinks, files, unmarked non-empty dirs, other sources), and `remove_stale` never enters a subfolder holding another marker. `check_target` requires an absolute path and rejects targets overlapping the source or any registered project. Selection and copy propagate read errors (only NotFound counts as gone). `mirror::prepare_parent` checks every component below the scope dir so stale backup symlinks can't redirect writes. `.bork/state.json` and `.bork/config.toml` are copied by content (symlinks followed) and never pruned. The flock is required, not best effort.
 - Restore is a manual copy-back (README). There is no manifest or restore command.
 - Runs are serialized machine-wide with a flock on `~/.config/bork/backup.lock`.

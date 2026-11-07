@@ -2090,19 +2090,32 @@ fn submit_prune_dialog(app: &mut App, action_tx: &mpsc::Sender<ActionResult>) {
     }
 
     let project_id = dialog.project_id.clone();
+    app.close_prune_dialog();
+    spawn_prune(app, action_tx, project_id, to_remove, dirty, false);
+}
+
+/// Run a prune off the main thread and send its outcome back.
+fn spawn_prune(
+    app: &mut App,
+    action_tx: &mpsc::Sender<ActionResult>,
+    project_id: ProjectId,
+    to_remove: Vec<crate::prune::PruneTarget>,
+    dirty: Vec<String>,
+    force_plans: bool,
+) {
     let Some(project) = app.find_project(&project_id) else {
-        app.close_prune_dialog();
+        app.set_warning("Project no longer available");
         return;
     };
     let project_root = project.config.project_root.clone();
 
-    app.close_prune_dialog();
     app.begin_busy();
     app.set_message(format!("Pruning {} worktree(s)...", to_remove.len()));
 
     let tx = action_tx.clone();
     thread::spawn(move || {
-        let outcome = crate::prune::execute_removals(&project_root, &to_remove, &dirty);
+        let outcome =
+            crate::prune::execute_removals(&project_root, &to_remove, &dirty, force_plans);
         let (message, message_kind) = format_prune_result(&outcome);
         let _ = tx.send(ActionResult {
             message,
@@ -2111,6 +2124,63 @@ fn submit_prune_dialog(app: &mut App, action_tx: &mpsc::Sender<ActionResult>) {
             ..Default::default()
         });
     });
+}
+
+/// Hold worktrees a prune kept because their plan couldn't be saved until
+/// `show_queued_force_prune` can offer removing them anyway.
+pub fn queue_force_prune(
+    app: &mut App,
+    project_id: ProjectId,
+    targets: Vec<crate::prune::PruneTarget>,
+) {
+    if targets.is_empty() {
+        return;
+    }
+    app.queued_force_prunes
+        .retain(|(queued_project, _)| *queued_project != project_id);
+    app.queued_force_prunes.push((project_id, targets));
+}
+
+/// Ask whether to remove one project's queued worktrees anyway. Waits for
+/// Normal mode like `show_queued_force_archive`. Returns whether a prompt
+/// opened.
+pub fn show_queued_force_prune(app: &mut App) -> bool {
+    if app.input_mode != InputMode::Normal
+        || app.pending_confirm.is_some()
+        || app.queued_force_prunes.is_empty()
+    {
+        return false;
+    }
+    let (project_id, targets) = app.queued_force_prunes.remove(0);
+    let message = match targets.as_slice() {
+        [target] => format!(
+            "Kept {}: its plan couldn't be saved. Remove it anyway and lose the plan? (y/n)",
+            target.worktree
+        ),
+        _ => {
+            let mut named: Vec<String> = targets
+                .iter()
+                .take(FORCE_PROMPT_NAMED)
+                .map(|target| target.worktree.clone())
+                .collect();
+            if targets.len() > FORCE_PROMPT_NAMED {
+                named.push(format!("{} more", targets.len() - FORCE_PROMPT_NAMED));
+            }
+            format!(
+                "Kept {} worktrees whose plan couldn't be saved ({}). Remove them anyway and lose the plans? (y/n)",
+                targets.len(),
+                named.join(", ")
+            )
+        }
+    };
+    app.start_confirm(
+        message,
+        ConfirmAction::ForcePrune {
+            project_id,
+            targets,
+        },
+    );
+    true
 }
 
 fn format_prune_result(outcome: &crate::prune::PruneOutcome) -> (String, MessageKind) {
@@ -2124,7 +2194,10 @@ fn format_prune_result(outcome: &crate::prune::PruneOutcome) -> (String, Message
         .iter()
         .filter_map(|r| match &r.outcome {
             crate::prune::RemoveOutcome::Failed(msg) => Some(format!("{}: {}", r.worktree, msg)),
-            _ => None,
+            crate::prune::RemoveOutcome::PlanNotSaved { error, .. } => {
+                Some(format!("{}: plan not saved, {}", r.worktree, error))
+            }
+            crate::prune::RemoveOutcome::Removed => None,
         })
         .collect();
     (
@@ -2364,6 +2437,16 @@ fn handle_confirm(
                                 result
                                     .issues_to_delete
                                     .push((project_id.clone(), issue.id.clone()));
+                                if let Err(e) = crate::issue_plan::remove_saved_plans(
+                                    &config.project_root,
+                                    &issue.id,
+                                ) {
+                                    result.message = format!(
+                                        "Deleted {} but couldn't remove its saved plans: {e}",
+                                        issue.id
+                                    );
+                                    result.message_kind = MessageKind::Warning;
+                                }
                             }
                             result
                         },
@@ -2371,6 +2454,10 @@ fn handle_confirm(
                     ConfirmAction::RemoveProject { project_id } => {
                         unregister_sidebar_project(app, project_id)
                     }
+                    ConfirmAction::ForcePrune {
+                        project_id,
+                        targets,
+                    } => spawn_prune(app, action_tx, project_id, targets, Vec::new(), true),
                     ConfirmAction::ArchiveIssue {
                         issue_ids,
                         project_id,
@@ -2452,7 +2539,7 @@ fn archive_to_result(
         } else {
             Removal::Safe
         };
-        if let Err(e) = crate::worktree::remove_worktree_in(config, dir, removal) {
+        if let Err(e) = crate::worktree::remove_worktree_in(config, &issue_id, dir, removal) {
             let force_archive_offers = e
                 .downcast_ref::<ForceRequired>()
                 .map(|reason| vec![(project_id, issue_id.clone(), reason.clone())])
@@ -2536,6 +2623,28 @@ fn force_archive_prompt(offers: &[(String, ForceRequired)]) -> String {
         [(issue_id, ForceRequired::TeardownFailed { code, dirty: true })] => format!(
             "{issue_id}'s teardown script failed (exit {code}) and its worktree has uncommitted changes. Archive anyway and discard them? (y/n)"
         ),
+        [(
+            issue_id,
+            ForceRequired::PlanNotSaved {
+                error,
+                teardown,
+                dirty,
+            },
+        )] => {
+            let mut problems = format!("{issue_id}'s plan couldn't be saved ({error})");
+            if let Some(code) = teardown {
+                problems.push_str(&format!(", its teardown script failed (exit {code})"));
+            }
+            if *dirty {
+                problems.push_str(" and its worktree has uncommitted changes");
+            }
+            let question = if *dirty {
+                "Archive anyway, losing the plan and the changes?"
+            } else {
+                "Archive anyway and lose the plan?"
+            };
+            format!("{problems}. {question} (y/n)")
+        }
         _ => {
             let mut named: Vec<String> = offers
                 .iter()
@@ -2548,13 +2657,19 @@ fn force_archive_prompt(offers: &[(String, ForceRequired)]) -> String {
             let any_dirty = offers.iter().any(|(_, reason)| {
                 matches!(
                     reason,
-                    ForceRequired::Uncommitted(_) | ForceRequired::TeardownFailed { dirty: true, .. }
+                    ForceRequired::Uncommitted(_)
+                        | ForceRequired::TeardownFailed { dirty: true, .. }
+                        | ForceRequired::PlanNotSaved { dirty: true, .. }
                 )
             });
-            let question = if any_dirty {
-                "Archive anyway and discard their uncommitted changes?"
-            } else {
-                "Archive anyway?"
+            let any_plan = offers
+                .iter()
+                .any(|(_, reason)| matches!(reason, ForceRequired::PlanNotSaved { .. }));
+            let question = match (any_dirty, any_plan) {
+                (true, true) => "Archive anyway, losing unsaved plans and uncommitted changes?",
+                (true, false) => "Archive anyway and discard their uncommitted changes?",
+                (false, true) => "Archive anyway and lose the unsaved plans?",
+                (false, false) => "Archive anyway?",
             };
             format!(
                 "{} stopped short ({}). {question} (y/n)",
@@ -2571,6 +2686,18 @@ fn force_reason(reason: &ForceRequired) -> String {
         ForceRequired::TeardownFailed { code, dirty: false } => format!("teardown exit {code}"),
         ForceRequired::TeardownFailed { code, dirty: true } => {
             format!("teardown exit {code}, uncommitted changes")
+        }
+        ForceRequired::PlanNotSaved {
+            teardown, dirty, ..
+        } => {
+            let mut reason = "plan not saved".to_string();
+            if let Some(code) = teardown {
+                reason.push_str(&format!(", teardown exit {code}"));
+            }
+            if *dirty {
+                reason.push_str(", uncommitted changes");
+            }
+            reason
         }
     }
 }
@@ -4783,6 +4910,114 @@ mod tests {
             issue_id.into(),
             ForceRequired::TeardownFailed { code: 2, dirty },
         )
+    }
+
+    fn plan_not_saved(
+        project_id: &ProjectId,
+        issue_id: &str,
+        teardown: Option<i32>,
+        dirty: bool,
+    ) -> (ProjectId, String, ForceRequired) {
+        (
+            project_id.clone(),
+            issue_id.into(),
+            ForceRequired::PlanNotSaved {
+                error: "disk full".into(),
+                teardown,
+                dirty,
+            },
+        )
+    }
+
+    #[test]
+    fn an_unsaved_plan_asks_before_archiving() {
+        let mut app = app_with_issues();
+        let project_id = app.project().id();
+
+        assert!(offer(
+            &mut app,
+            vec![plan_not_saved(&project_id, "bork-1", None, false)]
+        ));
+
+        assert_eq!(
+            app.confirm_message.as_deref(),
+            Some("bork-1's plan couldn't be saved (disk full). Archive anyway and lose the plan? (y/n)")
+        );
+        assert!(matches!(
+            app.pending_confirm,
+            Some(ConfirmAction::ArchiveIssue { force: true, .. })
+        ));
+    }
+
+    #[test]
+    fn an_unsaved_plan_names_every_other_problem() {
+        let mut app = app_with_issues();
+        let project_id = app.project().id();
+
+        assert!(offer(
+            &mut app,
+            vec![plan_not_saved(&project_id, "bork-1", Some(2), true)]
+        ));
+        assert_eq!(
+            app.confirm_message.as_deref(),
+            Some("bork-1's plan couldn't be saved (disk full), its teardown script failed (exit 2) and its worktree has uncommitted changes. Archive anyway, losing the plan and the changes? (y/n)")
+        );
+        app.cancel_confirm();
+
+        assert!(offer(
+            &mut app,
+            vec![
+                plan_not_saved(&project_id, "bork-1", Some(2), false),
+                teardown_failed(&project_id, "bork-2", false),
+            ]
+        ));
+        assert_eq!(
+            app.confirm_message.as_deref(),
+            Some("2 issues stopped short (bork-1: plan not saved, teardown exit 2, bork-2: teardown exit 2). Archive anyway and lose the unsaved plans? (y/n)")
+        );
+    }
+
+    #[test]
+    fn a_prune_that_kept_unsaved_plans_asks_to_remove_them() {
+        use crate::prune::PruneTarget;
+        let mut app = app_with_issues();
+        let project_id = app.project().id();
+        let target = |worktree: &str, issue_id: &str| PruneTarget {
+            worktree: worktree.into(),
+            issue_id: Some(issue_id.into()),
+        };
+
+        queue_force_prune(&mut app, project_id.clone(), Vec::new());
+        assert!(!show_queued_force_prune(&mut app));
+
+        queue_force_prune(
+            &mut app,
+            project_id.clone(),
+            vec![target("bork-1-a", "bork-1")],
+        );
+        assert!(show_queued_force_prune(&mut app));
+        assert_eq!(
+            app.confirm_message.as_deref(),
+            Some("Kept bork-1-a: its plan couldn't be saved. Remove it anyway and lose the plan? (y/n)")
+        );
+        match &app.pending_confirm {
+            Some(ConfirmAction::ForcePrune { targets, .. }) => {
+                assert_eq!(targets, &vec![target("bork-1-a", "bork-1")])
+            }
+            other => panic!("expected ForcePrune, got {other:?}"),
+        }
+        app.cancel_confirm();
+
+        queue_force_prune(
+            &mut app,
+            project_id,
+            vec![target("bork-1-a", "bork-1"), target("bork-2-b", "bork-2")],
+        );
+        assert!(show_queued_force_prune(&mut app));
+        assert_eq!(
+            app.confirm_message.as_deref(),
+            Some("Kept 2 worktrees whose plan couldn't be saved (bork-1-a, bork-2-b). Remove them anyway and lose the plans? (y/n)")
+        );
     }
 
     #[test]

@@ -11,6 +11,7 @@ mod global_config;
 mod handler;
 mod init;
 mod input;
+mod issue_plan;
 mod lock;
 mod ops;
 mod prune;
@@ -675,6 +676,11 @@ enum Command {
         /// Skip these worktree directory names
         #[arg(long)]
         exclude: Vec<String>,
+
+        /// Remove worktrees even when their issue plan can't be saved (dirty
+        /// worktrees are still skipped)
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -1093,7 +1099,8 @@ fn main() -> anyhow::Result<()> {
             yes,
             include,
             exclude,
-        }) => run_prune_command(dry_run, yes, &include, &exclude),
+            force,
+        }) => run_prune_command(dry_run, yes, &include, &exclude, force),
         None => run_tui(),
     }
 }
@@ -1103,6 +1110,7 @@ fn run_prune_command(
     yes: bool,
     include: &[String],
     exclude: &[String],
+    force: bool,
 ) -> anyhow::Result<()> {
     use crate::prune::{
         apply_outcome_to_issues, execute_removals, partition_selection, PruneAction,
@@ -1194,12 +1202,16 @@ fn run_prune_command(
         }
     }
 
-    let outcome = execute_removals(&config.project_root, &to_remove, &dirty_names);
+    let outcome = execute_removals(&config.project_root, &to_remove, &dirty_names, force);
 
     for result in &outcome.results {
         match &result.outcome {
             RemoveOutcome::Removed => println!("Removed: {}", result.worktree),
             RemoveOutcome::Failed(msg) => println!("Failed: {} ({})", result.worktree, msg),
+            RemoveOutcome::PlanNotSaved { issue_id, error } => println!(
+                "Kept: {} (couldn't save {issue_id}'s plan: {error})",
+                result.worktree
+            ),
         }
     }
 
@@ -1209,6 +1221,13 @@ fn run_prune_command(
     config::save_state(&state, &config.project_root)?;
 
     println!("\nDone. Pruned {} worktree(s).", outcome.removed_count());
+    let plan_not_saved = outcome.plan_not_saved();
+    if !plan_not_saved.is_empty() {
+        anyhow::bail!(
+            "kept {} worktree(s) whose plan couldn't be saved; fix it or re-run with --force to remove them and lose the plans",
+            plan_not_saved.len()
+        );
+    }
     if outcome.failed_count() > 0 {
         anyhow::bail!(
             "{} worktree(s) failed, see .bork/errors.log",
@@ -2536,6 +2555,7 @@ fn run_tui() -> anyhow::Result<()> {
     // --- Main event loop ---
     loop {
         needs_redraw |= handler::show_queued_force_archive(&mut app);
+        needs_redraw |= handler::show_queued_force_prune(&mut app);
         if needs_redraw {
             terminal.draw(|frame| {
                 ui::render(frame, &app);
@@ -2701,6 +2721,7 @@ fn run_tui() -> anyhow::Result<()> {
                     // Reset cooldown so we don't immediately re-prompt.
                     project.last_auto_prune_check = Some(std::time::Instant::now());
                 }
+                handler::queue_force_prune(&mut app, project_id, outcome.plan_not_saved());
             }
 
             for (project_id, issue_id) in result.issues_to_delete {

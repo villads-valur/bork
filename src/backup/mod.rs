@@ -208,7 +208,6 @@ pub fn run_all() -> (Vec<ProjectRun>, Option<anyhow::Result<MirrorReport>>) {
 ///
 /// Returns `Ok(false)` when backups are off for the project or the worktree
 /// has no plan, `Ok(true)` once the plan is in the backup.
-#[cfg_attr(not(test), allow(dead_code))] // Wired into removal paths in a follow-up
 pub fn save_issue_plan(
     project_root: &Path,
     issue_id: &str,

@@ -182,7 +182,7 @@ fn state_path(project_root: &Path) -> PathBuf {
     config_dir(project_root).join("state.json")
 }
 
-fn error_log_path(project_root: &Path) -> PathBuf {
+pub(crate) fn error_log_path(project_root: &Path) -> PathBuf {
     config_dir(project_root).join("errors.log")
 }
 
