@@ -865,10 +865,27 @@ enum IssueCommand {
         force: bool,
     },
 
+    /// Run an issue's agent in this terminal: setup script, then the agent
+    /// (bork types this into the issue's tmux pane)
+    Launch {
+        /// Issue ID (e.g. bork-1)
+        id: String,
+    },
+
     /// Delete an issue
     Delete {
         /// Issue ID (e.g. bork-1)
         id: String,
+    },
+
+    /// Forget an issue's stored agent session so the next launch starts fresh
+    ResetSession {
+        /// Issue ID (e.g. bork-1)
+        id: String,
+
+        /// Agent whose session to forget (defaults to the issue's agent)
+        #[arg(long, value_parser = parse_agent_kind)]
+        agent: Option<AgentKind>,
     },
 
     /// Show issue details
@@ -1670,6 +1687,19 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
             println!("Deleted {}: \"{}\"", issue.id, issue.title);
             Ok(())
         }
+        IssueCommand::Launch { id } => external::agent::exec_launch(&project_root, &id),
+        IssueCommand::ResetSession { id, agent } => {
+            let reset = ops::reset_session(&project_root, &id, agent)?;
+            if reset.removed {
+                println!(
+                    "Forgot {}'s {} session; the next launch starts a new one",
+                    reset.issue_id, reset.agent
+                );
+            } else {
+                println!("{} has no stored {} session", reset.issue_id, reset.agent);
+            }
+            Ok(())
+        }
         IssueCommand::Show { id, json } => {
             let output = ops::show_issue(&project_root, &id, json)?;
             println!("{}", output);
@@ -1828,9 +1858,8 @@ fn start_issue(project_root: &Path, opts: StartIssueOptions) -> anyhow::Result<S
     };
 
     let launched_agent = issue.agent_kind;
-    let (session_name, agent_session_id, setup_ran) =
-        external::agent::launch_session(&issue, &config)
-            .map_err(|e| anyhow::anyhow!("Failed to launch agent: {e}"))?;
+    let outcome = external::agent::launch_session(&issue, &config)
+        .map_err(|e| anyhow::anyhow!("Failed to launch agent: {e}"))?;
 
     // Resolve the link target: explicit --link wins, else the spawning agent's
     // issue from BORK_ISSUE_ID. Only link when the target exists in this same
@@ -1847,17 +1876,12 @@ fn start_issue(project_root: &Path, opts: StartIssueOptions) -> anyhow::Result<S
         if saved.column == Column::Todo {
             saved.column = Column::InProgress;
         }
-        // A kind change during the launch detached what it produced (see
-        // Issue::accepts_launch_result); setup_ran additionally ignores
-        // agent changes since the setup script is agent-independent.
-        if setup_ran && saved.kind == issue.kind {
-            saved.setup_ran = true;
-        }
-        if let Some(sid) =
-            agent_session_id.filter(|_| saved.accepts_launch_result(issue.kind, launched_agent))
-        {
-            saved.sessions.insert(launched_agent, sid);
-        }
+        saved.record_launch(
+            issue.kind,
+            launched_agent,
+            outcome.agent_session_id,
+            outcome.setup_ran,
+        );
     }
     config::save_state(&state, project_root)?;
 
@@ -1890,7 +1914,7 @@ fn start_issue(project_root: &Path, opts: StartIssueOptions) -> anyhow::Result<S
         issue_id: issue.id,
         title: issue.title,
         worktree_dir,
-        session_name,
+        session_name: outcome.session_name,
         linked_to,
     })
 }
@@ -2729,6 +2753,12 @@ fn run_tui() -> anyhow::Result<()> {
                             dirty = true;
                         }
                     }
+                    if let Some(agent) = result.forget_lost_session.filter(|_| !invalidated) {
+                        if issue.agent_kind == agent {
+                            issue.forget_session(agent);
+                            dirty = true;
+                        }
+                    }
                     if dirty {
                         project.mark_dirty();
                     }
@@ -2751,6 +2781,7 @@ fn run_tui() -> anyhow::Result<()> {
                             }
                         }
                         if open_popup {
+                            let popup_title = result.popup_title.unwrap_or(popup_title);
                             pending_popup_session = Some((session_name, popup_title));
                         }
                     }

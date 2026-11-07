@@ -71,6 +71,12 @@ impl AgentProvider for Pi {
         detect_session_id(&dir, ctx.before)
     }
 
+    fn has_session(&self, project_root: &Path, session_id: &str) -> bool {
+        sessions_dir(project_root)
+            .and_then(|dir| session_in(&dir, session_id))
+            .unwrap_or(true)
+    }
+
     fn install_hooks(&self) -> anyhow::Result<()> {
         hooks::install_pi_extension()
     }
@@ -78,6 +84,27 @@ impl AgentProvider for Pi {
     fn uninstall_hooks(&self) -> anyhow::Result<()> {
         hooks::uninstall_pi_extension()
     }
+}
+
+/// `None` when the session dir (e.g. Pi never ran for this cwd) or one of its
+/// entries can't be read and the id wasn't found, so the session is kept.
+fn session_in(dir: &Path, session_id: &str) -> Option<bool> {
+    let mut unreadable = false;
+    for entry in fs::read_dir(dir).ok()? {
+        let Ok(entry) = entry else {
+            unreadable = true;
+            continue;
+        };
+        let found = entry
+            .file_name()
+            .to_str()
+            .and_then(parse_session_id_from_filename)
+            .is_some_and(|id| id == session_id);
+        if found {
+            return Some(true);
+        }
+    }
+    (!unreadable).then_some(false)
 }
 
 fn detect_session_id(dir: &Path, before: &HashSet<String>) -> Option<String> {
@@ -157,6 +184,24 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
         assert!(before.contains(old));
         assert_eq!(detected.as_deref(), Some(new));
+    }
+
+    #[test]
+    fn session_in_matches_session_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sid = "019d76ad-9734-77c0-8169-a727a5524013";
+        fs::write(
+            dir.path().join(format!("2026-11-05T09-00-00_{sid}.jsonl")),
+            "",
+        )
+        .unwrap();
+
+        assert_eq!(session_in(dir.path(), sid), Some(true));
+        assert_eq!(
+            session_in(dir.path(), "019d76ad-9734-77c0-8169-a727a5524099"),
+            Some(false)
+        );
+        assert_eq!(session_in(&dir.path().join("missing"), sid), None);
     }
 
     #[test]

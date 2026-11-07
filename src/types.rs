@@ -515,6 +515,19 @@ impl Issue {
         self.sessions.get(&self.agent_kind).map(String::as_str)
     }
 
+    /// Whether forgetting `agent`'s session means killing the live tmux
+    /// session: only the current agent's process is running, and re-attaching
+    /// it would keep the old conversation going.
+    pub fn forgetting_kills_session(&self, agent: AgentKind) -> bool {
+        agent == self.agent_kind && self.sessions.contains_key(&agent)
+    }
+
+    /// Drop `agent`'s stored session so its next launch starts fresh. Callers
+    /// check `forgetting_kills_session()` first and kill before forgetting.
+    pub fn forget_session(&mut self, agent: AgentKind) {
+        self.sessions.remove(&agent);
+    }
+
     /// Whether a landed launch result's detected session id still applies to
     /// this issue. A kind change while detection was polling means `set_kind`
     /// invalidated everything the launch produced; an agent change means the
@@ -525,6 +538,26 @@ impl Issue {
         launched_agent: AgentKind,
     ) -> bool {
         self.kind == launched_kind && self.agent_kind == launched_agent
+    }
+
+    /// Store what a launch produced. A kind change during the launch detached
+    /// all of it (see `accepts_launch_result`); `setup_ran` ignores agent
+    /// changes since the setup script is agent-independent.
+    pub fn record_launch(
+        &mut self,
+        launched_kind: IssueKind,
+        launched_agent: AgentKind,
+        session_id: Option<String>,
+        setup_ran: bool,
+    ) {
+        if setup_ran && self.kind == launched_kind {
+            self.setup_ran = true;
+        }
+        if let Some(sid) =
+            session_id.filter(|_| self.accepts_launch_result(launched_kind, launched_agent))
+        {
+            self.sessions.insert(launched_agent, sid);
+        }
     }
 
     /// Attach a worktree to this issue. Clears the `pruned_at` marker so the

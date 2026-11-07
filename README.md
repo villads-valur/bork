@@ -212,6 +212,7 @@ bork issue list --json                    # machine-readable output
 bork issue move bork-3 code-review
 bork issue update bork-3 --title "Fix OAuth flow"
 bork issue show bork-3
+bork issue reset-session bork-3           # next launch starts a new agent session
 bork issue archive bork-3                 # cleanup when work is merged
 bork issue delete bork-3
 ```
@@ -221,6 +222,8 @@ bork issue delete bork-3
 **Start options:** `--prompt`, `--agent` (opencode, claude, codex), `--mode` (plan, build, yolo), `--model`, `--slug`, `--no-worktree`, `--project` (registered project name or path). `bork issue start` defaults to build mode and creates a worktree with a slug generated from the title. If a `setup_script` is configured, it runs inside the worktree before the agent starts.
 
 **Model per issue:** `--model <name>` on `create`, `start` and `update` is saved on the issue and passed to the agent as `--model <name>` on every launch and resume, e.g. `bork issue start "Review PR 42" --agent claude --model sonnet`. It replaces any `--model`/`-m` in `[agent.<name>].args`. Model names are agent-specific, so changing an issue's agent clears it. OpenCode's TUI has no `--model` flag, so `--model` on an opencode issue is an error. `bork issue update <id> --model ""` clears it.
+
+**Lost sessions:** if an issue's conversation is gone (Claude cleans up old transcripts after `cleanupPeriodDays`; Codex, Pi and Cursor sessions go when you delete them), bork notices on launch, starts a new session with the issue's prompt, and says so in the popup title and status bar. To start fresh on purpose, run `bork issue reset-session <id> [--agent <kind>]`, or edit the issue, focus the Agent field, press Backspace and save. If that agent's session is running, it's killed. The old conversation isn't deleted. OpenCode keeps sessions in a database bork doesn't read, so its sessions are always resumed.
 
 **Archive options:** `bork issue archive <id> [--force]` kills the issue's tmux session, runs the configured `teardown_script` inside the worktree, removes the worktree, and moves the issue to Done. `--force` proceeds past a failing teardown and discards uncommitted changes.
 
@@ -307,6 +310,7 @@ With issues marked, `H`, `L`, `D`, `T`, `Shift+Enter`, `o`, `O`, `x`, `d` and `A
 | `Ctrl+e` | Open prompt in `$EDITOR` (on Prompt field) |
 | `Esc` / `Ctrl+c` | Cancel |
 | `Space` / `h` / `l` | Cycle agent (on Agent field); cycle mode (on Mode field); open Linear picker (on Linear field) |
+| `Backspace` | Start the selected agent's next launch in a new session, on save (on Agent field) |
 
 ### Sidebar Mode
 

@@ -93,7 +93,7 @@ fn wait_for_exit(alive: &mut Vec<i32>, budget: Duration) {
 }
 
 /// Returns true if a process with this PID currently exists.
-fn process_alive(pid: i32) -> bool {
+pub(crate) fn process_alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
