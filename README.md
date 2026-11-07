@@ -498,6 +498,8 @@ bork backup --dry-run           # print the file path and its contents, write no
 bork backup status              # opted-in projects, last run, result and size per file
 ```
 
+Archive and prune keep issue plans: before they remove a worktree, its `.claude/planning.md` is copied to `plans/<issue-id>/planning.md` in the project container, so it lands in the next backup. A worktree no issue claims (for example one whose issue was deleted) gets `plans/_orphans/<worktree>/planning.md` instead. If the copy fails, the worktree is kept: the TUI asks whether to remove it anyway, and `bork issue archive` / `bork prune` need `--force` (a plan lost that way is noted in `.bork/errors.log`). Deleting an issue also removes its `plans/<issue-id>/` folder.
+
 Backups run once a day automatically while the TUI is open (coming) and whenever you run `bork backup`. The file is replaced atomically and left untouched when nothing changed since the last backup. A file bork can't read (or a corrupt `.bork/state.json`) fails the run and keeps the previous backup. The last result per file is stored in `~/.config/bork/backup.json`.
 
 #### Restoring

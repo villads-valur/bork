@@ -342,6 +342,18 @@ fn is_due_at(records: &status::StatusFile, file: Option<&Path>, now: u64) -> boo
     }
 }
 
+/// Container directory holding saved plans, one subdirectory per issue.
+pub const PLANS_DIR: &str = "plans";
+
+/// Subdirectory of [`PLANS_DIR`] for plans of removed worktrees that no issue
+/// claims, by worktree name. Not a valid issue id, so it can't collide.
+pub const ORPHAN_PLANS_DIR: &str = "_orphans";
+
+/// Where an issue's saved plan lives: `plans/<issue_id>/`.
+pub fn issue_plan_dir(project_root: &Path, issue_id: &str) -> PathBuf {
+    project_root.join(PLANS_DIR).join(issue_id)
+}
+
 /// Copy an issue worktree's `.claude/planning.md` into the container's
 /// `plans/<issue_id>/planning.md`, so the plan survives the worktree being
 /// removed (and lands in the next backup with the rest of `plans/`). Meant
@@ -349,7 +361,6 @@ fn is_due_at(records: &status::StatusFile, file: Option<&Path>, now: u64) -> boo
 ///
 /// Returns `Ok(false)` when the project has backups off or the worktree has
 /// no plan, `Ok(true)` once the plan is copied.
-#[cfg_attr(not(test), allow(dead_code))] // Wired into the removal paths in a follow-up
 pub fn save_issue_plan(
     project_root: &Path,
     issue_id: &str,
@@ -358,8 +369,32 @@ pub fn save_issue_plan(
     if !config::project_enabled(project_root)? {
         return Ok(false);
     }
-    if !select::is_plain_component(issue_id) || !select::is_plain_component(worktree_dir) {
-        bail!("invalid issue id {issue_id:?} or worktree {worktree_dir:?}");
+    if !select::is_plain_component(issue_id) {
+        bail!("invalid issue id {issue_id:?}");
+    }
+    copy_plan(
+        project_root,
+        worktree_dir,
+        &issue_plan_dir(project_root, issue_id),
+    )
+}
+
+/// Like [`save_issue_plan`] for a worktree no issue claims: the plan goes to
+/// `plans/_orphans/<worktree_dir>/planning.md`.
+pub fn save_orphan_plan(project_root: &Path, worktree_dir: &str) -> anyhow::Result<bool> {
+    if !config::project_enabled(project_root)? {
+        return Ok(false);
+    }
+    let dir = project_root
+        .join(PLANS_DIR)
+        .join(ORPHAN_PLANS_DIR)
+        .join(worktree_dir);
+    copy_plan(project_root, worktree_dir, &dir)
+}
+
+fn copy_plan(project_root: &Path, worktree_dir: &str, dir: &Path) -> anyhow::Result<bool> {
+    if !select::is_plain_component(worktree_dir) {
+        bail!("invalid worktree {worktree_dir:?}");
     }
     let source = project_root.join(worktree_dir).join(PLAN_FILE);
     let bytes = match fs::read(&source) {
@@ -367,8 +402,7 @@ pub fn save_issue_plan(
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
         Err(err) => return Err(err).with_context(|| format!("reading {}", source.display())),
     };
-    let dir = project_root.join("plans").join(issue_id);
-    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     crate::config::atomic_write(&dir.join(PLAN_NAME), &bytes)?;
     Ok(true)
 }
