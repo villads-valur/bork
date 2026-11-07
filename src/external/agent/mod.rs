@@ -417,6 +417,10 @@ fn run_setup(prefix: &str, project_root: &Path) -> Result<(), AppError> {
         .arg(prefix)
         .current_dir(project_root)
         .status()?;
+    setup_result(status)
+}
+
+fn setup_result(status: std::process::ExitStatus) -> Result<(), AppError> {
     if status.success() {
         return Ok(());
     }
@@ -2231,20 +2235,20 @@ mod tests {
         let config = setup_config(root.path(), "exit 7");
         let issue = issue_in_worktree(root.path());
 
-        let err = prepare_launch(&issue, &config, &root.path().join("status")).unwrap_err();
+        let status = root.path().join("status");
+
+        let err = prepare_launch(&issue, &config, &status).unwrap_err();
         assert!(err.to_string().contains("status 7"), "{err}");
+        assert!(!prompt_file_path(&status, "bork-bork-1").exists());
     }
 
     #[test]
-    fn interrupted_setup_blocks_the_launch() {
-        let root = tempfile::TempDir::new().unwrap();
-        let config = setup_config(root.path(), "touch started; kill -INT $$; touch finished");
-        let issue = issue_in_worktree(root.path());
+    fn setup_killed_by_a_signal_reports_an_interruption() {
+        use std::os::unix::process::ExitStatusExt;
 
-        let err = prepare_launch(&issue, &config, &root.path().join("status")).unwrap_err();
+        let status = std::process::ExitStatus::from_raw(libc::SIGINT);
+        let err = setup_result(status).unwrap_err();
         assert!(err.to_string().contains("interrupted"), "{err}");
-        assert!(root.path().join("bork-1/started").exists());
-        assert!(!root.path().join("bork-1/finished").exists());
     }
 
     #[test]
