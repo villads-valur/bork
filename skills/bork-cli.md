@@ -111,6 +111,15 @@ bork types this into each issue's tmux pane. It runs the setup script if it's du
 bork issue launch bork-1
 ```
 
+### Start a fresh agent session
+
+Forget the issue's stored session so the next launch starts a new conversation with the issue's prompt. Kills the live session if it runs that agent.
+
+```bash
+bork issue reset-session bork-1
+bork issue reset-session bork-1 --agent codex    # a different agent's stored session
+```
+
 ### Delete an issue
 
 ```bash

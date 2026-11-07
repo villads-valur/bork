@@ -515,6 +515,19 @@ impl Issue {
         self.sessions.get(&self.agent_kind).map(String::as_str)
     }
 
+    /// Whether forgetting `agent`'s session means killing the live tmux
+    /// session: only the current agent's process is running, and re-attaching
+    /// it would keep the old conversation going.
+    pub fn forgetting_kills_session(&self, agent: AgentKind) -> bool {
+        agent == self.agent_kind && self.sessions.contains_key(&agent)
+    }
+
+    /// Drop `agent`'s stored session so its next launch starts fresh. Callers
+    /// check `forgetting_kills_session()` first and kill before forgetting.
+    pub fn forget_session(&mut self, agent: AgentKind) {
+        self.sessions.remove(&agent);
+    }
+
     /// Whether a landed launch result's detected session id still applies to
     /// this issue. A kind change while detection was polling means `set_kind`
     /// invalidated everything the launch produced; an agent change means the

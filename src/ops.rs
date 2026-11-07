@@ -317,9 +317,49 @@ pub fn record_launch(
         && issue.accepts_launch_result(launched.kind, launched.agent_kind);
     issue.record_launch(launched.kind, launched.agent_kind, session_id, setup_ran);
     if forget_lost {
-        issue.sessions.remove(&launched.agent_kind);
+        issue.forget_session(launched.agent_kind);
     }
     config::save_state(&state, project_root)
+}
+
+pub struct SessionReset {
+    pub issue_id: String,
+    pub agent: AgentKind,
+    pub removed: bool,
+}
+
+/// Forget the stored session for `agent` (default: the issue's agent) so the
+/// next launch starts fresh. Kills the live session when it runs that agent,
+/// since re-attaching it would keep the old conversation going.
+pub fn reset_session(
+    project_root: &Path,
+    issue_id: &str,
+    agent: Option<AgentKind>,
+) -> anyhow::Result<SessionReset> {
+    let mut state = config::load_state(project_root);
+
+    let idx = find_issue_index(&state.issues, issue_id)
+        .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", issue_id))?;
+
+    let issue = &mut state.issues[idx];
+    let agent = agent.unwrap_or(issue.agent_kind);
+    let removed = issue.sessions.contains_key(&agent);
+
+    if removed {
+        // Kill first so a failed cleanup aborts before the state is saved.
+        if issue.forgetting_kills_session(agent) {
+            let config = config::load_config_from(project_root);
+            agent::terminate_session(project_root, &issue.session_name(&config.project_name))?;
+        }
+        issue.forget_session(agent);
+        config::save_state(&state, project_root)?;
+    }
+
+    Ok(SessionReset {
+        issue_id: state.issues[idx].id.clone(),
+        agent,
+        removed,
+    })
 }
 
 pub fn delete_issue(project_root: &Path, issue_id: &str) -> anyhow::Result<Issue> {
@@ -1245,6 +1285,44 @@ mod tests {
         let issue = &config::load_state(root).issues[0];
         assert_eq!(issue.current_session_id(), Some("new-uuid"));
         assert!(issue.setup_ran);
+    }
+
+    #[test]
+    fn reset_session_forgets_only_the_chosen_agent() {
+        let dir = setup_project();
+        let root = dir.path();
+        create_issue(
+            root,
+            CreateOptions {
+                title: "Lost session".into(),
+                agent_kind: Some(AgentKind::OpenCode),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mut state = config::load_state(root);
+        state.issues[0]
+            .sessions
+            .insert(AgentKind::OpenCode, "ses_abc".into());
+        state.issues[0]
+            .sessions
+            .insert(AgentKind::Claude, "uuid-1".into());
+        config::save_state(&state, root).unwrap();
+
+        let reset = reset_session(root, "test-1", None).unwrap();
+        assert_eq!(reset.agent, AgentKind::OpenCode);
+        assert!(reset.removed);
+
+        let sessions = &config::load_state(root).issues[0].sessions;
+        assert!(!sessions.contains_key(&AgentKind::OpenCode));
+        assert_eq!(
+            sessions.get(&AgentKind::Claude).map(String::as_str),
+            Some("uuid-1")
+        );
+
+        let again = reset_session(root, "test-1", Some(AgentKind::Codex)).unwrap();
+        assert!(!again.removed);
     }
 
     #[test]

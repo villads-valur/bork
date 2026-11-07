@@ -70,6 +70,12 @@ impl AgentProvider for Codex {
         detect_session_id(&root, ctx.before)
     }
 
+    fn has_session(&self, _project_root: &Path, session_id: &str) -> bool {
+        sessions_root()
+            .and_then(|root| session_in(&root, session_id))
+            .unwrap_or(true)
+    }
+
     fn install_hooks(&self) -> anyhow::Result<()> {
         hooks::install_codex_hooks()
     }
@@ -82,6 +88,41 @@ impl AgentProvider for Codex {
 pub(super) fn sessions_root() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     Some(PathBuf::from(home).join(".codex").join("sessions"))
+}
+
+/// Rollouts are filed by date, so look the id up among all of them. `None`
+/// when the root (e.g. Codex never ran here) or any dir below it can't be
+/// read and the id wasn't found, so the session is kept.
+fn session_in(root: &Path, session_id: &str) -> Option<bool> {
+    let mut unreadable = false;
+    let mut stack = vec![fs::read_dir(root).ok()?];
+
+    while let Some(entries) = stack.pop() {
+        for entry in entries {
+            let Ok(entry) = entry else {
+                unreadable = true;
+                continue;
+            };
+            let path = entry.path();
+            if path.is_dir() {
+                match fs::read_dir(&path) {
+                    Ok(children) => stack.push(children),
+                    Err(_) => unreadable = true,
+                }
+                continue;
+            }
+            let found = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(parse_session_id_from_filename)
+                .is_some_and(|id| id == session_id);
+            if found {
+                return Some(true);
+            }
+        }
+    }
+
+    (!unreadable).then_some(false)
 }
 
 fn detect_session_id(root: &Path, before: &HashSet<String>) -> Option<String> {
@@ -155,6 +196,41 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
         assert!(before.contains(old));
         assert_eq!(detected.as_deref(), Some(new));
+    }
+
+    #[test]
+    fn session_in_finds_dated_rollout() {
+        let root = tempfile::TempDir::new().unwrap();
+        let day = root.path().join("2026").join("11").join("05");
+        fs::create_dir_all(&day).unwrap();
+        let sid = "019d76ad-9734-77c0-8169-a727a5524013";
+        fs::write(
+            day.join(format!("rollout-2026-11-05T09-00-00-{sid}.jsonl")),
+            "",
+        )
+        .unwrap();
+
+        assert_eq!(session_in(root.path(), sid), Some(true));
+        assert_eq!(
+            session_in(root.path(), "019d76ad-9734-77c0-8169-a727a5524099"),
+            Some(false)
+        );
+        assert_eq!(session_in(&root.path().join("missing"), sid), None);
+    }
+
+    #[test]
+    fn session_in_unreadable_day_is_unknown() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::TempDir::new().unwrap();
+        let day = root.path().join("2026").join("11").join("05");
+        fs::create_dir_all(&day).unwrap();
+        fs::set_permissions(&day, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = session_in(root.path(), "019d76ad-9734-77c0-8169-a727a5524013");
+        fs::set_permissions(&day, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(result, None);
     }
 
     #[test]
