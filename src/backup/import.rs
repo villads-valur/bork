@@ -1084,6 +1084,7 @@ mod tests {
                 path: path.to_string(),
                 source: source.to_path_buf(),
                 follow: false,
+                captured: None,
             })
             .collect();
         let file = dir.join("crafted.tar.gz");
