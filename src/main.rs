@@ -437,7 +437,7 @@ fn apply_backup_report(app: &mut App, report: BackupReport) -> bool {
         let line = format!("backup failed: {error}");
         for project in &app.projects {
             let root = &project.config.project_root;
-            if backup::config::project_enabled(root) {
+            if matches!(backup::config::project_enabled(root), Ok(true)) {
                 config::append_error_log(root, std::slice::from_ref(&line));
             }
         }
@@ -501,19 +501,15 @@ fn spawn_backup_worker(
             let file = backup::config::load_settings()
                 .path
                 .map(|dir| dir.join(backup::BACKUP_FILE));
-            let check = match &file {
-                None => Check::NoPath,
-                Some(file) => {
-                    let record = record_for(file);
-                    if manual || schedule::is_due(record.as_ref(), app::unix_now()) {
-                        let result = backup::run(&backup::Selection::All)
-                            .map(|outcome| outcome.map(|o| o.written))
-                            .map_err(|err| format!("{err:#}"));
-                        Check::Ran(result)
-                    } else {
-                        Check::Skipped
-                    }
-                }
+            let check = if file.is_none() {
+                Check::NoPath
+            } else if manual || backup::is_due(app::unix_now()) {
+                let result = backup::run(&backup::Selection::All)
+                    .map(|outcome| outcome.map(|o| o.written))
+                    .map_err(|err| format!("{err:#}"));
+                Check::Ran(result)
+            } else {
+                Check::Skipped
             };
             let record = file.as_deref().and_then(record_for);
             let indicator = schedule::indicator(&check, record.as_ref(), app::unix_now());
@@ -1391,21 +1387,19 @@ fn run_backup_status() -> anyhow::Result<()> {
     let settings = backup::config::load_settings();
     match &settings.path {
         Some(path) => println!(
-            "path: {} (every {} min once the TUI worker lands)",
-            path.display(),
-            settings.interval_minutes
+            "path: {} (backed up daily, and on `bork backup`)",
+            path.display()
         ),
         None => println!("path: not set (set `path` under [backup] in ~/.config/bork/config.toml)"),
     }
 
     println!("projects:");
     for entry in global_config::list_projects() {
-        let state = if backup::config::project_enabled(&entry.path) {
-            "on"
-        } else {
-            "off"
-        };
-        println!("  {}: {state}", entry.name);
+        match backup::config::project_enabled(&entry.path) {
+            Ok(true) => println!("  {}: on", entry.name),
+            Ok(false) => println!("  {}: off", entry.name),
+            Err(err) => println!("  {}: unknown ({err:#})", entry.name),
+        }
     }
 
     let records = backup::status::read(&backup::status::status_path()).archives;

@@ -485,7 +485,6 @@ Both keys accept a single shell command line and can live in either config layer
 # ~/.config/bork/config.toml
 [backup]
 path = "~/Library/Mobile Documents/com~apple~CloudDocs/bork"  # absolute or ~/
-interval_minutes = 2                                           # for automatic backups in the TUI (coming)
 
 # <project>/.bork/config.toml: nothing is backed up until a project opts in
 [backup]
@@ -499,9 +498,9 @@ bork backup --dry-run           # print the file path and its contents, write no
 bork backup status              # opted-in projects, last run, result and size per file
 ```
 
-The file is replaced atomically and left untouched when nothing changed since the last backup. A file bork can't read fails the run and keeps the previous backup. The last result per file is stored in `~/.config/bork/backup.json`.
+Backups run once a day automatically while the TUI is open and whenever you run `bork backup`. The file is replaced atomically and left untouched when nothing changed since the last backup. A file bork can't read fails the run and keeps the previous backup. The last result per file is stored in `~/.config/bork/backup.json`.
 
-While the TUI runs, it backs up automatically once a day: it checks shortly after startup and then hourly, and runs a backup when none has succeeded in the last 24 hours. Press `B` to back up right away. The header stays quiet while backups work, and shows a warning when the last run failed (the error also goes to `.bork/errors.log` of each opted-in project) or when no backup has succeeded in over 48 hours.
+The TUI checks shortly after startup and then hourly, and runs a backup when none has succeeded in the last 24 hours. Press `B` to back up right away. The header stays quiet while backups work, and shows a warning when the last run failed (the error also goes to `.bork/errors.log` of each opted-in project) or when no backup has succeeded in over 48 hours.
 
 #### Restoring
 

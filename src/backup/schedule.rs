@@ -1,9 +1,10 @@
-//! Scheduling and status decisions for the TUI backup worker. Pure
-//! functions over the status record in `~/.config/bork/backup.json`, so the
-//! worker thread in `main.rs` only does the I/O.
+//! Status decisions for the TUI backup worker. Pure functions over the
+//! status record in `~/.config/bork/backup.json`, so the worker thread in
+//! `main.rs` only does the I/O.
 //!
 //! Backups run once a day: the worker checks shortly after startup and then
-//! hourly whether one is due, and `B` in the TUI forces a run.
+//! hourly whether one is due ([`super::is_due`]), and `B` in the TUI forces
+//! a run.
 
 use std::time::Duration;
 
@@ -13,19 +14,8 @@ use super::status::ArchiveStatus;
 pub const STARTUP_DELAY: Duration = Duration::from_secs(15);
 /// How often the worker checks whether a backup is due.
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
-/// A backup is due once the last success is this old.
-pub const DUE_AFTER_SECS: u64 = 24 * 60 * 60;
 /// The TUI warns once the last success is this old.
 pub const STALE_AFTER_SECS: u64 = 48 * 60 * 60;
-
-/// Whether a scheduled backup should run now: no success recorded yet, or
-/// the last one is at least [`DUE_AFTER_SECS`] old.
-pub fn is_due(record: Option<&ArchiveStatus>, now: u64) -> bool {
-    match record.and_then(|r| r.last_success_at) {
-        Some(at) => now.saturating_sub(at) >= DUE_AFTER_SECS,
-        None => true,
-    }
-}
 
 /// What one worker check did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,21 +157,6 @@ mod tests {
             error: Some(error.to_string()),
             ..ArchiveStatus::default()
         }
-    }
-
-    #[test]
-    fn due_without_a_success() {
-        assert!(is_due(None, NOW));
-        assert!(is_due(Some(&failed(None, "boom")), NOW));
-    }
-
-    #[test]
-    fn due_once_a_day() {
-        assert!(!is_due(Some(&ok_at(NOW - HOUR)), NOW));
-        assert!(!is_due(Some(&ok_at(NOW - 23 * HOUR)), NOW));
-        assert!(is_due(Some(&ok_at(NOW - 24 * HOUR)), NOW));
-        // A later failure doesn't reset the clock.
-        assert!(is_due(Some(&failed(Some(NOW - 25 * HOUR), "boom")), NOW));
     }
 
     #[test]
