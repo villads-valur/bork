@@ -275,10 +275,12 @@ pub fn remove_worktree_in(
 
     let plan_error = match removal {
         Removal::ForceSkipTeardown => None,
-        Removal::Safe | Removal::Force => {
-            crate::issue_plan::save_before_removal(&config.project_root, issue_id, worktree_dir)
-                .err()
-        }
+        Removal::Safe | Removal::Force => crate::issue_plan::save_before_removal(
+            &config.project_root,
+            Some(issue_id),
+            worktree_dir,
+        )
+        .err(),
     };
     if !force {
         if let Some(error) = plan_error {

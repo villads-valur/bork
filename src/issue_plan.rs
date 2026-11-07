@@ -8,20 +8,20 @@
 
 use std::path::Path;
 
-/// Directory in the project container holding saved plans, one subdirectory
-/// per issue.
-const PLANS_DIR: &str = "plans";
-
-/// Save `worktree_dir`'s plan for `issue_id` before the worktree goes away.
-/// Projects with backups off are a no-op.
+/// Save `worktree_dir`'s plan before the worktree goes away: under its
+/// issue, or under `plans/_orphans/<worktree_dir>/` when no issue claims it
+/// (a deleted issue, a card that became an orchestrator, a hand-made
+/// worktree). Projects with backups off are a no-op.
 pub fn save_before_removal(
     project_root: &Path,
-    issue_id: &str,
+    issue_id: Option<&str>,
     worktree_dir: &str,
 ) -> Result<(), String> {
-    crate::backup::save_issue_plan(project_root, issue_id, worktree_dir)
-        .map(|_| ())
-        .map_err(|e| format!("{e:#}"))
+    let saved = match issue_id {
+        Some(issue_id) => crate::backup::save_issue_plan(project_root, issue_id, worktree_dir),
+        None => crate::backup::save_orphan_plan(project_root, worktree_dir),
+    };
+    saved.map(|_| ()).map_err(|e| format!("{e:#}"))
 }
 
 /// Record a plan that a forced removal went past, so it never disappears
@@ -45,7 +45,7 @@ pub fn remove_saved_plans(project_root: &Path, issue_id: &str) -> anyhow::Result
     if !crate::backup::select::is_plain_component(issue_id) {
         anyhow::bail!("invalid issue id {issue_id:?}");
     }
-    let dir = project_root.join(PLANS_DIR).join(issue_id);
+    let dir = crate::backup::issue_plan_dir(project_root, issue_id);
     match std::fs::symlink_metadata(&dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
@@ -71,7 +71,7 @@ pub mod test_support {
     /// be saved.
     pub fn enable_broken_backups(root: &Path) {
         enable_backups(root);
-        fs::write(root.join(super::PLANS_DIR), "not a dir").unwrap();
+        fs::write(root.join(crate::backup::PLANS_DIR), "not a dir").unwrap();
     }
 
     pub fn write_plan(root: &Path, worktree_dir: &str, contents: &str) {
@@ -82,9 +82,7 @@ pub mod test_support {
 
     /// Where a saved plan for `issue_id` ends up.
     pub fn saved_plan(root: &Path, issue_id: &str) -> PathBuf {
-        root.join(super::PLANS_DIR)
-            .join(issue_id)
-            .join("planning.md")
+        crate::backup::issue_plan_dir(root, issue_id).join("planning.md")
     }
 }
 
@@ -112,7 +110,7 @@ mod tests {
         enable_backups(root.path());
         write_plan(root.path(), "demo-1-x", "plan");
 
-        save_before_removal(root.path(), "demo-1", "demo-1-x").unwrap();
+        save_before_removal(root.path(), Some("demo-1"), "demo-1-x").unwrap();
 
         let saved = saved_plan(root.path(), "demo-1");
         assert_eq!(fs::read_to_string(saved).unwrap(), "plan");
@@ -123,9 +121,21 @@ mod tests {
         let root = project();
         write_plan(root.path(), "demo-1-x", "plan");
 
-        save_before_removal(root.path(), "demo-1", "demo-1-x").unwrap();
+        save_before_removal(root.path(), Some("demo-1"), "demo-1-x").unwrap();
 
-        assert!(!root.path().join(PLANS_DIR).exists());
+        assert!(!root.path().join(crate::backup::PLANS_DIR).exists());
+    }
+
+    #[test]
+    fn orphan_plans_are_saved_by_worktree_name() {
+        let root = project();
+        enable_backups(root.path());
+        write_plan(root.path(), "demo-1-x", "plan");
+
+        save_before_removal(root.path(), None, "demo-1-x").unwrap();
+
+        let saved = root.path().join("plans/_orphans/demo-1-x/planning.md");
+        assert_eq!(fs::read_to_string(saved).unwrap(), "plan");
     }
 
     #[test]
@@ -134,7 +144,7 @@ mod tests {
         enable_broken_backups(root.path());
         write_plan(root.path(), "demo-1-x", "plan");
 
-        let err = save_before_removal(root.path(), "demo-1", "demo-1-x").unwrap_err();
+        let err = save_before_removal(root.path(), Some("demo-1"), "demo-1-x").unwrap_err();
         assert!(err.contains("plans"), "{err}");
     }
 
@@ -153,7 +163,7 @@ mod tests {
     fn delete_removes_only_that_issues_plans() {
         let root = project();
         enable_backups(root.path());
-        let plans = root.path().join(PLANS_DIR);
+        let plans = root.path().join(crate::backup::PLANS_DIR);
         fs::create_dir_all(plans.join("demo-1")).unwrap();
         fs::write(plans.join("demo-1/planning.md"), "1").unwrap();
         fs::create_dir_all(plans.join("demo-10")).unwrap();
@@ -171,7 +181,7 @@ mod tests {
     #[test]
     fn delete_leaves_plans_alone_when_backups_are_off() {
         let root = project();
-        let dir = root.path().join(PLANS_DIR).join("demo-1");
+        let dir = root.path().join(crate::backup::PLANS_DIR).join("demo-1");
         fs::create_dir_all(&dir).unwrap();
 
         remove_saved_plans(root.path(), "demo-1").unwrap();

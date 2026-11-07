@@ -1213,8 +1213,8 @@ fn run_prune_command(
         match &result.outcome {
             RemoveOutcome::Removed => println!("Removed: {}", result.worktree),
             RemoveOutcome::Failed(msg) => println!("Failed: {} ({})", result.worktree, msg),
-            RemoveOutcome::PlanNotSaved { issue_id, error } => println!(
-                "Kept: {} (couldn't save {issue_id}'s plan: {error})",
+            RemoveOutcome::PlanNotSaved { error, .. } => println!(
+                "Kept: {} (couldn't save its plan: {error})",
                 result.worktree
             ),
         }

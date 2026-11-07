@@ -159,10 +159,10 @@ pub fn partition_selection(candidates: &[PruneCandidate]) -> (Vec<PruneTarget>, 
 pub enum RemoveOutcome {
     Removed,
     Failed(String),
-    /// Kept because its issue's plan couldn't be saved. Removing it anyway
-    /// takes `force_plans`.
+    /// Kept because its plan couldn't be saved. Removing it anyway takes
+    /// `force_plans`. `issue_id` is `None` for an orphan.
     PlanNotSaved {
-        issue_id: String,
+        issue_id: Option<String>,
         error: String,
     },
 }
@@ -201,7 +201,7 @@ impl PruneOutcome {
             .filter_map(|r| match &r.outcome {
                 RemoveOutcome::PlanNotSaved { issue_id, .. } => Some(PruneTarget {
                     worktree: r.worktree.clone(),
-                    issue_id: Some(issue_id.clone()),
+                    issue_id: issue_id.clone(),
                 }),
                 _ => None,
             })
@@ -259,19 +259,17 @@ fn remove_worktree(
     target: &PruneTarget,
     force_plans: bool,
 ) -> RemoveOutcome {
-    // Orphans have nothing to save: their issue was deleted with its plans.
-    if let Some(issue_id) = target.issue_id.as_deref() {
-        if let Err(error) =
-            crate::issue_plan::save_before_removal(project_root, issue_id, &target.worktree)
-        {
-            if !force_plans {
-                return RemoveOutcome::PlanNotSaved {
-                    issue_id: issue_id.to_string(),
-                    error,
-                };
-            }
-            crate::issue_plan::log_dropped_plan(project_root, &target.worktree, &error);
+    let issue_id = target.issue_id.as_deref();
+    if let Err(error) =
+        crate::issue_plan::save_before_removal(project_root, issue_id, &target.worktree)
+    {
+        if !force_plans {
+            return RemoveOutcome::PlanNotSaved {
+                issue_id: target.issue_id.clone(),
+                error,
+            };
         }
+        crate::issue_plan::log_dropped_plan(project_root, &target.worktree, &error);
     }
 
     let worktree_path = project_root.join(&target.worktree);
@@ -590,7 +588,7 @@ mod tests {
 
         assert!(matches!(
             &outcome.results[0].outcome,
-            RemoveOutcome::PlanNotSaved { issue_id, .. } if issue_id == "demo-1"
+            RemoveOutcome::PlanNotSaved { issue_id: Some(issue_id), .. } if issue_id == "demo-1"
         ));
         assert_eq!(outcome.failed_count(), 1);
         assert_eq!(
@@ -608,14 +606,23 @@ mod tests {
     }
 
     #[test]
-    fn prune_removes_orphans_without_a_plan_save() {
+    fn prune_saves_orphan_plans_and_keeps_orphans_it_cant_save() {
         let project = project_with_planned_worktree();
         let root = project.path();
         enable_broken_backups(root);
 
         let outcome = execute_removals(root, &[orphan("demo-1-x")], &[], false);
+        assert!(matches!(
+            &outcome.results[0].outcome,
+            RemoveOutcome::PlanNotSaved { issue_id: None, .. }
+        ));
+        assert_eq!(outcome.plan_not_saved(), vec![orphan("demo-1-x")]);
 
+        std::fs::remove_file(root.join("plans")).unwrap();
+        let outcome = execute_removals(root, &[orphan("demo-1-x")], &[], false);
         assert_eq!(outcome.results[0].outcome, RemoveOutcome::Removed);
+        let saved = root.join("plans/_orphans/demo-1-x/planning.md");
+        assert_eq!(std::fs::read_to_string(saved).unwrap(), "the plan");
     }
 
     fn make_issue(id: &str, worktree: Option<&str>) -> Issue {
