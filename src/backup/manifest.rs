@@ -42,6 +42,9 @@ pub struct Manifest {
     pub created_at: u64,
     /// Version of the bork that wrote it (`CARGO_PKG_VERSION`).
     pub bork_version: String,
+    /// Short host name of the machine that wrote it (see `backup::host_name`).
+    #[serde(default)]
+    pub host: String,
     pub projects: Vec<ProjectManifest>,
     /// Archive paths of the global files (under `_global/`), empty for a
     /// single-project archive.
