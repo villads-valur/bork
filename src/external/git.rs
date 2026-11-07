@@ -275,7 +275,7 @@ pub fn poll_all_worktrees(project_root: &Path, skip: &HashSet<String>) -> GitPol
     poller.poll(&classify, true)
 }
 
-fn list_worktree_branches(project_root: &Path) -> HashMap<String, String> {
+pub fn list_worktree_branches(project_root: &Path) -> HashMap<String, String> {
     let main_dir = project_root.join("main");
     let Some(stdout) = git_output(&main_dir, &["worktree", "list", "--porcelain"]) else {
         return HashMap::new();

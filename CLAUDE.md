@@ -27,8 +27,9 @@ Main Thread (50ms tick event loop)
 │   │                       --porcelain` for branches)
 │   └── PR Status Worker (polls every 60s - GitHub PRs via gh api graphql)
 ├── Swimlane Workers (one ProjectWorkers set per visible swimlane, excluding focused)
-├── Background PR Workers (one PR-only poller per hidden project, every 180s; stores PR
-│                          data for the sidebar's needs-you dot, no imports or title rewrites)
+├── Background PR Workers (per hidden project: PR poll every 180s + `git worktree list`
+│                          every 60s; stores PR data and branches for the sidebar's
+│                          needs-you dot, no imports or title rewrites)
 └── Action Threads (fire-and-forget per user action)
 ```
 

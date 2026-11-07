@@ -111,6 +111,7 @@ const PR_POLL_INTERVAL: Duration = Duration::from_secs(60);
 /// PR polling for projects that are neither focused nor a swimlane. Only
 /// feeds the sidebar's needs-you dot, so it can run slower.
 const BACKGROUND_PR_POLL_INTERVAL: Duration = Duration::from_secs(180);
+const BACKGROUND_BRANCH_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const STATE_POLL_TICKS: usize = 40; // 40 * 50ms = 2s
 /// Minimum interval between auto-prune checks (and thus toasts) for the same
 /// project. Keeps the tick loop from counting worktrees constantly and the
@@ -1840,12 +1841,17 @@ fn spawn_shared_workers() -> SharedWorkers {
     }
 }
 
-/// PR-only poller for a project that is neither focused nor a swimlane, so
-/// its sidebar dot reflects PR attention without git or agent-status workers.
+/// PR poller for a project that is neither focused nor a swimlane, so its
+/// sidebar dot reflects PR attention without full git or agent-status
+/// workers. Worktree branches come from one cheap `git worktree list`, so
+/// cards whose PR is only found by branch still count.
 struct BackgroundPrWorker {
     pr_rx: mpsc::Receiver<PrPollResult>,
     pr_wake_tx: mpsc::Sender<github_poll::Wake>,
     targets: Arc<Mutex<github_poll::Targets>>,
+    branch_rx: mpsc::Receiver<HashMap<String, String>>,
+    /// Never sent on; dropping it stops the branch thread.
+    _branch_stop_tx: mpsc::Sender<()>,
 }
 
 fn spawn_background_pr_worker(
@@ -1861,16 +1867,40 @@ fn spawn_background_pr_worker(
         pr_wake_rx,
         BACKGROUND_PR_POLL_INTERVAL,
     );
+    let (branch_tx, branch_rx) = mpsc::channel();
+    let (branch_stop_tx, branch_stop_rx) = mpsc::channel::<()>();
+    let project_root = project.config.project_root.clone();
+    let suspended = suspended.clone();
+    thread::spawn(move || loop {
+        wait_while_suspended(&suspended);
+        let branches = external::git::list_worktree_branches(&project_root);
+        if branch_tx.send(branches).is_err() {
+            break;
+        }
+        if !sleep_with_wake(&branch_stop_rx, BACKGROUND_BRANCH_POLL_INTERVAL) {
+            break;
+        }
+    });
     BackgroundPrWorker {
         pr_rx,
         pr_wake_tx,
         targets,
+        branch_rx,
+        _branch_stop_tx: branch_stop_tx,
     }
 }
 
 /// Only stores the PR data: imports and title rewrites wait until the project
 /// is shown and gets its full workers.
 fn drain_background_pr_worker(project: &mut app::Project, worker: &BackgroundPrWorker) -> bool {
+    let mut needs_redraw = false;
+    while let Ok(branches) = worker.branch_rx.try_recv() {
+        if project.live.worktree_branches != branches {
+            project.live.worktree_branches = branches;
+            needs_redraw = true;
+        }
+    }
+
     let requested = github_poll::Targets::for_project(project);
     let mut targets = worker
         .targets
@@ -1882,7 +1912,6 @@ fn drain_background_pr_worker(project: &mut app::Project, worker: &BackgroundPrW
     }
     drop(targets);
 
-    let mut needs_redraw = false;
     while let Ok(pr_result) = worker.pr_rx.try_recv() {
         needs_redraw |= apply_pr_result(project, pr_result) != PrApplied::Unchanged;
     }
