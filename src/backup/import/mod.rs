@@ -34,6 +34,7 @@ mod report;
 
 /// Board file inside a project's archive dir and container.
 const STATE_FILE: &str = ".bork/state.json";
+const PROJECT_CONFIG: &str = ".bork/config.toml";
 /// Global config file, under `_global/` in the archive.
 const GLOBAL_CONFIG: &str = "config.toml";
 
@@ -105,6 +106,8 @@ pub struct ProjectReport {
     pub dropped_issues: Vec<String>,
     /// Where the replaced local board was saved, when there was one.
     pub previous_board: Option<PathBuf>,
+    /// Where the replaced `.bork/config.toml` was saved, when there was one.
+    pub previous_config: Option<PathBuf>,
     pub warnings: Vec<String>,
     /// Set when restoring this project stopped part-way; the rest of the
     /// import still ran.
@@ -127,6 +130,7 @@ impl ProjectReport {
             kept_files: Vec::new(),
             dropped_issues: Vec::new(),
             previous_board: None,
+            previous_config: None,
             warnings: Vec::new(),
             error: None,
         }
@@ -494,7 +498,15 @@ fn restore_project(
                 .to_string(),
         );
     }
-    restore_files(src, project, target, local.as_ref(), opts.dry_run, report)?;
+    restore_files(
+        src,
+        project,
+        target,
+        local.as_ref(),
+        opts.dry_run,
+        now,
+        report,
+    )?;
     restore_board(
         src,
         project,
@@ -538,6 +550,7 @@ fn restore_files(
     target: &Path,
     local: Option<&AppState>,
     dry_run: bool,
+    now: u64,
     report: &mut ProjectReport,
 ) -> anyhow::Result<()> {
     // Checkouts at the target (main/, worktrees, anything with a `.git`),
@@ -579,11 +592,63 @@ fn restore_files(
             report.kept_files.push(rel.clone());
             continue;
         }
+        // Like the board: a config that --force replaces stays recoverable.
+        if rel == PROJECT_CONFIG {
+            report.previous_config =
+                save_pre_import(src, &rel_path, target, &rel_path, now, dry_run)?;
+        }
         if copy_reported(src, rel, target, &rel_path, dry_run, report)? {
             report.files.push(rel.clone());
         }
     }
     Ok(())
+}
+
+/// Before [`copy_entry`] replaces `dest_root/dest_rel` with the archived
+/// `src_root/src_rel`, keep the old file as `<file>.pre-import-<now>`, so a
+/// mistaken `--force` stays recoverable. Only a regular file that the copy
+/// really replaces with something different is saved (a re-run that
+/// changes nothing saves nothing). Returns where it was (or would be) saved.
+fn save_pre_import(
+    src_root: &Path,
+    src_rel: &Path,
+    dest_root: &Path,
+    dest_rel: &Path,
+    now: u64,
+    dry_run: bool,
+) -> anyhow::Result<Option<PathBuf>> {
+    // `copy_entry` writes nothing through a symlinked directory.
+    if has_symlinked_parent(src_root, src_rel) || has_symlinked_parent(dest_root, dest_rel) {
+        return Ok(None);
+    }
+    let dest = dest_root.join(dest_rel);
+    let src = src_root.join(src_rel);
+    // A symlink at the target is kept by `copy_entry`, so nothing to save.
+    if !fs::symlink_metadata(&dest).is_ok_and(|m| m.is_file()) {
+        return Ok(None);
+    }
+    let Ok(src_meta) = fs::symlink_metadata(&src) else {
+        return Ok(None);
+    };
+    let changed = if src_meta.file_type().is_symlink() {
+        true
+    } else if src_meta.is_file() {
+        fs::read(&src).ok() != fs::read(&dest).ok()
+    } else {
+        return Ok(None);
+    };
+    if !changed {
+        return Ok(None);
+    }
+    let Some(name) = dest.file_name().and_then(|n| n.to_str()) else {
+        return Ok(None);
+    };
+    let path = unused_path(&dest.with_file_name(format!("{name}.pre-import-{now}")));
+    if !dry_run {
+        fs::copy(&dest, &path)
+            .with_context(|| format!("saving the old {name} to {}", path.display()))?;
+    }
+    Ok(Some(path))
 }
 
 /// The board, rewritten for a machine without the worktrees (see
@@ -1044,23 +1109,14 @@ fn restore_global_config(
         return Ok(GlobalConfigOutcome::KeptExisting(dest));
     }
     // Like the board: a config that --force replaces stays recoverable.
-    let source = extracted.join(&rel);
-    let replaced = fs::symlink_metadata(&dest).is_ok_and(|m| m.is_file())
-        && fs::read(&dest).ok() != fs::read(&source).ok();
-    let previous = replaced.then(|| {
-        unused_path(&dir.join(format!(
-            "{GLOBAL_CONFIG}.pre-import-{}",
-            crate::app::unix_now()
-        )))
-    });
-    if let (Some(previous), false) = (&previous, opts.dry_run) {
-        if !has_symlinked_parent(extracted, Path::new(&rel))
-            && fs::symlink_metadata(&source).is_ok_and(|m| m.is_file())
-        {
-            fs::copy(&dest, previous)
-                .with_context(|| format!("saving the old config to {}", previous.display()))?;
-        }
-    }
+    let previous = save_pre_import(
+        extracted,
+        Path::new(&rel),
+        &dir,
+        Path::new(GLOBAL_CONFIG),
+        crate::app::unix_now(),
+        opts.dry_run,
+    )?;
     match copy_entry(
         extracted,
         Path::new(&rel),
@@ -1486,6 +1542,10 @@ mod tests {
         write(&target.join("plans/demo-1/planning.md"), "newer local plan");
         write(&target.join("AGENTS.md"), "stale");
         write(
+            &target.join(".bork/config.toml"),
+            "project_name = \"demo\"\ndefault_agent = \"codex\"\n",
+        );
+        write(
             &target.join("plans/demo-2/planning.md"),
             "newer orchestrator plan",
         );
@@ -1520,10 +1580,19 @@ mod tests {
                     assert!(saved.starts_with(target.join(".bork")));
                     assert!(read(&saved).contains("demo-7"));
                     first_saved = Some(saved);
+                    let config = p.previous_config.clone().unwrap();
+                    assert!(config.starts_with(target.join(".bork")));
+                    assert!(read(&config).contains("codex"));
+                    assert!(
+                        report.render().contains("old .bork/config.toml saved to"),
+                        "{}",
+                        report.render()
+                    );
                 } else {
                     // Nothing changed, so nothing is saved over the first copy.
                     assert!(p.dropped_issues.is_empty());
                     assert_eq!(p.previous_board, None);
+                    assert_eq!(p.previous_config, None);
                     assert!(read(first_saved.as_ref().unwrap()).contains("demo-7"));
                 }
                 assert_eq!(p.repo, Some(RepoOutcome::KeptExisting));
@@ -2389,5 +2458,39 @@ mod tests {
             );
             assert_eq!(crate::global_config::list_projects().len(), 1);
         });
+    }
+
+    #[test]
+    fn pre_import_copy_is_kept_whenever_a_file_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dest = dir.path().join("dest");
+        let rel = Path::new("config.toml");
+        let save = |dry_run| save_pre_import(&src, rel, &dest, rel, 7, dry_run).unwrap();
+        write(&dest.join("config.toml"), "mine\n");
+
+        // Missing from the archive: nothing replaces it.
+        assert_eq!(save(false), None);
+
+        // Same content: nothing to keep.
+        write(&src.join("config.toml"), "mine\n");
+        assert_eq!(save(false), None);
+
+        // A symlink in the archive replaces the file even with equal content.
+        fs::remove_file(src.join("config.toml")).unwrap();
+        write(&src.join("real.toml"), "mine\n");
+        std::os::unix::fs::symlink("real.toml", src.join("config.toml")).unwrap();
+        let planned = save(true).unwrap();
+        assert!(!planned.exists());
+        let saved = save(false).unwrap();
+        assert_eq!(saved, dest.join("config.toml.pre-import-7"));
+        assert_eq!(read(&saved), "mine\n");
+        // Never over an earlier copy.
+        assert_eq!(save(false), Some(dest.join("config.toml.pre-import-7-2")));
+
+        // A symlink at the target is kept by the copy, so nothing is saved.
+        fs::remove_file(dest.join("config.toml")).unwrap();
+        std::os::unix::fs::symlink(&saved, dest.join("config.toml")).unwrap();
+        assert_eq!(save(false), None);
     }
 }
