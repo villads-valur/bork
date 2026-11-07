@@ -31,6 +31,7 @@ use self::archive::ArchiveEntry;
 use self::manifest::{Manifest, ProjectManifest, GLOBAL_DIR, MANIFEST_VERSION, PROJECTS_DIR};
 use self::select::{ISSUES_DIR, PLAN_FILE};
 use self::status::ArchiveStatus;
+use crate::config::AppState;
 
 /// File name of the full backup.
 pub const BACKUP_FILE: &str = "bork-backup.tar.gz";
@@ -90,8 +91,11 @@ pub fn plan(selection: &Selection) -> anyhow::Result<Option<Plan>> {
             dir.display()
         );
     }
+    // Resolve symlinks and `..` so every spelling of the same folder maps to
+    // one file (status records and ownership are keyed by it).
+    let dir = resolve_through_existing(&dir);
 
-    let registry = crate::global_config::list_projects();
+    let registry = crate::global_config::try_list_projects()?;
     let labels: HashMap<PathBuf, Option<String>> = registry
         .iter()
         .map(|p| {
@@ -129,32 +133,20 @@ pub fn plan(selection: &Selection) -> anyhow::Result<Option<Plan>> {
             if !select::is_plain_component(&name) {
                 bail!("project name {name:?} can't be used in a file name");
             }
-            // Same-named projects share a file name; never let one replace
-            // another's single-project backup.
+            // Same-named projects (or names differing only in case, on a
+            // case-insensitive disk) share a file; never let one replace
+            // another's single-project backup. The archive's own manifest is
+            // the source of truth, not the status file.
             let file = dir.join(format!("bork-backup-{name}.tar.gz"));
-            let records = status::read(&status::status_path());
-            if let Some(owner) = records
-                .archives
-                .get(&file)
-                .and_then(|record| record.paths.first())
-                .filter(|owner| **owner != root)
-            {
-                bail!(
-                    "{} holds the backup of {}; give {} a different project_name",
-                    file.display(),
-                    owner.display(),
-                    root.display()
-                );
-            }
+            check_single_project_owner(&file, &root)?;
             (vec![root], format!("bork-backup-{name}.tar.gz"))
         }
     };
 
     // The backup must not land inside a project: it would be archived into
     // the next backup of that project.
-    let resolved_dir = resolve_through_existing(&dir);
     for root in roots.iter().chain(labels.keys()) {
-        if resolved_dir.starts_with(root) {
+        if dir.starts_with(root) {
             bail!(
                 "backup path {} is inside the project at {}; pick a path outside it",
                 dir.display(),
@@ -185,6 +177,7 @@ pub fn plan(selection: &Selection) -> anyhow::Result<Option<Plan>> {
                     path,
                     source,
                     follow: true,
+                    captured: None,
                 });
             }
         }
@@ -211,9 +204,14 @@ pub fn run(selection: &Selection) -> anyhow::Result<Option<Outcome>> {
         Ok(Some(plan)) => plan,
         Ok(None) => return Ok(None),
         Err(err) => {
-            // Record against the file this run would have written, if known.
-            if let Some(file) = target_file(selection) {
-                record_failure(&file, &err);
+            // Record against the full backup's file so the daily status shows
+            // it. A refused `--project` run is reported by the caller only:
+            // its target file may belong to another project, whose healthy
+            // record must not turn into a failure.
+            if *selection == Selection::All {
+                if let Some(file) = full_backup_file() {
+                    record_failure(&file, &err);
+                }
             }
             return Err(err);
         }
@@ -250,9 +248,7 @@ pub fn run(selection: &Selection) -> anyhow::Result<Option<Outcome>> {
 /// ([`BACKUP_FILE`] at the configured path) or the last one is at least
 /// [`BACKUP_MAX_AGE_SECS`] old. Explicit `bork backup` calls run regardless.
 pub fn is_due(now: u64) -> bool {
-    let file = config::load_settings()
-        .path
-        .map(|dir| dir.join(BACKUP_FILE));
+    let file = full_backup_file();
     is_due_at(&status::read(&status::status_path()), file.as_deref(), now)
 }
 
@@ -297,6 +293,45 @@ pub fn save_issue_plan(
     Ok(true)
 }
 
+/// Read the board (symlinks followed) as bytes and mode. `None` when the
+/// project has no board yet; other read errors fail.
+fn read_board(path: &Path) -> anyhow::Result<Option<(Vec<u8>, u32)>> {
+    use std::os::unix::fs::PermissionsExt;
+    let context = || format!("reading {}", path.display());
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(context),
+    };
+    let meta = file.metadata().with_context(context)?;
+    if !meta.is_file() {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes).with_context(context)?;
+    Ok(Some((bytes, meta.permissions().mode() & 0o777)))
+}
+
+/// ASCII-only directory name for a project in the archive: characters
+/// outside `[A-Za-z0-9._-]` become `_`.
+fn archive_dir_name(name: &str) -> String {
+    let safe: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if safe.is_empty() || safe.chars().all(|c| c == '.') {
+        "project".to_string()
+    } else {
+        safe
+    }
+}
+
 /// Archive files and manifest entry for one project. `used_dirs` keeps
 /// archive directories unique when registered projects share a name.
 fn project_part(
@@ -305,22 +340,30 @@ fn project_part(
     used_dirs: &mut HashSet<String>,
 ) -> anyhow::Result<(ProjectManifest, Vec<ArchiveEntry>)> {
     let name = crate::config::load_config_from(root).project_name;
-    let base = if select::is_plain_component(&name) {
-        name.clone()
-    } else {
-        "project".to_string()
-    };
+    let base = archive_dir_name(&name);
+    // ASCII and compared case-insensitively, so names stay distinct on any
+    // disk (case- or Unicode-normalization-insensitive ones included).
     let mut archive_dir = base.clone();
     let mut n = 2;
-    while !used_dirs.insert(archive_dir.clone()) {
+    while !used_dirs.insert(archive_dir.to_lowercase()) {
         archive_dir = format!("{base}-{n}");
         n += 1;
     }
     let prefix = format!("{PROJECTS_DIR}/{archive_dir}");
 
-    // A missing or corrupt board still backs up everything else; the raw
-    // state.json is copied as-is when present.
-    let board = crate::config::try_load_state(root).unwrap_or_default();
+    // A corrupt board fails the run (keeping the previous backup) instead of
+    // reading as empty, which would drop every issue and plan from the new
+    // file. A project without a board yet backs up everything else.
+    // The board is read once: the same bytes pick the plans, build the
+    // manifest and go into the archive, so a board saved mid-run can't leave
+    // them out of step.
+    let board_rel = ".bork/state.json";
+    let board_bytes = read_board(&root.join(board_rel))?;
+    let board: AppState = match &board_bytes {
+        Some((bytes, _)) => serde_json::from_slice(bytes)
+            .with_context(|| format!("{} can't be parsed", root.join(board_rel).display()))?,
+        None => AppState::default(),
+    };
     let facts = manifest::RepoFacts::gather(root);
     let worktrees = select::worktree_dirs(root, &facts.worktree_paths(), &board);
 
@@ -330,12 +373,26 @@ fn project_part(
         let Some(rel_str) = rel.to_str().map(String::from) else {
             continue;
         };
+        if rel_str == board_rel {
+            continue;
+        }
         entries.push(ArchiveEntry {
             path: format!("{prefix}/{rel_str}"),
             follow: select::BORK_FILES.contains(&rel_str.as_str()),
             source: root.join(&rel),
+            captured: None,
         });
         files.push(rel_str);
+    }
+
+    if let Some(captured) = board_bytes {
+        entries.push(ArchiveEntry {
+            path: format!("{prefix}/{board_rel}"),
+            source: root.join(board_rel),
+            follow: true,
+            captured: Some(captured),
+        });
+        files.push(board_rel.to_string());
     }
 
     let mut plans = HashMap::new();
@@ -347,6 +404,7 @@ fn project_part(
             path,
             source,
             follow: true,
+            captured: None,
         });
         files.push(rel);
     }
@@ -367,7 +425,8 @@ fn project_part(
 /// same file. Returns the outcome and the content fingerprint.
 fn write_plan(plan: &Plan) -> anyhow::Result<(Outcome, String)> {
     // `created_at` is still 0 here, so the fingerprint only tracks content.
-    let fingerprint = archive::fingerprint(&serde_json::to_vec(&plan.manifest)?, &plan.entries)?;
+    let contents = archive::load(&plan.entries)?;
+    let fingerprint = archive::fingerprint(&serde_json::to_vec(&plan.manifest)?, &contents);
     let projects: Vec<String> = plan
         .manifest
         .projects
@@ -393,7 +452,7 @@ fn write_plan(plan: &Plan) -> anyhow::Result<(Outcome, String)> {
     manifest.created_at = crate::app::unix_now();
     let mut json = serde_json::to_vec_pretty(&manifest)?;
     json.push(b'\n');
-    let size = archive::write(&plan.file, &json, &plan.entries)?;
+    let size = archive::write(&plan.file, &json, &contents)?;
     let outcome = Outcome {
         file: plan.file.clone(),
         size,
@@ -403,16 +462,38 @@ fn write_plan(plan: &Plan) -> anyhow::Result<(Outcome, String)> {
     Ok((outcome, fingerprint))
 }
 
-/// The file a selection writes to, when the backup path is configured.
-fn target_file(selection: &Selection) -> Option<PathBuf> {
-    let dir = config::load_settings().path?;
-    match selection {
-        Selection::All => Some(dir.join(BACKUP_FILE)),
-        Selection::Project(root) => {
-            let name = crate::config::load_config_from(root).project_name;
-            Some(dir.join(format!("bork-backup-{name}.tar.gz")))
-        }
+/// Refuse to replace an existing single-project archive that belongs to
+/// another project, or whose owner can't be read from its manifest.
+fn check_single_project_owner(file: &Path, root: &Path) -> anyhow::Result<()> {
+    match fs::symlink_metadata(file) {
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).with_context(|| format!("reading {}", file.display())),
+        Ok(_) => {}
     }
+    let manifest = archive::read_manifest(file).with_context(|| {
+        format!(
+            "{} exists but its owner can't be read; move it away to back up {} there",
+            file.display(),
+            root.display()
+        )
+    })?;
+    let owners: Vec<&Path> = manifest.projects.iter().map(|p| p.path.as_path()).collect();
+    if owners != [root] {
+        let owners: Vec<String> = owners.iter().map(|p| p.display().to_string()).collect();
+        bail!(
+            "{} holds the backup of {}; give {} a different project_name, or move the old file away if this is the same project in a new place",
+            file.display(),
+            owners.join(", "),
+            root.display()
+        );
+    }
+    Ok(())
+}
+
+/// The full backup's file, when the backup path is configured.
+fn full_backup_file() -> Option<PathBuf> {
+    let dir = config::load_settings().path?;
+    Some(resolve_through_existing(&dir).join(BACKUP_FILE))
 }
 
 fn record_failure(file: &Path, err: &anyhow::Error) {
@@ -427,26 +508,36 @@ fn record_failure(file: &Path, err: &anyhow::Error) {
     }
 }
 
-/// Canonicalize the deepest existing ancestor of `path` and append the rest,
-/// so symlinks and `..` resolve even before the folder exists.
+/// Canonicalize the longest existing prefix of `path` and apply the rest
+/// lexically (`..` pops, `.` is dropped), so symlinks and `..` resolve even
+/// for folders that don't exist yet.
 fn resolve_through_existing(path: &Path) -> PathBuf {
-    let mut existing = path;
-    let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
-    loop {
-        if let Ok(canonical) = existing.canonicalize() {
-            return rest
-                .iter()
-                .rev()
-                .fold(canonical, |acc, part| acc.join(part));
-        }
-        match (existing.parent(), existing.file_name()) {
-            (Some(parent), Some(name)) => {
-                rest.push(name);
-                existing = parent;
+    use std::path::Component;
+    let parts: Vec<Component> = path.components().collect();
+    for split in (1..=parts.len()).rev() {
+        let prefix: PathBuf = parts[..split].iter().collect();
+        let Ok(mut resolved) = prefix.canonicalize() else {
+            continue;
+        };
+        let mut popped = false;
+        for part in &parts[split..] {
+            match part {
+                Component::Normal(name) => resolved.push(name),
+                Component::ParentDir => {
+                    resolved.pop();
+                    popped = true;
+                }
+                _ => {}
             }
-            _ => return path.to_path_buf(),
         }
+        // `..` can step back into existing folders (and their symlinks), so
+        // resolve once more; the result has no `..` left, so this terminates.
+        if popped {
+            return resolve_through_existing(&resolved);
+        }
+        return resolved;
     }
+    path.to_path_buf()
 }
 
 /// Serialize backup runs machine-wide (CLI and the TUI worker can overlap).
@@ -555,7 +646,7 @@ mod tests {
 
             let outcome = run(&Selection::All).unwrap().unwrap();
 
-            let file = dest.path().join(BACKUP_FILE);
+            let file = resolve_through_existing(&dest.path().join(BACKUP_FILE));
             assert_eq!(outcome.file, file);
             assert!(outcome.written);
             assert_eq!(outcome.projects, vec!["demo".to_string()]);
@@ -628,7 +719,10 @@ mod tests {
                 .unwrap()
                 .unwrap();
 
-            assert_eq!(outcome.file, dest.path().join("bork-backup-demo.tar.gz"));
+            assert_eq!(
+                outcome.file,
+                resolve_through_existing(&dest.path().join("bork-backup-demo.tar.gz"))
+            );
             assert_eq!(
                 list(&outcome.file),
                 vec![
@@ -698,7 +792,7 @@ mod tests {
             assert!(format!("{err:#}").contains("inside the project"), "{err:#}");
             assert!(!demo.path().join("backups").exists());
 
-            let file = demo.path().join("backups").join(BACKUP_FILE);
+            let file = resolve_through_existing(&demo.path().join("backups").join(BACKUP_FILE));
             let recorded = &status::read(&status::status_path()).archives[&file];
             assert!(!recorded.ok);
         });
@@ -780,7 +874,7 @@ mod tests {
             assert!(is_due(crate::app::unix_now()));
             run(&Selection::All).unwrap();
             let success = status::read(&status::status_path()).archives
-                [&dest.path().join(BACKUP_FILE)]
+                [&resolve_through_existing(&dest.path().join(BACKUP_FILE))]
                 .last_success_at
                 .unwrap();
             assert!(!is_due(success));
@@ -859,6 +953,8 @@ mod tests {
                 format!("{err:#}").contains("holds the backup of"),
                 "{err:#}"
             );
+            // The refusal doesn't mark the owner's healthy backup as failed.
+            assert!(status::read(&status::status_path()).archives[&outcome.file].ok);
             let manifest = read_manifest(&outcome.file);
             assert_eq!(
                 manifest.projects[0].path,
@@ -872,6 +968,245 @@ mod tests {
                     .unwrap()
                     .written
             );
+        });
+    }
+
+    #[test]
+    fn resolves_symlinks_and_parent_dirs_through_missing_folders() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().canonicalize().unwrap();
+        fs::create_dir(real.join("dest")).unwrap();
+        std::os::unix::fs::symlink(real.join("dest"), real.join("alias")).unwrap();
+        assert_eq!(
+            resolve_through_existing(&real.join("alias")),
+            real.join("dest")
+        );
+        assert_eq!(
+            resolve_through_existing(&real.join("alias/new/sub")),
+            real.join("dest/new/sub")
+        );
+        assert_eq!(
+            resolve_through_existing(&real.join("outside/new/../../alias/x")),
+            real.join("dest/x")
+        );
+    }
+
+    #[test]
+    fn path_spellings_cannot_bypass_checks() {
+        let home = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let base = scratch.path().canonicalize().unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            let first = project("demo", true);
+            let second = project("demo", true);
+            write(&first.path().join("AGENTS.md"), "1");
+            fs::create_dir(base.join("dest")).unwrap();
+            std::os::unix::fs::symlink(base.join("dest"), base.join("alias")).unwrap();
+
+            set_global_path(&base.join("dest"));
+            run(&Selection::Project(first.path().to_path_buf())).unwrap();
+            set_global_path(&base.join("alias"));
+            assert!(run(&Selection::Project(second.path().to_path_buf())).is_err());
+
+            // `..` through missing folders into a project is still "inside".
+            let first_root = crate::global_config::normalize_path(first.path());
+            let rel = format!(
+                "{}/outside/new/../../{}/backups",
+                first_root.parent().unwrap().display(),
+                first_root.file_name().unwrap().to_str().unwrap()
+            );
+            write(
+                &crate::global_config::global_config_dir().join("config.toml"),
+                &format!("[backup]\npath = \"{rel}\"\n"),
+            );
+            let err = run(&Selection::All).unwrap_err();
+            assert!(format!("{err:#}").contains("inside the project"), "{err:#}");
+        });
+    }
+
+    #[test]
+    fn unreadable_registry_fails_instead_of_backing_up_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            set_global_path(dest.path());
+            let demo = project("demo", true);
+            write(&demo.path().join("AGENTS.md"), "a");
+            run(&Selection::All).unwrap();
+            let registry = crate::global_config::global_config_dir().join("projects.json");
+            with_unreadable(&registry, || {
+                assert!(run(&Selection::All).is_err());
+                let file = resolve_through_existing(&dest.path().join(BACKUP_FILE));
+                assert!(!status::read(&status::status_path()).archives[&file].ok);
+            });
+            write(&registry, "{ not json");
+            assert!(run(&Selection::All).is_err());
+        });
+    }
+
+    #[test]
+    fn ownership_comes_from_the_archive_not_the_status_file() {
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            set_global_path(dest.path());
+            let first = project("demo", true);
+            let second = project("demo", true);
+            write(&first.path().join("AGENTS.md"), "1");
+            let outcome = run(&Selection::Project(first.path().to_path_buf()))
+                .unwrap()
+                .unwrap();
+
+            fs::remove_file(status::status_path()).unwrap();
+            let err = run(&Selection::Project(second.path().to_path_buf())).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("holds the backup of"),
+                "{err:#}"
+            );
+
+            // An existing file without a readable manifest is never replaced.
+            write(&outcome.file, "not a tarball");
+            let err = run(&Selection::Project(first.path().to_path_buf())).unwrap_err();
+            assert!(format!("{err:#}").contains("can't be read"), "{err:#}");
+            assert_eq!(fs::read_to_string(&outcome.file).unwrap(), "not a tarball");
+        });
+    }
+
+    #[test]
+    fn names_differing_in_case_get_separate_dirs() {
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            set_global_path(dest.path());
+            let upper = project("Demo", true);
+            let lower = project("demo", true);
+            write(&upper.path().join("AGENTS.md"), "first");
+            write(&lower.path().join("AGENTS.md"), "second");
+            let outcome = run(&Selection::All).unwrap().unwrap();
+            let manifest = read_manifest(&outcome.file);
+            let dirs: HashSet<String> = manifest
+                .projects
+                .iter()
+                .map(|p| p.archive_dir.to_lowercase())
+                .collect();
+            assert_eq!(dirs.len(), 2);
+            let agents: Vec<String> = list(&outcome.file)
+                .into_iter()
+                .filter(|p| p.ends_with("/AGENTS.md"))
+                .collect();
+            assert_eq!(agents.len(), 2, "{agents:?}");
+        });
+    }
+
+    #[test]
+    fn archive_dirs_are_ascii_and_distinct() {
+        assert_eq!(archive_dir_name("bork"), "bork");
+        assert_eq!(archive_dir_name("Caf\u{e9}"), "Caf_");
+        assert_eq!(archive_dir_name("Cafe\u{301}"), "Cafe_");
+        assert_eq!(archive_dir_name(".."), "project");
+        assert_eq!(archive_dir_name("a/b c"), "a_b_c");
+
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            set_global_path(dest.path());
+            let a = project("Caf\u{e9}", true);
+            let b = project("Cafe\u{301}", true);
+            write(&a.path().join("AGENTS.md"), "first");
+            write(&b.path().join("AGENTS.md"), "second");
+            let outcome = run(&Selection::All).unwrap().unwrap();
+            let agents = list(&outcome.file)
+                .into_iter()
+                .filter(|p| p.ends_with("/AGENTS.md"))
+                .count();
+            assert_eq!(agents, 2);
+        });
+    }
+
+    #[test]
+    fn container_entry_aliasing_issues_dir_never_writes_outside() {
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            set_global_path(dest.path());
+            let demo = project("demo", true);
+            let root = demo.path();
+            save_board(root, &[("demo-1", Some("demo-1-task"))]);
+            write(&root.join("demo-1-task/.git"), "gitdir: x");
+            write(&root.join("demo-1-task/.claude/planning.md"), "live plan");
+            write(&outside.path().join("demo-1/planning.md"), "outside");
+            std::os::unix::fs::symlink(outside.path(), root.join("_ISSUES")).unwrap();
+
+            // On a case-insensitive disk this collides and fails; on a
+            // case-sensitive one both entries are archived. Either way the
+            // outside file is untouched.
+            if let Ok(Some(outcome)) = run(&Selection::All) {
+                assert!(list(&outcome.file)
+                    .contains(&"projects/demo/_issues/demo-1/planning.md".to_string()));
+            }
+        });
+        assert_eq!(
+            fs::read_to_string(outside.path().join("demo-1/planning.md")).unwrap(),
+            "outside"
+        );
+    }
+
+    #[test]
+    fn corrupt_board_fails_and_keeps_the_previous_archive() {
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            set_global_path(dest.path());
+            let demo = project("demo", true);
+            let root = demo.path();
+            save_board(root, &[("demo-1", Some("demo-1-a"))]);
+            write(&root.join("demo-1-a/.git"), "gitdir: x");
+            write(&root.join("demo-1-a/.claude/planning.md"), "plan");
+            let first = run(&Selection::All).unwrap().unwrap();
+
+            write(&root.join(".bork/state.json"), "{ corrupt");
+            let err = run(&Selection::All).unwrap_err();
+            assert!(format!("{err:#}").contains("state.json"), "{err:#}");
+            assert!(
+                list(&first.file).contains(&"projects/demo/_issues/demo-1/planning.md".to_string())
+            );
+            assert_eq!(fs::metadata(&first.file).unwrap().len(), first.size);
+            assert!(!status::read(&status::status_path()).archives[&first.file].ok);
+        });
+    }
+
+    #[test]
+    fn board_is_archived_from_the_bytes_that_were_parsed() {
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            set_global_path(dest.path());
+            let demo = project("demo", true);
+            let root = demo.path();
+            save_board(root, &[("demo-1", None)]);
+            let plan = plan(&Selection::All).unwrap().unwrap();
+            let board = plan
+                .entries
+                .iter()
+                .find(|e| e.path == "projects/demo/.bork/state.json")
+                .unwrap();
+            let (bytes, _) = board.captured.as_ref().unwrap();
+            assert_eq!(bytes, &fs::read(root.join(".bork/state.json")).unwrap());
+            assert_eq!(plan.manifest.projects[0].issues.len(), 1);
+
+            // A board saved after planning doesn't reach this archive.
+            save_board(root, &[("demo-1", None), ("demo-2", None)]);
+            let contents = archive::load(&plan.entries).unwrap();
+            let file = dest.path().join("snapshot.tar.gz");
+            archive::write(&file, b"{}", &contents).unwrap();
+            let out = std::process::Command::new("tar")
+                .arg("-xzOf")
+                .arg(&file)
+                .arg("projects/demo/.bork/state.json")
+                .output()
+                .unwrap();
+            assert_eq!(&out.stdout, bytes);
         });
     }
 

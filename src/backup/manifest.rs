@@ -210,12 +210,15 @@ pub fn parse_worktrees(porcelain: &str) -> Vec<(PathBuf, Option<String>)> {
 /// Parse `git remote -v`, keeping each remote's fetch URL.
 pub fn parse_remotes(output: &str) -> Vec<Remote> {
     let mut remotes: Vec<Remote> = Vec::new();
+    // Lines are `<name>\t<url> (fetch|push)`; URLs may contain spaces.
     for line in output.lines() {
-        let mut parts = line.split_whitespace();
-        let (Some(name), Some(url)) = (parts.next(), parts.next()) else {
+        let Some((name, rest)) = line.split_once('\t') else {
             continue;
         };
-        if parts.next() == Some("(push)") || remotes.iter().any(|r| r.name == name) {
+        let Some(url) = rest.strip_suffix(" (fetch)") else {
+            continue;
+        };
+        if url.is_empty() || remotes.iter().any(|r| r.name == name) {
             continue;
         }
         remotes.push(Remote {
@@ -296,6 +299,13 @@ detached
             ..RepoFacts::default()
         };
         assert_eq!(facts.remotes.len(), 2);
+        assert_eq!(
+            parse_remotes("local\t/Volumes/Backup/repo with spaces.git (fetch)\nlocal\t/Volumes/Backup/repo with spaces.git (push)\n"),
+            vec![Remote {
+                name: "local".into(),
+                url: "/Volumes/Backup/repo with spaces.git".into()
+            }]
+        );
         assert_eq!(
             facts.repo_manifest().clone_url.as_deref(),
             Some("git@github.com:me/bork.git")
