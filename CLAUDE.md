@@ -150,6 +150,20 @@ cd main && cargo build --release
 
 The binary is symlinked to `/opt/homebrew/bin/bork`.
 
+### Testing a change with a debug build
+
+Build in your own worktree with `cargo build` and run the result as `./target/debug/bork`. Don't build `--release` in `main/`, because that replaces the installed binary.
+
+- bork finds its state by walking up from the cwd to the nearest `.bork/`. From inside an issue worktree that's the real project board, so `./target/debug/bork issue list`/`show` see live data and any write changes it.
+- The TUI holds a global single-instance lock in `~/.config/bork/`. A debug TUI won't start while the installed one is running, so quit that one first to try your build against the real board.
+- To test without touching real state, point the global config at a temp dir and run from a scratch project:
+
+```bash
+mkdir -p /tmp/bork-sandbox/proj/.bork
+cd /tmp/bork-sandbox/proj
+XDG_CONFIG_HOME=/tmp/bork-sandbox/xdg <worktree>/target/debug/bork issue create "test"
+```
+
 ## Conventions
 
 - Vim-style navigation: h/j/k/l for column jumping and vertical movement
