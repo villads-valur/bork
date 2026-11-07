@@ -478,7 +478,7 @@ Both keys accept a single shell command line and can live in either config layer
 
 ### Backups
 
-`bork backup` writes one file, `<path>/bork-backup.tar.gz`, holding what git doesn't cover: each opted-in project's board, container docs (`AGENTS.md`, `plans/`, `.claude/`, `.agents/`, `opencode.jsonc`) and the `.claude/planning.md` of every live issue worktree, plus your global `projects.json` and `config.toml`. Point `path` at a synced folder such as iCloud Drive and a wiped machine can get its boards and plans back. Code in worktrees and agent transcripts are not backed up.
+`bork backup` writes one file, `<path>/bork-backup.tar.gz`, holding what git doesn't cover: each opted-in project's board (`.bork/state.json`, `.bork/config.toml`), everything else in the project folder (`AGENTS.md`, `plans/`, `.claude/`, `.agents/`, `opencode.jsonc`, ...) except `main/`, worktrees, nested git checkouts and temp files, and the `.claude/planning.md` of every live issue worktree, plus your global `projects.json` and `config.toml`. Point `path` at a synced folder such as iCloud Drive and a wiped machine can get its boards and plans back. Code in worktrees and agent transcripts are not backed up.
 
 ```toml
 # ~/.config/bork/config.toml
