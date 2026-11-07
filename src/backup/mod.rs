@@ -23,7 +23,7 @@ pub mod schedule;
 pub mod select;
 pub mod status;
 
-pub use archive::{abort_in_flight, in_flight, stop_new_writes};
+pub use archive::{abort_in_flight, in_flight, stop_new_runs};
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -334,7 +334,7 @@ pub fn run(selection: &Selection) -> anyhow::Result<Option<Outcome>> {
             Ok(Some(outcome))
         }
         // Stopped because bork quit: not a broken backup, so not recorded.
-        Err(err) if archive::stopped() => Err(err),
+        Err(err) if archive::aborted() => Err(err),
         Err(err) => Err(with_status_warning(err, Some(&plan.file))),
     }
 }

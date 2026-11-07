@@ -180,7 +180,7 @@ struct InFlight {
 static IN_FLIGHT: Mutex<Vec<InFlight>> = Mutex::new(Vec::new());
 /// `backup::run` calls holding a [`RunGuard`].
 static RUNNING: AtomicUsize = AtomicUsize::new(0);
-/// Set by [`stop_new_writes`]: no new run or `write` may start.
+/// Set by [`stop_new_runs`]: no new run may start.
 static STOPPING: AtomicBool = AtomicBool::new(false);
 /// Set by [`abort_in_flight`]: running writes stop at the next step.
 static ABORT: AtomicBool = AtomicBool::new(false);
@@ -195,7 +195,7 @@ fn in_flight_list() -> std::sync::MutexGuard<'static, Vec<InFlight>> {
 pub(super) struct RunGuard(());
 
 impl RunGuard {
-    /// Fails with [`ABORTED`] once bork is quitting ([`stop_new_writes`]).
+    /// Fails with [`ABORTED`] once bork is quitting ([`stop_new_runs`]).
     pub(super) fn new() -> anyhow::Result<Self> {
         let _list = in_flight_list();
         if STOPPING.load(Ordering::SeqCst) {
@@ -216,9 +216,11 @@ impl Drop for RunGuard {
 struct Registered(PathBuf);
 
 impl Registered {
+    /// A run that started before quitting still writes (quit waits for
+    /// it; [`RunGuard`] refuses new runs); only an abort refuses.
     fn new(staging: &Path, tmp: &Path) -> anyhow::Result<Self> {
         let mut list = in_flight_list();
-        if STOPPING.load(Ordering::SeqCst) {
+        if ABORT.load(Ordering::SeqCst) {
             bail!(ABORTED);
         }
         list.push(InFlight {
@@ -256,15 +258,11 @@ fn forget_tar(staging: &Path) {
     }
 }
 
-fn aborted() -> bool {
+/// Whether [`abort_in_flight`] stopped the writes. A write that failed
+/// because of it isn't recorded: bork quit, the backup isn't broken. Any
+/// other failure, even while quitting waits, is recorded as usual.
+pub fn aborted() -> bool {
     ABORT.load(Ordering::SeqCst)
-}
-
-/// Whether bork is quitting ([`stop_new_writes`] or [`abort_in_flight`]),
-/// so a write that failed with [`ABORTED`] isn't recorded: the backup isn't
-/// broken.
-pub fn stopped() -> bool {
-    STOPPING.load(Ordering::SeqCst) || ABORT.load(Ordering::SeqCst)
 }
 
 /// Whether a backup run or file write is underway in this process.
@@ -273,15 +271,15 @@ pub fn in_flight() -> bool {
     RUNNING.load(Ordering::SeqCst) > 0 || !list.is_empty()
 }
 
-/// Refuse new runs and writes from now on (bork is quitting). Those
-/// already running carry on.
-pub fn stop_new_writes() {
+/// Refuse new runs from now on (bork is quitting). A run already going,
+/// including its write, carries on.
+pub fn stop_new_runs() {
     let _list = in_flight_list();
     STOPPING.store(true, Ordering::SeqCst);
 }
 
 /// Stop every running write: kill its `tar` and remove its temp file and
-/// staging dir. Implies [`stop_new_writes`]. The writer thread sees the
+/// staging dir. Implies [`stop_new_runs`]. The writer thread sees the
 /// abort and fails without recording it.
 pub fn abort_in_flight() {
     let list = in_flight_list();

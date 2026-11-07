@@ -2631,7 +2631,7 @@ fn spawn_activity_poller(
     rx
 }
 
-/// Quitting while the Backup Worker writes a backup file: wait up to
+/// Quitting while the Backup Worker runs a backup: wait up to
 /// `schedule::QUIT_WAIT` with "Finishing backup…" and the spinner, then
 /// stop `tar` and remove its temp file and staging dir. Otherwise `tar`
 /// would outlive bork and leave both behind (the backup folder is often a
@@ -2639,7 +2639,7 @@ fn spawn_activity_poller(
 fn finish_backup_before_quit(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) {
     use backup::schedule::{quit_step, QuitStep, FINISHING_BACKUP};
 
-    backup::stop_new_writes();
+    backup::stop_new_runs();
     let started = std::time::Instant::now();
     let mut shown = false;
     loop {
@@ -2659,17 +2659,10 @@ fn finish_backup_before_quit(terminal: &mut Terminal<CrosstermBackend<io::Stdout
         app.spinner_tick = app.spinner_tick.wrapping_add(1);
         // The terminal may already be gone (SIGHUP); keep waiting anyway.
         let _ = terminal.draw(|frame| ui::render(frame, app));
-        // Doubles as the tick; input is ignored while finishing.
-        // Without a terminal (SIGHUP) poll/read fail at once; wait a tick
-        // anyway so the loop doesn't spin.
-        let ticked = match event::poll(TICK_RATE) {
-            Ok(true) => event::read().is_ok(),
-            Ok(false) => true,
-            Err(_) => false,
-        };
-        if !ticked {
-            thread::sleep(TICK_RATE);
-        }
+        // A plain sleep, not `event::poll`: after a hangup (SIGHUP) crossterm
+        // can block in its tty read and never get back to the deadline.
+        // Input is ignored while finishing anyway.
+        thread::sleep(TICK_RATE);
     }
 }
 

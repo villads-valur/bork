@@ -2113,6 +2113,8 @@ pub struct App {
     /// warning about them shows once per change (and once per TUI session,
     /// since this starts empty).
     pub backup_local_only: Vec<std::path::PathBuf>,
+    /// Last `backup.json` write failure logged, so an hourly repeat isn't.
+    pub backup_status_warning: Option<String>,
     /// Header warning derived from `backup` and the clock; refreshed by
     /// `refresh_backup_warning` so rendering stays pure.
     pub backup_warning: Option<String>,
@@ -2158,6 +2160,7 @@ impl App {
             backup_manual_pending: false,
             backup_warning: None,
             backup_local_only: Vec::new(),
+            backup_status_warning: None,
         }
     }
 
@@ -2423,17 +2426,39 @@ impl App {
                 schedule::local_only_warning(&self.backup_local_only, &report.local_only_repos);
             self.backup_local_only = report.local_only_repos.clone();
         }
+        // An unwritable backup.json stays unwritable and keeps the run due,
+        // so only a changed warning is logged (and flashed by a scheduled run).
+        let new_status_warning = report
+            .status_warning
+            .as_ref()
+            .filter(|w| self.backup_status_warning.as_ref() != Some(*w))
+            .cloned();
+        if let Some(warning) = &new_status_warning {
+            self.log_backup_error(format!("backup: {warning}"));
+            self.backup_status_warning = Some(warning.clone());
+        }
         if let Some(check) = &report.manual {
             self.finish_manual_backup();
             let (message, is_error) = schedule::manual_message(check);
+            let mut notes = Vec::new();
+            if !report.local_only_repos.is_empty() {
+                notes.push(schedule::local_only_summary(&report.local_only_repos));
+            }
+            if let Some(warning) = &report.status_warning {
+                let mut chars = warning.chars();
+                let first = chars.next().map(|c| c.to_uppercase().to_string());
+                notes.push(format!("{}{}", first.unwrap_or_default(), chars.as_str()));
+            }
             if is_error {
                 self.set_error(message);
-            } else if report.local_only_repos.is_empty() {
+            } else if notes.is_empty() {
                 self.set_message(message);
             } else {
-                let skipped = schedule::local_only_summary(&report.local_only_repos);
-                self.set_warning(format!("{message}. {skipped}"));
+                self.set_warning(format!("{message}. {}", notes.join(". ")));
             }
+            redraw = true;
+        } else if let Some(warning) = new_status_warning {
+            self.set_warning(format!("Backup done, but {warning}"));
             redraw = true;
         } else if let Some(warning) = skipped_warning {
             self.set_warning(warning);
@@ -2449,11 +2474,6 @@ impl App {
             if report.manual.is_none() {
                 self.set_error(format!("Backup failed: {error}"));
             }
-            redraw = true;
-        }
-        if let Some(warning) = &report.status_warning {
-            self.log_backup_error(format!("backup: {warning}"));
-            self.set_warning(format!("Backup done, but {warning}"));
             redraw = true;
         }
         if self.backup != report.indicator {
@@ -3702,15 +3722,41 @@ mod tests {
         assert_eq!(
             app.message,
             Some((
-                "Backup done, but could not record backup status: disk full".into(),
+                "Backup written. Could not record backup status: disk full".into(),
                 MessageKind::Warning
             ))
         );
-        assert_eq!(
-            error_log(dir.path())
+        let logged = |dir: &std::path::Path| {
+            error_log(dir)
                 .matches("backup: could not record backup status: disk full")
-                .count(),
-            1
+                .count()
+        };
+        assert_eq!(logged(dir.path()), 1);
+
+        // The hourly run hitting the same problem stays quiet.
+        app.message = None;
+        let scheduled = Report {
+            indicator: BackupIndicator::Ok {
+                last_success_at: Some(1),
+            },
+            status_warning: Some("could not record backup status: disk full".into()),
+            ..Default::default()
+        };
+        app.apply_backup_report(scheduled.clone());
+        assert_eq!(app.message, None);
+        assert_eq!(logged(dir.path()), 1);
+
+        // A changed problem from a scheduled run flashes and logs once.
+        app.apply_backup_report(Report {
+            status_warning: Some("could not record backup status: read-only".into()),
+            ..scheduled
+        });
+        assert_eq!(
+            app.message,
+            Some((
+                "Backup done, but could not record backup status: read-only".into(),
+                MessageKind::Warning
+            ))
         );
     }
 
