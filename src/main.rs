@@ -1,6 +1,7 @@
 mod agent_config;
 mod app;
 mod attention;
+mod backup;
 mod config;
 mod dialog_state;
 mod error;
@@ -660,6 +661,26 @@ enum Command {
         #[arg(long)]
         exclude: Vec<String>,
     },
+
+    /// Back up the project
+    Backup {
+        #[command(subcommand)]
+        command: BackupCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum BackupCommand {
+    /// Snapshot in-flight worktree changes to hidden `refs/bork-backup/<issue-id>` refs on origin
+    Wip {
+        /// Project name, label or path (defaults to the current project)
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Show what would be pushed or pruned without changing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1046,8 +1067,47 @@ fn main() -> anyhow::Result<()> {
             include,
             exclude,
         }) => run_prune_command(dry_run, yes, &include, &exclude),
+        Some(Command::Backup { command }) => run_backup_command(command),
         None => run_tui(),
     }
+}
+
+fn run_backup_command(command: BackupCommand) -> anyhow::Result<()> {
+    use crate::backup::wip::{self, PruneOutcome, WipOptions, WipOutcome};
+
+    let BackupCommand::Wip { project, dry_run } = command;
+    let project_root = resolve_start_project_root(project.as_deref())?;
+    let report = wip::snapshot_project(&project_root, WipOptions { dry_run });
+
+    if let Some(reason) = &report.skipped {
+        println!("Skipped {}: {reason}", project_root.display());
+        return Ok(());
+    }
+    for entry in &report.entries {
+        let status = match &entry.outcome {
+            WipOutcome::Pushed { commit } => format!("pushed {}", &commit[..commit.len().min(10)]),
+            WipOutcome::WouldPush => "would push".to_string(),
+            WipOutcome::Unchanged => "unchanged".to_string(),
+            WipOutcome::Clean => "clean".to_string(),
+            WipOutcome::Skipped(reason) => format!("skipped: {reason}"),
+            WipOutcome::Error(err) => format!("error: {err}"),
+        };
+        println!("  {:<40} {status}", entry.worktree);
+    }
+    for pruned in &report.pruned {
+        let status = match &pruned.outcome {
+            PruneOutcome::Deleted => "deleted".to_string(),
+            PruneOutcome::WouldDelete => "would delete".to_string(),
+            PruneOutcome::Error(err) => format!("error: {err}"),
+        };
+        println!("  {:<40} {status}", wip::backup_ref(&pruned.issue_id));
+    }
+
+    let errors = report.error_count();
+    if errors > 0 {
+        anyhow::bail!("{errors} WIP backup error(s)");
+    }
+    Ok(())
 }
 
 fn run_prune_command(

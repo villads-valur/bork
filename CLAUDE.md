@@ -63,6 +63,9 @@ src/
 ├── init.rs           # `bork init` subcommand (clone repo, scaffold .bork/ directory)
 ├── lock.rs           # Single-instance PID file lock + signal handlers (SIGTERM, SIGHUP)
 ├── worktree.rs       # `bork worktree` subcommand (create git worktree, register with state)
+├── backup/
+│   ├── mod.rs
+│   └── wip.rs        # WIP snapshots of issue worktrees to `refs/bork-backup/<issue-id>` on origin
 ├── input/
 │   ├── mod.rs
 │   ├── action.rs     # Action enum (~70 variants)
@@ -191,6 +194,16 @@ Issues can be tied to other issues in the same project via a symmetric `linked_i
 - **Filter**: `f` toggles the board to the selected issue's connected component; `Esc`/`f` clears. `bork issue list --linked <id>` does the same from the CLI.
 - Cards show a cyan `∞N` badge (link count). Deleting an issue strips its id from every other issue's `linked_issues` (`ops::remove_link_references`).
 - Any new `Issue` field (including `linked_issues`) must be added to `merge_issue_fields` in `app.rs` or concurrent TUI edits drop CLI-written values.
+
+## WIP backups
+
+`backup::wip::snapshot_project()` backs up in-flight worktree work (opt-in via `[backup] enabled = true`, `wip` defaults to true, project config only). CLI: `bork backup wip`.
+
+- Snapshot = `commit-tree` of a tree written from a copy of the worktree's index (`GIT_INDEX_FILE` + `add -A`), parent HEAD. Never touch the real index, working tree or stash; reads use `--no-optional-locks`.
+- Push only to `origin` (the repo's own trust boundary, important for work repos). The forced `+` refspec is allowed only for `refs/bork-backup/*`, never for branches. Pushes use `--no-verify` and `GIT_TERMINAL_PROMPT=0`.
+- The local `refs/bork-backup/<id>` mirrors the last pushed snapshot: it is the unchanged-check cache and keeps objects from gc. A ref exists only while there's something to restore (dirty or unpushed); clean+pushed, Done or missing worktrees get their ref deleted.
+- Prune only deletes ids that have a local ref, never unknown remote refs (they may be a teammate's on a shared repo).
+- Manual recovery: `git fetch origin 'refs/bork-backup/*:refs/bork-backup/*'`, then `git checkout -b <branch> refs/bork-backup/<id>`.
 
 ## Loading indicators
 

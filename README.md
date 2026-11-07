@@ -153,6 +153,7 @@ bork --help
 | `bork update` | Pull latest from `main` and rebuild |
 | `bork update --check` | Check whether a new version is available without pulling |
 | `bork prune` | Prune stale worktrees (interactive; `--dry-run`, `--yes`, `--include`, `--exclude`) |
+| `bork backup wip` | Snapshot in-flight worktree changes to hidden refs on `origin` (`--project`, `--dry-run`) |
 
 ### `bork init`
 
@@ -491,6 +492,30 @@ Cursor notes:
 Issue data is stored in `.bork/state.json` as a flat JSON array. Writes are atomic (write to temp file, then rename) so state is never corrupted even if bork crashes.
 
 Agent status files are written to `.bork/agent-status/` by the hooks installed with `bork install`.
+
+### WIP Backups
+
+Uncommitted changes, untracked files and unpushed commits in issue worktrees can be backed up to hidden refs on the repo's own `origin`. It's per-project opt-in, in `.bork/config.toml`:
+
+```toml
+[backup]
+enabled = true
+wip = true   # default once enabled
+```
+
+`bork backup wip` then, for every worktree of an issue that isn't Done:
+
+- builds a snapshot commit (parent = HEAD) from a throwaway index, so the working tree, index and stash are never touched. `.gitignore` is respected.
+- pushes it to `refs/bork-backup/<issue-id>` on `origin`, skipping the push when nothing changed since the last snapshot. Worktrees mid merge/rebase/cherry-pick are skipped.
+- deletes the ref once the worktree is clean and pushed, or the issue is Done or its worktree is gone.
+
+These refs aren't branches, so they don't show up in PRs or the GitHub branch list. To recover work by hand:
+
+```bash
+git fetch origin 'refs/bork-backup/*:refs/bork-backup/*'
+git checkout -b <branch> refs/bork-backup/<issue-id>
+git reset --soft HEAD~1   # optional: turn the snapshot back into uncommitted changes
+```
 
 ### Global Project Registry
 
