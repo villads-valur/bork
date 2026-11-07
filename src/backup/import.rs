@@ -85,6 +85,29 @@ pub struct ProjectReport {
     /// Files under `plans/` that already existed at the target and were kept.
     pub kept_files: Vec<String>,
     pub warnings: Vec<String>,
+    /// Set when restoring this project stopped part-way; the rest of the
+    /// import still ran.
+    pub error: Option<String>,
+}
+
+impl ProjectReport {
+    fn new(project: &ProjectManifest, target: &Path) -> Self {
+        Self {
+            name: project.name.clone(),
+            label: project.label.clone(),
+            target: target.to_path_buf(),
+            repo: RepoOutcome::NoCloneUrl,
+            board_restored: false,
+            issues: 0,
+            cleared_worktrees: Vec::new(),
+            files: Vec::new(),
+            plans: Vec::new(),
+            kept_plans: Vec::new(),
+            kept_files: Vec::new(),
+            warnings: Vec::new(),
+            error: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +127,13 @@ pub struct Report {
     pub global_config: GlobalConfigOutcome,
 }
 
+impl Report {
+    /// Whether any project failed part-way.
+    pub fn failed(&self) -> bool {
+        self.projects.iter().any(|p| p.error.is_some())
+    }
+}
+
 /// Restore projects from the backup `file`.
 pub fn import(file: &Path, opts: &Options) -> anyhow::Result<Report> {
     let extracted = extract(file)?;
@@ -115,12 +145,16 @@ pub fn import(file: &Path, opts: &Options) -> anyhow::Result<Report> {
         .map(|p| resolve_target(p, opts.root.as_deref()))
         .collect::<anyhow::Result<Vec<_>>>()?;
     check_targets(&targets, opts.force)?;
+    check_names(&selected, &targets)?;
 
     let now = crate::app::unix_now();
     let mut projects = Vec::new();
     for (project, target) in selected.iter().zip(&targets) {
-        let report = restore_project(dir, project, target, opts, now)
-            .with_context(|| format!("restoring {} to {}", project.name, target.display()))?;
+        let mut report = ProjectReport::new(project, target);
+        // One broken project shouldn't hide what happened to the others.
+        if let Err(err) = restore_project(dir, project, target, opts, now, &mut report) {
+            report.error = Some(format!("{err:#}"));
+        }
         projects.push(report);
     }
 
@@ -271,31 +305,46 @@ fn check_targets(targets: &[PathBuf], force: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Refuse to register a second project under a name that's already in use
+/// at another path: issue ids and tmux sessions are built from the name, so
+/// the two boards would share agent sessions.
+fn check_names(projects: &[&ProjectManifest], targets: &[PathBuf]) -> anyhow::Result<()> {
+    let registry = crate::global_config::list_projects();
+    for (project, target) in projects.iter().zip(targets) {
+        let target = crate::global_config::normalize_path(target);
+        let clash = registry.iter().find(|entry| {
+            entry.name == project.name
+                && crate::global_config::normalize_path(&entry.path) != target
+                && entry.path.join(".bork").join("config.toml").exists()
+        });
+        if let Some(entry) = clash {
+            bail!(
+                "a project named '{}' is already registered at {}; two projects with one name share issue ids and tmux sessions.\nRestore to that path, or unregister it first (`bork project remove {}`).",
+                project.name,
+                entry.path.display(),
+                entry.path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn restore_project(
     extracted: &Path,
     project: &ProjectManifest,
     target: &Path,
     opts: &Options,
     now: u64,
-) -> anyhow::Result<ProjectReport> {
+    report: &mut ProjectReport,
+) -> anyhow::Result<()> {
     if !is_plain_component(&project.archive_dir) {
         bail!("invalid archive dir {:?}", project.archive_dir);
     }
     let src = extracted.join(PROJECTS_DIR).join(&project.archive_dir);
-    let mut report = ProjectReport {
-        name: project.name.clone(),
-        label: project.label.clone(),
-        target: target.to_path_buf(),
-        repo: RepoOutcome::NoCloneUrl,
-        board_restored: false,
-        issues: 0,
-        cleared_worktrees: Vec::new(),
-        files: Vec::new(),
-        plans: Vec::new(),
-        kept_plans: Vec::new(),
-        kept_files: Vec::new(),
-        warnings: Vec::new(),
-    };
+    // Sessions only survive when restoring over the same live project.
+    let keep_sessions = fs::symlink_metadata(target).is_ok()
+        && crate::global_config::normalize_path(target)
+            == crate::global_config::normalize_path(&project.path);
 
     if !opts.dry_run {
         fs::create_dir_all(target).with_context(|| format!("creating {}", target.display()))?;
@@ -350,7 +399,7 @@ fn restore_project(
                     .iter()
                     .filter_map(|i| Some((i.id.as_str(), i.branch.as_deref()?)))
                     .collect();
-                report.cleared_worktrees = rewrite_state(&mut state, target, &project.path, now)
+                report.cleared_worktrees = rewrite_state(&mut state, target, keep_sessions, now)
                     .into_iter()
                     .map(|id| {
                         let branch = branches.get(id.as_str()).map(|b| b.to_string());
@@ -405,7 +454,7 @@ fn restore_project(
             }
         }
     }
-    Ok(report)
+    Ok(())
 }
 
 /// Clone the repo into `<target>/main` unless something is already there.
@@ -432,6 +481,23 @@ fn restore_repo(
             url,
             error: format!("{err:#}"),
         };
+    }
+    for remote in &project.repo.remotes {
+        if remote.url == url || remote.name == "origin" {
+            continue;
+        }
+        let added = crate::external::git_command()
+            .arg("-C")
+            .arg(&main)
+            .args(["remote", "add", &remote.name, &remote.url])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !added {
+            warnings.push(format!(
+                "could not add remote {} ({})",
+                remote.name, remote.url
+            ));
+        }
     }
     if let Some(branch) = &branch {
         if let Err(err) = checkout(&main, branch) {
@@ -467,38 +533,31 @@ fn checkout(repo: &Path, branch: &str) -> anyhow::Result<()> {
 
 /// Prepare a backed-up board for a machine without its worktrees. An issue
 /// whose worktree isn't at `target` loses the link (like a prune: `pruned_at`
-/// set, setup to re-run) and its agent sessions, since transcripts aren't
-/// backed up and resume is tied to the worktree. Restoring somewhere else
-/// than `recorded` drops every session for the same reason. Everything else
-/// is kept. Returns the ids whose worktree was cleared.
+/// set, setup to re-run) and its agent sessions. Other sessions are kept only
+/// with `keep_sessions` (restoring over the same live project): transcripts
+/// aren't backed up, and OpenCode can't tell a dead session from a live one.
+/// Everything else is kept. Returns the ids whose worktree was cleared.
 pub fn rewrite_state(
     state: &mut AppState,
     target: &Path,
-    recorded: &Path,
+    keep_sessions: bool,
     now: u64,
 ) -> Vec<String> {
-    let moved = crate::global_config::normalize_path(target)
-        != crate::global_config::normalize_path(recorded);
     let mut cleared = Vec::new();
     for issue in &mut state.issues {
-        let Some(worktree) = issue.worktree.clone() else {
-            if moved {
-                issue.sessions.clear();
-            }
-            continue;
-        };
-        let present = is_plain_component(&worktree) && target.join(&worktree).is_dir();
-        if present {
-            if moved {
-                issue.sessions.clear();
-            }
-            continue;
+        let gone = issue
+            .worktree
+            .as_deref()
+            .is_some_and(|w| !is_plain_component(w) || !target.join(w).is_dir());
+        if gone {
+            issue.worktree = None;
+            issue.pruned_at = Some(now);
+            issue.setup_ran = false;
+            issue.sessions.clear();
+            cleared.push(issue.id.clone());
+        } else if !keep_sessions {
+            issue.sessions.clear();
         }
-        issue.worktree = None;
-        issue.pruned_at = Some(now);
-        issue.setup_ran = false;
-        issue.sessions.clear();
-        cleared.push(issue.id.clone());
     }
     cleared
 }
@@ -700,16 +759,21 @@ impl Report {
                     p.kept_plans.join(", ")
                 );
             }
-            let _ = writeln!(
-                out,
-                "  {}",
-                would(
-                    "registered in projects.json",
-                    "would register in projects.json"
-                )
-            );
+            if p.error.is_none() {
+                let _ = writeln!(
+                    out,
+                    "  {}",
+                    would(
+                        "registered in projects.json",
+                        "would register in projects.json"
+                    )
+                );
+            }
             for warning in &p.warnings {
                 let _ = writeln!(out, "  warning:  {warning}");
+            }
+            if let Some(error) = &p.error {
+                let _ = writeln!(out, "  error:    stopped here: {error}");
             }
             out.push('\n');
         }
@@ -848,6 +912,37 @@ mod tests {
         file.unwrap()
     }
 
+    /// An archive with a hand-written manifest and `(archive path, source)` entries.
+    fn crafted_archive(
+        dir: &Path,
+        projects: serde_json::Value,
+        entries: &[(&str, &Path)],
+    ) -> PathBuf {
+        let manifest = serde_json::json!({
+            "version": MANIFEST_VERSION, "created_at": 1, "bork_version": "0",
+            "projects": projects,
+        });
+        let entries: Vec<_> = entries
+            .iter()
+            .map(|(path, source)| super::super::archive::ArchiveEntry {
+                path: path.to_string(),
+                source: source.to_path_buf(),
+                follow: false,
+            })
+            .collect();
+        let file = dir.join("crafted.tar.gz");
+        super::super::archive::write(&file, manifest.to_string().as_bytes(), &entries).unwrap();
+        file
+    }
+
+    fn project_json(name: &str, archive_dir: &str, files: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "name": name, "path": format!("/old/{name}"), "archive_dir": archive_dir,
+            "repo": {"clone_url": null, "remotes": [], "default_branch": null},
+            "files": files, "issues": []
+        })
+    }
+
     fn demo_archive(out: &Path) -> PathBuf {
         backup_demo(out, |root| {
             crate::config::save_state(
@@ -909,7 +1004,7 @@ mod tests {
         ]);
         state.issues[0].pruned_at = None;
 
-        let cleared = rewrite_state(&mut state, &target, &target, 42);
+        let cleared = rewrite_state(&mut state, &target, true, 42);
 
         assert_eq!(cleared, vec!["demo-1".to_string()]);
         let gone = &state.issues[0];
@@ -920,17 +1015,18 @@ mod tests {
         assert_eq!(gone.prompt.as_deref(), Some("prompt demo-1"));
         assert_eq!(gone.column, Column::InProgress);
         assert_eq!(gone.linked_issues, vec!["demo-9".to_string()]);
-        // Same path: present worktrees and worktree-less issues keep their sessions.
+        // Restoring over the live project: present worktrees and worktree-less
+        // issues keep their sessions.
         assert_eq!(state.issues[1].worktree.as_deref(), Some("demo-2-b"));
         assert!(state.issues[1].setup_ran);
         assert_eq!(state.issues[1].sessions.len(), 1);
         assert_eq!(state.issues[2].sessions.len(), 1);
 
-        // Another path: every session goes, their transcripts are tied to the old one.
-        let mut moved = board(&[("demo-3", None)]);
-        rewrite_state(&mut moved, &target, Path::new("/elsewhere"), 42);
-        assert!(moved.issues[0].sessions.is_empty());
-        assert_eq!(moved.issues[0].pruned_at, None);
+        // A fresh restore: every session goes, transcripts aren't backed up.
+        let mut fresh = board(&[("demo-2", Some("demo-2-b")), ("demo-3", None)]);
+        assert!(rewrite_state(&mut fresh, &target, false, 42).is_empty());
+        assert!(fresh.issues.iter().all(|i| i.sessions.is_empty()));
+        assert_eq!(fresh.issues[1].pruned_at, None);
     }
 
     #[test]
@@ -954,7 +1050,7 @@ mod tests {
             let state = crate::config::load_state(&target);
             assert_eq!(state.issues.len(), 2);
             assert_eq!(state.issues[0].worktree, None);
-            assert!(state.issues[0].sessions.is_empty());
+            assert!(state.issues.iter().all(|i| i.sessions.is_empty()));
             assert_eq!(read(&target.join("AGENTS.md")), "agents");
             assert_eq!(
                 fs::read_link(target.join("CLAUDE.md")).unwrap(),
@@ -1089,21 +1185,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src");
         write(&src.join("AGENTS.md"), "agents");
-        let manifest = serde_json::json!({
-            "version": MANIFEST_VERSION, "created_at": 1, "bork_version": "0",
-            "projects": [{
-                "name": "demo", "path": "/old/demo", "archive_dir": "demo",
-                "repo": {"clone_url": null, "remotes": [], "default_branch": null},
-                "files": [STATE_FILE, "AGENTS.md"], "issues": []
-            }],
-        });
-        let file = dir.path().join("b.tar.gz");
-        let entries = [super::super::archive::ArchiveEntry {
-            path: "projects/demo/AGENTS.md".to_string(),
-            source: src.join("AGENTS.md"),
-            follow: false,
-        }];
-        super::super::archive::write(&file, manifest.to_string().as_bytes(), &entries).unwrap();
+        let file = crafted_archive(
+            dir.path(),
+            serde_json::json!([project_json("demo", "demo", &[STATE_FILE, "AGENTS.md"])]),
+            &[("projects/demo/AGENTS.md", &src.join("AGENTS.md"))],
+        );
 
         let home = tempfile::tempdir().unwrap();
         let dest = tempfile::tempdir().unwrap();
@@ -1123,6 +1209,82 @@ mod tests {
                 p.warnings
             );
             assert_eq!(crate::config::load_state(&target).issues.len(), 1);
+        });
+    }
+
+    #[test]
+    fn nothing_is_read_through_a_symlinked_archive_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        write(&outside.join("settings.json"), "outside the archive");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let file = crafted_archive(
+            dir.path(),
+            serde_json::json!([project_json("demo", "demo", &[".claude/settings.json"])]),
+            &[("projects/demo/.claude", &link)],
+        );
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            let report = import(&file, &opts(dest.path())).unwrap();
+            let p = &report.projects[0];
+            assert!(p.files.is_empty());
+            assert!(
+                p.warnings.iter().any(|w| w.contains("symlink")),
+                "{:?}",
+                p.warnings
+            );
+            assert!(!dest.path().join("demo/.claude/settings.json").exists());
+        });
+    }
+
+    #[test]
+    fn a_failing_project_does_not_stop_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join("AGENTS.md");
+        write(&agents, "agents");
+        let file = crafted_archive(
+            dir.path(),
+            serde_json::json!([
+                project_json("broken", "..", &["AGENTS.md"]),
+                project_json("good", "good", &["AGENTS.md"]),
+            ]),
+            &[("projects/good/AGENTS.md", &agents)],
+        );
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            let report = import(&file, &opts(dest.path())).unwrap();
+            assert!(report.failed());
+            assert!(report.projects[0].error.is_some());
+            assert!(report.projects[1].error.is_none());
+            assert_eq!(read(&dest.path().join("good/AGENTS.md")), "agents");
+            assert!(report.render().contains("stopped here"));
+            let names: Vec<String> = crate::global_config::list_projects()
+                .into_iter()
+                .map(|p| p.name)
+                .collect();
+            assert_eq!(names, vec!["good".to_string()]);
+        });
+    }
+
+    #[test]
+    fn refuses_a_name_registered_at_another_path() {
+        let out = tempfile::tempdir().unwrap();
+        let file = demo_archive(out.path());
+        let home = tempfile::tempdir().unwrap();
+        let original = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        write(
+            &original.path().join(".bork/config.toml"),
+            "project_name = \"demo\"\n",
+        );
+        crate::global_config::with_test_config_home(home.path(), || {
+            crate::global_config::register_project("demo", original.path()).unwrap();
+            let err = import(&file, &opts(dest.path())).unwrap_err();
+            assert!(format!("{err:#}").contains("already registered"), "{err:#}");
+            assert!(!dest.path().join("demo").exists());
         });
     }
 
@@ -1218,6 +1380,10 @@ mod tests {
                     main.to_str().unwrap(),
                 ],
             );
+            git(
+                &main,
+                &["remote", "add", "upstream", "https://example.com/up.git"],
+            );
             let wt = root.join("demo-1-fix");
             git(
                 &main,
@@ -1255,6 +1421,10 @@ mod tests {
 
             let target = dest.join("demo");
             assert_eq!(read(&target.join("main/README.md")), "hello");
+            assert_eq!(
+                git_out(&target.join("main"), &["remote", "get-url", "upstream"]),
+                "https://example.com/up.git"
+            );
             assert_eq!(
                 git_out(&target.join("main"), &["symbolic-ref", "--short", "HEAD"]),
                 "trunk"

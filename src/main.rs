@@ -1315,6 +1315,9 @@ fn run_import_command(
             eprintln!("You can run 'bork install' later to set up hooks.");
         }
     }
+    if report.failed() {
+        anyhow::bail!("some projects were not fully restored, see above");
+    }
     Ok(())
 }
 
