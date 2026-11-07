@@ -14,9 +14,11 @@ use anyhow::Context;
 
 use crate::config::AppState;
 
-/// Files inside `.bork/` worth restoring. Everything else there is derived or
-/// ephemeral (agent-status/, github-cache.json, errors.log, locks, temps).
-const BORK_FILES: &[&str] = &["state.json", "config.toml"];
+/// Files inside `.bork/` worth restoring, as paths relative to the
+/// container. Everything else there is derived or ephemeral (agent-status/,
+/// github-cache.json, errors.log, locks, temps). Symlinks are followed, since
+/// these are what bork itself reads.
+pub const BORK_FILES: &[&str] = &[".bork/state.json", ".bork/config.toml"];
 
 /// Destination subdirectory holding issue plans (`_issues/<issue-id>/planning.md`).
 /// The underscore keeps it clear of container entries.
@@ -138,10 +140,9 @@ pub fn select_files(
 ) -> anyhow::Result<Vec<PathBuf>> {
     let mut out: BTreeSet<PathBuf> = BTreeSet::new();
 
-    for name in BORK_FILES {
-        let rel = Path::new(".bork").join(name);
-        if fs::symlink_metadata(project_root.join(&rel)).is_ok_and(|m| m.is_file()) {
-            out.insert(rel);
+    for rel in BORK_FILES {
+        if fs::metadata(project_root.join(rel)).is_ok_and(|m| m.is_file()) {
+            out.insert(PathBuf::from(rel));
         }
     }
 

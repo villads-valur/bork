@@ -9,12 +9,53 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context};
 
+/// Marker file at the top of every backup directory, holding the source path.
+/// Bork only writes into an empty directory or one whose marker names the same
+/// source, and stale-file cleanup never enters another backup's directory.
+pub const MARKER: &str = ".bork-backup-source";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     /// Path relative to the destination directory.
     pub rel: PathBuf,
-    /// File or symlink on disk (symlinks are recreated, not followed).
+    /// File or symlink on disk. Symlinks are recreated as links unless
+    /// `follow` is set, in which case the target's content is copied.
     pub source: PathBuf,
+    pub follow: bool,
+}
+
+/// Make `dest` a backup directory owned by `source`: create it when missing,
+/// accept it when its marker names `source`, and refuse anything else (a
+/// symlink, a file, a non-empty unmarked directory, another source's backup).
+pub fn claim(dest: &Path, source: &Path) -> anyhow::Result<()> {
+    let owner = source.display().to_string();
+    let marker = dest.join(MARKER);
+    match fs::symlink_metadata(dest) {
+        Ok(meta) if meta.is_dir() => match fs::read_to_string(&marker) {
+            Ok(existing) if existing.trim() == owner => return Ok(()),
+            Ok(existing) => bail!(
+                "{} holds the backup of {}, not {owner}",
+                dest.display(),
+                existing.trim()
+            ),
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                if fs::read_dir(dest)?.next().is_some() {
+                    bail!(
+                        "{} is not empty and is not a bork backup; pick another path or empty it",
+                        dest.display()
+                    );
+                }
+            }
+            Err(err) => return Err(err).with_context(|| format!("reading {}", marker.display())),
+        },
+        Ok(_) => bail!(
+            "{} is a file or symlink, not a backup directory",
+            dest.display()
+        ),
+        Err(err) if err.kind() == ErrorKind::NotFound => fs::create_dir_all(dest)?,
+        Err(err) => return Err(err).with_context(|| format!("reading {}", dest.display())),
+    }
+    crate::config::atomic_write(&marker, format!("{owner}\n").as_bytes())
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -31,8 +72,9 @@ impl MirrorReport {
 }
 
 /// Make `dest` contain exactly `entries`, except stale files for which
-/// `retain` returns true. Sources that vanished mid-run are skipped (and their
-/// stale copy removed unless retained) rather than failing the backup.
+/// `retain` returns true, the marker, and nested backups. Sources that
+/// vanished mid-run are skipped (and their stale copy removed unless
+/// retained) rather than failing the backup. Call [`claim`] first.
 pub fn mirror(
     entries: &[Entry],
     dest: &Path,
@@ -43,7 +85,7 @@ pub fn mirror(
     let mut keep: HashSet<PathBuf> = HashSet::new();
 
     for entry in entries {
-        let Some(wrote) = sync_path(&entry.source, dest, &entry.rel)? else {
+        let Some(wrote) = sync_path(&entry.source, entry.follow, dest, &entry.rel)? else {
             continue;
         };
         keep.insert(entry.rel.clone());
@@ -62,8 +104,18 @@ pub fn mirror(
 /// Copy one file or symlink to `dest/rel` if it differs. `Ok(None)` when
 /// the source is gone or not a file; otherwise whether it wrote. Read errors
 /// other than "not found" fail, so an unreadable source never looks deleted.
-pub fn sync_path(src: &Path, dest: &Path, rel: &Path) -> anyhow::Result<Option<bool>> {
-    let meta = match fs::symlink_metadata(src) {
+pub fn sync_path(
+    src: &Path,
+    follow: bool,
+    dest: &Path,
+    rel: &Path,
+) -> anyhow::Result<Option<bool>> {
+    let meta = if follow {
+        fs::metadata(src)
+    } else {
+        fs::symlink_metadata(src)
+    };
+    let meta = match meta {
         Ok(meta) => meta,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err).with_context(|| format!("reading {}", src.display())),
@@ -89,7 +141,6 @@ pub fn sync_path(src: &Path, dest: &Path, rel: &Path) -> anyhow::Result<Option<b
 /// each component from `dest` down means a symlink left in the backup can
 /// never redirect a write outside it.
 fn prepare_parent(dest: &Path, rel: &Path) -> anyhow::Result<PathBuf> {
-    fs::create_dir_all(dest)?;
     let mut dir = dest.to_path_buf();
     if let Some(parent) = rel.parent() {
         for component in parent.components() {
@@ -163,7 +214,14 @@ fn remove_stale(
         let entry = entry?;
         let child_rel = rel.join(entry.file_name());
         let path = entry.path();
+        if rel.as_os_str().is_empty() && child_rel == Path::new(MARKER) {
+            continue;
+        }
         if entry.file_type()?.is_dir() {
+            // Another backup nested in this one is not ours to clean up.
+            if fs::symlink_metadata(path.join(MARKER)).is_ok() {
+                continue;
+            }
             remove_stale(dest, &child_rel, keep, retain, removed)?;
             if fs::read_dir(&path)?.next().is_none() {
                 fs::remove_dir(&path)?;
@@ -189,6 +247,7 @@ mod tests {
         Entry {
             rel: PathBuf::from(rel),
             source: src.join(rel),
+            follow: false,
         }
     }
 
@@ -226,6 +285,69 @@ mod tests {
         assert_eq!(fs::read_to_string(dest.join("AGENTS.md")).unwrap(), "v2");
         assert!(!dest.join("plans").exists(), "empty dirs are pruned");
         assert!(sibling.exists(), "never touches outside dest");
+    }
+
+    #[test]
+    fn claim_only_accepts_own_or_empty_dirs() {
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("demo");
+        let me = Path::new("/projects/demo");
+
+        claim(&dest, me).unwrap();
+        assert_eq!(
+            fs::read_to_string(dest.join(MARKER)).unwrap(),
+            "/projects/demo\n"
+        );
+        claim(&dest, me).unwrap();
+        let err = claim(&dest, Path::new("/elsewhere/demo")).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("holds the backup of /projects/demo"));
+
+        let live = root.path().join("live");
+        write(&live.join("main/code.rs"), "code");
+        assert!(claim(&live, me).is_err());
+
+        let outside = tempfile::tempdir().unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        assert!(claim(&link, me).is_err());
+        assert!(!outside.path().join(MARKER).exists());
+
+        let empty = root.path().join("empty");
+        fs::create_dir(&empty).unwrap();
+        claim(&empty, me).unwrap();
+    }
+
+    #[test]
+    fn cleanup_keeps_marker_and_nested_backups() {
+        let dest = tempfile::tempdir().unwrap();
+        write(&dest.path().join(MARKER), "/p\n");
+        write(&dest.path().join("child/.bork-backup-source"), "/c\n");
+        write(&dest.path().join("child/AGENTS.md"), "child");
+        write(&dest.path().join("stale.md"), "x");
+        let report = mirror(&[], dest.path(), NO_RETAIN).unwrap();
+        assert_eq!(report.removed, vec![PathBuf::from("stale.md")]);
+        assert!(dest.path().join(MARKER).exists());
+        assert!(dest.path().join("child/AGENTS.md").exists());
+    }
+
+    #[test]
+    fn follow_copies_symlink_content() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        write(&src.path().join("real.json"), "{}");
+        std::os::unix::fs::symlink(src.path().join("real.json"), src.path().join("state.json"))
+            .unwrap();
+        let mut e = entry(src.path(), "state.json");
+        e.follow = true;
+        mirror(&[e], dest.path(), NO_RETAIN).unwrap();
+        let meta = fs::symlink_metadata(dest.path().join("state.json")).unwrap();
+        assert!(meta.is_file());
+        assert_eq!(
+            fs::read_to_string(dest.path().join("state.json")).unwrap(),
+            "{}"
+        );
     }
 
     #[test]

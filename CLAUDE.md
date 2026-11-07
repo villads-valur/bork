@@ -150,12 +150,12 @@ Legacy: `~/.config/bork/agents.toml` is no longer read (bork-119). A one-line st
 
 ## Backups
 
-- Folder destination only (typically iCloud Drive). Opt-in per project: `[backup] enabled = true` is only read from `<project>/.bork/config.toml`. `path` (`~` expanded) and `interval_minutes` (default 15, for the TUI worker) layer global → project.
+- Folder destination only (typically iCloud Drive). Opt-in per project: `[backup] enabled = true` is only read from `<project>/.bork/config.toml`. `path` (`~` expanded) and `interval_minutes` (default 15, reserved for the TUI worker) layer global → project.
 - Each project writes to `<path>/<project_name>/`, global files (`projects.json`, `config.toml`) to `<path>/_global/` when the global `[backup]` has a path.
 - Worktrees are excluded by union of `git worktree list` paths, `issue.worktree` names and child dirs with a `.git` entry. From `.bork/` only `state.json` and `config.toml` are copied.
 - Issue plans: each worktree's `.claude/planning.md` goes to `_issues/<issue-id>/planning.md`. The mirror removes stale files, except plans of issues still on the board (archived/pruned keep theirs); a plan is dropped only once its issue is deleted. If `state.json` can't be read, no plan is dropped.
 - `backup::save_issue_plan(root, issue_id, worktree_dir)` saves one plan; the worktree removal paths (archive/delete/prune) should call it before removing a worktree. It is a no-op when backups are off.
-- Safety: `resolve_project` rejects targets overlapping the project and targets shared with another registered project; selection and copy propagate read errors (only NotFound counts as gone); `mirror::prepare_parent` checks every path component from the scope dir down so stale backup symlinks can't redirect writes.
+- Safety: every backup folder holds a `.bork-backup-source` marker naming its source; `mirror::claim` only writes into an empty folder or one marked with the same source (refuses symlinks, files, unmarked non-empty dirs, other sources), and `remove_stale` never enters a subfolder holding another marker. `check_target` requires an absolute path and rejects targets overlapping the source or any registered project. Selection and copy propagate read errors (only NotFound counts as gone). `mirror::prepare_parent` checks every component below the scope dir so stale backup symlinks can't redirect writes. `.bork/state.json` and `.bork/config.toml` are copied by content (symlinks followed) and never pruned. The flock is required, not best effort.
 - Restore is a manual copy-back (README). There is no manifest or restore command.
 - Runs are serialized machine-wide with a flock on `~/.config/bork/backup.lock`.
 

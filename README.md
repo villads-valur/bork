@@ -484,8 +484,8 @@ Both keys accept a single shell command line and can live in either config layer
 # <project>/.bork/config.toml
 [backup]
 enabled = true                                                       # per-project opt-in (only read from the project file)
-path = "~/Library/Mobile Documents/com~apple~CloudDocs/bork-backups" # each project lands in <path>/<project_name>/
-interval_minutes = 15                                                # how often the TUI runs a backup
+path = "~/Library/Mobile Documents/com~apple~CloudDocs/bork-backups" # absolute or ~/; each project lands in <path>/<project_name>/
+interval_minutes = 15                                                # reserved for the upcoming automatic backups in the TUI
 ```
 
 `path` and `interval_minutes` can be set in `~/.config/bork/config.toml` as defaults; a project's own values win. When the global `[backup]` has a `path`, `projects.json` and the global `config.toml` are backed up to `<path>/_global/`. Only opt in projects whose files are allowed in that folder.
@@ -498,7 +498,9 @@ What lands in `<path>/<project_name>/`:
 
 The folder mirrors the project: files removed from the project are removed from the backup. Issue plans are the exception. An archived or pruned issue keeps its plan in the backup, which is only dropped once the issue is deleted from the board.
 
-A backup refuses to run when `path` overlaps the project itself, or when another registered project with the same `project_name` backs up to the same folder. A file it can't read fails the run instead of being dropped from the backup, and a missing `.bork/state.json` never removes saved issue plans.
+For now backups only run when you call `bork backup`; a later version runs them automatically in the TUI every `interval_minutes`.
+
+Each backup folder holds a `.bork-backup-source` file naming the project it belongs to. Bork only writes into an empty folder or one that names the same project, so a backup can never overwrite another project's backup or an unrelated folder. It also refuses a `path` that overlaps the project or any registered project. If you move a project, delete the old backup folder's `.bork-backup-source` (or the folder) so the next backup can claim it. A file bork can't read fails the run instead of being dropped from the backup, and a missing `.bork/state.json` never removes the backed-up board or saved issue plans.
 
 ```bash
 bork backup                     # all opted-in projects + global files
@@ -517,7 +519,7 @@ There is no restore command; copy the files back by hand:
 2. Recreate each project with `bork init <repo> <directory>`, then copy the backup over it, leaving out the issue plans:
 
    ```bash
-   rsync -a --exclude _issues "<path>/<project_name>/" <container>/
+   rsync -a --exclude _issues --exclude .bork-backup-source "<path>/<project_name>/" <container>/
    ```
 
 3. For each issue you want to continue, create its worktree with `bork worktree <issue-id> <slug>` and copy its plan back:

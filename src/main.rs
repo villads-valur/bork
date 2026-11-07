@@ -1224,14 +1224,15 @@ fn run_backup_command(project: Option<&str>, dry_run: bool) -> anyhow::Result<()
             Some(name) => vec![backup::plan_project(&lookup_project_root(name)?)?],
             None => backup_targets()
                 .into_iter()
-                .filter_map(|(name, path)| match backup::plan_project(&path) {
+                .map(|(name, path)| (name, backup::plan_project(&path)))
+                .chain(backup::plan_global().map(|plan| (backup::GLOBAL_SCOPE.to_string(), plan)))
+                .filter_map(|(name, plan)| match plan {
                     Ok(plan) => Some(plan),
                     Err(err) => {
                         eprintln!("{name}: {err:#}");
                         None
                     }
                 })
-                .chain(backup::plan_global())
                 .collect(),
         };
         if plans.is_empty() {
@@ -1309,10 +1310,14 @@ fn run_backup_status() -> anyhow::Result<()> {
             let last = backup::status::read(&backup::status::project_status_path(&p.path));
             (p.name, cfg, last)
         })
-        .chain(backup::plan_global().map(|plan| {
-            let last = backup::status::read(&backup::status::global_status_path());
-            (backup::GLOBAL_SCOPE.to_string(), plan.config, last)
-        }));
+        .chain(
+            Some(backup::global_config())
+                .filter(|cfg| cfg.enabled)
+                .map(|cfg| {
+                    let last = backup::status::read(&backup::status::global_status_path());
+                    (backup::GLOBAL_SCOPE.to_string(), cfg, last)
+                }),
+        );
 
     for (name, cfg, last) in rows {
         if !cfg.enabled {
