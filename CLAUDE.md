@@ -18,7 +18,9 @@ Main Thread (50ms tick event loop)
 │   ├── Linear Worker (polls every 45s - assigned Linear issues + open projects, conditional on `linear` CLI)
 │   ├── tuicr Draft Worker (polls every 10s - unposted tuicr comments, conditional on `tuicr`)
 │   ├── Activity Poller (polls every 5s - agent status dirs for all registered projects, feeds the sidebar's needs-you dots)
-│   └── Update Check Worker (every 6h - new-version banner, plus cache mtime poll every 2s)
+│   ├── Update Check Worker (every 6h - new-version banner, plus cache mtime poll every 2s)
+│   └── Backup Worker (checks 15s after startup, then hourly; runs `backup::run` when no
+│                      success in 24h or on `B`; feeds the header's backup warning)
 ├── Primary ProjectWorkers (for focused project)
 │   ├── Agent Status Worker (polls every 2s - agent status files)
 │   ├── Git Status Worker (adaptive: in-progress worktrees ~5s, others 15-30s, done
@@ -69,6 +71,7 @@ src/
 ├── backup/           # Backups (library; `bork backup` CLI in main.rs is a thin layer)
 │   ├── mod.rs        # Selection, plan/run (one tar.gz, skip when unchanged), save_issue_plan
 │   ├── config.rs     # `[backup]`: enabled (project file), path + interval_minutes (global file)
+│   ├── schedule.rs   # TUI worker decisions: is_due, BackupIndicator, failure de-dup (pure)
 │   ├── manifest.rs   # Public manifest.json types (archive contract for `bork import`) + repo facts
 │   ├── archive.rs    # Staging copy + system `tar -czf`, atomic rename, content fingerprint
 │   ├── select.rs     # Container file selection, worktree detection, ephemeral excludes, issue plans
@@ -161,6 +164,7 @@ Legacy: `~/.config/bork/agents.toml` is no longer read (bork-119). A one-line st
 - Unchanged content (fingerprint over manifest without `created_at` + every file) skips the write. Read errors other than NotFound fail the run and keep the previous file. The path may not be inside a registered project.
 - `backup::save_issue_plan(root, issue_id, worktree_dir)` copies a worktree's plan into the container's `plans/<issue-id>/planning.md` before removal (no-op when backups are off); the archive/delete/prune paths call it (follow-up).
 - Runs are serialized with a required flock on `~/.config/bork/backup.lock`.
+- TUI: the shared Backup Worker (`spawn_backup_worker` in main.rs, decisions in `backup/schedule.rs`) runs a daily backup: due when `backup.json` has no success for the file or the last one is 24h old. `B` forces a run. The header renders only warnings (last run failed, or no success in 48h); a new failure (or changed error) flashes once and is appended to `.bork/errors.log` of each loaded opted-in project.
 
 ## Build & Run
 

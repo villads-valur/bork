@@ -271,6 +271,7 @@ bork update --check   # force a fresh check without pulling
 | `Enter` | Open session (resume or launch if none, attach if running) |
 | `Ctrl+P` | Toggle project sidebar |
 | `P` | Force-sync PR statuses from GitHub |
+| `B` | Back up now (see [Backups](#backups)) |
 | `o` | Open PR in browser (if issue has a matching PR, or all marked issues' PRs) |
 | `t` | Open project-root terminal in tmux |
 | `/` | Search / filter board |
@@ -499,6 +500,8 @@ bork backup status              # opted-in projects, last run, result and size p
 ```
 
 The file is replaced atomically and left untouched when nothing changed since the last backup. A file bork can't read fails the run and keeps the previous backup. The last result per file is stored in `~/.config/bork/backup.json`.
+
+While the TUI runs, it backs up automatically once a day: it checks shortly after startup and then hourly, and runs a backup when none has succeeded in the last 24 hours. Press `B` to back up right away. The header stays quiet while backups work, and shows a warning when the last run failed (the error also goes to `.bork/errors.log` of each opted-in project) or when no backup has succeeded in over 48 hours.
 
 #### Restoring
 
