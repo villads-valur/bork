@@ -128,11 +128,20 @@ pub fn is_ephemeral(name: &str) -> bool {
 
 /// Relative paths (files and symlinks) under `project_root` to back up,
 /// sorted. Directories are implied by their contents; empty ones are dropped.
-pub fn select_files(
-    project_root: &Path,
-    worktrees: &HashSet<String>,
-) -> anyhow::Result<Vec<PathBuf>> {
+/// What [`select_files`] found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Selected {
+    /// Files and symlinks to back up, relative to the container, sorted.
+    pub files: Vec<PathBuf>,
+    /// Git checkouts skipped as code, relative to the container: nested ones
+    /// at any depth, plus standalone clones at the top level (a `.git`
+    /// directory other than `main/`'s; issue worktrees have a `.git` file).
+    pub checkouts: Vec<PathBuf>,
+}
+
+pub fn select_files(project_root: &Path, worktrees: &HashSet<String>) -> anyhow::Result<Selected> {
     let mut out: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut checkouts: BTreeSet<PathBuf> = BTreeSet::new();
 
     for rel in BORK_FILES {
         if is_existing_file(&project_root.join(rel))? {
@@ -141,19 +150,34 @@ pub fn select_files(
     }
 
     for name in list_dir(project_root)? {
-        if name == ".bork" || name == ISSUES_DIR || worktrees.contains(&name) || is_ephemeral(&name)
-        {
+        if worktrees.contains(&name) {
+            let is_clone = fs::symlink_metadata(project_root.join(&name).join(".git"))
+                .is_ok_and(|m| m.is_dir());
+            if name != "main" && is_clone {
+                checkouts.insert(PathBuf::from(&name));
+            }
             continue;
         }
-        walk(project_root, Path::new(&name), &mut out)?;
+        if name == ".bork" || name == ISSUES_DIR || is_ephemeral(&name) {
+            continue;
+        }
+        walk(project_root, Path::new(&name), &mut out, &mut checkouts)?;
     }
 
-    Ok(out.into_iter().collect())
+    Ok(Selected {
+        files: out.into_iter().collect(),
+        checkouts: checkouts.into_iter().collect(),
+    })
 }
 
 /// Any error other than "not found" fails the selection, since a backup that
 /// silently misses files would replace a complete one.
-fn walk(root: &Path, rel: &Path, out: &mut BTreeSet<PathBuf>) -> anyhow::Result<()> {
+fn walk(
+    root: &Path,
+    rel: &Path,
+    out: &mut BTreeSet<PathBuf>,
+    checkouts: &mut BTreeSet<PathBuf>,
+) -> anyhow::Result<()> {
     let path = root.join(rel);
     let meta = match fs::symlink_metadata(&path) {
         Ok(meta) => meta,
@@ -171,7 +195,10 @@ fn walk(root: &Path, rel: &Path, out: &mut BTreeSet<PathBuf>) -> anyhow::Result<
     // A nested checkout (anything with its own `.git`) is code, not
     // container docs: skip it whole, like top-level worktrees.
     match fs::symlink_metadata(path.join(".git")) {
-        Ok(_) => return Ok(()),
+        Ok(_) => {
+            checkouts.insert(rel.to_path_buf());
+            return Ok(());
+        }
         Err(err) if err.kind() == ErrorKind::NotFound => {}
         Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
     }
@@ -179,7 +206,7 @@ fn walk(root: &Path, rel: &Path, out: &mut BTreeSet<PathBuf>) -> anyhow::Result<
         if is_ephemeral(&name) {
             continue;
         }
-        walk(root, &rel.join(&name), out)?;
+        walk(root, &rel.join(&name), out, checkouts)?;
     }
     Ok(())
 }
@@ -278,6 +305,11 @@ mod tests {
             &state,
         );
         let selected = select_files(root, &worktrees).unwrap();
+        assert_eq!(
+            selected.checkouts,
+            vec![PathBuf::from("plans/tool"), PathBuf::from("refs/other")]
+        );
+        let selected = selected.files;
 
         assert_eq!(
             selected,
@@ -321,6 +353,7 @@ mod tests {
         // `_issues` in the container is never picked up as a container entry.
         assert!(select_files(root, &HashSet::new())
             .unwrap()
+            .files
             .iter()
             .all(|p| !p.starts_with(ISSUES_DIR)));
     }
@@ -346,7 +379,7 @@ mod tests {
         let root = dir.path();
         touch(root, "AGENTS.md");
         std::os::unix::fs::symlink("AGENTS.md", root.join("CLAUDE.md")).unwrap();
-        let selected = select_files(root, &HashSet::new()).unwrap();
+        let selected = select_files(root, &HashSet::new()).unwrap().files;
         assert_eq!(selected, paths(&["AGENTS.md", "CLAUDE.md"]));
     }
 }

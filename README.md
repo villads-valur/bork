@@ -479,7 +479,7 @@ Both keys accept a single shell command line and can live in either config layer
 
 ### Backups
 
-`bork backup` writes one file, `<path>/bork-backup.tar.gz`, holding what git doesn't cover: each opted-in project's board (`.bork/state.json`, `.bork/config.toml`), everything else in the project folder (`AGENTS.md`, `plans/`, `.claude/`, `.agents/`, `opencode.jsonc`, ...) except `main/`, worktrees, nested git checkouts and temp files, and the `.claude/planning.md` of every live issue worktree, plus your global `projects.json` and `config.toml`. Point `path` at a synced folder such as iCloud Drive and a wiped machine can get its boards and plans back. Code in worktrees and agent transcripts are not backed up.
+`bork backup` writes one file per Mac, `<path>/bork-backup-<host>.tar.gz`, holding what git doesn't cover: each opted-in project's board (`.bork/state.json`, `.bork/config.toml`), everything else in the project folder (`AGENTS.md`, `plans/`, `.claude/`, `.agents/`, `opencode.jsonc`, ...) except `main/`, worktrees, nested git checkouts and temp files, and the `.claude/planning.md` of every live issue worktree, plus your global `projects.json` and `config.toml`. Point `path` at a synced folder such as iCloud Drive and a wiped machine can get its boards and plans back; several Macs can share the folder, since each writes its own file (`<host>` is the Mac's short host name, lowercased, see `bork backup status`). Code in worktrees and agent transcripts are not backed up. Nested git repos inside a project folder are skipped too; if one has no remote, `bork backup` and `bork backup status` list it, since nothing else holds its content.
 
 ```toml
 # ~/.config/bork/config.toml
@@ -492,8 +492,8 @@ enabled = true
 ```
 
 ```bash
-bork backup                     # all opted-in projects -> <path>/bork-backup.tar.gz
-bork backup --project bork      # just one project -> <path>/bork-backup-bork.tar.gz
+bork backup                     # all opted-in projects -> <path>/bork-backup-<host>.tar.gz
+bork backup --project bork      # just one project -> <path>/bork-backup-<host>--bork.tar.gz
 bork backup --dry-run           # print the file path and its contents, write nothing
 bork backup status              # opted-in projects, last run, result and size per file
 ```
@@ -507,9 +507,9 @@ The TUI checks shortly after startup and then hourly, and runs a backup when non
 `bork import <file>` (coming) restores from the backup file: it clones each project's repo, puts the board and container files back, and registers the projects. To look inside a backup by hand:
 
 ```bash
-tar -tzf bork-backup.tar.gz                       # list the contents
-tar -xzOf bork-backup.tar.gz manifest.json        # projects, repos, issues
-tar -xzf bork-backup.tar.gz -C /tmp/bork-restore  # extract everything
+tar -tzf bork-backup-<host>.tar.gz                       # list the contents
+tar -xzOf bork-backup-<host>.tar.gz manifest.json        # host, projects, repos, issues
+tar -xzf bork-backup-<host>.tar.gz -C /tmp/bork-restore  # extract everything
 ```
 
 Inside, `manifest.json` describes each project (path, clone URL, default branch, issues), `projects/<name>/` holds its files with worktree plans under `_issues/<issue-id>/planning.md`, and `_global/` holds the global config.

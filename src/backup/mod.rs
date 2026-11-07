@@ -2,9 +2,9 @@
 //! plans of every opted-in project, plus the global config, so a wiped
 //! machine can be restored with `bork import`.
 //!
-//! `bork backup` writes `<path>/bork-backup.tar.gz` (all opted-in projects
+//! `bork backup` writes `<path>/bork-backup-<host>.tar.gz` (all opted-in projects
 //! and `_global/`); `bork backup --project <name>` writes
-//! `<path>/bork-backup-<name>.tar.gz` with just that project. The archive
+//! `<path>/bork-backup-<host>--<name>.tar.gz` with just that project. The archive
 //! layout and manifest are documented in [`manifest`]. A run whose content
 //! matches the last archive leaves the file untouched.
 //!
@@ -33,8 +33,50 @@ use self::select::{ISSUES_DIR, PLAN_FILE};
 use self::status::ArchiveStatus;
 use crate::config::AppState;
 
-/// File name of the full backup.
-pub const BACKUP_FILE: &str = "bork-backup.tar.gz";
+/// Stable short name of this machine for backup file names: `gethostname`'s
+/// first label (the macOS LocalHostName), lowercased, with anything outside
+/// `[a-z0-9-]` turned into `-`. Never contains `--`, never empty.
+pub fn host_name() -> String {
+    let mut buf = [0u8; 256];
+    // SAFETY: buf is valid for writes of buf.len() bytes for the call.
+    let ret = unsafe { libc::gethostname(buf.as_mut_ptr().cast::<libc::c_char>(), buf.len()) };
+    let raw = if ret == 0 {
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        String::from_utf8_lossy(&buf[..end]).into_owned()
+    } else {
+        String::new()
+    };
+    sanitize_host(&raw)
+}
+
+fn sanitize_host(raw: &str) -> String {
+    let label = raw.split('.').next().unwrap_or("");
+    let mut out = String::new();
+    for c in label.chars().flat_map(char::to_lowercase) {
+        let c = if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            c
+        } else {
+            '-'
+        };
+        if c == '-' && (out.is_empty() || out.ends_with('-')) {
+            continue;
+        }
+        out.push(c);
+    }
+    let out = out.trim_end_matches('-').to_string();
+    if out.is_empty() {
+        "host".to_string()
+    } else {
+        out
+    }
+}
+
+/// File name of this machine's full backup: `bork-backup-<host>.tar.gz`,
+/// one per Mac so machines sharing a synced folder don't overwrite each
+/// other. Use this (or [`full_backup_file`]) instead of spelling the name.
+pub fn backup_file_name() -> String {
+    format!("bork-backup-{}.tar.gz", host_name())
+}
 
 /// How long a successful full backup counts as current for [`is_due`].
 pub const BACKUP_MAX_AGE_SECS: u64 = 24 * 60 * 60;
@@ -49,10 +91,10 @@ const PLAN_NAME: &str = "planning.md";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selection {
     /// Every registered, opted-in project plus the global files, written to
-    /// [`BACKUP_FILE`].
+    /// [`backup_file_name`].
     All,
     /// One opted-in project (its container root), written to
-    /// `bork-backup-<project_name>.tar.gz`.
+    /// `bork-backup-<host>--<project_name>.tar.gz`.
     Project(PathBuf),
 }
 
@@ -64,6 +106,9 @@ pub struct Plan {
     /// Manifest with `created_at` still 0; set when writing.
     pub manifest: Manifest,
     pub entries: Vec<ArchiveEntry>,
+    /// Skipped git checkouts with no remote (absolute paths): their content
+    /// is in neither the backup nor any remote. Reported as a warning.
+    pub local_only_repos: Vec<PathBuf>,
 }
 
 /// Result of a successful run.
@@ -74,6 +119,8 @@ pub struct Outcome {
     /// False when the content matched the last archive and the file was left alone.
     pub written: bool,
     pub projects: Vec<String>,
+    /// See [`Plan::local_only_repos`].
+    pub local_only_repos: Vec<PathBuf>,
 }
 
 /// Resolve what a run would write. `Ok(None)` when [`Selection::All`] finds
@@ -119,7 +166,7 @@ pub fn plan(selection: &Selection) -> anyhow::Result<Option<Plan>> {
             if roots.is_empty() {
                 return Ok(None);
             }
-            (roots, dir.join(BACKUP_FILE))
+            (roots, dir.join(backup_file_name()))
         }
         Selection::Project(root) => {
             let root = crate::global_config::normalize_path(root);
@@ -153,12 +200,15 @@ pub fn plan(selection: &Selection) -> anyhow::Result<Option<Plan>> {
 
     let mut projects = Vec::new();
     let mut entries = Vec::new();
+    let mut local_only_repos = Vec::new();
     let mut used_dirs = HashSet::new();
     for root in &roots {
         let label = labels.get(root).cloned().flatten();
-        let (project, mut project_entries) = project_part(root, label, &mut used_dirs)?;
+        let (project, mut project_entries, mut local_only) =
+            project_part(root, label, &mut used_dirs)?;
         projects.push(project);
         entries.append(&mut project_entries);
+        local_only_repos.append(&mut local_only);
     }
 
     let mut global_files = Vec::new();
@@ -185,10 +235,12 @@ pub fn plan(selection: &Selection) -> anyhow::Result<Option<Plan>> {
             version: MANIFEST_VERSION,
             created_at: 0,
             bork_version: env!("CARGO_PKG_VERSION").to_string(),
+            host: host_name(),
             projects,
             global_files,
         },
         entries,
+        local_only_repos,
     }))
 }
 
@@ -214,6 +266,7 @@ pub fn run(selection: &Selection) -> anyhow::Result<Option<Outcome>> {
                 ok: true,
                 size: outcome.size,
                 projects: outcome.projects.clone(),
+                local_only_repos: outcome.local_only_repos.clone(),
                 paths: plan
                     .manifest
                     .projects
@@ -235,7 +288,7 @@ pub fn run(selection: &Selection) -> anyhow::Result<Option<Outcome>> {
 
 /// Whether the daily automatic backup should run at `now` (unix seconds):
 /// true when `~/.config/bork/backup.json` has no successful full backup
-/// ([`BACKUP_FILE`] at the configured path) or the last one is at least
+/// ([`full_backup_file`]) or the last one is at least
 /// [`BACKUP_MAX_AGE_SECS`] old. Explicit `bork backup` calls run regardless.
 pub fn is_due(now: u64) -> bool {
     let file = full_backup_file();
@@ -322,13 +375,14 @@ fn archive_dir_name(name: &str) -> String {
     }
 }
 
-/// Archive files and manifest entry for one project. `used_dirs` keeps
-/// archive directories unique when registered projects share a name.
+/// Archive files, manifest entry and local-only skipped repos for one
+/// project. `used_dirs` keeps archive directories unique when registered
+/// projects share a name.
 fn project_part(
     root: &Path,
     label: Option<String>,
     used_dirs: &mut HashSet<String>,
-) -> anyhow::Result<(ProjectManifest, Vec<ArchiveEntry>)> {
+) -> anyhow::Result<(ProjectManifest, Vec<ArchiveEntry>, Vec<PathBuf>)> {
     let name = crate::config::load_config_from(root).project_name;
     let base = archive_dir_name(&name);
     // ASCII and compared case-insensitively, so names stay distinct on any
@@ -359,7 +413,14 @@ fn project_part(
 
     let mut files = Vec::new();
     let mut entries = Vec::new();
-    for rel in select::select_files(root, &worktrees)? {
+    let selected = select::select_files(root, &worktrees)?;
+    let local_only: Vec<PathBuf> = selected
+        .checkouts
+        .iter()
+        .map(|rel| root.join(rel))
+        .filter(|repo| !has_remote(repo))
+        .collect();
+    for rel in selected.files {
         let Some(rel_str) = rel.to_str().map(String::from) else {
             continue;
         };
@@ -408,7 +469,18 @@ fn project_part(
         archive_dir,
         files,
     };
-    Ok((project, entries))
+    Ok((project, entries, local_only))
+}
+
+/// Whether the checkout at `repo` has at least one remote. A repo git can't
+/// read counts as having none, so it gets reported rather than ignored.
+fn has_remote(repo: &Path) -> bool {
+    crate::external::git_command()
+        .arg("-C")
+        .arg(repo)
+        .arg("remote")
+        .output()
+        .is_ok_and(|out| out.status.success() && !out.stdout.trim_ascii().is_empty())
 }
 
 /// Write the archive unless its content matches the last one written to the
@@ -433,6 +505,7 @@ fn write_plan(plan: &Plan) -> anyhow::Result<(Outcome, String)> {
                 size: prev.size,
                 written: false,
                 projects,
+                local_only_repos: plan.local_only_repos.clone(),
             };
             return Ok((outcome, fingerprint));
         }
@@ -448,6 +521,7 @@ fn write_plan(plan: &Plan) -> anyhow::Result<(Outcome, String)> {
         size,
         written: true,
         projects,
+        local_only_repos: plan.local_only_repos.clone(),
     };
     Ok((outcome, fingerprint))
 }
@@ -480,14 +554,16 @@ fn check_single_project_owner(file: &Path, root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `<dir>/bork-backup-<project_name>.tar.gz` for a `--project` run. The
-/// only place that name is built, so planning and status always agree.
+/// `<dir>/bork-backup-<host>--<project_name>.tar.gz` for a `--project` run.
+/// The `--` can't occur in a host name, so this never matches another
+/// machine's full backup. The only place that name is built, so planning
+/// and status always agree.
 fn project_backup_file(dir: &Path, root: &Path) -> anyhow::Result<PathBuf> {
     let name = crate::config::load_config_from(root).project_name;
     if !select::is_plain_component(&name) {
         bail!("project name {name:?} can't be used in a file name");
     }
-    Ok(dir.join(format!("bork-backup-{name}.tar.gz")))
+    Ok(dir.join(format!("bork-backup-{}--{name}.tar.gz", host_name())))
 }
 
 /// Where a failed planning step is recorded: the full backup's file, or the
@@ -510,11 +586,12 @@ fn failure_file(selection: &Selection) -> Option<PathBuf> {
     }
 }
 
-/// The full backup file for the configured path, resolved the way runs and
-/// `backup.json` key it (symlinks and `..` followed). `None` without a path.
+/// This machine's full backup file (`<path>/bork-backup-<host>.tar.gz`,
+/// path resolved), when the backup path is configured. The TUI worker and
+/// `bork import` use this instead of building the name themselves.
 pub fn full_backup_file() -> Option<PathBuf> {
     let dir = config::load_settings().path?;
-    Some(resolve_through_existing(&dir).join(BACKUP_FILE))
+    Some(resolve_through_existing(&dir).join(backup_file_name()))
 }
 
 fn record_failure(file: &Path, err: &anyhow::Error) {
@@ -667,7 +744,7 @@ mod tests {
 
             let outcome = run(&Selection::All).unwrap().unwrap();
 
-            let file = resolve_through_existing(&dest.path().join(BACKUP_FILE));
+            let file = resolve_through_existing(&dest.path().join(backup_file_name()));
             assert_eq!(outcome.file, file);
             assert!(outcome.written);
             assert_eq!(outcome.projects, vec!["demo".to_string()]);
@@ -720,7 +797,7 @@ mod tests {
             assert!(run(&Selection::All).unwrap().unwrap().written);
 
             // A deleted backup file is rewritten even when nothing changed.
-            fs::remove_file(dest.path().join(BACKUP_FILE)).unwrap();
+            fs::remove_file(dest.path().join(backup_file_name())).unwrap();
             assert!(run(&Selection::All).unwrap().unwrap().written);
         });
     }
@@ -742,7 +819,11 @@ mod tests {
 
             assert_eq!(
                 outcome.file,
-                resolve_through_existing(&dest.path().join("bork-backup-demo.tar.gz"))
+                resolve_through_existing(
+                    &dest
+                        .path()
+                        .join(format!("bork-backup-{}--demo.tar.gz", host_name()))
+                )
             );
             assert_eq!(
                 list(&outcome.file),
@@ -753,11 +834,15 @@ mod tests {
                 ]
             );
             assert!(read_manifest(&outcome.file).global_files.is_empty());
-            assert!(!dest.path().join(BACKUP_FILE).exists());
+            assert!(!dest.path().join(backup_file_name()).exists());
 
             let off = project("off", false);
             assert!(run(&Selection::Project(off.path().to_path_buf())).is_err());
-            let off_file = resolve_through_existing(&dest.path().join("bork-backup-off.tar.gz"));
+            let off_file = resolve_through_existing(
+                &dest
+                    .path()
+                    .join(format!("bork-backup-{}--off.tar.gz", host_name())),
+            );
             assert!(!status::read(&status::status_path())
                 .archives
                 .contains_key(&off_file));
@@ -796,7 +881,7 @@ mod tests {
             let _off = project("off", false);
             assert_eq!(run(&Selection::All).unwrap(), None);
         });
-        assert!(!dest.path().join(BACKUP_FILE).exists());
+        assert!(!dest.path().join(backup_file_name()).exists());
     }
 
     #[test]
@@ -817,7 +902,8 @@ mod tests {
             assert!(format!("{err:#}").contains("inside the project"), "{err:#}");
             assert!(!demo.path().join("backups").exists());
 
-            let file = resolve_through_existing(&demo.path().join("backups").join(BACKUP_FILE));
+            let file =
+                resolve_through_existing(&demo.path().join("backups").join(backup_file_name()));
             let recorded = &status::read(&status::status_path()).archives[&file];
             assert!(!recorded.ok);
         });
@@ -899,7 +985,7 @@ mod tests {
             assert!(is_due(crate::app::unix_now()));
             run(&Selection::All).unwrap();
             let success = status::read(&status::status_path()).archives
-                [&resolve_through_existing(&dest.path().join(BACKUP_FILE))]
+                [&resolve_through_existing(&dest.path().join(backup_file_name()))]
                 .last_success_at
                 .unwrap();
             assert!(!is_due(success));
@@ -1061,7 +1147,7 @@ mod tests {
             let registry = crate::global_config::global_config_dir().join("projects.json");
             with_unreadable(&registry, || {
                 assert!(run(&Selection::All).is_err());
-                let file = resolve_through_existing(&dest.path().join(BACKUP_FILE));
+                let file = resolve_through_existing(&dest.path().join(backup_file_name()));
                 assert!(!status::read(&status::status_path()).archives[&file].ok);
             });
             write(&registry, "{ not json");
@@ -1267,6 +1353,89 @@ mod tests {
                 "{err:#}"
             );
             assert!(status::read(&status::status_path()).archives.is_empty());
+        });
+    }
+
+    #[test]
+    fn host_names_are_short_safe_and_never_contain_double_dashes() {
+        assert_eq!(
+            sanitize_host("Villads-MacBook-Pro.local"),
+            "villads-macbook-pro"
+        );
+        assert_eq!(sanitize_host("My Mac (2)"), "my-mac-2");
+        assert_eq!(sanitize_host("a--b__c"), "a-b-c");
+        assert_eq!(sanitize_host("Ünïcode"), "n-code");
+        assert_eq!(sanitize_host(""), "host");
+        assert_eq!(sanitize_host("---"), "host");
+        let host = host_name();
+        assert!(!host.is_empty() && !host.contains("--"));
+        assert!(host
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
+        assert_eq!(backup_file_name(), format!("bork-backup-{host}.tar.gz"));
+    }
+
+    fn git_init(dir: &Path, remote: Option<&str>) {
+        fs::create_dir_all(dir).unwrap();
+        let git = |args: &[&str]| {
+            let ok = crate::external::git_command()
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        if let Some(url) = remote {
+            git(&["remote", "add", "origin", url]);
+        }
+    }
+
+    #[test]
+    fn warns_about_skipped_repos_without_a_remote() {
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            set_global_path(dest.path());
+            let demo = project("demo", true);
+            let root = crate::global_config::normalize_path(demo.path());
+            write(&root.join("AGENTS.md"), "a");
+            git_init(&root.join("plans/scratch"), None);
+            write(&root.join("plans/scratch/notes.md"), "local only");
+            git_init(
+                &root.join(".claude/tool"),
+                Some("https://example.com/tool.git"),
+            );
+            git_init(&root.join("vendored"), None);
+
+            let plan = plan(&Selection::All).unwrap().unwrap();
+            assert_eq!(
+                plan.local_only_repos,
+                vec![root.join("plans/scratch"), root.join("vendored")]
+            );
+            assert!(plan.entries.iter().all(|e| !e.path.contains("scratch")));
+
+            let outcome = run(&Selection::All).unwrap().unwrap();
+            assert_eq!(outcome.local_only_repos, plan.local_only_repos);
+            let record = &status::read(&status::status_path()).archives[&outcome.file];
+            assert_eq!(record.local_only_repos, plan.local_only_repos);
+        });
+    }
+
+    #[test]
+    fn manifest_records_the_host() {
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            set_global_path(dest.path());
+            let demo = project("demo", true);
+            write(&demo.path().join("AGENTS.md"), "a");
+            let outcome = run(&Selection::All).unwrap().unwrap();
+            assert_eq!(Some(outcome.file.clone()), full_backup_file());
+            assert_eq!(read_manifest(&outcome.file).host, host_name());
         });
     }
 
