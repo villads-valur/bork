@@ -203,14 +203,8 @@ pub fn run(selection: &Selection) -> anyhow::Result<Option<Outcome>> {
         Ok(Some(plan)) => plan,
         Ok(None) => return Ok(None),
         Err(err) => {
-            // Record against the full backup's file so the daily status shows
-            // it. A refused `--project` run is reported by the caller only:
-            // its target file may belong to another project, whose healthy
-            // record must not turn into a failure.
-            if *selection == Selection::All {
-                if let Some(file) = full_backup_file() {
-                    record_failure(&file, &err);
-                }
+            if let Some(file) = failure_file(selection) {
+                record_failure(&file, &err);
             }
             return Err(err);
         }
@@ -488,6 +482,23 @@ fn check_single_project_owner(file: &Path, root: &Path) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Where a failed planning step is recorded: the full backup's file, or the
+/// project's own `--project` file. Nothing is recorded when that file
+/// belongs to another project, so its healthy record stays intact.
+fn failure_file(selection: &Selection) -> Option<PathBuf> {
+    match selection {
+        Selection::All => full_backup_file(),
+        Selection::Project(root) => {
+            let root = crate::global_config::normalize_path(root);
+            let dir = resolve_through_existing(&config::load_settings().path?);
+            let name = crate::config::load_config_from(&root).project_name;
+            let file = dir.join(format!("bork-backup-{name}.tar.gz"));
+            check_single_project_owner(&file, &root).ok()?;
+            Some(file)
+        }
+    }
 }
 
 /// The full backup's file, when the backup path is configured.
@@ -1207,6 +1218,25 @@ mod tests {
                 .output()
                 .unwrap();
             assert_eq!(&out.stdout, bytes);
+        });
+    }
+
+    #[test]
+    fn failed_project_run_is_recorded_on_its_own_file() {
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            set_global_path(dest.path());
+            let demo = project("demo", true);
+            save_board(demo.path(), &[("demo-1", None)]);
+            let outcome = run(&Selection::Project(demo.path().to_path_buf()))
+                .unwrap()
+                .unwrap();
+            write(&demo.path().join(".bork/state.json"), "{ corrupt");
+            assert!(run(&Selection::Project(demo.path().to_path_buf())).is_err());
+            let record = &status::read(&status::status_path()).archives[&outcome.file];
+            assert!(!record.ok);
+            assert_eq!(record.size, outcome.size);
         });
     }
 
