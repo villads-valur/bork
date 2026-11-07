@@ -225,6 +225,14 @@ pub enum ForceRequired {
     PlanNotSaved { error: String, dirty: bool },
 }
 
+/// What a successful `remove_worktree_in` went past.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Removed {
+    /// Exit code of a teardown script that failed but a forced removal ran
+    /// anyway, for the caller to report.
+    pub teardown_failed: Option<i32>,
+}
+
 /// How far `remove_worktree_in` pushes past a plan that can't be saved, a
 /// failing teardown or a dirty worktree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,7 +261,7 @@ pub fn remove_worktree_in(
     issue_id: &str,
     worktree_dir: &str,
     removal: Removal,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Removed> {
     let force = removal != Removal::Safe;
     let main_dir = config.project_root.join("main");
     if !main_dir.join(".git").exists() {
@@ -270,7 +278,7 @@ pub fn remove_worktree_in(
             .args(["worktree", "prune"])
             .current_dir(&main_dir)
             .status();
-        return Ok(());
+        return Ok(Removed::default());
     }
 
     let plan_error = match removal {
@@ -351,7 +359,9 @@ pub fn remove_worktree_in(
     if let Some(error) = plan_error {
         crate::issue_plan::log_dropped_plan(&config.project_root, worktree_dir, &error);
     }
-    Ok(())
+    Ok(Removed {
+        teardown_failed: teardown_failure,
+    })
 }
 
 /// Whether `git worktree remove --force` would discard anything in
@@ -723,7 +733,11 @@ mod tests {
         create_worktree_in(&cfg, "bork-1", Some("fix-bug"), None, None).unwrap();
 
         let result = remove_worktree_in(&cfg, "bork-1", "bork-1-fix-bug", Removal::Force);
-        assert!(result.is_ok(), "force remove failed: {:?}", result.err());
+        assert_eq!(
+            result.expect("force remove failed").teardown_failed,
+            Some(1),
+            "the ignored teardown failure is reported"
+        );
         assert!(!project.join("bork-1-fix-bug").exists());
 
         let _ = fs::remove_dir_all(&tmp);

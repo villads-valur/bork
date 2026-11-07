@@ -1643,6 +1643,11 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
             if let Some(worktree_dir) = report.worktree_removed {
                 println!("Removed worktree: {}/", worktree_dir);
             }
+            if let Some(code) = report.teardown_failed {
+                eprintln!(
+                    "Warning: teardown_script failed (exit {code}); removed anyway (--force)"
+                );
+            }
             if report.session_killed {
                 println!("Killed session: {}", report.session_name);
             }

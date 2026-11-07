@@ -260,16 +260,13 @@ fn remove_worktree(
     force_plans: bool,
 ) -> RemoveOutcome {
     let issue_id = target.issue_id.as_deref();
-    if let Err(error) =
-        crate::issue_plan::save_before_removal(project_root, issue_id, &target.worktree)
-    {
-        if !force_plans {
-            return RemoveOutcome::PlanNotSaved {
-                issue_id: target.issue_id.clone(),
-                error,
-            };
-        }
-        crate::issue_plan::log_dropped_plan(project_root, &target.worktree, &error);
+    let plan_error =
+        crate::issue_plan::save_before_removal(project_root, issue_id, &target.worktree).err();
+    if let (Some(error), false) = (&plan_error, force_plans) {
+        return RemoveOutcome::PlanNotSaved {
+            issue_id: target.issue_id.clone(),
+            error: error.clone(),
+        };
     }
 
     let worktree_path = project_root.join(&target.worktree);
@@ -278,7 +275,12 @@ fn remove_worktree(
         run_git_worktree(main_dir, "remove", &worktree_path)
     });
     match result {
-        Ok(()) => RemoveOutcome::Removed,
+        Ok(()) => {
+            if let Some(error) = plan_error {
+                crate::issue_plan::log_dropped_plan(project_root, &target.worktree, &error);
+            }
+            RemoveOutcome::Removed
+        }
         Err(msg) => RemoveOutcome::Failed(msg),
     }
 }
@@ -576,6 +578,25 @@ mod tests {
 
         assert_eq!(outcome.results[0].outcome, RemoveOutcome::Removed);
         assert!(!root.join("plans").exists());
+    }
+
+    #[test]
+    fn a_forced_prune_logs_a_dropped_plan_only_once_removed() {
+        let project = project_with_planned_worktree();
+        let root = project.path();
+        enable_broken_backups(root);
+        // Untracked work makes git refuse the removal.
+        std::fs::write(root.join("demo-1-x/wip.txt"), "wip").unwrap();
+
+        let outcome = execute_removals(root, &[of_issue("demo-1-x", "demo-1")], &[], true);
+
+        assert!(matches!(
+            outcome.results[0].outcome,
+            RemoveOutcome::Failed(_)
+        ));
+        assert!(root.join("demo-1-x/.claude/planning.md").exists());
+        let log = std::fs::read_to_string(root.join(".bork/errors.log")).unwrap();
+        assert!(!log.contains("without saving its plan"), "{log}");
     }
 
     #[test]

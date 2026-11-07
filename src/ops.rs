@@ -749,6 +749,8 @@ pub struct ArchiveReport {
     pub session_name: String,
     pub session_killed: bool,
     pub worktree_removed: Option<String>,
+    /// Exit code of a teardown script that failed but `--force` went past.
+    pub teardown_failed: Option<i32>,
 }
 
 /// Archive an issue: kill its agent session, run the teardown script, remove
@@ -771,6 +773,7 @@ pub fn archive_issue(
     let session_name = issue.session_name(&app_config.project_name);
     let session_killed = agent::terminate_session(project_root, &session_name)?;
 
+    let mut teardown_failed = None;
     let worktree_removed = match issue.worktree.as_deref() {
         Some(dir) => {
             let removal = if force {
@@ -778,7 +781,8 @@ pub fn archive_issue(
             } else {
                 worktree::Removal::Safe
             };
-            worktree::remove_worktree_in(&app_config, &issue.id, dir, removal)?;
+            teardown_failed =
+                worktree::remove_worktree_in(&app_config, &issue.id, dir, removal)?.teardown_failed;
             Some(dir.to_string())
         }
         None => None,
@@ -799,6 +803,7 @@ pub fn archive_issue(
         session_name,
         session_killed,
         worktree_removed,
+        teardown_failed,
     })
 }
 

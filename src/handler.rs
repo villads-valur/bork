@@ -2479,13 +2479,7 @@ fn handle_confirm(
                         "Archived",
                         "issue",
                         move |config, project_id, issue| {
-                            let removal = if !force {
-                                Removal::Safe
-                            } else if teardown_due.contains(&issue.id) {
-                                Removal::Force
-                            } else {
-                                Removal::ForceSkipTeardown
-                            };
+                            let removal = archive_removal(force, &teardown_due, &issue.id);
                             archive_issue_off_thread(config, project_id, issue, removal)
                         },
                     ),
@@ -2496,6 +2490,19 @@ fn handle_confirm(
             app.cancel_confirm();
         }
         _ => {}
+    }
+}
+
+/// How a confirmed archive removes `issue_id`'s worktree. A forced archive
+/// follows an attempt that stopped short: the teardown already ran, unless
+/// the attempt stopped at an unsaved plan (`teardown_due`).
+fn archive_removal(force: bool, teardown_due: &[String], issue_id: &str) -> Removal {
+    if !force {
+        Removal::Safe
+    } else if teardown_due.iter().any(|id| id == issue_id) {
+        Removal::Force
+    } else {
+        Removal::ForceSkipTeardown
     }
 }
 
@@ -2542,29 +2549,39 @@ fn archive_to_result(
         }
     };
 
+    let mut teardown_failed = None;
     if let Some(dir) = worktree {
-        if let Err(e) = crate::worktree::remove_worktree_in(config, &issue_id, dir, removal) {
-            let force_archive_offers = e
-                .downcast_ref::<ForceRequired>()
-                .map(|reason| vec![(project_id, issue_id.clone(), reason.clone())])
-                .unwrap_or_default();
-            return ActionResult {
-                message: format!("Failed to archive {issue_id}: {e}"),
-                message_kind: MessageKind::Error,
-                force_archive_offers,
-                ..Default::default()
-            };
+        match crate::worktree::remove_worktree_in(config, &issue_id, dir, removal) {
+            Ok(removed) => teardown_failed = removed.teardown_failed,
+            Err(e) => {
+                let force_archive_offers = e
+                    .downcast_ref::<ForceRequired>()
+                    .map(|reason| vec![(project_id, issue_id.clone(), reason.clone())])
+                    .unwrap_or_default();
+                return ActionResult {
+                    message: format!("Failed to archive {issue_id}: {e}"),
+                    message_kind: MessageKind::Error,
+                    force_archive_offers,
+                    ..Default::default()
+                };
+            }
         }
     }
 
-    let message = match (worktree.is_some(), session_killed) {
+    let mut message = match (worktree.is_some(), session_killed) {
         (true, true) => format!("Archived {issue_id} (session killed, worktree removed)"),
         (true, false) => format!("Archived {issue_id} (worktree removed)"),
         (false, true) => format!("Archived {issue_id} (session killed)"),
         (false, false) => format!("Archived {issue_id}"),
     };
+    let mut message_kind = MessageKind::Info;
+    if let Some(code) = teardown_failed {
+        message.push_str(&format!(", but its teardown script failed (exit {code})"));
+        message_kind = MessageKind::Warning;
+    }
     ActionResult {
         message,
+        message_kind,
         issues_to_archive: vec![(project_id, issue_id)],
         ..Default::default()
     }
@@ -4970,6 +4987,17 @@ mod tests {
             }
             other => panic!("expected a forced ArchiveIssue, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_forced_archive_runs_the_teardown_only_where_it_is_due() {
+        let due = vec!["bork-1".to_string()];
+        assert_eq!(archive_removal(false, &due, "bork-1"), Removal::Safe);
+        assert_eq!(archive_removal(true, &due, "bork-1"), Removal::Force);
+        assert_eq!(
+            archive_removal(true, &due, "bork-2"),
+            Removal::ForceSkipTeardown
+        );
     }
 
     #[test]
