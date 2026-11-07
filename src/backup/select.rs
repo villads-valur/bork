@@ -151,8 +151,8 @@ pub fn select_files(
     Ok(out.into_iter().collect())
 }
 
-/// Any error other than "not found" fails the selection, since a partial
-/// file list would make the mirror delete the missing files' backups.
+/// Any error other than "not found" fails the selection, since a backup that
+/// silently misses files would replace a complete one.
 fn walk(root: &Path, rel: &Path, out: &mut BTreeSet<PathBuf>) -> anyhow::Result<()> {
     let path = root.join(rel);
     let meta = match fs::symlink_metadata(&path) {
