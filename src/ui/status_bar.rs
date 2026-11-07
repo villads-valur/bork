@@ -53,27 +53,38 @@ pub fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         ));
     }
 
-    let title = Line::from(title_spans);
-    frame.render_widget(Paragraph::new(title), area);
-
-    if let Some(warning) = backup_warning_span(app) {
-        let right = Paragraph::new(Line::from(warning)).alignment(Alignment::Right);
-        frame.render_widget(right, area);
+    // The backup warning keeps its space and drops its key hint when the
+    // title wouldn't fit next to it; the title is cut before it after that.
+    let title_width: usize = title_spans.iter().map(|span| span.width()).sum();
+    let mut title_area = area;
+    let warning = backup_warning_span(app, false)
+        .filter(|full| title_width + full.width() <= area.width as usize)
+        .or_else(|| backup_warning_span(app, true));
+    if let Some(warning) = warning {
+        let width = (warning.width() as u16).min(area.width);
+        title_area.width = area.width - width;
+        let warning_area = Rect::new(title_area.right(), area.y, width, area.height);
+        frame.render_widget(Paragraph::new(Line::from(warning)), warning_area);
     }
+
+    let title = Line::from(title_spans);
+    frame.render_widget(Paragraph::new(title), title_area);
 }
 
-/// Header warning when the last backup failed or is too old; nothing otherwise.
-fn backup_warning_span(app: &App) -> Option<Span<'static>> {
-    use crate::backup::schedule::{warning_text, BackupIndicator};
+/// Header warning when the last backup failed or is too old; nothing
+/// otherwise. `compact` drops the key hint.
+fn backup_warning_span(app: &App, compact: bool) -> Option<Span<'static>> {
+    use crate::backup::schedule::warning_text;
 
     let text = warning_text(&app.backup, crate::app::unix_now())?;
-    let (color, hint) = match app.backup {
-        BackupIndicator::Failed(_) => (ratatui::style::Color::Red, "B to retry"),
-        _ => (ratatui::style::Color::Yellow, "B to back up"),
+    let text = if compact {
+        format!(" \u{26a0} {text} ")
+    } else {
+        format!(" \u{26a0} {text} (B to retry) ")
     };
     Some(Span::styled(
-        format!("\u{26a0} {text} ({hint}) "),
-        Style::default().fg(color),
+        text,
+        Style::default().fg(ratatui::style::Color::Red),
     ))
 }
 

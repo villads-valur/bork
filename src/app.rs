@@ -2381,6 +2381,53 @@ impl App {
         self.message_ttl = ttl;
     }
 
+    /// Fold a backup worker report in. A new failure from a real check goes
+    /// to the status bar (unless the manual result already says so) and to
+    /// `.bork/errors.log` of every loaded project with backups on; the
+    /// startup baseline and routine successes stay silent. Returns whether
+    /// to redraw.
+    pub fn apply_backup_report(&mut self, report: crate::backup::schedule::Report) -> bool {
+        use crate::backup::schedule;
+
+        let mut redraw = false;
+        if let Some(check) = &report.manual {
+            if self.backup_manual_pending {
+                self.backup_manual_pending = false;
+                self.busy_count = self.busy_count.saturating_sub(1);
+            }
+            let (message, is_error) = schedule::manual_message(check);
+            if is_error {
+                self.set_error(message);
+            } else {
+                self.set_message(message);
+            }
+            redraw = true;
+        }
+        let failure = if report.baseline {
+            None
+        } else {
+            schedule::failure_to_report(&self.backup, &report.indicator)
+        };
+        if let Some(error) = failure {
+            let line = format!("backup failed: {error}");
+            for project in &self.projects {
+                let root = &project.config.project_root;
+                if matches!(crate::backup::config::project_enabled(root), Ok(true)) {
+                    crate::config::append_error_log(root, std::slice::from_ref(&line));
+                }
+            }
+            if report.manual.is_none() {
+                self.set_error(format!("Backup failed: {error}"));
+            }
+            redraw = true;
+        }
+        if self.backup != report.indicator {
+            self.backup = report.indicator;
+            redraw = true;
+        }
+        redraw
+    }
+
     pub fn set_message(&mut self, msg: impl Into<String>) {
         self.show_message(msg, MessageKind::Info);
     }
@@ -3448,8 +3495,12 @@ mod tests {
     }
 
     fn header_text(app: &App) -> String {
+        header_text_at(app, 100)
+    }
+
+    fn header_text_at(app: &App, width: u16) -> String {
         let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 1)).unwrap();
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 1)).unwrap();
         terminal
             .draw(|frame| crate::ui::status_bar::render_header(frame, app, frame.area()))
             .unwrap();
@@ -3476,11 +3527,141 @@ mod tests {
             assert!(!header_text(&app).contains("backup"));
         }
 
-        app.backup = BackupIndicator::Failed("tar failed".into());
+        app.backup = BackupIndicator::Failed {
+            error: "tar failed".into(),
+            last_success_at: Some(unix_now()),
+        };
         assert!(header_text(&app).contains("backup failed (B to retry)"));
 
-        app.backup = BackupIndicator::Stale(unix_now() - 3 * 24 * 60 * 60);
-        assert!(header_text(&app).contains("no backup in 3d (B to back up)"));
+        app.backup = BackupIndicator::Failed {
+            error: "tar failed".into(),
+            last_success_at: Some(unix_now() - 3 * 24 * 60 * 60),
+        };
+        assert!(header_text(&app).contains("backup failed, none in 3d (B to retry)"));
+    }
+
+    fn backup_report(
+        indicator: crate::backup::schedule::BackupIndicator,
+        manual: Option<crate::backup::schedule::Check>,
+        baseline: bool,
+    ) -> crate::backup::schedule::Report {
+        crate::backup::schedule::Report {
+            indicator,
+            manual,
+            baseline,
+        }
+    }
+
+    fn backup_failure(error: &str) -> crate::backup::schedule::BackupIndicator {
+        crate::backup::schedule::BackupIndicator::Failed {
+            error: error.into(),
+            last_success_at: Some(1),
+        }
+    }
+
+    /// An app whose only project lives in a temp dir with backups enabled,
+    /// so failures land in its errors.log.
+    fn backup_app(dir: &std::path::Path) -> App {
+        std::fs::create_dir_all(dir.join(".bork")).unwrap();
+        std::fs::write(dir.join(".bork/config.toml"), "[backup]\nenabled = true\n").unwrap();
+        let mut config = test_config();
+        config.project_root = dir.to_path_buf();
+        App::new(config, AppState::default())
+    }
+
+    fn error_log(dir: &std::path::Path) -> String {
+        std::fs::read_to_string(crate::config::error_log_path(dir)).unwrap_or_default()
+    }
+
+    #[test]
+    fn backup_failure_reports_once_until_it_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = backup_app(dir.path());
+
+        assert!(app.apply_backup_report(backup_report(backup_failure("a"), None, false)));
+        assert_eq!(
+            app.message,
+            Some(("Backup failed: a".into(), MessageKind::Error))
+        );
+        app.message = None;
+
+        // The hourly check failing the same way stays quiet.
+        assert!(!app.apply_backup_report(backup_report(backup_failure("a"), None, false)));
+        assert_eq!(app.message, None);
+        assert_eq!(error_log(dir.path()).matches("backup failed: a").count(), 1);
+
+        app.apply_backup_report(backup_report(backup_failure("b"), None, false));
+        assert_eq!(error_log(dir.path()).matches("backup failed: b").count(), 1);
+    }
+
+    #[test]
+    fn startup_baseline_does_not_re_report_an_old_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = backup_app(dir.path());
+
+        assert!(app.apply_backup_report(backup_report(backup_failure("old"), None, true)));
+        assert_eq!(app.backup, backup_failure("old"));
+        assert_eq!(app.message, None);
+        assert_eq!(error_log(dir.path()), "");
+
+        // The first real check failing the same way is not new either.
+        app.apply_backup_report(backup_report(backup_failure("old"), None, false));
+        assert_eq!(app.message, None);
+        assert_eq!(error_log(dir.path()), "");
+    }
+
+    #[test]
+    fn manual_backup_releases_the_spinner_and_shows_the_result() {
+        use crate::backup::schedule::{BackupIndicator, Check};
+
+        let mut app = test_app(Vec::new());
+        app.backup_manual_pending = true;
+        app.begin_busy();
+
+        app.apply_backup_report(backup_report(
+            BackupIndicator::Healthy,
+            Some(Check::Ran(Ok(Some(true)))),
+            false,
+        ));
+        assert!(!app.backup_manual_pending);
+        assert_eq!(app.busy_count, 0);
+        assert_eq!(
+            app.message,
+            Some(("Backup written".into(), MessageKind::Info))
+        );
+
+        // A manual failure shows the manual message, not a second flash.
+        app.apply_backup_report(backup_report(
+            backup_failure("tar failed"),
+            Some(Check::Ran(Err("tar failed".into()))),
+            false,
+        ));
+        assert_eq!(app.busy_count, 0);
+        assert_eq!(
+            app.message,
+            Some(("Backup failed: tar failed".into(), MessageKind::Error))
+        );
+    }
+
+    #[test]
+    fn narrow_header_drops_the_backup_hint_before_the_title() {
+        let mut app = test_app(Vec::new());
+        app.backup = crate::backup::schedule::BackupIndicator::Failed {
+            error: "x".into(),
+            last_success_at: Some(unix_now()),
+        };
+        let title = format!(" BORK - {} ", app.active_project().display_name());
+        let full = " \u{26a0} backup failed (B to retry) ";
+        let compact = " \u{26a0} backup failed ";
+
+        let width = (title.chars().count() + compact.chars().count()) as u16;
+        let text = header_text_at(&app, width);
+        assert!(text.starts_with(&title), "{text:?}");
+        assert!(text.ends_with(compact), "{text:?}");
+        assert!(!text.contains("B to retry"));
+
+        let wide = header_text_at(&app, (title.chars().count() + full.chars().count()) as u16);
+        assert!(wide.starts_with(&title) && wide.ends_with(full), "{wide:?}");
     }
 
     fn footer_text(app: &App) -> String {

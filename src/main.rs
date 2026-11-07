@@ -405,54 +405,6 @@ fn spawn_linear_worker(
     rx
 }
 
-/// One backup worker check, sent to the main loop.
-struct BackupReport {
-    indicator: backup::schedule::BackupIndicator,
-    /// Set when the check was forced by "back up now"; `None` for scheduled
-    /// checks and the startup snapshot.
-    manual: Option<backup::schedule::Check>,
-}
-
-/// Fold a backup worker report into the app. New failures go to the status
-/// bar and to `.bork/errors.log` of every loaded project with backups on;
-/// routine successes stay silent. Returns whether to redraw.
-fn apply_backup_report(app: &mut App, report: BackupReport) -> bool {
-    use backup::schedule;
-
-    let mut redraw = false;
-    if let Some(check) = &report.manual {
-        if app.backup_manual_pending {
-            app.backup_manual_pending = false;
-            app.busy_count = app.busy_count.saturating_sub(1);
-        }
-        let (message, is_error) = schedule::manual_message(check);
-        if is_error {
-            app.set_error(message);
-        } else {
-            app.set_message(message);
-        }
-        redraw = true;
-    }
-    if let Some(error) = schedule::failure_to_report(&app.backup, &report.indicator) {
-        let line = format!("backup failed: {error}");
-        for project in &app.projects {
-            let root = &project.config.project_root;
-            if matches!(backup::config::project_enabled(root), Ok(true)) {
-                config::append_error_log(root, std::slice::from_ref(&line));
-            }
-        }
-        if report.manual.is_none() {
-            app.set_error(format!("Backup failed: {error}"));
-        }
-        redraw = true;
-    }
-    if app.backup != report.indicator {
-        app.backup = report.indicator;
-        redraw = true;
-    }
-    redraw
-}
-
 /// Daily backup of every opted-in project. Sends the recorded status right
 /// away, checks `STARTUP_DELAY` after startup and then hourly whether a
 /// backup is due, and runs one when it is (or when woken by "back up now").
@@ -461,8 +413,8 @@ fn apply_backup_report(app: &mut App, report: BackupReport) -> bool {
 fn spawn_backup_worker(
     suspended: Arc<AtomicBool>,
     wake_rx: mpsc::Receiver<()>,
-) -> mpsc::Receiver<BackupReport> {
-    use backup::schedule::{self, Check};
+) -> mpsc::Receiver<backup::schedule::Report> {
+    use backup::schedule::{self, Check, Report};
 
     let (tx, rx) = mpsc::channel();
 
@@ -474,13 +426,25 @@ fn spawn_backup_worker(
                 .cloned()
         };
 
+        let enabled = || {
+            schedule::any_enabled(
+                global_config::list_projects()
+                    .iter()
+                    .map(|entry| backup::config::project_enabled(&entry.path)),
+            )
+        };
+
         if let Some(dir) = backup::config::load_settings().path {
             let record = record_for(&dir.join(backup::BACKUP_FILE));
-            let indicator = schedule::from_record(record.as_ref(), app::unix_now());
+            let indicator = match schedule::blocked(true, enabled()) {
+                Some(check) => schedule::indicator(&check, record.as_ref()),
+                None => schedule::from_record(record.as_ref()),
+            };
             if tx
-                .send(BackupReport {
+                .send(Report {
                     indicator,
                     manual: None,
+                    baseline: true,
                 })
                 .is_err()
             {
@@ -501,8 +465,8 @@ fn spawn_backup_worker(
             let file = backup::config::load_settings()
                 .path
                 .map(|dir| dir.join(backup::BACKUP_FILE));
-            let check = if file.is_none() {
-                Check::NoPath
+            let check = if let Some(check) = schedule::blocked(file.is_some(), enabled()) {
+                check
             } else if manual || backup::is_due(app::unix_now()) {
                 let result = backup::run(&backup::Selection::All)
                     .map(|outcome| outcome.map(|o| o.written))
@@ -512,10 +476,11 @@ fn spawn_backup_worker(
                 Check::Skipped
             };
             let record = file.as_deref().and_then(record_for);
-            let indicator = schedule::indicator(&check, record.as_ref(), app::unix_now());
-            let report = BackupReport {
+            let indicator = schedule::indicator(&check, record.as_ref());
+            let report = Report {
                 indicator,
                 manual: manual.then_some(check),
+                baseline: false,
             };
             if tx.send(report).is_err() {
                 break;
@@ -2079,7 +2044,7 @@ struct SharedWorkers {
     linear_wake_tx: mpsc::Sender<()>,
     linear_wake_rx: Option<mpsc::Receiver<()>>,
     tuicr_rx: Option<mpsc::Receiver<external::tuicr::DraftComments>>,
-    backup_rx: mpsc::Receiver<BackupReport>,
+    backup_rx: mpsc::Receiver<backup::schedule::Report>,
     backup_wake_tx: mpsc::Sender<()>,
     shutdown: Arc<AtomicBool>,
     /// While set, all pollers idle instead of spawning subprocesses. Used when
@@ -3120,7 +3085,7 @@ fn run_tui() -> anyhow::Result<()> {
 
         // --- Backup worker ---
         while let Ok(report) = shared.backup_rx.try_recv() {
-            needs_redraw |= apply_backup_report(&mut app, report);
+            needs_redraw |= app.apply_backup_report(report);
         }
 
         // --- tuicr: check availability ---

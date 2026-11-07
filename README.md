@@ -500,7 +500,7 @@ bork backup status              # opted-in projects, last run, result and size p
 
 Backups run once a day automatically while the TUI is open and whenever you run `bork backup`. The file is replaced atomically and left untouched when nothing changed since the last backup. A file bork can't read fails the run and keeps the previous backup. The last result per file is stored in `~/.config/bork/backup.json`.
 
-The TUI checks shortly after startup and then hourly, and runs a backup when none has succeeded in the last 24 hours. Press `B` to back up right away. The header stays quiet while backups work, and shows a warning when the last run failed (the error also goes to `.bork/errors.log` of each opted-in project) or when no backup has succeeded in over 48 hours.
+The TUI checks shortly after startup and then hourly, and runs a backup when none has succeeded in the last 24 hours. Press `B` to back up right away. The header stays quiet while backups work, and shows a warning when the last run failed (the error also goes to `.bork/errors.log` of each opted-in project), including how long it's been once no backup has succeeded in over 48 hours.
 
 #### Restoring
 
