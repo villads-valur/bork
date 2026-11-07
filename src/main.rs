@@ -2680,6 +2680,10 @@ fn run_tui() -> anyhow::Result<()> {
     // Cleared if the backup worker thread dies (a panic), so a pending
     // "back up now" doesn't spin forever.
     let mut backup_worker_alive = true;
+    // The 48h backup warning depends on the clock, not on a worker report
+    // (the worker may be blocked on the backup lock), so redraw when the
+    // text the header would show changes.
+    let mut last_backup_warning: Option<String> = None;
 
     // --- Main event loop ---
     loop {
@@ -3258,6 +3262,12 @@ fn run_tui() -> anyhow::Result<()> {
         state_poll_counter += 1;
         if state_poll_counter >= STATE_POLL_TICKS {
             state_poll_counter = 0;
+
+            let backup_warning = backup::schedule::warning_text(&app.backup, app::unix_now());
+            if backup_warning != last_backup_warning {
+                last_backup_warning = backup_warning;
+                needs_redraw = true;
+            }
 
             // Pick up `bork update --check` runs from other terminals.
             let mtime = update::cache_mtime_secs();
