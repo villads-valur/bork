@@ -491,7 +491,9 @@ fn check_single_project_owner(file: &Path, root: &Path) -> anyhow::Result<()> {
 }
 
 /// The full backup's file, when the backup path is configured.
-fn full_backup_file() -> Option<PathBuf> {
+/// The full backup file for the configured path, resolved the way runs and
+/// `backup.json` key it (symlinks and `..` followed). `None` without a path.
+pub fn full_backup_file() -> Option<PathBuf> {
     let dir = config::load_settings().path?;
     Some(resolve_through_existing(&dir).join(BACKUP_FILE))
 }

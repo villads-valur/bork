@@ -419,6 +419,7 @@ fn spawn_backup_worker(
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || {
+        // Keyed by the resolved path, like `backup::run` records it.
         let record_for = |file: &Path| {
             backup::status::read(&backup::status::status_path())
                 .archives
@@ -426,28 +427,22 @@ fn spawn_backup_worker(
                 .cloned()
         };
 
+        // An unreadable registry or project config is an error, not "off".
         let enabled = || {
-            schedule::any_enabled(
-                global_config::list_projects()
-                    .iter()
-                    .map(|entry| backup::config::project_enabled(&entry.path)),
-            )
+            global_config::try_list_projects()
+                .map_err(|err| format!("{err:#}"))
+                .and_then(|projects| {
+                    schedule::any_enabled(projects.iter().map(|entry| {
+                        backup::config::project_enabled(&global_config::normalize_path(&entry.path))
+                    }))
+                })
         };
 
-        if let Some(dir) = backup::config::load_settings().path {
-            let record = record_for(&dir.join(backup::BACKUP_FILE));
-            let indicator = match schedule::blocked(true, enabled()) {
-                Some(check) => schedule::indicator(&check, record.as_ref()),
-                None => schedule::from_record(record.as_ref()),
-            };
-            if tx
-                .send(Report {
-                    indicator,
-                    manual: None,
-                    baseline: true,
-                })
-                .is_err()
-            {
+        if let Some(file) = backup::full_backup_file() {
+            let record = record_for(&file);
+            let report =
+                schedule::startup_report(schedule::blocked(true, enabled()), record.as_ref());
+            if tx.send(report).is_err() {
                 return;
             }
         }
@@ -462,9 +457,7 @@ fn spawn_backup_worker(
             wait = schedule::CHECK_INTERVAL;
             wait_while_suspended(&suspended);
 
-            let file = backup::config::load_settings()
-                .path
-                .map(|dir| dir.join(backup::BACKUP_FILE));
+            let file = backup::full_backup_file();
             let check = if let Some(check) = schedule::blocked(file.is_some(), enabled()) {
                 check
             } else if manual || backup::is_due(app::unix_now()) {
@@ -2684,6 +2677,9 @@ fn run_tui() -> anyhow::Result<()> {
     // that stays wrong would otherwise re-raise the same warning forever.
     let mut last_linear_error: Option<String> = None;
     let mut state_poll_counter: usize = 0;
+    // Cleared if the backup worker thread dies (a panic), so a pending
+    // "back up now" doesn't spin forever.
+    let mut backup_worker_alive = true;
 
     // --- Main event loop ---
     loop {
@@ -3084,8 +3080,19 @@ fn run_tui() -> anyhow::Result<()> {
         }
 
         // --- Backup worker ---
-        while let Ok(report) = shared.backup_rx.try_recv() {
-            needs_redraw |= app.apply_backup_report(report);
+        if backup_worker_alive {
+            loop {
+                match shared.backup_rx.try_recv() {
+                    Ok(report) => needs_redraw |= app.apply_backup_report(report),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        backup_worker_alive = false;
+                        app.backup_worker_stopped();
+                        needs_redraw = true;
+                        break;
+                    }
+                }
+            }
         }
 
         // --- tuicr: check availability ---

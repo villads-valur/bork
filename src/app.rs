@@ -2428,6 +2428,16 @@ impl App {
         redraw
     }
 
+    /// The backup worker thread is gone (it panicked): release a pending
+    /// "back up now" and say so, since no more reports will come.
+    pub fn backup_worker_stopped(&mut self) {
+        if self.backup_manual_pending {
+            self.backup_manual_pending = false;
+            self.busy_count = self.busy_count.saturating_sub(1);
+        }
+        self.set_error("Automatic backups stopped (worker crashed); restart bork");
+    }
+
     pub fn set_message(&mut self, msg: impl Into<String>) {
         self.show_message(msg, MessageKind::Info);
     }
@@ -3521,11 +3531,21 @@ mod tests {
         for quiet in [
             BackupIndicator::Unknown,
             BackupIndicator::Off(OffReason::NoPath),
-            BackupIndicator::Healthy,
+            BackupIndicator::Ok {
+                last_success_at: Some(unix_now()),
+            },
+            BackupIndicator::Ok {
+                last_success_at: None,
+            },
         ] {
             app.backup = quiet;
             assert!(!header_text(&app).contains("backup"));
         }
+
+        app.backup = BackupIndicator::Ok {
+            last_success_at: Some(unix_now() - 3 * 24 * 60 * 60),
+        };
+        assert!(header_text(&app).contains("no backup in 3d (B to back up)"));
 
         app.backup = BackupIndicator::Failed {
             error: "tar failed".into(),
@@ -3611,6 +3631,19 @@ mod tests {
     }
 
     #[test]
+    fn a_stopped_backup_worker_releases_the_spinner() {
+        let mut app = test_app(Vec::new());
+        app.backup_manual_pending = true;
+        app.begin_busy();
+
+        app.backup_worker_stopped();
+
+        assert!(!app.backup_manual_pending);
+        assert_eq!(app.busy_count, 0);
+        assert!(matches!(app.message, Some((_, MessageKind::Error))));
+    }
+
+    #[test]
     fn manual_backup_releases_the_spinner_and_shows_the_result() {
         use crate::backup::schedule::{BackupIndicator, Check};
 
@@ -3619,7 +3652,9 @@ mod tests {
         app.begin_busy();
 
         app.apply_backup_report(backup_report(
-            BackupIndicator::Healthy,
+            BackupIndicator::Ok {
+                last_success_at: Some(1),
+            },
             Some(Check::Ran(Ok(Some(true)))),
             false,
         ));

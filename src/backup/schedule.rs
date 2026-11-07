@@ -4,9 +4,9 @@
 //!
 //! Backups run once a day: the worker checks shortly after startup and then
 //! hourly whether one is due ([`super::is_due`]), and `B` in the TUI forces
-//! a run. Since a due backup runs within the hour, a success older than
-//! [`STALE_AFTER_SECS`] only happens while runs keep failing, so the age is
-//! shown as part of the failure warning.
+//! a run. The TUI warns when the last run failed, or when the last success
+//! is older than [`STALE_AFTER_SECS`] (TUI closed for days, a run stuck on
+//! the backup lock); the age is checked at render time.
 
 use std::time::Duration;
 
@@ -16,8 +16,7 @@ use super::status::ArchiveStatus;
 pub const STARTUP_DELAY: Duration = Duration::from_secs(15);
 /// How often the worker checks whether a backup is due.
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
-/// A failure warning also says how long ago the last success was once it's
-/// this old.
+/// The TUI warns once the last success is this old.
 pub const STALE_AFTER_SECS: u64 = 48 * 60 * 60;
 
 /// What one worker check did.
@@ -73,6 +72,23 @@ pub fn blocked(path_configured: bool, enabled: Result<bool, String>) -> Option<C
     }
 }
 
+/// The report sent at startup, before the first check: the recorded status,
+/// unless backups can't run. Only a failure already in `backup.json` is a
+/// silent baseline; a config or registry error found now is reported like
+/// any check's.
+pub fn startup_report(blocked: Option<Check>, record: Option<&ArchiveStatus>) -> Report {
+    let baseline = !matches!(blocked, Some(Check::Ran(Err(_))));
+    let indicator = match &blocked {
+        Some(check) => indicator(check, record),
+        None => from_record(record),
+    };
+    Report {
+        indicator,
+        manual: None,
+        baseline,
+    }
+}
+
 /// Why backups are off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OffReason {
@@ -80,14 +96,17 @@ pub enum OffReason {
     NoProjects,
 }
 
-/// Backup state as the TUI shows it. Only `Failed` renders.
+/// Backup state as the TUI shows it. Only `Failed` and an old `Ok` render.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum BackupIndicator {
     /// Nothing known yet (before the first report).
     #[default]
     Unknown,
     Off(OffReason),
-    Healthy,
+    /// The last run succeeded (or none has run yet).
+    Ok {
+        last_success_at: Option<u64>,
+    },
     /// The last run failed.
     Failed {
         error: String,
@@ -118,7 +137,9 @@ pub fn from_record(record: Option<&ArchiveStatus>) -> BackupIndicator {
                 .unwrap_or_else(|| "unknown error".to_string()),
             last_success_at: record.last_success_at,
         },
-        _ => BackupIndicator::Healthy,
+        _ => BackupIndicator::Ok {
+            last_success_at: record.and_then(|r| r.last_success_at),
+        },
     }
 }
 
@@ -137,21 +158,24 @@ pub fn failure_to_report<'a>(prev: &BackupIndicator, next: &'a BackupIndicator) 
 
 /// Short warning text for the header, `None` when nothing should show.
 pub fn warning_text(indicator: &BackupIndicator, now: u64) -> Option<String> {
-    let BackupIndicator::Failed {
-        last_success_at, ..
-    } = indicator
-    else {
-        return None;
+    let stale_age = |at: &Option<u64>| {
+        at.map(|at| now.saturating_sub(at))
+            .filter(|age| *age > STALE_AFTER_SECS)
+            .map(format_age)
     };
-    let text = match last_success_at {
-        None => "backup failed, none yet".to_string(),
-        Some(at) if now.saturating_sub(*at) > STALE_AFTER_SECS => format!(
-            "backup failed, none in {}",
-            format_age(now.saturating_sub(*at))
-        ),
-        Some(_) => "backup failed".to_string(),
-    };
-    Some(text)
+    match indicator {
+        BackupIndicator::Failed {
+            last_success_at, ..
+        } => Some(match (last_success_at, stale_age(last_success_at)) {
+            (None, _) => "backup failed, none yet".to_string(),
+            (Some(_), Some(age)) => format!("backup failed, none in {age}"),
+            (Some(_), None) => "backup failed".to_string(),
+        }),
+        BackupIndicator::Ok { last_success_at } => {
+            stale_age(last_success_at).map(|age| format!("no backup in {age}"))
+        }
+        _ => None,
+    }
 }
 
 /// Status bar message after a manual "back up now", and whether it's an error.
@@ -211,6 +235,10 @@ mod tests {
         }
     }
 
+    fn healthy(last_success_at: Option<u64>) -> BackupIndicator {
+        BackupIndicator::Ok { last_success_at }
+    }
+
     fn failure(error: &str, last_success_at: Option<u64>) -> BackupIndicator {
         BackupIndicator::Failed {
             error: error.to_string(),
@@ -239,6 +267,22 @@ mod tests {
             Some(Check::Ran(Err("reading config".into())))
         );
         assert_eq!(blocked(true, Ok(true)), None);
+    }
+
+    #[test]
+    fn startup_reports_new_config_errors_but_not_recorded_failures() {
+        let record = failed(Some(NOW - HOUR), "tar failed");
+
+        let recorded = startup_report(None, Some(&record));
+        assert!(recorded.baseline);
+        assert_eq!(recorded.indicator, failure("tar failed", Some(NOW - HOUR)));
+
+        let config = startup_report(Some(Check::Ran(Err("bad registry".into()))), Some(&record));
+        assert!(!config.baseline);
+        assert_eq!(config.indicator, failure("bad registry", Some(NOW - HOUR)));
+
+        let off = startup_report(Some(Check::NoProjects), Some(&record));
+        assert_eq!(off.indicator, BackupIndicator::Off(OffReason::NoProjects));
     }
 
     #[test]
@@ -278,7 +322,7 @@ mod tests {
     fn success_is_healthy() {
         assert_eq!(
             indicator(&Check::Ran(Ok(Some(true))), Some(&ok_at(NOW))),
-            BackupIndicator::Healthy
+            healthy(Some(NOW))
         );
     }
 
@@ -291,27 +335,25 @@ mod tests {
         );
         assert_eq!(
             indicator(&Check::Skipped, Some(&ok_at(NOW - HOUR))),
-            BackupIndicator::Healthy
+            healthy(Some(NOW - HOUR))
         );
-        assert_eq!(indicator(&Check::Skipped, None), BackupIndicator::Healthy);
+        assert_eq!(indicator(&Check::Skipped, None), healthy(None));
     }
 
     #[test]
-    fn an_old_success_alone_is_not_a_warning() {
-        // It's due, so the next check runs; only a failure warns.
-        assert_eq!(
-            from_record(Some(&ok_at(NOW - 72 * HOUR))),
-            BackupIndicator::Healthy
-        );
-        assert_eq!(
-            warning_text(&from_record(Some(&ok_at(NOW - 72 * HOUR))), NOW),
-            None
-        );
+    fn warns_when_the_last_success_is_over_two_days_old() {
+        // E.g. the TUI was closed for days, or the due run waits on the lock.
+        let old = from_record(Some(&ok_at(NOW - 72 * HOUR)));
+        assert_eq!(old, healthy(Some(NOW - 72 * HOUR)));
+        assert_eq!(warning_text(&old, NOW).as_deref(), Some("no backup in 3d"));
+        assert_eq!(warning_text(&healthy(Some(NOW - 47 * HOUR)), NOW), None);
+        // Never backed up: the first run is about to happen, nothing to say.
+        assert_eq!(warning_text(&healthy(None), NOW), None);
     }
 
     #[test]
     fn reports_only_new_failures() {
-        let healthy = BackupIndicator::Healthy;
+        let healthy = healthy(Some(1));
         let a = failure("a", Some(1));
         let b = failure("b", Some(1));
         assert_eq!(failure_to_report(&healthy, &a), Some("a"));
@@ -323,8 +365,8 @@ mod tests {
     }
 
     #[test]
-    fn warning_text_only_for_failures() {
-        assert_eq!(warning_text(&BackupIndicator::Healthy, NOW), None);
+    fn warning_text_for_failures() {
+        assert_eq!(warning_text(&healthy(Some(NOW)), NOW), None);
         assert_eq!(
             warning_text(&BackupIndicator::Off(OffReason::NoPath), NOW),
             None
