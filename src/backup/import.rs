@@ -71,7 +71,8 @@ pub struct ProjectReport {
     pub name: String,
     pub label: Option<String>,
     pub target: PathBuf,
-    pub repo: RepoOutcome,
+    /// `None` when the project failed before the clone step.
+    pub repo: Option<RepoOutcome>,
     /// Whether the archive had a board to restore.
     pub board_restored: bool,
     pub issues: usize,
@@ -97,7 +98,7 @@ impl ProjectReport {
             name: project.name.clone(),
             label: project.label.clone(),
             target: target.to_path_buf(),
-            repo: RepoOutcome::NoCloneUrl,
+            repo: None,
             board_restored: false,
             issues: 0,
             cleared_worktrees: Vec::new(),
@@ -148,8 +149,11 @@ pub fn import(file: &Path, opts: &Options) -> anyhow::Result<Report> {
     for (project, target) in selected.iter().zip(&targets) {
         let mut report = ProjectReport::new(project, target);
         // One broken project shouldn't hide what happened to the others.
-        let result = claim_target(target, opts.dry_run, &mut restored_dirs)
-            .and_then(|()| restore_project(dir, project, target, opts, now, &mut report));
+        // Archive-side checks first, so a bad entry leaves no empty target.
+        let result = project_src(dir, project).and_then(|src| {
+            claim_target(target, opts.dry_run, &mut restored_dirs)?;
+            restore_project(&src, project, target, opts, now, &mut report)
+        });
         if let Err(err) = result {
             report.error = Some(format!("{err:#}"));
         }
@@ -370,32 +374,40 @@ fn claim_target(
     Ok(())
 }
 
+/// The project's directory in the extracted archive, refusing names that
+/// could leave it and symlinks that could point anywhere.
+fn project_src(extracted: &Path, project: &ProjectManifest) -> anyhow::Result<PathBuf> {
+    if !is_plain_component(&project.archive_dir) {
+        bail!("invalid archive dir {:?}", project.archive_dir);
+    }
+    let rel = Path::new(PROJECTS_DIR).join(&project.archive_dir);
+    if has_symlinked_parent(extracted, &rel.join("x")) {
+        bail!(
+            "projects/{} in the backup is a symlink",
+            project.archive_dir
+        );
+    }
+    Ok(extracted.join(rel))
+}
+
+/// Restore one project from its extracted archive dir `src` into `target`.
 fn restore_project(
-    extracted: &Path,
+    src: &Path,
     project: &ProjectManifest,
     target: &Path,
     opts: &Options,
     now: u64,
     report: &mut ProjectReport,
 ) -> anyhow::Result<()> {
-    if !is_plain_component(&project.archive_dir) {
-        bail!("invalid archive dir {:?}", project.archive_dir);
-    }
-    let src = extracted.join(PROJECTS_DIR).join(&project.archive_dir);
-    if has_symlinked_parent(
-        extracted,
-        &Path::new(PROJECTS_DIR).join(&project.archive_dir).join("x"),
-    ) {
-        bail!(
-            "projects/{} in the backup is a symlink",
-            project.archive_dir
-        );
-    }
-
-    report.repo = restore_repo(project, target, opts.dry_run, &mut report.warnings);
-    restore_files(&src, project, target, opts.dry_run, report)?;
-    restore_board(&src, project, target, opts.dry_run, now, report)?;
-    restore_plans(&src, project, target, opts.dry_run, report)?;
+    report.repo = Some(restore_repo(
+        project,
+        target,
+        opts.dry_run,
+        &mut report.warnings,
+    ));
+    restore_files(src, project, target, opts.dry_run, report)?;
+    restore_board(src, project, target, opts.dry_run, now, report)?;
+    restore_plans(src, project, target, opts.dry_run, report)?;
 
     if !opts.dry_run {
         crate::config::ensure_agent_status_dir(target);
@@ -435,7 +447,11 @@ fn restore_files(
             .and_then(|rest| rest.strip_suffix(&format!("/{PLAN_NAME}")))
             .is_some_and(|id| {
                 let worktree_plan = format!("{ISSUES_DIR}/{id}/{PLAN_NAME}");
+                // Only when that copy is really there; otherwise the saved
+                // plan is the one to restore.
                 project.files.contains(&worktree_plan)
+                    && fs::symlink_metadata(src.join(&worktree_plan)).is_ok_and(|m| m.is_file())
+                    && !has_symlinked_parent(src, Path::new(&worktree_plan))
             });
         if superseded {
             continue;
@@ -551,6 +567,7 @@ fn copy_reported(
         Copied::Yes => return Ok(true),
         Copied::Missing => format!("{rel} is missing from the backup"),
         Copied::Unsafe => format!("skipped {rel}: a directory on its path is a symlink"),
+        Copied::KeptLink => format!("kept {rel}: it's a symlink at the target"),
     };
     report.warnings.push(warning);
     Ok(false)
@@ -693,6 +710,8 @@ enum Copied {
     Missing,
     /// A directory on the source or destination path is a symlink.
     Unsafe,
+    /// The destination is a symlink (dotfiles, say) and was left alone.
+    KeptLink,
 }
 
 /// Whether a directory between `root` and `root/rel` is a symlink, which
@@ -731,6 +750,10 @@ fn copy_entry(
     let file_type = meta.file_type();
     if !file_type.is_symlink() && !file_type.is_file() {
         return Ok(Copied::Missing);
+    }
+    // A file over a symlink would silently cut it loose from what it links to.
+    if file_type.is_file() && fs::symlink_metadata(dest).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Ok(Copied::KeptLink);
     }
     if dry_run {
         return Ok(Copied::Yes);
@@ -782,6 +805,7 @@ fn restore_global_config(
         opts.dry_run,
     )? {
         Copied::Yes => Ok(GlobalConfigOutcome::Restored(dest)),
+        Copied::KeptLink => Ok(GlobalConfigOutcome::KeptExisting(dest)),
         Copied::Missing | Copied::Unsafe => Ok(GlobalConfigOutcome::Skipped),
     }
 }
@@ -814,7 +838,7 @@ impl Report {
                 .unwrap_or_default();
             let _ = writeln!(out, "{}{label} -> {}", p.name, p.target.display());
 
-            let repo = match &p.repo {
+            let repo = p.repo.as_ref().map(|repo| match repo {
                 RepoOutcome::Cloned { url, branch } => {
                     let branch = branch
                         .as_deref()
@@ -829,8 +853,10 @@ impl Report {
                 RepoOutcome::Failed { url, error } => {
                     format!("clone of {url} failed ({error}); clone it into main/ yourself")
                 }
-            };
-            let _ = writeln!(out, "  repo:     {repo}");
+            });
+            if let Some(repo) = repo {
+                let _ = writeln!(out, "  repo:     {repo}");
+            }
 
             if p.board_restored {
                 let _ = writeln!(
@@ -855,12 +881,14 @@ impl Report {
                     list.join(", ")
                 );
             }
-            let _ = writeln!(
-                out,
-                "  files:    {} {}",
-                would("restored", "would restore"),
-                count(p.files.len(), "container file")
-            );
+            if p.repo.is_some() {
+                let _ = writeln!(
+                    out,
+                    "  files:    {} {}",
+                    would("restored", "would restore"),
+                    count(p.files.len(), "container file")
+                );
+            }
             if self.dry_run {
                 for file in &p.files {
                     let _ = writeln!(out, "            {file}");
@@ -1175,7 +1203,7 @@ mod tests {
 
             let target = dest_root.join("demo");
             let p = &report.projects[0];
-            assert_eq!(p.repo, RepoOutcome::NoCloneUrl);
+            assert_eq!(p.repo, Some(RepoOutcome::NoCloneUrl));
             assert_eq!(p.issues, 2);
             assert_eq!(p.cleared_worktrees, vec![("demo-1".to_string(), None)]);
             assert_eq!(p.plans, vec!["demo-1".to_string()]);
@@ -1300,7 +1328,7 @@ mod tests {
             for _ in 0..2 {
                 let report = import(&file, &force).unwrap();
                 let p = &report.projects[0];
-                assert_eq!(p.repo, RepoOutcome::KeptExisting);
+                assert_eq!(p.repo, Some(RepoOutcome::KeptExisting));
                 assert!(p.cleared_worktrees.is_empty());
                 assert_eq!(p.kept_plans, vec!["demo-1".to_string()]);
                 assert_eq!(p.kept_files, vec!["plans/demo-2/planning.md".to_string()]);
@@ -1412,7 +1440,14 @@ mod tests {
             assert!(report.projects[0].error.is_some());
             assert!(report.projects[1].error.is_none());
             assert_eq!(read(&dest.path().join("good/AGENTS.md")), "agents");
-            assert!(report.render().contains("stopped here"));
+            let text = report.render();
+            assert!(text.contains("stopped here"), "{text}");
+            // It failed before the clone step, so nothing claims a missing remote,
+            // and no empty target is left behind to need --force next time.
+            assert_eq!(report.projects[0].repo, None);
+            let broken = text.split("\n\n").next().unwrap();
+            assert!(!broken.contains("repo:"), "{broken}");
+            assert!(!dest.path().join("broken").exists());
             let names: Vec<String> = crate::global_config::list_projects()
                 .into_iter()
                 .map(|p| p.name)
@@ -1528,6 +1563,77 @@ mod tests {
                     .unwrap()
                     .contains("same directory"));
             }
+        });
+    }
+
+    #[test]
+    fn falls_back_to_the_saved_plan_when_the_worktree_plan_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved = dir.path().join("saved.md");
+        write(&saved, "saved plan");
+        let file = crafted_archive(
+            dir.path(),
+            serde_json::json!([project_json(
+                "demo",
+                "demo",
+                &["plans/demo-1/planning.md", "_issues/demo-1/planning.md"]
+            )]),
+            &[("projects/demo/plans/demo-1/planning.md", &saved)],
+        );
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            import(&file, &opts(dest.path())).unwrap();
+            assert_eq!(
+                read(&dest.path().join("demo/plans/demo-1/planning.md")),
+                "saved plan"
+            );
+        });
+    }
+
+    #[test]
+    fn force_keeps_symlinked_files_at_the_target() {
+        let out = tempfile::tempdir().unwrap();
+        let file = demo_archive(out.path());
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let dotfiles = tempfile::tempdir().unwrap();
+        let agents = dotfiles.path().join("AGENTS.md");
+        let global = dotfiles.path().join("config.toml");
+        write(&agents, "dotfiles agents");
+        write(&global, "dotfiles = true\n");
+        let target = dest.path().join("demo");
+        fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&agents, target.join("AGENTS.md")).unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            let global_link = crate::global_config::global_config_dir().join("config.toml");
+            fs::create_dir_all(global_link.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&global, &global_link).unwrap();
+            let force = Options {
+                force: true,
+                ..opts(dest.path())
+            };
+            let report = import(&file, &force).unwrap();
+            let p = &report.projects[0];
+            assert!(
+                p.warnings.iter().any(|w| w.contains("kept AGENTS.md")),
+                "{:?}",
+                p.warnings
+            );
+            assert!(fs::symlink_metadata(target.join("AGENTS.md"))
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(read(&agents), "dotfiles agents");
+            assert!(matches!(
+                report.global_config,
+                GlobalConfigOutcome::KeptExisting(_)
+            ));
+            assert!(fs::symlink_metadata(&global_link)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(read(&global), "dotfiles = true\n");
         });
     }
 
@@ -1686,10 +1792,10 @@ mod tests {
             let p = &report.projects[0];
             assert_eq!(
                 p.repo,
-                RepoOutcome::Cloned {
+                Some(RepoOutcome::Cloned {
                     url: origin.to_str().unwrap().to_string(),
                     branch: Some("trunk".to_string()),
-                }
+                })
             );
             assert_eq!(
                 p.cleared_worktrees,
@@ -1745,7 +1851,11 @@ mod tests {
         crate::global_config::with_test_config_home(home.path(), || {
             let report = import(&file, &opts(dest.path())).unwrap();
             let p = &report.projects[0];
-            assert!(matches!(p.repo, RepoOutcome::Failed { .. }), "{:?}", p.repo);
+            assert!(
+                matches!(p.repo, Some(RepoOutcome::Failed { .. })),
+                "{:?}",
+                p.repo
+            );
             assert!(report.render().contains("clone it into main/ yourself"));
             assert_eq!(
                 crate::config::load_state(&dest.path().join("demo"))
