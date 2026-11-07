@@ -154,6 +154,43 @@ bork integration attach-pr 42          # inside an agent session: uses BORK_ISSU
 
 This sets the PR number on the issue so the TUI can display PR status (checks, reviews, etc.). Always run it right after you open a PR for an issue, including stacked or follow-up PRs.
 
+## Backups
+
+### Back up
+
+```bash
+bork backup                     # all opted-in projects -> <path>/bork-backup-<host>.tar.gz
+bork backup --project bork      # just one project -> <path>/bork-backup-<host>--bork.tar.gz
+bork backup --dry-run           # print the file path and its contents, write nothing
+bork backup status              # opted-in projects, last run, result and size per file
+```
+
+The file holds what git doesn't: each opted-in project's board and config, container files (`AGENTS.md`, `plans/`, `.claude/`, ...) and every live worktree's `.claude/planning.md`, plus the global `projects.json` and `config.toml`. It goes to the global `[backup] path`. Code in worktrees and agent transcripts are not backed up. The TUI also backs up once a day (`Shift+B` runs one now).
+
+### Restore
+
+```bash
+bork import <backup-file>                 # every project, back to its recorded path
+bork import                               # this Mac's backup file in the configured path
+bork import <backup-file> --root ~/code   # restore to ~/code/<name> instead
+bork import <backup-file> --project bork  # just one project
+bork import <backup-file> --dry-run       # print what would be cloned, written and registered
+bork import <backup-file> --force         # restore over existing directories
+```
+
+Rebuilding a wiped laptop:
+
+1. Install bork
+2. `bork import --dry-run <backup-file>` and check the output with the user
+3. `bork import <backup-file>`: clones each repo into `main/`, restores boards, docs and plans, registers the projects
+4. Worktrees aren't recreated; the summary lists each issue's branch. Reopen one from its pushed branch with `bork worktree <issue-id> <slug> --base origin/<issue-id>/<slug>` (without `--base` the branch starts from `main`)
+
+### Rules for agents
+
+- Run `bork backup --dry-run` before telling the user what is or isn't backed up
+- Never edit `[backup]` config or turn backups on/off for a project unless the user asks. Some projects (e.g. work projects) are deliberately opted out
+- Never pass `--force` to `bork import` without the user's explicit OK
+
 ## Typical workflow
 
 1. Spin off work: `bork issue start "Implement feature X" --prompt "Details..."`
