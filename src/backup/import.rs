@@ -82,6 +82,8 @@ pub struct ProjectReport {
     pub plans: Vec<String>,
     /// Issue ids whose `plans/<id>/planning.md` already existed and was kept.
     pub kept_plans: Vec<String>,
+    /// Files under `plans/` that already existed at the target and were kept.
+    pub kept_files: Vec<String>,
     pub warnings: Vec<String>,
 }
 
@@ -291,6 +293,7 @@ fn restore_project(
         files: Vec::new(),
         plans: Vec::new(),
         kept_plans: Vec::new(),
+        kept_files: Vec::new(),
         warnings: Vec::new(),
     };
 
@@ -312,18 +315,34 @@ fn restore_project(
             report.warnings.push(format!("skipped unsafe path {rel:?}"));
             continue;
         };
-        match copy_entry(&src, &rel_path, &target.join(&rel_path), opts.dry_run)? {
+        // Plans are the work itself; a local copy is newer than the backup.
+        if rel_path.starts_with("plans") && fs::symlink_metadata(target.join(&rel_path)).is_ok() {
+            report.kept_files.push(rel.clone());
+            continue;
+        }
+        match copy_entry(&src, &rel_path, target, &rel_path, opts.dry_run)? {
             Copied::Yes => report.files.push(rel.clone()),
             Copied::Missing => report
                 .warnings
                 .push(format!("{rel} is missing from the backup")),
-            Copied::Unsafe => report
-                .warnings
-                .push(format!("skipped {rel}: it sits under a symlink")),
+            Copied::Unsafe => report.warnings.push(format!(
+                "skipped {rel}: a directory on its path is a symlink"
+            )),
         }
     }
 
-    if project.files.iter().any(|f| f == STATE_FILE) {
+    let state_rel = Path::new(STATE_FILE);
+    let archived_board = fs::symlink_metadata(src.join(state_rel)).is_ok_and(|m| m.is_file())
+        && !has_symlinked_parent(&src, state_rel);
+    if !archived_board {
+        report
+            .warnings
+            .push("the backup has no board for this project".to_string());
+    } else if has_symlinked_parent(target, state_rel) {
+        report
+            .warnings
+            .push("skipped the board: .bork/ at the target is a symlink".to_string());
+    } else {
         match crate::config::try_load_state(&src) {
             Some(mut state) => {
                 let branches: HashMap<&str, &str> = project
@@ -348,10 +367,6 @@ fn restore_project(
                 .warnings
                 .push("the board in the backup is unreadable; skipped it".to_string()),
         }
-    } else {
-        report
-            .warnings
-            .push("the backup has no board for this project".to_string());
     }
 
     for rel in plan_files {
@@ -362,19 +377,19 @@ fn restore_project(
         if !is_plain_component(id) || file != PLAN_NAME {
             continue;
         }
-        let dest = target.join("plans").join(id).join(PLAN_NAME);
-        if fs::symlink_metadata(&dest).is_ok() {
+        let dest_rel = Path::new("plans").join(id).join(PLAN_NAME);
+        if fs::symlink_metadata(target.join(&dest_rel)).is_ok() {
             report.kept_plans.push(id.to_string());
             continue;
         }
-        match copy_entry(&src, Path::new(rel), &dest, opts.dry_run)? {
+        match copy_entry(&src, Path::new(rel), target, &dest_rel, opts.dry_run)? {
             Copied::Yes => report.plans.push(id.to_string()),
             Copied::Missing => report
                 .warnings
                 .push(format!("{rel} is missing from the backup")),
-            Copied::Unsafe => report
-                .warnings
-                .push(format!("skipped {rel}: it sits under a symlink")),
+            Copied::Unsafe => report.warnings.push(format!(
+                "skipped {rel}: a directory on its path is a symlink"
+            )),
         }
     }
 
@@ -498,24 +513,38 @@ fn plain_relative(rel: &str) -> Option<PathBuf> {
 enum Copied {
     Yes,
     Missing,
-    /// A parent inside the extracted archive is a symlink, which could point
-    /// anywhere on disk.
+    /// A directory on the source or destination path is a symlink.
     Unsafe,
 }
 
-/// Copy `src_root/rel` to `dest`. Symlinks are recreated as symlinks, files
-/// replaced atomically with their mode.
-fn copy_entry(src_root: &Path, rel: &Path, dest: &Path, dry_run: bool) -> anyhow::Result<Copied> {
-    let mut parent = src_root.to_path_buf();
-    if let Some(dir) = rel.parent() {
-        for part in dir.components() {
-            parent.push(part);
-            if fs::symlink_metadata(&parent).is_ok_and(|m| m.file_type().is_symlink()) {
-                return Ok(Copied::Unsafe);
-            }
-        }
+/// Whether a directory between `root` and `root/rel` is a symlink, which
+/// could point anywhere on disk.
+fn has_symlinked_parent(root: &Path, rel: &Path) -> bool {
+    let mut dir = root.to_path_buf();
+    let Some(parents) = rel.parent() else {
+        return false;
+    };
+    parents.components().any(|part| {
+        dir.push(part);
+        fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_symlink())
+    })
+}
+
+/// Copy `src_root/src_rel` to `dest_root/dest_rel`. Symlinks are recreated as
+/// symlinks, files replaced atomically with their mode. Nothing is read or
+/// written through a symlinked directory on either side.
+fn copy_entry(
+    src_root: &Path,
+    src_rel: &Path,
+    dest_root: &Path,
+    dest_rel: &Path,
+    dry_run: bool,
+) -> anyhow::Result<Copied> {
+    if has_symlinked_parent(src_root, src_rel) || has_symlinked_parent(dest_root, dest_rel) {
+        return Ok(Copied::Unsafe);
     }
-    let src = src_root.join(rel);
+    let dest = &dest_root.join(dest_rel);
+    let src = src_root.join(src_rel);
     let meta = match fs::symlink_metadata(&src) {
         Ok(meta) => meta,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Copied::Missing),
@@ -562,11 +591,18 @@ fn restore_global_config(
     if !manifest.global_files.contains(&rel) {
         return Ok(GlobalConfigOutcome::Skipped);
     }
-    let dest = crate::global_config::global_config_dir().join(GLOBAL_CONFIG);
+    let dir = crate::global_config::global_config_dir();
+    let dest = dir.join(GLOBAL_CONFIG);
     if !opts.force && fs::symlink_metadata(&dest).is_ok() {
         return Ok(GlobalConfigOutcome::KeptExisting(dest));
     }
-    match copy_entry(extracted, Path::new(&rel), &dest, opts.dry_run)? {
+    match copy_entry(
+        extracted,
+        Path::new(&rel),
+        &dir,
+        Path::new(GLOBAL_CONFIG),
+        opts.dry_run,
+    )? {
         Copied::Yes => Ok(GlobalConfigOutcome::Restored(dest)),
         Copied::Missing | Copied::Unsafe => Ok(GlobalConfigOutcome::Skipped),
     }
@@ -653,6 +689,9 @@ impl Report {
                     would("wrote", "would write"),
                     p.plans.join(", ")
                 );
+            }
+            if !p.kept_files.is_empty() {
+                let _ = writeln!(out, "  kept:     existing {}", p.kept_files.join(", "));
             }
             if !p.kept_plans.is_empty() {
                 let _ = writeln!(
@@ -818,6 +857,7 @@ mod tests {
             .unwrap();
             write(&root.join("AGENTS.md"), "agents");
             write(&root.join("plans/demo-2/planning.md"), "orchestrator plan");
+            write(&root.join(".claude/settings.json"), "backup settings");
             std::os::unix::fs::symlink("AGENTS.md", root.join("CLAUDE.md")).unwrap();
             write(&root.join("demo-1-a/.git"), "gitdir: x");
             write(&root.join("demo-1-a/.claude/planning.md"), "worktree plan");
@@ -990,6 +1030,13 @@ mod tests {
         write(&target.join("demo-1-a/wip.rs"), "local wip");
         write(&target.join("plans/demo-1/planning.md"), "newer local plan");
         write(&target.join("AGENTS.md"), "stale");
+        write(
+            &target.join("plans/demo-2/planning.md"),
+            "newer orchestrator plan",
+        );
+        let outside = dest_root.join("outside");
+        write(&outside.join("settings.json"), "outside settings");
+        std::os::unix::fs::symlink(&outside, target.join(".claude")).unwrap();
         crate::global_config::with_test_config_home(home.path(), || {
             let global = crate::global_config::global_config_dir().join("config.toml");
             write(&global, "mine = true\n");
@@ -1008,7 +1055,20 @@ mod tests {
                 assert_eq!(p.repo, RepoOutcome::KeptExisting);
                 assert!(p.cleared_worktrees.is_empty());
                 assert_eq!(p.kept_plans, vec!["demo-1".to_string()]);
+                assert_eq!(p.kept_files, vec!["plans/demo-2/planning.md".to_string()]);
+                assert!(
+                    p.warnings
+                        .iter()
+                        .any(|w| w.contains(".claude/settings.json")),
+                    "{:?}",
+                    p.warnings
+                );
             }
+            assert_eq!(read(&outside.join("settings.json")), "outside settings");
+            assert_eq!(
+                read(&target.join("plans/demo-2/planning.md")),
+                "newer orchestrator plan"
+            );
             assert_eq!(read(&target.join("main/code.rs")), "local code");
             assert_eq!(read(&target.join("demo-1-a/wip.rs")), "local wip");
             assert_eq!(
@@ -1021,6 +1081,48 @@ mod tests {
             assert_eq!(crate::global_config::list_projects().len(), 1);
             // --force also replaces the global config.
             assert!(read(&global).contains("[backup]"));
+        });
+    }
+
+    #[test]
+    fn a_board_missing_from_the_archive_keeps_the_local_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        write(&src.join("AGENTS.md"), "agents");
+        let manifest = serde_json::json!({
+            "version": MANIFEST_VERSION, "created_at": 1, "bork_version": "0",
+            "projects": [{
+                "name": "demo", "path": "/old/demo", "archive_dir": "demo",
+                "repo": {"clone_url": null, "remotes": [], "default_branch": null},
+                "files": [STATE_FILE, "AGENTS.md"], "issues": []
+            }],
+        });
+        let file = dir.path().join("b.tar.gz");
+        let entries = [super::super::archive::ArchiveEntry {
+            path: "projects/demo/AGENTS.md".to_string(),
+            source: src.join("AGENTS.md"),
+            follow: false,
+        }];
+        super::super::archive::write(&file, manifest.to_string().as_bytes(), &entries).unwrap();
+
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let target = dest.path().join("demo");
+        crate::config::save_state(&board(&[("demo-1", None)]), &target).unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            let force = Options {
+                force: true,
+                ..opts(dest.path())
+            };
+            let report = import(&file, &force).unwrap();
+            let p = &report.projects[0];
+            assert!(!p.board_restored);
+            assert!(
+                p.warnings.iter().any(|w| w.contains("no board")),
+                "{:?}",
+                p.warnings
+            );
+            assert_eq!(crate::config::load_state(&target).issues.len(), 1);
         });
     }
 
