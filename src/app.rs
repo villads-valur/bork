@@ -2470,14 +2470,23 @@ impl App {
         let p = self.context_project(ctx);
         let github_available = p.can_browse_github() || issue.has_pr();
         let live = &p.live;
-        self.dialog = Some(DialogState::from_issue(
+        let mut dialog = DialogState::from_issue(
             issue,
             index,
             p.available_agents.clone(),
             p.linear_available,
             github_available,
             live,
-        ));
+        );
+        dialog.lost_sessions = issue
+            .sessions
+            .iter()
+            .filter(|(agent, sid)| {
+                !crate::external::agent::provider(**agent).has_session(&p.config.project_root, sid)
+            })
+            .map(|(agent, sid)| (*agent, sid.clone()))
+            .collect();
+        self.dialog = Some(dialog);
         self.input_mode = InputMode::Dialog;
     }
 

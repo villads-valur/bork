@@ -103,6 +103,15 @@ bork issue archive bork-1 --force    # proceed past a failing teardown, discard 
 
 Without `--force`, the archive aborts if the teardown script fails or the worktree has uncommitted changes.
 
+### Start a fresh agent session
+
+Forget the issue's stored session so the next launch starts a new conversation with the issue's prompt. Kills the live session if it runs that agent.
+
+```bash
+bork issue reset-session bork-1
+bork issue reset-session bork-1 --agent codex    # a different agent's stored session
+```
+
 ### Delete an issue
 
 ```bash

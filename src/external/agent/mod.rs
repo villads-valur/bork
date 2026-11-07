@@ -68,6 +68,13 @@ pub trait AgentProvider {
         None
     }
 
+    /// Whether the agent can still resume `session_id`. Harnesses that can't
+    /// tell (or whose storage can't be read) return `true` so the stored
+    /// session is kept.
+    fn has_session(&self, _project_root: &Path, _session_id: &str) -> bool {
+        true
+    }
+
     /// Install hooks (plugin/extension/settings) for this harness. Providers
     /// with no status plumbing return `Ok(())` without touching disk.
     fn install_hooks(&self) -> anyhow::Result<()> {
@@ -111,6 +118,32 @@ pub struct DetectContext<'a> {
     pub project_root: &'a Path,
     /// Session ids visible before launch, excluded from post-launch detection.
     pub before: &'a HashSet<String>,
+}
+
+/// Whether any direct subdir of `root` contains `name`. For harnesses that
+/// group sessions by a workspace key bork doesn't derive itself. `None` when
+/// any part of the search can't be read and `name` wasn't found, so callers
+/// keep the session.
+fn exists_in_any_subdir(root: &Path, name: &str) -> Option<bool> {
+    let mut unreadable = false;
+    for entry in fs::read_dir(root).ok()? {
+        let Ok(entry) = entry else {
+            unreadable = true;
+            continue;
+        };
+        // Skip stray files like `.DS_Store`: probing below them fails with
+        // NotADirectory, which would read as unreadable storage.
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        match path.join(name).try_exists() {
+            Ok(true) => return Some(true),
+            Ok(false) => {}
+            Err(_) => unreadable = true,
+        }
+    }
+    (!unreadable).then_some(false)
 }
 
 /// Map an `AgentKind` to its provider. The one dispatch point — a match here is
@@ -167,31 +200,46 @@ pub fn supports_model(kind: AgentKind) -> bool {
     provider(kind).supports_model()
 }
 
+pub struct LaunchOutcome {
+    pub session_name: String,
+    /// The agent's own session id, used to resume the conversation later:
+    ///   - Claude: UUID pre-assigned via --session-id
+    ///   - OpenCode: ses_xxx detected by polling `opencode session list` after launch
+    ///   - Codex: UUID detected from newest ~/.codex/sessions rollout transcript
+    pub agent_session_id: Option<String>,
+    /// The launch included the one-time worktree setup script.
+    pub setup_ran: bool,
+    /// The stored session was gone, so this launch started a new one.
+    pub replaced_lost_session: bool,
+}
+
 /// Launch an agent session for an issue.
 /// Creates a tmux session with two windows:
 ///   1. The agent launched at the project root with issue context
 ///   2. A bare terminal
 ///
 /// Exports BORK_SESSION and BORK_STATUS_DIR so hooks/plugins can write status files.
-/// Returns (tmux_session_name, agent_session_id).
-/// The agent_session_id is the agent's internal session ID for resuming conversations:
-///   - Claude: UUID pre-assigned via --session-id
-///   - OpenCode: ses_xxx detected by polling `opencode session list` after launch
-///   - Codex: UUID detected from newest ~/.codex/sessions rollout transcript
-pub fn launch_session(
-    issue: &Issue,
-    config: &AppConfig,
-) -> Result<(String, Option<String>, bool), AppError> {
+pub fn launch_session(issue: &Issue, config: &AppConfig) -> Result<LaunchOutcome, AppError> {
     let session_name = issue.session_name(&config.project_name);
     let cwd = &config.project_root;
 
     if tmux::session_exists(&session_name) {
-        return Ok((
-            session_name.clone(),
-            issue.current_session_id().map(str::to_string),
-            false,
-        ));
+        return Ok(LaunchOutcome {
+            session_name,
+            agent_session_id: issue.current_session_id().map(str::to_string),
+            setup_ran: false,
+            replaced_lost_session: false,
+        });
     }
+
+    let provider = provider(issue.agent_kind);
+
+    // A stored session the agent no longer has (e.g. Claude cleaned up the
+    // transcript) would fail to resume, so launch fresh instead.
+    let resume_session = issue
+        .current_session_id()
+        .filter(|sid| provider.has_session(cwd, sid));
+    let replaced_lost_session = issue.current_session_id().is_some() && resume_session.is_none();
 
     tmux::create_session(&session_name, cwd)?;
 
@@ -203,6 +251,7 @@ pub fn launch_session(
 
     let (agent_cmd, pre_assigned_session_id, prompt_contents) = build_agent_cmd(
         issue,
+        resume_session,
         config,
         &session_name,
         status_dir_str,
@@ -224,7 +273,6 @@ pub fn launch_session(
         None => agent_cmd,
     };
 
-    let provider = provider(issue.agent_kind);
     let before = if pre_assigned_session_id.is_none() {
         provider.snapshot_session_ids(&config.project_root)
     } else {
@@ -249,7 +297,12 @@ pub fn launch_session(
         }),
     };
 
-    Ok((session_name, agent_session_id, setup.is_some()))
+    Ok(LaunchOutcome {
+        session_name,
+        agent_session_id,
+        setup_ran: setup.is_some(),
+        replaced_lost_session,
+    })
 }
 
 /// Kill an issue's tmux session and remove its transient hook/prompt files.
@@ -333,6 +386,7 @@ fn write_prompt_file(path: &Path, contents: &str) -> Result<(), AppError> {
 /// caller) and `None` for resume sessions, which carry no prompt.
 fn build_agent_cmd(
     issue: &Issue,
+    resume_session: Option<&str>,
     config: &AppConfig,
     session_name: &str,
     status_dir_str: &str,
@@ -435,7 +489,7 @@ fn build_agent_cmd(
         trailing: &trailing,
         prompt_subst: &prompt_subst,
         prompt_cleanup: &prompt_cleanup,
-        current_session: issue.current_session_id(),
+        current_session: resume_session,
         build_prompt: &build_prompt_contents,
     };
 
@@ -1258,7 +1312,14 @@ mod tests {
         session: &str,
         status_dir: &str,
     ) -> (String, Option<String>, Option<String>) {
-        build_agent_cmd(issue, config, session, status_dir, TEST_PROMPT_PATH)
+        build_agent_cmd(
+            issue,
+            issue.current_session_id(),
+            config,
+            session,
+            status_dir,
+            TEST_PROMPT_PATH,
+        )
     }
 
     // --- OpenCode ---
@@ -1690,6 +1751,27 @@ mod tests {
         assert!(!cmd.contains("ses_abc123"));
         // Fresh launch for the new agent carries the full prompt.
         assert!(prompt.is_some());
+    }
+
+    #[test]
+    fn lost_session_launches_fresh() {
+        let issue = resumable_issue(AgentKind::Claude, AgentMode::Build, "dead-uuid");
+        let config = test_config();
+        // launch_session passes no resume id when has_session says it's gone.
+        let (cmd, sid, prompt) = build_agent_cmd(
+            &issue,
+            None,
+            &config,
+            "bork-bork-1",
+            "/tmp/status",
+            TEST_PROMPT_PATH,
+        );
+        assert!(!cmd.contains("--resume"));
+        assert!(!cmd.contains("dead-uuid"));
+        assert!(prompt.is_some());
+        if let Some(id) = sid {
+            assert!(cmd.contains(&format!("--session-id '{id}'")));
+        }
     }
 
     #[test]
