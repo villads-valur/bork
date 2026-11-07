@@ -1266,9 +1266,8 @@ fn run_backup_status() -> anyhow::Result<()> {
     let settings = backup::config::load_settings();
     match &settings.path {
         Some(path) => println!(
-            "path: {} (every {} min once the TUI worker lands)",
-            path.display(),
-            settings.interval_minutes
+            "path: {} (backed up daily, and on `bork backup`)",
+            path.display()
         ),
         None => println!("path: not set (set `path` under [backup] in ~/.config/bork/config.toml)"),
     }

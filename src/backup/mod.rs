@@ -8,8 +8,10 @@
 //! layout and manifest are documented in [`manifest`]. A run whose content
 //! matches the last archive leaves the file untouched.
 //!
-//! The CLI is a thin layer over [`plan`] and [`run`]; the TUI worker and the
-//! worktree removal paths ([`save_issue_plan`]) call the same functions.
+//! Backups run once a day automatically (the TUI worker checks [`is_due`])
+//! and whenever `bork backup` is called. The CLI is a thin layer over
+//! [`plan`] and [`run`]; the worker and the worktree removal paths
+//! ([`save_issue_plan`]) call the same functions.
 
 pub mod archive;
 pub mod config;
@@ -31,6 +33,9 @@ use self::status::ArchiveStatus;
 
 /// File name of the full backup.
 pub const BACKUP_FILE: &str = "bork-backup.tar.gz";
+
+/// How long a successful full backup counts as current for [`is_due`].
+pub const BACKUP_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 
 /// Global files worth restoring; `bork.pid`, locks and caches are not.
 const GLOBAL_FILES: &[&str] = &["projects.json", "config.toml"];
@@ -212,6 +217,28 @@ pub fn run(selection: &Selection) -> anyhow::Result<Option<Outcome>> {
         Err(err) => record_failure(&plan.file, err),
     }
     result.map(|(outcome, _)| Some(outcome))
+}
+
+/// Whether the daily automatic backup should run at `now` (unix seconds):
+/// true when `~/.config/bork/backup.json` has no successful full backup
+/// ([`BACKUP_FILE`] at the configured path) or the last one is at least
+/// [`BACKUP_MAX_AGE_SECS`] old. Explicit `bork backup` calls run regardless.
+#[cfg_attr(not(test), allow(dead_code))] // Used by the TUI worker in a follow-up
+pub fn is_due(now: u64) -> bool {
+    let file = config::load_settings()
+        .path
+        .map(|dir| dir.join(BACKUP_FILE));
+    is_due_at(&status::read(&status::status_path()), file.as_deref(), now)
+}
+
+fn is_due_at(records: &status::StatusFile, file: Option<&Path>, now: u64) -> bool {
+    let last_success = file
+        .and_then(|file| records.archives.get(file))
+        .and_then(|record| record.last_success_at);
+    match last_success {
+        Some(at) => now.saturating_sub(at) >= BACKUP_MAX_AGE_SECS,
+        None => true,
+    }
 }
 
 /// Copy an issue worktree's `.claude/planning.md` into the container's
@@ -677,6 +704,63 @@ mod tests {
             let recorded = &status::read(&status::status_path()).archives[&first.file];
             assert!(!recorded.ok);
             assert_eq!(recorded.size, first.size);
+        });
+    }
+
+    #[test]
+    fn due_daily_after_the_last_success() {
+        let file = Path::new("/b/bork-backup.tar.gz");
+        let mut records = status::StatusFile::default();
+        assert!(is_due_at(&records, Some(file), 1_000));
+        assert!(is_due_at(&records, None, 1_000));
+
+        let success = ArchiveStatus {
+            last_run_at: 1_000,
+            last_success_at: Some(1_000),
+            ok: true,
+            ..ArchiveStatus::default()
+        };
+        records.archives.insert(file.to_path_buf(), success);
+        assert!(!is_due_at(&records, Some(file), 1_000));
+        assert!(!is_due_at(
+            &records,
+            Some(file),
+            1_000 + BACKUP_MAX_AGE_SECS - 1
+        ));
+        assert!(is_due_at(&records, Some(file), 1_000 + BACKUP_MAX_AGE_SECS));
+
+        // A later failure doesn't reset the clock; a single-project file doesn't count.
+        let failed = ArchiveStatus {
+            last_run_at: 2_000,
+            ok: false,
+            ..records.archives[file].clone()
+        };
+        records.archives.insert(file.to_path_buf(), failed);
+        assert!(!is_due_at(&records, Some(file), 2_000));
+        assert!(is_due_at(
+            &records,
+            Some(Path::new("/b/other.tar.gz")),
+            2_000
+        ));
+    }
+
+    #[test]
+    fn is_due_reads_the_status_file() {
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            set_global_path(dest.path());
+            let demo = project("demo", true);
+            write(&demo.path().join("AGENTS.md"), "a");
+            assert!(is_due(crate::app::unix_now()));
+            run(&Selection::All).unwrap();
+            let success = status::read(&status::status_path()).archives
+                [&dest.path().join(BACKUP_FILE)]
+                .last_success_at
+                .unwrap();
+            assert!(!is_due(success));
+            assert!(!is_due(success + BACKUP_MAX_AGE_SECS - 1));
+            assert!(is_due(success + BACKUP_MAX_AGE_SECS));
         });
     }
 

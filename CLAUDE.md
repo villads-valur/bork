@@ -67,8 +67,8 @@ src/
 ├── lock.rs           # Single-instance PID file lock + signal handlers (SIGTERM, SIGHUP)
 ├── worktree.rs       # `bork worktree` subcommand (create git worktree, register with state)
 ├── backup/           # Backups (library; `bork backup` CLI in main.rs is a thin layer)
-│   ├── mod.rs        # Selection, plan/run (one tar.gz, skip when unchanged), save_issue_plan
-│   ├── config.rs     # `[backup]`: enabled (project file), path + interval_minutes (global file)
+│   ├── mod.rs        # Selection, plan/run (one tar.gz, skip when unchanged), is_due, save_issue_plan
+│   ├── config.rs     # `[backup]`: enabled (project file), path (global file)
 │   ├── manifest.rs   # Public manifest.json types (archive contract for `bork import`) + repo facts
 │   ├── archive.rs    # Staging copy + system `tar -czf`, atomic rename, content fingerprint
 │   ├── select.rs     # Container file selection, worktree detection, ephemeral excludes, issue plans
@@ -155,7 +155,8 @@ Legacy: `~/.config/bork/agents.toml` is no longer read (bork-119). A one-line st
 ## Backups
 
 - One file: `bork backup` writes `<path>/bork-backup.tar.gz` with every registered, opted-in project plus `_global/` (`projects.json`, `config.toml`); `--project` writes `bork-backup-<name>.tar.gz` with just that project. Built with the system `tar` from a private staging dir, then renamed into place.
-- Config: `[backup] enabled = true` is the per-project opt-in (project file only). `path` (absolute or `~/`) and `interval_minutes` (default 2, for the upcoming TUI worker) are global-only.
+- Config: `[backup] enabled = true` is the per-project opt-in (project file only). `path` (absolute or `~/`) is global-only. No schedule setting.
+- Schedule: once a day automatically plus explicit `bork backup`. `backup::is_due(now)` is true when `~/.config/bork/backup.json` has no successful full backup (`<path>/bork-backup.tar.gz`) or the last success is 24h+ old (`BACKUP_MAX_AGE_SECS`); the TUI worker (follow-up) checks it.
 - Layout and manifest: see the module docs in `backup/manifest.rs`. Those serde types are the contract for `bork import`; add fields with `#[serde(default)]` and only bump `MANIFEST_VERSION` for breaking changes.
 - Per project: `.bork/state.json` + `.bork/config.toml` (symlinks followed), every container entry except `main/`, worktrees (union of `git worktree list`, `issue.worktree` and dirs with a `.git` entry) and ephemeral files, plus each live worktree's `.claude/planning.md` as `_issues/<issue-id>/planning.md`.
 - Unchanged content (fingerprint over manifest without `created_at` + every file) skips the write. Read errors other than NotFound fail the run and keep the previous file. The path may not be inside a registered project.

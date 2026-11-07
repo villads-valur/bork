@@ -1,21 +1,19 @@
 //! `[backup]` config. `enabled` is the per-project opt-in and is only read
-//! from `<project>/.bork/config.toml`. `path` and `interval_minutes` describe
-//! the single backup file, so they are only read from the global
-//! `~/.config/bork/config.toml`.
+//! from `<project>/.bork/config.toml`. `path` locates the single backup file,
+//! so it is only read from the global `~/.config/bork/config.toml`. There is
+//! no schedule setting: backups run daily (see `backup::is_due`) and on
+//! `bork backup`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::toml_lite::{self, Table};
 
-pub const DEFAULT_INTERVAL_MINUTES: u64 = 2;
-
 /// One config file's `[backup]` keys; `None` when unset.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BackupLayer {
     pub enabled: Option<bool>,
     pub path: Option<String>,
-    pub interval_minutes: Option<u64>,
 }
 
 impl BackupLayer {
@@ -28,9 +26,6 @@ impl BackupLayer {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(String::from),
-            interval_minutes: table
-                .get("backup.interval_minutes")
-                .and_then(|v| v.as_u64()),
         }
     }
 
@@ -42,20 +37,17 @@ impl BackupLayer {
     }
 }
 
-/// Where and how often the backup file is written (global config).
+/// Where the backup file is written (global config).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackupSettings {
     /// Folder holding `bork-backup.tar.gz`, `~` expanded. `None` when unset.
     pub path: Option<PathBuf>,
-    /// How often the TUI worker runs a backup.
-    pub interval_minutes: u64,
 }
 
 impl BackupSettings {
     pub fn from_layer(global: &BackupLayer) -> Self {
         Self {
             path: global.path.as_deref().map(expand_tilde),
-            interval_minutes: global.interval_minutes.unwrap_or(DEFAULT_INTERVAL_MINUTES),
         }
     }
 }
@@ -106,12 +98,10 @@ project_name = "x"
 [backup]
 enabled = true
 path = "~/Backups"
-interval_minutes = 30
 "#,
         );
         assert_eq!(p.enabled, Some(true));
         assert_eq!(p.path.as_deref(), Some("~/Backups"));
-        assert_eq!(p.interval_minutes, Some(30));
     }
 
     #[test]
@@ -130,7 +120,6 @@ interval_minutes = 30
     fn settings_defaults() {
         let settings = BackupSettings::from_layer(&layer(""));
         assert_eq!(settings.path, None);
-        assert_eq!(settings.interval_minutes, 2);
     }
 
     #[test]
