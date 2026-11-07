@@ -69,7 +69,7 @@ src/
 ├── backup/           # Backups (library; `bork backup` CLI in main.rs is a thin layer)
 │   ├── mod.rs        # Selection, plan/run (one tar.gz, skip when unchanged), is_due, save_issue_plan
 │   ├── config.rs     # `[backup]`: enabled (project file), path (global file)
-│   ├── import.rs     # `bork import`: extract, version check, clone main/, restore board/files/plans, register
+│   ├── import/       # `bork import`: mod.rs extract, checks, clone, restore board/files/plans, register; report.rs the summary
 │   ├── manifest.rs   # Public manifest.json types (archive contract for `bork import`) + repo facts
 │   ├── archive.rs    # Staging copy + system `tar -czf`, atomic rename, content fingerprint
 │   ├── select.rs     # Container file selection, worktree detection, ephemeral excludes, issue plans
@@ -163,7 +163,12 @@ Legacy: `~/.config/bork/agents.toml` is no longer read (bork-119). A one-line st
 - Unchanged content (fingerprint over manifest without `created_at` + every file) skips the write. Read errors other than NotFound fail the run and keep the previous file. The path may not be inside a registered project.
 - `backup::save_issue_plan(root, issue_id, worktree_dir)` copies a worktree's plan into the container's `plans/<issue-id>/planning.md` before removal (no-op when backups are off); the archive/delete/prune paths call it (follow-up).
 - Runs are serialized with a required flock on `~/.config/bork/backup.lock`.
-- `bork import [file]` (`backup/import.rs`, see its module docs): any backup file path; without one, `backup::full_backup_file()`. It checks `manifest.version` before parsing the rest; checks every target and name before any write, plus a (dev, inode) check per target as it's created, since case and Unicode normalization can make different names one directory; never deletes `main/` or worktrees, never writes into a checkout at the target (`select::worktree_dirs` plus any ancestor with a `.git`), refuses a target that is a symlink or a repo, or an existing one inside a repo's working tree and never replaces a plan that existed before the import; a replaced board or global config is kept as `<file>.pre-import-<time>` unless the import changes nothing; an unreadable `projects.json` stops the import (`try_list_projects`); clones via `init::clone_repo` (shared with `bork init`); restores the board through `try_load_state`/`save_state` with `rewrite_state` (missing worktrees cleared like a prune, a session kept only when the board being replaced has the same id, since OpenCode's `has_session` is always true); never reads or writes through a symlinked directory and never replaces a symlink at the target (a symlinked `.bork/state.json` skips the board); git args from the manifest are guarded against option injection; the CLI installs only the global agent hooks (`hooks::install_agent_hooks`), not project skills; a failing project or global config is reported and the rest continues.
+- `bork import [file]` (`backup/import/`, see the module docs): any backup file path; without one, `backup::full_backup_file()`.
+  - Before writing: `manifest.version` first; every target and name checked (duplicates, names registered elsewhere, an unreadable `projects.json`); per target, refuse a symlink, a repo, an existing dir inside a repo (real path), and a (dev, inode) clash with an earlier target.
+  - Never touched: `main/`, worktrees and any checkout at the target (`select::worktree_dirs` plus any ancestor with a `.git`), plans that existed before the import (`plans/` matched case-insensitively), symlinks at the target (a symlinked `.bork/state.json` skips the board). Nothing is read or written through a symlinked directory.
+  - Board: through `try_load_state`/`save_state` with `rewrite_state` (missing worktrees cleared like a prune; a session kept only when the replaced board has the same id, since OpenCode's `has_session` is always true). A replaced board or global config is kept as `<file>.pre-import-<time>` unless nothing changed.
+  - Clone via `init::clone_repo` (shared with `bork init`), default branch and recorded remote names; git args from the manifest are guarded against option injection. Only the global agent hooks are installed (`hooks::install_agent_hooks`).
+  - Failures (a project, a clone or wrong branch, the global config) are reported and the rest continues; the CLI exits non-zero after the summary.
 
 ## Build & Run
 

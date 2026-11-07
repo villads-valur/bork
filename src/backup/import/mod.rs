@@ -13,7 +13,6 @@
 //! re-running an import is safe.
 
 use std::collections::{HashMap, HashSet};
-use std::fmt::Write as _;
 use std::fs;
 use std::io::ErrorKind;
 use std::os::unix::fs::PermissionsExt;
@@ -30,6 +29,8 @@ use super::manifest::{
 use super::select::{is_plain_component, ISSUES_DIR};
 use super::PLAN_NAME;
 use crate::config::AppState;
+
+mod report;
 
 /// Board file inside a project's archive dir and container.
 const STATE_FILE: &str = ".bork/state.json";
@@ -255,7 +256,7 @@ fn read_manifest(dir: &Path) -> anyhow::Result<Manifest> {
 
 /// Parse `manifest.json`, checking its version before the rest so a newer
 /// format gets a clear message instead of a field error.
-pub fn parse_manifest(bytes: &[u8]) -> anyhow::Result<Manifest> {
+fn parse_manifest(bytes: &[u8]) -> anyhow::Result<Manifest> {
     #[derive(Deserialize)]
     struct Versioned {
         version: u32,
@@ -268,7 +269,9 @@ pub fn parse_manifest(bytes: &[u8]) -> anyhow::Result<Manifest> {
         );
     }
     if version != MANIFEST_VERSION {
-        bail!("unknown backup format version {version} (this bork reads {MANIFEST_VERSION})");
+        bail!(
+            "this backup uses format version {version}, from an older bork; this one reads only version {MANIFEST_VERSION}"
+        );
     }
     serde_json::from_slice(bytes).context("manifest.json is malformed")
 }
@@ -299,7 +302,7 @@ fn select_projects<'a>(
 }
 
 /// Where a project goes: `<root>/<name>` with a root, else its recorded path.
-pub fn resolve_target(project: &ProjectManifest, root: Option<&Path>) -> anyhow::Result<PathBuf> {
+fn resolve_target(project: &ProjectManifest, root: Option<&Path>) -> anyhow::Result<PathBuf> {
     match root {
         Some(root) => {
             if !is_plain_component(&project.name) {
@@ -416,7 +419,10 @@ fn claim_target(
     // An existing target inside a repo's working tree could have uncommitted
     // files the restore would overwrite. A new one has nothing to lose.
     if fs::symlink_metadata(target).is_ok() {
-        if let Some(repo) = target
+        // The real path: a symlinked parent can lead into a repo.
+        let real =
+            fs::canonicalize(target).with_context(|| format!("resolving {}", target.display()))?;
+        if let Some(repo) = real
             .ancestors()
             .skip(1)
             .find(|dir| fs::symlink_metadata(dir.join(".git")).is_ok())
@@ -562,15 +568,14 @@ fn restore_files(
         }
         // A live worktree's plan is newer than the copy saved in `plans/`;
         // `restore_plans` places it instead.
-        let superseded = rel
-            .strip_prefix("plans/")
+        let superseded = under_plans(rel)
             .and_then(|rest| rest.strip_suffix(&format!("/{PLAN_NAME}")))
             .is_some_and(|id| worktree_plan_available(src, project, id));
         if superseded {
             continue;
         }
         // Plans are the work itself; a local copy is newer than the backup.
-        if rel_path.starts_with("plans") && fs::symlink_metadata(target.join(&rel_path)).is_ok() {
+        if under_plans(rel).is_some() && fs::symlink_metadata(target.join(&rel_path)).is_ok() {
             report.kept_files.push(rel.clone());
             continue;
         }
@@ -896,7 +901,7 @@ fn checkout(repo: &Path, branch: &str) -> anyhow::Result<()> {
 /// for that issue and agent: transcripts aren't backed up, and OpenCode can't
 /// tell a dead session from a live one. Everything else is kept. Returns the
 /// ids whose worktree was cleared.
-pub fn rewrite_state(
+fn rewrite_state(
     state: &mut AppState,
     target: &Path,
     local: Option<&AppState>,
@@ -939,6 +944,13 @@ enum Copied {
     Unsafe,
     /// The destination is a symlink (dotfiles, say) and was left alone.
     KeptLink,
+}
+
+/// The rest of `rel` when it sits under `plans/`, matched case-insensitively
+/// since macOS disks usually treat `Plans/` and `plans/` as one directory.
+fn under_plans(rel: &str) -> Option<&str> {
+    let (top, rest) = rel.split_once('/')?;
+    top.eq_ignore_ascii_case("plans").then_some(rest)
 }
 
 /// Whether a directory between `root` and `root/rel` is a symlink, which
@@ -1062,199 +1074,6 @@ fn restore_global_config(
         }),
         Copied::KeptLink => Ok(GlobalConfigOutcome::KeptExisting(dest)),
         Copied::Missing | Copied::Unsafe => Ok(GlobalConfigOutcome::Skipped),
-    }
-}
-
-impl Report {
-    /// Whether at least one project was restored without an error.
-    pub fn any_restored(&self) -> bool {
-        self.projects.iter().any(|p| p.error.is_none())
-    }
-
-    /// Whether any project failed part-way or couldn't be cloned.
-    pub fn failed(&self) -> bool {
-        self.projects
-            .iter()
-            .any(|p| p.error.is_some() || p.repo.as_ref().is_some_and(RepoOutcome::is_failure))
-            || matches!(self.global_config, GlobalConfigOutcome::Failed(_))
-    }
-
-    /// Human-readable summary, one block per project.
-    pub fn render(&self) -> String {
-        let would = |done: &str, planned: &str| {
-            if self.dry_run {
-                planned.to_string()
-            } else {
-                done.to_string()
-            }
-        };
-        let mut out = String::new();
-        if self.dry_run {
-            out.push_str("Dry run, nothing was changed.\n");
-        }
-        if !self.host.is_empty() {
-            let _ = writeln!(out, "Backup from {}.", self.host);
-        }
-        if self.dry_run || !self.host.is_empty() {
-            out.push('\n');
-        }
-        for p in &self.projects {
-            let label = p
-                .label
-                .as_deref()
-                .map(|l| format!(" ({l})"))
-                .unwrap_or_default();
-            let _ = writeln!(out, "{}{label} -> {}", p.name, p.target.display());
-
-            let repo = p.repo.as_ref().map(|repo| match repo {
-                RepoOutcome::Cloned { url, branch } => {
-                    let branch = branch
-                        .as_deref()
-                        .map(|b| format!(" on {b}"))
-                        .unwrap_or_default();
-                    format!("{} {url}{branch}", would("cloned", "would clone"))
-                }
-                RepoOutcome::KeptExisting => "kept the existing main/".to_string(),
-                RepoOutcome::NoCloneUrl => {
-                    "no remote in the backup; clone the repo into main/ yourself".to_string()
-                }
-                RepoOutcome::Failed { url, error } => {
-                    format!("clone of {url} failed ({error}); clone it into main/ yourself")
-                }
-                RepoOutcome::WrongBranch { url, branch, error } => format!(
-                    "cloned {url}, but couldn't check out {branch} ({error}); main/ is on the remote's default branch"
-                ),
-            });
-            if let Some(repo) = repo {
-                let _ = writeln!(out, "  repo:     {repo}");
-            }
-
-            if p.board_restored {
-                let _ = writeln!(
-                    out,
-                    "  board:    {} {}",
-                    would("restored", "would restore"),
-                    count(p.issues, "issue")
-                );
-            }
-            if !p.dropped_issues.is_empty() {
-                let _ = writeln!(
-                    out,
-                    "  board:    {} not in the backup: {}",
-                    would("dropped", "would drop"),
-                    p.dropped_issues.join(", ")
-                );
-            }
-            if let Some(previous) = &p.previous_board {
-                let _ = writeln!(
-                    out,
-                    "  board:    old board {} {}",
-                    would("saved to", "would be saved to"),
-                    previous.display()
-                );
-            }
-            if !p.cleared_worktrees.is_empty() {
-                let list: Vec<String> = p
-                    .cleared_worktrees
-                    .iter()
-                    .map(|(id, branch)| match branch {
-                        Some(b) => format!("{id} ({b})"),
-                        None => id.clone(),
-                    })
-                    .collect();
-                let _ = writeln!(
-                    out,
-                    "  worktrees: not recreated, reopen from their branches: {}",
-                    list.join(", ")
-                );
-            }
-            if p.repo.is_some() {
-                let _ = writeln!(
-                    out,
-                    "  files:    {} {}",
-                    would("restored", "would restore"),
-                    count(p.files.len(), "container file")
-                );
-            }
-            if self.dry_run {
-                for file in &p.files {
-                    let _ = writeln!(out, "            {file}");
-                }
-            }
-            if !p.plans.is_empty() {
-                let _ = writeln!(
-                    out,
-                    "  plans:    {} plans/<id>/planning.md for {}",
-                    would("wrote", "would write"),
-                    p.plans.join(", ")
-                );
-            }
-            if !p.kept_files.is_empty() {
-                let _ = writeln!(out, "  kept:     existing {}", p.kept_files.join(", "));
-            }
-            if !p.kept_plans.is_empty() {
-                let _ = writeln!(
-                    out,
-                    "  plans:    kept existing plans for {}",
-                    p.kept_plans.join(", ")
-                );
-            }
-            if p.error.is_none() {
-                let _ = writeln!(
-                    out,
-                    "  {}",
-                    would(
-                        "registered in projects.json",
-                        "would register in projects.json"
-                    )
-                );
-            }
-            for warning in &p.warnings {
-                let _ = writeln!(out, "  warning:  {warning}");
-            }
-            if let Some(error) = &p.error {
-                let _ = writeln!(out, "  error:    stopped here: {error}");
-            }
-            out.push('\n');
-        }
-        match &self.global_config {
-            GlobalConfigOutcome::Skipped => {}
-            GlobalConfigOutcome::Restored { path, previous } => {
-                let _ = writeln!(
-                    out,
-                    "global config: {} {}",
-                    would("restored", "would restore"),
-                    path.display()
-                );
-                if let Some(previous) = previous {
-                    let _ = writeln!(
-                        out,
-                        "global config: old one {} {}",
-                        would("saved to", "would be saved to"),
-                        previous.display()
-                    );
-                }
-            }
-            GlobalConfigOutcome::Failed(error) => {
-                let _ = writeln!(out, "global config: not restored: {error}");
-            }
-            GlobalConfigOutcome::KeptExisting(path) => {
-                let _ = writeln!(
-                    out,
-                    "global config: kept the existing {} (--force replaces it)",
-                    path.display()
-                );
-            }
-        }
-        out.trim_end().to_string()
-    }
-}
-
-fn count(n: usize, noun: &str) -> String {
-    if n == 1 {
-        format!("1 {noun}")
-    } else {
-        format!("{n} {noun}s")
     }
 }
 
@@ -1418,7 +1237,10 @@ mod tests {
         let newer = parse_manifest(br#"{"version":99,"whatever":true}"#).unwrap_err();
         assert!(format!("{newer:#}").contains("newer"), "{newer:#}");
         let older = parse_manifest(manifest_json(0).as_bytes()).unwrap_err();
-        assert!(format!("{older:#}").contains("unknown backup format version 0"));
+        assert!(
+            format!("{older:#}").contains("from an older bork"),
+            "{older:#}"
+        );
         assert!(parse_manifest(b"[]").is_err());
         assert!(parse_manifest(br#"{"version":1}"#).is_err());
     }
@@ -2135,6 +1957,62 @@ mod tests {
                 read(&repo.path().join("demo/AGENTS.md")),
                 "uncommitted work"
             );
+        });
+    }
+
+    #[test]
+    fn a_symlinked_parent_does_not_hide_a_checkout() {
+        let out = tempfile::tempdir().unwrap();
+        let file = demo_archive(out.path());
+        let home = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let repo = work.path().join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        write(&repo.join("inner/demo/AGENTS.md"), "uncommitted work");
+        let alias = work.path().join("alias");
+        std::os::unix::fs::symlink(repo.join("inner"), &alias).unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            let force = Options {
+                force: true,
+                ..opts(&alias)
+            };
+            let report = import(&file, &force).unwrap();
+            let error = report.projects[0].error.clone().unwrap_or_default();
+            assert!(error.contains("inside the git checkout"), "{error}");
+            assert_eq!(read(&repo.join("inner/demo/AGENTS.md")), "uncommitted work");
+        });
+    }
+
+    #[test]
+    fn plans_are_matched_case_insensitively() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved = dir.path().join("saved.md");
+        write(&saved, "old backup plan");
+        let file = crafted_archive(
+            dir.path(),
+            serde_json::json!([project_json("demo", "demo", &["Plans/demo-1/planning.md"])]),
+            &[("projects/demo/Plans/demo-1/planning.md", &saved)],
+        );
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let local = dest.path().join("demo/plans/demo-1/planning.md");
+        write(&local, "new local plan");
+        crate::global_config::with_test_config_home(home.path(), || {
+            let force = Options {
+                force: true,
+                ..opts(dest.path())
+            };
+            let report = import(&file, &force).unwrap();
+            // On a case-sensitive disk `Plans/` is its own directory; either
+            // way the local plan survives.
+            assert_eq!(read(&local), "new local plan");
+            let p = &report.projects[0];
+            let case_insensitive = dest.path().join("demo/Plans/demo-1/planning.md").exists()
+                && fs::read_to_string(dest.path().join("demo/Plans/demo-1/planning.md")).unwrap()
+                    == "new local plan";
+            if case_insensitive {
+                assert_eq!(p.kept_files, vec!["Plans/demo-1/planning.md".to_string()]);
+            }
         });
     }
 
