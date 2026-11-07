@@ -33,20 +33,54 @@ use self::select::{ISSUES_DIR, PLAN_FILE};
 use self::status::ArchiveStatus;
 use crate::config::AppState;
 
-/// Stable short name of this machine for backup file names: `gethostname`'s
-/// first label (the macOS LocalHostName), lowercased, with anything outside
-/// `[a-z0-9-]` turned into `-`. Never contains `--`, never empty.
+/// Stable short name of this machine for backup file names, lowercased,
+/// with anything outside `[a-z0-9-]` turned into `-`. Never contains `--`,
+/// never empty.
+///
+/// On macOS this is the LocalHostName (`/usr/sbin/scutil --get LocalHostName`), which
+/// the user controls and which doesn't change between networks; the kernel
+/// host name can follow DHCP or reverse DNS when no HostName is set.
+/// Elsewhere, or if that fails, `gethostname`'s first label. Read once per
+/// process.
 pub fn host_name() -> String {
+    static HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HOST.get_or_init(|| {
+        let raw = local_host_name()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(kernel_host_name);
+        sanitize_host(raw.trim())
+    })
+    .clone()
+}
+
+#[cfg(target_os = "macos")]
+fn local_host_name() -> Option<String> {
+    // Absolute path: a trimmed PATH (launchd, cron, agents) often lacks
+    // /usr/sbin, and silently falling back would change the file name.
+    let out = std::process::Command::new("/usr/sbin/scutil")
+        .args(["--get", "LocalHostName"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn local_host_name() -> Option<String> {
+    None
+}
+
+fn kernel_host_name() -> String {
     let mut buf = [0u8; 256];
     // SAFETY: buf is valid for writes of buf.len() bytes for the call.
     let ret = unsafe { libc::gethostname(buf.as_mut_ptr().cast::<libc::c_char>(), buf.len()) };
-    let raw = if ret == 0 {
-        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-        String::from_utf8_lossy(&buf[..end]).into_owned()
-    } else {
-        String::new()
-    };
-    sanitize_host(&raw)
+    if ret != 0 {
+        return String::new();
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..end]).into_owned()
 }
 
 fn sanitize_host(raw: &str) -> String {
@@ -1369,6 +1403,11 @@ mod tests {
         assert_eq!(sanitize_host("---"), "host");
         let host = host_name();
         assert!(!host.is_empty() && !host.contains("--"));
+        assert_eq!(host, host_name(), "stable within a process");
+        #[cfg(target_os = "macos")]
+        if let Some(local) = local_host_name().filter(|n| !n.trim().is_empty()) {
+            assert_eq!(host, sanitize_host(local.trim()));
+        }
         assert!(host
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
