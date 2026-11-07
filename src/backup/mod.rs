@@ -505,7 +505,6 @@ fn failure_file(selection: &Selection) -> Option<PathBuf> {
     }
 }
 
-/// The full backup's file, when the backup path is configured.
 /// The full backup file for the configured path, resolved the way runs and
 /// `backup.json` key it (symlinks and `..` followed). `None` without a path.
 pub fn full_backup_file() -> Option<PathBuf> {
