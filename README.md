@@ -502,14 +502,14 @@ Backups run once a day automatically while the TUI is open (coming) and whenever
 
 #### Restoring
 
-After a wipe, install bork, grab the file from your synced folder and run `bork import`:
+After a wipe, install bork, grab the backup file from your synced folder and run `bork import` with its path (any name works):
 
 ```bash
-bork import bork-backup.tar.gz                    # every project, back to its recorded path
-bork import bork-backup.tar.gz --root ~/code      # restore to ~/code/<name> instead
-bork import bork-backup.tar.gz --project bork     # just one project
-bork import bork-backup.tar.gz --dry-run          # print what would be cloned, written and registered
-bork import bork-backup.tar.gz --force            # restore over existing directories
+bork import <backup-file>                    # every project, back to its recorded path
+bork import <backup-file> --root ~/code      # restore to ~/code/<name> instead
+bork import <backup-file> --project bork     # just one project
+bork import <backup-file> --dry-run          # print what would be cloned, written and registered
+bork import <backup-file> --force            # restore over existing directories
 ```
 
 For each project it clones the repo into `main/` (on the default branch, with your other remotes added back), restores the board and container files, moves each worktree plan to `plans/<issue-id>/planning.md` (it wins over an older copy saved there) and registers the project (with its sidebar label). Worktrees aren't recreated: issues that had one keep their prompt, column and links but lose the worktree, and the summary lists their branches so you can reopen them from the pushed branch. Agent sessions are dropped, since transcripts aren't in the backup, except ones the board you're restoring over still has. Without a clone URL, or when the clone fails, the board and docs are still restored and the summary says so. If one project fails part-way, the others still run and the command exits with an error after the summary. Your global `config.toml` is restored only when you don't have one yet; `--project` leaves it alone. Agent hooks are installed like `bork init` does.

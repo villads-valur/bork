@@ -665,7 +665,7 @@ enum Command {
 
     /// Restore projects, boards and plans from a `bork backup` file
     Import {
-        /// Backup file, e.g. bork-backup.tar.gz
+        /// Path to a backup file written by `bork backup` (any name)
         file: PathBuf,
 
         /// Only restore this project (name or label in the backup)
