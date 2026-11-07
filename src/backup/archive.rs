@@ -22,6 +22,10 @@ pub struct ArchiveEntry {
     pub source: PathBuf,
     /// Copy a symlink's target content instead of the link itself.
     pub follow: bool,
+    /// Content already read by the caller (bytes, mode), used instead of
+    /// reading `source` again. For files whose parsed content shaped the
+    /// rest of the archive, so the archive holds exactly what was parsed.
+    pub captured: Option<(Vec<u8>, u32)>,
 }
 
 /// Every entry's content, read once. The fingerprint and the archive are
@@ -146,6 +150,9 @@ pub(crate) enum Source {
 }
 
 fn read_source(entry: &ArchiveEntry) -> anyhow::Result<Source> {
+    if let Some((bytes, mode)) = &entry.captured {
+        return Ok(Source::File(bytes.clone(), *mode));
+    }
     let src = &entry.source;
     let context = || format!("reading {}", src.display());
     let meta = if entry.follow {
@@ -260,6 +267,7 @@ mod tests {
             path: path.to_string(),
             source: src.join(rel),
             follow: false,
+            captured: None,
         }
     }
 
@@ -410,6 +418,21 @@ mod tests {
         stage_file(staging.path(), "a/b.md", b"1", 0o644).unwrap();
         assert!(stage_file(staging.path(), "a/b.md", b"2", 0o644).is_err());
         assert!(stage_file(staging.path(), "a/b.md/c", b"3", 0o644).is_err());
+    }
+
+    #[test]
+    fn captured_content_is_archived_without_rereading() {
+        let src = tempfile::tempdir().unwrap();
+        let dest_dir = tempfile::tempdir().unwrap();
+        let dest = dest_dir.path().join("b.tar.gz");
+        write_file(&src.path().join("state.json"), "on disk now");
+        let mut e = entry(src.path(), "state.json", "projects/p/.bork/state.json");
+        e.captured = Some((b"what was parsed".to_vec(), 0o644));
+        write(&dest, b"{}", &load(&[e]).unwrap()).unwrap();
+        assert_eq!(
+            extract(&dest, "projects/p/.bork/state.json"),
+            "what was parsed"
+        );
     }
 
     #[test]
