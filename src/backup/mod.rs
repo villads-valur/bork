@@ -106,7 +106,7 @@ pub fn plan(selection: &Selection) -> anyhow::Result<Option<Plan>> {
         })
         .collect();
 
-    let (roots, file_name) = match selection {
+    let (roots, file) = match selection {
         Selection::All => {
             let mut seen = HashSet::new();
             let mut roots: Vec<PathBuf> = Vec::new();
@@ -119,7 +119,7 @@ pub fn plan(selection: &Selection) -> anyhow::Result<Option<Plan>> {
             if roots.is_empty() {
                 return Ok(None);
             }
-            (roots, BACKUP_FILE.to_string())
+            (roots, dir.join(BACKUP_FILE))
         }
         Selection::Project(root) => {
             let root = crate::global_config::normalize_path(root);
@@ -129,17 +129,13 @@ pub fn plan(selection: &Selection) -> anyhow::Result<Option<Plan>> {
                     root.display()
                 );
             }
-            let name = crate::config::load_config_from(&root).project_name;
-            if !select::is_plain_component(&name) {
-                bail!("project name {name:?} can't be used in a file name");
-            }
             // Same-named projects (or names differing only in case, on a
             // case-insensitive disk) share a file; never let one replace
             // another's single-project backup. The archive's own manifest is
             // the source of truth, not the status file.
-            let file = dir.join(format!("bork-backup-{name}.tar.gz"));
+            let file = project_backup_file(&dir, &root)?;
             check_single_project_owner(&file, &root)?;
-            (vec![root], format!("bork-backup-{name}.tar.gz"))
+            (vec![root], file)
         }
     };
 
@@ -184,7 +180,7 @@ pub fn plan(selection: &Selection) -> anyhow::Result<Option<Plan>> {
     }
 
     Ok(Some(Plan {
-        file: dir.join(file_name),
+        file,
         manifest: Manifest {
             version: MANIFEST_VERSION,
             created_at: 0,
@@ -484,6 +480,16 @@ fn check_single_project_owner(file: &Path, root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `<dir>/bork-backup-<project_name>.tar.gz` for a `--project` run. The
+/// only place that name is built, so planning and status always agree.
+fn project_backup_file(dir: &Path, root: &Path) -> anyhow::Result<PathBuf> {
+    let name = crate::config::load_config_from(root).project_name;
+    if !select::is_plain_component(&name) {
+        bail!("project name {name:?} can't be used in a file name");
+    }
+    Ok(dir.join(format!("bork-backup-{name}.tar.gz")))
+}
+
 /// Where a failed planning step is recorded: the full backup's file, or the
 /// project's own `--project` file. Nothing is recorded for a project that
 /// isn't opted in (it has no backup file to report on), or when the file
@@ -497,8 +503,7 @@ fn failure_file(selection: &Selection) -> Option<PathBuf> {
                 return None;
             }
             let dir = resolve_through_existing(&config::load_settings().path?);
-            let name = crate::config::load_config_from(&root).project_name;
-            let file = dir.join(format!("bork-backup-{name}.tar.gz"));
+            let file = project_backup_file(&dir, &root).ok()?;
             check_single_project_owner(&file, &root).ok()?;
             Some(file)
         }
@@ -1246,6 +1251,22 @@ mod tests {
             let record = &status::read(&status::status_path()).archives[&outcome.file];
             assert!(!record.ok);
             assert_eq!(record.size, outcome.size);
+        });
+    }
+
+    #[test]
+    fn unusable_project_name_fails_without_a_status_row() {
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            set_global_path(dest.path());
+            let odd = project("a/b", true);
+            let err = run(&Selection::Project(odd.path().to_path_buf())).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("can't be used in a file name"),
+                "{err:#}"
+            );
+            assert!(status::read(&status::status_path()).archives.is_empty());
         });
     }
 
