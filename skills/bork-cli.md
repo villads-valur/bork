@@ -1,11 +1,11 @@
 ---
 name: bork-cli
-description: Manage bork issues and integrations from the command line
+description: Manage bork issues, integrations and backups from the command line
 ---
 
 # Bork CLI
 
-Use `bork issue` and `bork integration` commands to manage the kanban board programmatically. Changes are picked up by the TUI within 2 seconds.
+Use `bork issue` and `bork integration` commands to manage the kanban board programmatically, and `bork backup` / `bork import` to back it up and restore it. Changes are picked up by the TUI within 2 seconds.
 
 All commands must be run from within a bork project directory (a directory containing `.bork/`), or any subdirectory of it.
 
@@ -183,7 +183,7 @@ Rebuilding a wiped laptop:
 1. Install bork
 2. `bork import --dry-run <backup-file>` and check the output with the user
 3. `bork import <backup-file>`: clones each repo into `main/`, restores boards, docs and plans, registers the projects
-4. Worktrees aren't recreated; the summary lists each issue's branch. Reopen one from its pushed branch with `bork worktree <issue-id> <slug> --base origin/<issue-id>/<slug>` (without `--base` the branch starts from `main`)
+4. Worktrees aren't recreated; the summary lists the affected issues as `<issue-id> (<branch>)`. Reopen one from its pushed branch with `bork worktree <issue-id> <slug> --base origin/<branch>`, where `<slug>` is the part of `<branch>` after `<issue-id>/` (omit it when the branch is just `<issue-id>`). Without `--base` the branch starts from `main`. Issues listed without a branch have none recorded
 
 ### Rules for agents
 
