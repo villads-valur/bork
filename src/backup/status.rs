@@ -26,8 +26,8 @@ pub struct ArchiveStatus {
     /// Project names in the last successful archive.
     #[serde(default)]
     pub projects: Vec<String>,
-    /// Container paths of those projects. A single-project file is only
-    /// rewritten for the same project.
+    /// Container paths of those projects (informational; ownership is
+    /// checked against the archive's own manifest).
     #[serde(default)]
     pub paths: Vec<PathBuf>,
     /// Content fingerprint of the last archive written.

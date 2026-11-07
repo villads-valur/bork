@@ -131,23 +131,12 @@ pub fn plan(selection: &Selection) -> anyhow::Result<Option<Plan>> {
             if !select::is_plain_component(&name) {
                 bail!("project name {name:?} can't be used in a file name");
             }
-            // Same-named projects share a file name; never let one replace
-            // another's single-project backup.
+            // Same-named projects (or names differing only in case, on a
+            // case-insensitive disk) share a file; never let one replace
+            // another's single-project backup. The archive's own manifest is
+            // the source of truth, not the status file.
             let file = dir.join(format!("bork-backup-{name}.tar.gz"));
-            let records = status::read(&status::status_path());
-            if let Some(owner) = records
-                .archives
-                .get(&file)
-                .and_then(|record| record.paths.first())
-                .filter(|owner| **owner != root)
-            {
-                bail!(
-                    "{} holds the backup of {}; give {} a different project_name",
-                    file.display(),
-                    owner.display(),
-                    root.display()
-                );
-            }
+            check_single_project_owner(&file, &root)?;
             (vec![root], format!("bork-backup-{name}.tar.gz"))
         }
     };
@@ -312,9 +301,10 @@ fn project_part(
     } else {
         "project".to_string()
     };
+    // Compared case-insensitively: staging may be on a case-insensitive disk.
     let mut archive_dir = base.clone();
     let mut n = 2;
-    while !used_dirs.insert(archive_dir.clone()) {
+    while !used_dirs.insert(archive_dir.to_lowercase()) {
         archive_dir = format!("{base}-{n}");
         n += 1;
     }
@@ -403,6 +393,34 @@ fn write_plan(plan: &Plan) -> anyhow::Result<(Outcome, String)> {
         projects,
     };
     Ok((outcome, fingerprint))
+}
+
+/// Refuse to replace an existing single-project archive that belongs to
+/// another project, or whose owner can't be read from its manifest.
+fn check_single_project_owner(file: &Path, root: &Path) -> anyhow::Result<()> {
+    match fs::symlink_metadata(file) {
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).with_context(|| format!("reading {}", file.display())),
+        Ok(_) => {}
+    }
+    let manifest = archive::read_manifest(file).with_context(|| {
+        format!(
+            "{} exists but its owner can't be read; move it away to back up {} there",
+            file.display(),
+            root.display()
+        )
+    })?;
+    let owners: Vec<&Path> = manifest.projects.iter().map(|p| p.path.as_path()).collect();
+    if owners != [root] {
+        let owners: Vec<String> = owners.iter().map(|p| p.display().to_string()).collect();
+        bail!(
+            "{} holds the backup of {}; give {} a different project_name",
+            file.display(),
+            owners.join(", "),
+            root.display()
+        );
+    }
+    Ok(())
 }
 
 /// The file a selection writes to, when the backup path is configured.
@@ -960,6 +978,60 @@ mod tests {
             });
             write(&registry, "{ not json");
             assert!(run(&Selection::All).is_err());
+        });
+    }
+
+    #[test]
+    fn ownership_comes_from_the_archive_not_the_status_file() {
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            set_global_path(dest.path());
+            let first = project("demo", true);
+            let second = project("demo", true);
+            write(&first.path().join("AGENTS.md"), "1");
+            let outcome = run(&Selection::Project(first.path().to_path_buf()))
+                .unwrap()
+                .unwrap();
+
+            fs::remove_file(status::status_path()).unwrap();
+            let err = run(&Selection::Project(second.path().to_path_buf())).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("holds the backup of"),
+                "{err:#}"
+            );
+
+            // An existing file without a readable manifest is never replaced.
+            write(&outcome.file, "not a tarball");
+            let err = run(&Selection::Project(first.path().to_path_buf())).unwrap_err();
+            assert!(format!("{err:#}").contains("can't be read"), "{err:#}");
+            assert_eq!(fs::read_to_string(&outcome.file).unwrap(), "not a tarball");
+        });
+    }
+
+    #[test]
+    fn names_differing_in_case_get_separate_dirs() {
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            set_global_path(dest.path());
+            let upper = project("Demo", true);
+            let lower = project("demo", true);
+            write(&upper.path().join("AGENTS.md"), "first");
+            write(&lower.path().join("AGENTS.md"), "second");
+            let outcome = run(&Selection::All).unwrap().unwrap();
+            let manifest = read_manifest(&outcome.file);
+            let dirs: HashSet<String> = manifest
+                .projects
+                .iter()
+                .map(|p| p.archive_dir.to_lowercase())
+                .collect();
+            assert_eq!(dirs.len(), 2);
+            let agents: Vec<String> = list(&outcome.file)
+                .into_iter()
+                .filter(|p| p.ends_with("/AGENTS.md"))
+                .collect();
+            assert_eq!(agents.len(), 2, "{agents:?}");
         });
     }
 
