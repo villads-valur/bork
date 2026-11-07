@@ -376,9 +376,12 @@ fn combine_results(results: Vec<ActionResult>, summary: String) -> ActionResult 
     let total = results.len();
     let mut combined = ActionResult::default();
     let mut failures = Vec::new();
+    let mut warnings = Vec::new();
     for result in results {
-        if result.message_kind == MessageKind::Error {
-            failures.push(result.message);
+        match result.message_kind {
+            MessageKind::Error => failures.push(result.message),
+            MessageKind::Warning => warnings.push(result.message),
+            MessageKind::Info => {}
         }
         combined.issues_to_delete.extend(result.issues_to_delete);
         combined.issues_to_archive.extend(result.issues_to_archive);
@@ -386,9 +389,13 @@ fn combine_results(results: Vec<ActionResult>, summary: String) -> ActionResult 
             .force_archive_offers
             .extend(result.force_archive_offers);
     }
-    match failures.first() {
-        None => combined.message = summary,
-        Some(first) => {
+    match (failures.first(), warnings.first()) {
+        (None, None) => combined.message = summary,
+        (None, Some(first)) => {
+            combined.message = format!("{summary}; {first}");
+            combined.message_kind = MessageKind::Warning;
+        }
+        (Some(first), _) => {
             combined.message = format!("{} of {} failed; {}", failures.len(), total, first);
             combined.message_kind = MessageKind::Error;
         }
@@ -408,7 +415,7 @@ fn run_confirmed(
     issue_ids: &[String],
     done: &'static str,
     noun: &'static str,
-    per_issue: fn(&AppConfig, &ProjectId, &Issue) -> ActionResult,
+    per_issue: impl Fn(&AppConfig, &ProjectId, &Issue) -> ActionResult + Send + 'static,
 ) {
     let Some(project) = app.find_project_mut(&project_id) else {
         app.set_warning("Project no longer available");
@@ -728,6 +735,7 @@ fn handle_normal(
                     issue_ids,
                     project_id: ctx.project_id.clone(),
                     force: false,
+                    teardown_due: Vec::new(),
                 },
             );
             PostAction::None
@@ -2462,6 +2470,7 @@ fn handle_confirm(
                         issue_ids,
                         project_id,
                         force,
+                        teardown_due,
                     } => run_confirmed(
                         app,
                         action_tx,
@@ -2469,14 +2478,15 @@ fn handle_confirm(
                         &issue_ids,
                         "Archived",
                         "issue",
-                        if force {
-                            |config, project_id, issue| {
-                                archive_issue_off_thread(config, project_id, issue, true)
-                            }
-                        } else {
-                            |config, project_id, issue| {
-                                archive_issue_off_thread(config, project_id, issue, false)
-                            }
+                        move |config, project_id, issue| {
+                            let removal = if !force {
+                                Removal::Safe
+                            } else if teardown_due.contains(&issue.id) {
+                                Removal::Force
+                            } else {
+                                Removal::ForceSkipTeardown
+                            };
+                            archive_issue_off_thread(config, project_id, issue, removal)
                         },
                     ),
                 }
@@ -2489,11 +2499,11 @@ fn handle_confirm(
     }
 }
 
-/// Run the off-thread half of a TUI archive: kill the agent session, run the
-/// teardown script, and remove the worktree. Without `force`, a failing
-/// teardown or dirty worktree stops the archive and comes back as a force
-/// offer for the main loop to confirm; with it, teardown is skipped and
-/// uncommitted changes are discarded. On success it sets `issues_to_archive`
+/// Run the off-thread half of a TUI archive: kill the agent session, save the
+/// plan, run the teardown script, and remove the worktree. A safe `removal`
+/// stops at an unsaved plan, a failing teardown or a dirty worktree and
+/// comes back as a force offer for the main loop to confirm; a forced one
+/// goes past them and discards uncommitted changes. On success it sets `issues_to_archive`
 /// so the main thread applies the move-to-Done and worktree drop against the
 /// live in-memory board, instead of writing state.json directly and racing
 /// concurrent merges.
@@ -2501,7 +2511,7 @@ fn archive_issue_off_thread(
     config: &AppConfig,
     project_id: &ProjectId,
     issue: &Issue,
-    force: bool,
+    removal: Removal,
 ) -> ActionResult {
     archive_to_result(
         config,
@@ -2509,7 +2519,7 @@ fn archive_issue_off_thread(
         issue.id.clone(),
         &issue.session_name(&config.project_name),
         issue.worktree.as_deref(),
-        force,
+        removal,
     )
 }
 
@@ -2519,7 +2529,7 @@ fn archive_to_result(
     issue_id: String,
     session_name: &str,
     worktree: Option<&str>,
-    force: bool,
+    removal: Removal,
 ) -> ActionResult {
     let session_killed = match agent::terminate_session(&config.project_root, session_name) {
         Ok(killed) => killed,
@@ -2533,12 +2543,6 @@ fn archive_to_result(
     };
 
     if let Some(dir) = worktree {
-        // A force archive always follows an attempt whose teardown already ran.
-        let removal = if force {
-            Removal::ForceSkipTeardown
-        } else {
-            Removal::Safe
-        };
         if let Err(e) = crate::worktree::remove_worktree_in(config, &issue_id, dir, removal) {
             let force_archive_offers = e
                 .downcast_ref::<ForceRequired>()
@@ -2598,12 +2602,19 @@ pub fn show_queued_force_archive(app: &mut App) -> bool {
         .map(|(_, issue_id, reason)| (issue_id, reason))
         .collect();
     let message = force_archive_prompt(&offers);
+    // An unsaved plan stops the archive before its teardown runs.
+    let teardown_due = offers
+        .iter()
+        .filter(|(_, reason)| matches!(reason, ForceRequired::PlanNotSaved { .. }))
+        .map(|(issue_id, _)| issue_id.clone())
+        .collect();
     app.start_confirm(
         message,
         ConfirmAction::ArchiveIssue {
             issue_ids: offers.into_iter().map(|(issue_id, _)| issue_id).collect(),
             project_id,
             force: true,
+            teardown_due,
         },
     );
     true
@@ -2623,28 +2634,12 @@ fn force_archive_prompt(offers: &[(String, ForceRequired)]) -> String {
         [(issue_id, ForceRequired::TeardownFailed { code, dirty: true })] => format!(
             "{issue_id}'s teardown script failed (exit {code}) and its worktree has uncommitted changes. Archive anyway and discard them? (y/n)"
         ),
-        [(
-            issue_id,
-            ForceRequired::PlanNotSaved {
-                error,
-                teardown,
-                dirty,
-            },
-        )] => {
-            let mut problems = format!("{issue_id}'s plan couldn't be saved ({error})");
-            if let Some(code) = teardown {
-                problems.push_str(&format!(", its teardown script failed (exit {code})"));
-            }
-            if *dirty {
-                problems.push_str(" and its worktree has uncommitted changes");
-            }
-            let question = if *dirty {
-                "Archive anyway, losing the plan and the changes?"
-            } else {
-                "Archive anyway and lose the plan?"
-            };
-            format!("{problems}. {question} (y/n)")
-        }
+        [(issue_id, ForceRequired::PlanNotSaved { error, dirty: false })] => format!(
+            "{issue_id}'s plan couldn't be saved ({error}). Archive anyway and lose the plan? (y/n)"
+        ),
+        [(issue_id, ForceRequired::PlanNotSaved { error, dirty: true })] => format!(
+            "{issue_id}'s plan couldn't be saved ({error}) and its worktree has uncommitted changes. Archive anyway, losing the plan and the changes? (y/n)"
+        ),
         _ => {
             let mut named: Vec<String> = offers
                 .iter()
@@ -2687,17 +2682,9 @@ fn force_reason(reason: &ForceRequired) -> String {
         ForceRequired::TeardownFailed { code, dirty: true } => {
             format!("teardown exit {code}, uncommitted changes")
         }
-        ForceRequired::PlanNotSaved {
-            teardown, dirty, ..
-        } => {
-            let mut reason = "plan not saved".to_string();
-            if let Some(code) = teardown {
-                reason.push_str(&format!(", teardown exit {code}"));
-            }
-            if *dirty {
-                reason.push_str(", uncommitted changes");
-            }
-            reason
+        ForceRequired::PlanNotSaved { dirty: false, .. } => "plan not saved".to_string(),
+        ForceRequired::PlanNotSaved { dirty: true, .. } => {
+            "plan not saved, uncommitted changes".to_string()
         }
     }
 }
@@ -4853,7 +4840,7 @@ mod tests {
             "bork-1".into(),
             &unique_session(),
             Some("bork-1-slug"),
-            false,
+            Removal::Safe,
         );
 
         assert!(result.issues_to_archive.is_empty());
@@ -4876,7 +4863,7 @@ mod tests {
             "bork-1".into(),
             &unique_session(),
             Some("bork-1-slug"),
-            true,
+            Removal::ForceSkipTeardown,
         );
 
         assert_eq!(
@@ -4915,7 +4902,6 @@ mod tests {
     fn plan_not_saved(
         project_id: &ProjectId,
         issue_id: &str,
-        teardown: Option<i32>,
         dirty: bool,
     ) -> (ProjectId, String, ForceRequired) {
         (
@@ -4923,30 +4909,33 @@ mod tests {
             issue_id.into(),
             ForceRequired::PlanNotSaved {
                 error: "disk full".into(),
-                teardown,
                 dirty,
             },
         )
     }
 
     #[test]
-    fn an_unsaved_plan_asks_before_archiving() {
+    fn an_unsaved_plan_asks_before_archiving_and_runs_the_teardown_when_forced() {
         let mut app = app_with_issues();
         let project_id = app.project().id();
 
         assert!(offer(
             &mut app,
-            vec![plan_not_saved(&project_id, "bork-1", None, false)]
+            vec![plan_not_saved(&project_id, "bork-1", false)]
         ));
 
         assert_eq!(
             app.confirm_message.as_deref(),
             Some("bork-1's plan couldn't be saved (disk full). Archive anyway and lose the plan? (y/n)")
         );
-        assert!(matches!(
-            app.pending_confirm,
-            Some(ConfirmAction::ArchiveIssue { force: true, .. })
-        ));
+        match &app.pending_confirm {
+            Some(ConfirmAction::ArchiveIssue {
+                force: true,
+                teardown_due,
+                ..
+            }) => assert_eq!(teardown_due, &["bork-1"]),
+            other => panic!("expected a forced ArchiveIssue, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4956,24 +4945,51 @@ mod tests {
 
         assert!(offer(
             &mut app,
-            vec![plan_not_saved(&project_id, "bork-1", Some(2), true)]
+            vec![plan_not_saved(&project_id, "bork-1", true)]
         ));
         assert_eq!(
             app.confirm_message.as_deref(),
-            Some("bork-1's plan couldn't be saved (disk full), its teardown script failed (exit 2) and its worktree has uncommitted changes. Archive anyway, losing the plan and the changes? (y/n)")
+            Some("bork-1's plan couldn't be saved (disk full) and its worktree has uncommitted changes. Archive anyway, losing the plan and the changes? (y/n)")
         );
         app.cancel_confirm();
 
         assert!(offer(
             &mut app,
             vec![
-                plan_not_saved(&project_id, "bork-1", Some(2), false),
+                plan_not_saved(&project_id, "bork-1", false),
                 teardown_failed(&project_id, "bork-2", false),
             ]
         ));
         assert_eq!(
             app.confirm_message.as_deref(),
-            Some("2 issues stopped short (bork-1: plan not saved, teardown exit 2, bork-2: teardown exit 2). Archive anyway and lose the unsaved plans? (y/n)")
+            Some("2 issues stopped short (bork-1: plan not saved, bork-2: teardown exit 2). Archive anyway and lose the unsaved plans? (y/n)")
+        );
+        match &app.pending_confirm {
+            Some(ConfirmAction::ArchiveIssue { teardown_due, .. }) => {
+                assert_eq!(teardown_due, &["bork-1"])
+            }
+            other => panic!("expected a forced ArchiveIssue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn combined_results_keep_warnings() {
+        let warning = |message: &str| ActionResult {
+            message: message.into(),
+            message_kind: MessageKind::Warning,
+            ..Default::default()
+        };
+        let combined = combine_results(
+            vec![
+                warning("Deleted bork-1 but couldn't remove its saved plans: denied"),
+                ActionResult::default(),
+            ],
+            "Deleted 2 issues".into(),
+        );
+        assert_eq!(combined.message_kind, MessageKind::Warning);
+        assert_eq!(
+            combined.message,
+            "Deleted 2 issues; Deleted bork-1 but couldn't remove its saved plans: denied"
         );
     }
 
@@ -5039,9 +5055,11 @@ mod tests {
                 issue_ids,
                 project_id: confirmed_project,
                 force: true,
+                teardown_due,
             }) => {
                 assert_eq!(issue_ids, &["bork-1"]);
                 assert_eq!(confirmed_project, &project_id);
+                assert!(teardown_due.is_empty());
             }
             _ => panic!("expected a forced ArchiveIssue"),
         }

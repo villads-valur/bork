@@ -219,14 +219,10 @@ pub enum ForceRequired {
     TeardownFailed { code: i32, dirty: bool },
     #[error("{0}")]
     Uncommitted(String),
-    /// The plan couldn't be saved; the teardown still ran. `teardown` holds
-    /// its exit code if it failed too, which forcing also goes past.
+    /// The plan couldn't be saved. Nothing else ran, so the teardown is
+    /// still due: force this with `Removal::Force`, not `ForceSkipTeardown`.
     #[error("couldn't save the issue's plan ({error}). Fix it or re-run with --force to remove the worktree and lose the plan.")]
-    PlanNotSaved {
-        error: String,
-        teardown: Option<i32>,
-        dirty: bool,
-    },
+    PlanNotSaved { error: String, dirty: bool },
 }
 
 /// How far `remove_worktree_in` pushes past a plan that can't be saved, a
@@ -238,18 +234,18 @@ pub enum Removal {
     /// Run the teardown script, ignore its failure and a failed plan save,
     /// and discard uncommitted changes.
     Force,
-    /// Skip the teardown script, which already ran on the attempt that
-    /// stopped short, and discard uncommitted changes.
+    /// Skip the plan save and the teardown script, which both already ran on
+    /// the attempt that stopped short (saving again could overwrite the plan
+    /// with whatever the teardown left), and discard uncommitted changes.
     ForceSkipTeardown,
 }
 
 /// Remove `issue_id`'s worktree: save its plan, run the configured teardown
 /// script inside it, then `git worktree remove` it from main/.
 ///
-/// The plan is saved before the teardown can touch it. The teardown runs even
-/// when the save failed, so every `ForceRequired` follows a teardown and a
-/// forced retry can use `ForceSkipTeardown`. A forced removal past a failed
-/// save logs the lost plan.
+/// The plan is saved before the teardown can touch it, and a failed save
+/// stops a safe removal before the teardown runs. A forced removal past a
+/// failed save logs the lost plan.
 ///
 /// A missing worktree directory is not an error; stale git metadata is pruned.
 pub fn remove_worktree_in(
@@ -277,8 +273,22 @@ pub fn remove_worktree_in(
         return Ok(());
     }
 
-    let plan_error =
-        crate::issue_plan::save_before_removal(&config.project_root, issue_id, worktree_dir).err();
+    let plan_error = match removal {
+        Removal::ForceSkipTeardown => None,
+        Removal::Safe | Removal::Force => {
+            crate::issue_plan::save_before_removal(&config.project_root, issue_id, worktree_dir)
+                .err()
+        }
+    };
+    if !force {
+        if let Some(error) = plan_error {
+            return Err(ForceRequired::PlanNotSaved {
+                error,
+                dirty: has_uncommitted_changes(&worktree_path),
+            }
+            .into());
+        }
+    }
 
     let teardown_script = match removal {
         Removal::ForceSkipTeardown => None,
@@ -296,22 +306,12 @@ pub fn remove_worktree_in(
         }
     }
 
-    if !force {
-        if let Some(error) = plan_error.clone() {
-            return Err(ForceRequired::PlanNotSaved {
-                error,
-                teardown: teardown_failure,
-                dirty: has_uncommitted_changes(&worktree_path),
-            }
-            .into());
+    if let (Some(code), false) = (teardown_failure, force) {
+        return Err(ForceRequired::TeardownFailed {
+            code,
+            dirty: has_uncommitted_changes(&worktree_path),
         }
-        if let Some(code) = teardown_failure {
-            return Err(ForceRequired::TeardownFailed {
-                code,
-                dirty: has_uncommitted_changes(&worktree_path),
-            }
-            .into());
-        }
+        .into());
     }
 
     let worktree_arg = format!("../{}", worktree_dir);
@@ -894,10 +894,10 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_worktree_failed_plan_save_requires_force() {
+    fn test_remove_worktree_failed_plan_save_stops_before_the_teardown() {
         let (tmp, project, mut cfg) = setup_test_project();
         let marker = tmp.join("teardown-ran");
-        cfg.teardown_script = Some(format!("touch '{}'", marker.display()));
+        cfg.teardown_script = Some(format!("touch '{}'; rm -rf .claude", marker.display()));
         enable_broken_backups(&project);
         worktree_with_plan(&cfg);
 
@@ -906,20 +906,18 @@ mod tests {
         assert!(
             matches!(
                 err.downcast_ref::<ForceRequired>(),
-                Some(ForceRequired::PlanNotSaved {
-                    teardown: None,
-                    dirty: false,
-                    ..
-                })
+                Some(ForceRequired::PlanNotSaved { dirty: false, .. })
             ),
             "{err:#}"
         );
         assert!(err.to_string().contains("--force"), "{err}");
+        // Keeping the worktree keeps the plan: the teardown never ran.
+        assert!(!marker.exists());
         assert!(project.join("bork-1-fix-bug/.claude/planning.md").exists());
-        // The teardown ran, so a forced retry can skip it like the others.
-        assert!(marker.exists());
 
-        remove_worktree_in(&cfg, "bork-1", "bork-1-fix-bug", Removal::ForceSkipTeardown).unwrap();
+        // Forcing it runs the teardown that is still due.
+        remove_worktree_in(&cfg, "bork-1", "bork-1-fix-bug", Removal::Force).unwrap();
+        assert!(marker.exists());
         assert!(!project.join("bork-1-fix-bug").exists());
         let log = fs::read_to_string(config::error_log_path(&project)).unwrap();
         assert!(
@@ -931,25 +929,23 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_worktree_failed_plan_save_reports_a_failed_teardown_too() {
+    fn test_remove_worktree_force_retry_keeps_the_pre_teardown_plan() {
         let (tmp, project, mut cfg) = setup_test_project();
-        cfg.teardown_script = Some("exit 4".to_string());
-        enable_broken_backups(&project);
+        cfg.teardown_script = Some("echo changed > .claude/planning.md; exit 4".to_string());
+        enable_backups(&project);
         worktree_with_plan(&cfg);
 
         let err = remove_worktree_in(&cfg, "bork-1", "bork-1-fix-bug", Removal::Safe).unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<ForceRequired>(),
+            Some(ForceRequired::TeardownFailed { code: 4, .. })
+        ));
 
-        assert!(
-            matches!(
-                err.downcast_ref::<ForceRequired>(),
-                Some(ForceRequired::PlanNotSaved {
-                    teardown: Some(4),
-                    ..
-                })
-            ),
-            "{err:#}"
-        );
-        assert!(project.join("bork-1-fix-bug").exists());
+        remove_worktree_in(&cfg, "bork-1", "bork-1-fix-bug", Removal::ForceSkipTeardown).unwrap();
+
+        assert!(!project.join("bork-1-fix-bug").exists());
+        let saved = saved_plan(&project, "bork-1");
+        assert_eq!(fs::read_to_string(saved).unwrap(), "the plan");
 
         let _ = fs::remove_dir_all(&tmp);
     }

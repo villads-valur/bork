@@ -1886,9 +1886,13 @@ pub enum ConfirmAction {
     ArchiveIssue {
         issue_ids: Vec<String>,
         project_id: ProjectId,
-        /// Skip the teardown, which already ran, go past a plan that couldn't
-        /// be saved, and discard uncommitted changes.
+        /// Go past what stopped the first attempt and discard uncommitted
+        /// changes. The teardown is skipped, since it already ran, except
+        /// for `teardown_due`.
         force: bool,
+        /// Forced issues whose first attempt stopped before the teardown (an
+        /// unsaved plan), so the forced archive still runs it.
+        teardown_due: Vec<String>,
     },
     /// Remove worktrees a prune kept because their issue plan couldn't be
     /// saved, losing the plans.
