@@ -8,6 +8,10 @@ pub enum AppError {
     #[error("setup error: {0}")]
     Setup(String),
 
+    /// Messages from the `bork issue launch` handoff, shown as is.
+    #[error("{0}")]
+    Launch(String),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 

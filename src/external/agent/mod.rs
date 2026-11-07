@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -15,9 +16,9 @@ use crate::types::{
 mod claude;
 mod codex;
 mod cursor;
+mod handoff;
 mod opencode;
 mod pi;
-mod setup;
 
 /// Per-provider surface behind the agent registry. One implementor per
 /// harness; `provider()` maps `AgentKind` to the matching `&'static dyn`.
@@ -218,7 +219,12 @@ pub struct LaunchOutcome {
 ///   1. The agent launched at the project root with issue context
 ///   2. A bare terminal
 ///
-/// Exports BORK_SESSION and BORK_STATUS_DIR so hooks/plugins can write status files.
+/// The pane only gets a short `bork issue launch <id>` line; that command
+/// (`exec_launch`) runs setup, builds the agent command and execs it. The
+/// issue is staged for it in a handoff dir because this copy may hold edits
+/// the TUI hasn't flushed to state.json yet. Session-id detection stays here
+/// so bulk launches, which run one after another, can't pick up each
+/// other's ids.
 pub fn launch_session(issue: &Issue, config: &AppConfig) -> Result<LaunchOutcome, AppError> {
     let session_name = issue.session_name(&config.project_name);
     let cwd = &config.project_root;
@@ -232,24 +238,151 @@ pub fn launch_session(issue: &Issue, config: &AppConfig) -> Result<LaunchOutcome
         });
     }
 
+    let status_dir = config::agent_status_dir(&config.project_root);
+    let handoff = handoff::Handoff::prepare(&status_dir, issue)?;
+    let launch_cmd = launch_command(&issue.id)?;
+
+    // Snapshot resumes too: the launch command starts fresh when the stored
+    // session turns out to be gone.
     let provider = provider(issue.agent_kind);
+    let before = provider.snapshot_session_ids(&config.project_root);
+
+    tmux::create_session(&session_name, cwd)?;
+    tmux::send_keys(&session_name, &launch_cmd)?;
+
+    // Second window: bare terminal for ad-hoc commands
+    tmux::create_window(&session_name, "terminal", cwd)?;
+
+    let (session_id, setup_ran, replaced_lost_session) =
+        match handoff.wait(|| tmux::is_pane_alive(&session_name))? {
+            handoff::Report::Started {
+                session_id,
+                setup_ran,
+                replaced_lost_session,
+            } => (session_id, setup_ran, replaced_lost_session),
+            handoff::Report::Failed { error } => return Err(AppError::Launch(error)),
+        };
+
+    // For OpenCode/Codex/Pi, detect session IDs after launch.
+    let agent_session_id = session_id.or_else(|| {
+        provider.detect_session_id(&DetectContext {
+            project_root: &config.project_root,
+            before: &before,
+        })
+    });
+
+    Ok(LaunchOutcome {
+        session_name,
+        agent_session_id,
+        setup_ran,
+        replaced_lost_session,
+    })
+}
+
+/// The line typed into the agent pane. Uses this binary's own path so PATH
+/// and a `bork update` mid-session can't run a different bork.
+fn launch_command(issue_id: &str) -> Result<String, AppError> {
+    let exe = std::env::current_exe()?;
+    Ok(format!(
+        "'{}' issue launch '{}'",
+        shell_escape_single_quotes(&exe.to_string_lossy()),
+        shell_escape_single_quotes(issue_id)
+    ))
+}
+
+/// What a launch did before exec'ing the agent.
+#[derive(Debug)]
+struct Prepared {
+    agent_cmd: String,
+    session_id: Option<String>,
+    setup_ran: bool,
+    replaced_lost_session: bool,
+}
+
+/// Body of `bork issue launch <id>`, run inside the agent pane: run the
+/// worktree setup script if it's due, build the agent command and exec it.
+/// Reports back to a waiting `launch_session`; when run by hand, records the
+/// result in state.json itself. Only returns on failure.
+pub fn exec_launch(project_root: &Path, issue_id: &str) -> anyhow::Result<()> {
+    let config = config::load_config_from(project_root);
+    let status_dir = config::agent_status_dir(project_root);
+
+    let (claim, issue) = match handoff::Claim::take(&status_dir, issue_id) {
+        Some((claim, issue)) => (Some(claim), issue),
+        None => {
+            let state = config::load_state(project_root);
+            let issue = state
+                .issues
+                .into_iter()
+                .find(|i| i.id.eq_ignore_ascii_case(issue_id))
+                .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", issue_id))?;
+            (None, issue)
+        }
+    };
+
+    let prepared = match prepare_launch(&issue, &config, &status_dir) {
+        Ok(prepared) => prepared,
+        Err(e) => {
+            if let Some(claim) = &claim {
+                let _ = claim.report(&handoff::Report::Failed {
+                    error: e.to_string(),
+                });
+            }
+            return Err(e.into());
+        }
+    };
+
+    match &claim {
+        Some(claim) => claim.report(&handoff::Report::Started {
+            session_id: prepared.session_id,
+            setup_ran: prepared.setup_ran,
+            replaced_lost_session: prepared.replaced_lost_session,
+        })?,
+        None => crate::ops::record_launch(
+            project_root,
+            &issue,
+            prepared.session_id,
+            prepared.setup_ran,
+            prepared.replaced_lost_session,
+        )?,
+    }
+
+    let err = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(&prepared.agent_cmd)
+        .current_dir(project_root)
+        .exec();
+    Err(anyhow::anyhow!(
+        "failed to start {}: {err}",
+        binary(issue.agent_kind)
+    ))
+}
+
+fn prepare_launch(
+    issue: &Issue,
+    config: &AppConfig,
+    status_dir: &Path,
+) -> Result<Prepared, AppError> {
+    let session_name = issue.session_name(&config.project_name);
+
+    let setup = setup_prefix(issue, config);
+    if let Some(prefix) = &setup {
+        run_setup(prefix, &config.project_root)?;
+    }
 
     // A stored session the agent no longer has (e.g. Claude cleaned up the
     // transcript) would fail to resume, so launch fresh instead.
+    let provider = provider(issue.agent_kind);
     let resume_session = issue
         .current_session_id()
-        .filter(|sid| provider.has_session(cwd, sid));
+        .filter(|sid| provider.has_session(&config.project_root, sid));
     let replaced_lost_session = issue.current_session_id().is_some() && resume_session.is_none();
 
-    tmux::create_session(&session_name, cwd)?;
-
-    let status_dir = config::agent_status_dir(&config.project_root);
     let status_dir_str = status_dir.to_str().unwrap_or("");
-
-    let prompt_path = prompt_file_path(&status_dir, &session_name);
+    let prompt_path = prompt_file_path(status_dir, &session_name);
     let prompt_path_str = prompt_path.to_str().unwrap_or("");
 
-    let (agent_cmd, pre_assigned_session_id, prompt_contents) = build_agent_cmd(
+    let (agent_cmd, session_id, prompt_contents) = build_agent_cmd(
         issue,
         resume_session,
         config,
@@ -258,51 +391,44 @@ pub fn launch_session(issue: &Issue, config: &AppConfig) -> Result<LaunchOutcome
         prompt_path_str,
     );
 
-    // Multiline prompts can't be typed directly: tmux send-keys collapses
-    // embedded newlines. Instead we write the prompt to a file and the launch
-    // command reads it back via `"$(cat ...)"`, which preserves it verbatim.
+    // The agent command reads the prompt back via `"$(cat ...)"`, which keeps
+    // a multiline prompt intact as a single argument.
     if let Some(contents) = &prompt_contents {
         write_prompt_file(&prompt_path, contents)?;
     }
 
-    let setup = setup_prefix(issue, config)
-        .map(|prefix| setup::SetupRun::prepare(&status_dir, &prefix))
-        .transpose()?;
-    let agent_cmd = match &setup {
-        Some(run) => format!("{} && {}", run.command(), agent_cmd),
-        None => agent_cmd,
-    };
-
-    let before = if pre_assigned_session_id.is_none() {
-        provider.snapshot_session_ids(&config.project_root)
-    } else {
-        HashSet::new()
-    };
-
-    tmux::send_keys(&session_name, &agent_cmd)?;
-
-    // Second window: bare terminal for ad-hoc commands
-    tmux::create_window(&session_name, "terminal", cwd)?;
-
-    if let Some(run) = &setup {
-        run.wait(|| tmux::is_pane_alive(&session_name))?;
-    }
-
-    // For OpenCode/Codex/Pi, detect session IDs after launch.
-    let agent_session_id = match pre_assigned_session_id {
-        Some(id) => Some(id),
-        None => provider.detect_session_id(&DetectContext {
-            project_root: &config.project_root,
-            before: &before,
-        }),
-    };
-
-    Ok(LaunchOutcome {
-        session_name,
-        agent_session_id,
+    Ok(Prepared {
+        agent_cmd,
+        session_id,
         setup_ran: setup.is_some(),
         replaced_lost_session,
     })
+}
+
+/// Run the setup script in the user's shell with the pane's stdio, so its
+/// output shows above the agent. A non-zero exit blocks the launch.
+fn run_setup(prefix: &str, project_root: &Path) -> Result<(), AppError> {
+    let shell = std::env::var("SHELL")
+        .ok()
+        .filter(|shell| !shell.is_empty())
+        .unwrap_or_else(|| "sh".to_string());
+    let status = Command::new(shell)
+        .arg("-c")
+        .arg(prefix)
+        .current_dir(project_root)
+        .status()?;
+    setup_result(status)
+}
+
+fn setup_result(status: std::process::ExitStatus) -> Result<(), AppError> {
+    if status.success() {
+        return Ok(());
+    }
+    let reason = match status.code() {
+        Some(code) => format!("script exited with status {code}"),
+        None => "script was interrupted".to_string(),
+    };
+    Err(AppError::Setup(reason))
 }
 
 /// Kill an issue's tmux session and remove its transient hook/prompt files.
@@ -462,7 +588,7 @@ fn build_agent_cmd(
 
     // Shell snippet that expands to the prompt at runtime by reading the staged
     // file, plus a cleanup suffix that removes the file afterwards. Using a file
-    // sidesteps tmux send-keys mangling newlines in the typed command line.
+    // keeps the multiline prompt out of the command's shell quoting.
     let escaped_prompt_path = shell_escape_single_quotes(prompt_path_str);
     let prompt_subst = format!("\"$(cat '{}')\"", escaped_prompt_path);
     let prompt_cleanup = format!("; rm -f '{}'", escaped_prompt_path);
@@ -2071,5 +2197,94 @@ mod tests {
         let config = config_with_launch(AgentKind::Claude, &["it's a flag"], &[]);
         let (cmd, _, _) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
         assert!(cmd.contains("'it'\\''s a flag'"));
+    }
+
+    fn setup_config(root: &Path, script: &str) -> AppConfig {
+        AppConfig {
+            project_root: root.to_path_buf(),
+            setup_script: Some(script.to_string()),
+            ..test_config()
+        }
+    }
+
+    fn issue_in_worktree(root: &Path) -> Issue {
+        fs::create_dir(root.join("bork-1")).unwrap();
+        Issue {
+            worktree: Some("bork-1".to_string()),
+            ..test_issue(AgentKind::Claude, AgentMode::Build)
+        }
+    }
+
+    #[test]
+    fn launch_runs_setup_in_the_worktree_then_stages_the_prompt() {
+        let root = tempfile::TempDir::new().unwrap();
+        let status = root.path().join("status");
+        let config = setup_config(root.path(), "touch setup-done");
+        let issue = issue_in_worktree(root.path());
+
+        let prepared = prepare_launch(&issue, &config, &status).unwrap();
+        assert!(prepared.setup_ran);
+        assert!(root.path().join("bork-1/setup-done").exists());
+        assert!(prepared.agent_cmd.contains("claude --name"));
+        assert!(prompt_file_path(&status, "bork-bork-1").exists());
+    }
+
+    #[test]
+    fn failed_setup_blocks_the_launch() {
+        let root = tempfile::TempDir::new().unwrap();
+        let config = setup_config(root.path(), "exit 7");
+        let issue = issue_in_worktree(root.path());
+
+        let status = root.path().join("status");
+
+        let err = prepare_launch(&issue, &config, &status).unwrap_err();
+        assert!(err.to_string().contains("status 7"), "{err}");
+        assert!(!prompt_file_path(&status, "bork-bork-1").exists());
+    }
+
+    #[test]
+    fn setup_killed_by_a_signal_reports_an_interruption() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let status = std::process::ExitStatus::from_raw(libc::SIGINT);
+        let err = setup_result(status).unwrap_err();
+        assert!(err.to_string().contains("interrupted"), "{err}");
+    }
+
+    #[test]
+    fn setup_skipped_once_it_ran_for_the_worktree() {
+        let root = tempfile::TempDir::new().unwrap();
+        let config = setup_config(root.path(), "exit 7");
+        let issue = Issue {
+            setup_ran: true,
+            ..issue_in_worktree(root.path())
+        };
+
+        let prepared = prepare_launch(&issue, &config, &root.path().join("status")).unwrap();
+        assert!(!prepared.setup_ran);
+    }
+
+    #[test]
+    fn resume_reports_the_stored_session() {
+        let root = tempfile::TempDir::new().unwrap();
+        let config = AppConfig {
+            project_root: root.path().to_path_buf(),
+            ..test_config()
+        };
+        // OpenCode can't tell whether a session is gone, so the stored one is
+        // always resumed; other agents would check this machine's storage.
+        let issue = resumable_issue(AgentKind::OpenCode, AgentMode::Build, "ses_1");
+
+        let prepared = prepare_launch(&issue, &config, &root.path().join("status")).unwrap();
+        assert_eq!(prepared.session_id.as_deref(), Some("ses_1"));
+        assert!(prepared.agent_cmd.contains("opencode --session 'ses_1'"));
+        assert!(!prepared.replaced_lost_session);
+    }
+
+    #[test]
+    fn launch_command_is_short_and_quoted() {
+        let cmd = launch_command("bork-204").unwrap();
+        assert!(cmd.ends_with("' issue launch 'bork-204'"), "{cmd}");
+        assert!(!cmd.contains("export"));
     }
 }
