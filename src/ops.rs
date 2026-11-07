@@ -299,17 +299,26 @@ pub fn update_issue(
 }
 
 /// Store a launch's result for `bork issue launch` run by hand, when no TUI
-/// or `bork issue start` is waiting to do it.
+/// or `bork issue start` is waiting to do it. A lost session with no new id
+/// to replace it is dropped, so the next launch doesn't retry the dead one.
 pub fn record_launch(
     project_root: &Path,
     launched: &Issue,
     session_id: Option<String>,
     setup_ran: bool,
+    replaced_lost_session: bool,
 ) -> anyhow::Result<()> {
     let mut state = config::load_state(project_root);
     let idx = find_issue_index(&state.issues, &launched.id)
         .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", launched.id))?;
-    state.issues[idx].record_launch(launched.kind, launched.agent_kind, session_id, setup_ran);
+    let issue = &mut state.issues[idx];
+    let forget_lost = replaced_lost_session
+        && session_id.is_none()
+        && issue.accepts_launch_result(launched.kind, launched.agent_kind);
+    issue.record_launch(launched.kind, launched.agent_kind, session_id, setup_ran);
+    if forget_lost {
+        issue.sessions.remove(&launched.agent_kind);
+    }
     config::save_state(&state, project_root)
 }
 
@@ -1182,6 +1191,60 @@ mod tests {
         let issue = &config::load_state(root).issues[0];
         assert_eq!(issue.agent_kind, AgentKind::Claude);
         assert_eq!(issue.model.as_deref(), Some("sonnet"));
+    }
+
+    fn issue_with_session(root: &Path, agent: AgentKind, sid: &str) -> Issue {
+        create_issue(
+            root,
+            CreateOptions {
+                title: "Launch by hand".into(),
+                agent_kind: Some(agent),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut state = config::load_state(root);
+        state.issues[0].sessions.insert(agent, sid.into());
+        config::save_state(&state, root).unwrap();
+        state.issues.remove(0)
+    }
+
+    #[test]
+    fn record_launch_drops_a_lost_session_with_no_new_id() {
+        let dir = setup_project();
+        let root = dir.path();
+        let launched = issue_with_session(root, AgentKind::OpenCode, "ses_dead");
+
+        record_launch(root, &launched, None, false, true).unwrap();
+        assert_eq!(
+            config::load_state(root).issues[0].current_session_id(),
+            None
+        );
+    }
+
+    #[test]
+    fn record_launch_keeps_a_live_session_with_no_new_id() {
+        let dir = setup_project();
+        let root = dir.path();
+        let launched = issue_with_session(root, AgentKind::OpenCode, "ses_live");
+
+        record_launch(root, &launched, None, false, false).unwrap();
+        assert_eq!(
+            config::load_state(root).issues[0].current_session_id(),
+            Some("ses_live")
+        );
+    }
+
+    #[test]
+    fn record_launch_replaces_a_lost_session_with_the_new_id() {
+        let dir = setup_project();
+        let root = dir.path();
+        let launched = issue_with_session(root, AgentKind::Claude, "dead-uuid");
+
+        record_launch(root, &launched, Some("new-uuid".into()), true, true).unwrap();
+        let issue = &config::load_state(root).issues[0];
+        assert_eq!(issue.current_session_id(), Some("new-uuid"));
+        assert!(issue.setup_ran);
     }
 
     #[test]

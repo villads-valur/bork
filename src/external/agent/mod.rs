@@ -316,6 +316,7 @@ pub fn exec_launch(project_root: &Path, issue_id: &str) -> anyhow::Result<()> {
             &issue,
             prepared.session_id,
             prepared.setup_ran,
+            prepared.replaced_lost_session,
         )?,
     }
 
