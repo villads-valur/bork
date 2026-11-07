@@ -214,7 +214,11 @@ impl Staging {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("bork-backup-{}-{nanos}", std::process::id()));
+        // The counter keeps two dirs made in the same instant apart.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("bork-backup-{}-{nanos}-{n}", std::process::id()));
         fs::create_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
         Ok(Self(dir))

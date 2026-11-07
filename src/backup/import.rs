@@ -144,10 +144,13 @@ pub fn import(file: &Path, opts: &Options) -> anyhow::Result<Report> {
 
     let now = crate::app::unix_now();
     let mut projects = Vec::new();
+    let mut restored_dirs = HashMap::new();
     for (project, target) in selected.iter().zip(&targets) {
         let mut report = ProjectReport::new(project, target);
         // One broken project shouldn't hide what happened to the others.
-        if let Err(err) = restore_project(dir, project, target, opts, now, &mut report) {
+        let result = claim_target(target, opts.dry_run, &mut restored_dirs)
+            .and_then(|()| restore_project(dir, project, target, opts, now, &mut report));
+        if let Err(err) = result {
             report.error = Some(format!("{err:#}"));
         }
         projects.push(report);
@@ -336,6 +339,37 @@ fn check_names(projects: &[&ProjectManifest], targets: &[PathBuf]) -> anyhow::Re
     Ok(())
 }
 
+/// Create `target` and refuse it when an earlier project of this import
+/// already landed in the same directory. File systems can treat different
+/// spellings as one name (case, Unicode normalization on macOS), which the
+/// string checks up front can't fully see.
+fn claim_target(
+    target: &Path,
+    dry_run: bool,
+    restored_dirs: &mut HashMap<(u64, u64), PathBuf>,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if !dry_run {
+        fs::create_dir_all(target).with_context(|| {
+            format!(
+                "creating {} (pass --root to restore somewhere else)",
+                target.display()
+            )
+        })?;
+    }
+    let Ok(meta) = fs::metadata(target) else {
+        return Ok(());
+    };
+    if let Some(other) = restored_dirs.insert((meta.dev(), meta.ino()), target.to_path_buf()) {
+        bail!(
+            "{} is the same directory as {}, restored just before; use --project to pick one",
+            target.display(),
+            other.display()
+        );
+    }
+    Ok(())
+}
+
 fn restore_project(
     extracted: &Path,
     project: &ProjectManifest,
@@ -358,14 +392,6 @@ fn restore_project(
         );
     }
 
-    if !opts.dry_run {
-        fs::create_dir_all(target).with_context(|| {
-            format!(
-                "creating {} (pass --root to restore somewhere else)",
-                target.display()
-            )
-        })?;
-    }
     report.repo = restore_repo(project, target, opts.dry_run, &mut report.warnings);
     restore_files(&src, project, target, opts.dry_run, report)?;
     restore_board(&src, project, target, opts.dry_run, now, report)?;
@@ -564,14 +590,21 @@ fn restore_repo(
             .is_ok_and(|o| o.status.success())
     };
     // `git clone` names the remote `origin`; give it back its recorded name.
-    let cloned_from = project.repo.remotes.iter().find(|r| r.url == url);
+    // Same choice as `RepoFacts::repo_manifest`: origin, else the first remote.
+    let cloned_from = project
+        .repo
+        .remotes
+        .iter()
+        .find(|r| r.name == "origin" && r.url == url)
+        .or_else(|| project.repo.remotes.iter().find(|r| r.url == url));
     if let Some(remote) = cloned_from.filter(|r| r.name != "origin") {
         if !git_ok(&["remote", "rename", "origin", &remote.name]) {
             warnings.push(format!("could not rename remote origin to {}", remote.name));
         }
     }
+    let cloned_name = cloned_from.map_or("origin", |r| r.name.as_str());
     for remote in &project.repo.remotes {
-        if remote.url == url || remote.name == "origin" {
+        if remote.name == cloned_name {
             continue;
         }
         if !git_ok(&["remote", "add", &remote.name, &remote.url]) {
@@ -1458,6 +1491,46 @@ mod tests {
     }
 
     #[test]
+    fn names_one_file_system_treats_as_equal_never_share_a_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.md"), dir.path().join("b.md"));
+        write(&a, "first");
+        write(&b, "second");
+        let (composed, decomposed) = ("caf\u{e9}", "cafe\u{301}");
+        let file = crafted_archive(
+            dir.path(),
+            serde_json::json!([
+                project_json(composed, "cafe", &["AGENTS.md"]),
+                project_json(decomposed, "cafe-2", &["AGENTS.md"]),
+            ]),
+            &[
+                ("projects/cafe/AGENTS.md", &a),
+                ("projects/cafe-2/AGENTS.md", &b),
+            ],
+        );
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            let report = import(&file, &opts(dest.path())).unwrap();
+            // macOS sees one directory and refuses the second; elsewhere both
+            // restore side by side. Either way the first is never overwritten.
+            assert_eq!(read(&dest.path().join(composed).join("AGENTS.md")), "first");
+            if report.projects[1].error.is_none() {
+                assert_eq!(
+                    read(&dest.path().join(decomposed).join("AGENTS.md")),
+                    "second"
+                );
+            } else {
+                assert!(report.projects[1]
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("same directory"));
+            }
+        });
+    }
+
+    #[test]
     fn a_failed_global_config_still_returns_the_report() {
         let out = tempfile::tempdir().unwrap();
         let file = demo_archive(out.path());
@@ -1576,6 +1649,11 @@ mod tests {
             );
             // No `origin`: the clone has to give `fork` its name back.
             git(&main, &["remote", "rename", "origin", "fork"]);
+            // Same URL, different name: still a remote of its own.
+            git(
+                &main,
+                &["remote", "add", "mirror", origin.to_str().unwrap()],
+            );
             git(
                 &main,
                 &["remote", "add", "upstream", "https://example.com/up.git"],
@@ -1623,10 +1701,12 @@ mod tests {
                 git_out(&target.join("main"), &["remote", "get-url", "upstream"]),
                 "https://example.com/up.git"
             );
-            assert_eq!(
-                git_out(&target.join("main"), &["remote", "get-url", "fork"]),
-                origin.to_str().unwrap()
-            );
+            for name in ["fork", "mirror"] {
+                assert_eq!(
+                    git_out(&target.join("main"), &["remote", "get-url", name]),
+                    origin.to_str().unwrap()
+                );
+            }
             assert_eq!(
                 git_out(&target.join("main"), &["remote", "get-url", "origin"]),
                 ""
