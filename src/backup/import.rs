@@ -64,6 +64,20 @@ pub enum RepoOutcome {
         url: String,
         error: String,
     },
+    /// Cloned, but the recorded default branch couldn't be checked out, so
+    /// `main/` is on the remote's current default instead.
+    WrongBranch {
+        url: String,
+        branch: String,
+        error: String,
+    },
+}
+
+impl RepoOutcome {
+    /// Whether `main/` didn't end up as the backup describes it.
+    pub fn is_failure(&self) -> bool {
+        matches!(self, Self::Failed { .. } | Self::WrongBranch { .. })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -159,6 +173,21 @@ pub fn import(file: &Path, opts: &Options) -> anyhow::Result<Report> {
     let mut restored_dirs = HashMap::new();
     for (project, target) in selected.iter().zip(&targets) {
         let mut report = ProjectReport::new(project, target);
+        // Targets don't exist yet in a dry run, so `claim_target` can't
+        // compare them; flag the likely case-only collisions instead.
+        if opts.dry_run {
+            let folded = target.to_string_lossy().to_lowercase();
+            if let Some(other) = targets
+                .iter()
+                .take_while(|t| *t != target)
+                .find(|t| t.to_string_lossy().to_lowercase() == folded)
+            {
+                report.warnings.push(format!(
+                    "may be the same directory as {} on a case-insensitive disk; the real run would refuse it",
+                    other.display()
+                ));
+            }
+        }
         // One broken project shouldn't hide what happened to the others.
         // Archive-side checks first, so a bad entry leaves no empty target.
         let result = project_src(dir, project).and_then(|src| {
@@ -433,12 +462,38 @@ fn restore_project(
         opts.dry_run,
         &mut report.warnings,
     ));
-    restore_files(src, project, target, opts.dry_run, report)?;
-    restore_board(src, project, target, opts.dry_run, now, report)?;
+    // Read once: it decides checkouts, sessions and the pre-import copy.
+    let local = local_board(target);
+    if local.is_none() && fs::metadata(target.join(STATE_FILE)).is_ok_and(|m| m.is_file()) {
+        report.warnings.push(
+            "the board at the target is unreadable; if replaced it's kept as .bork/state.json.corrupt"
+                .to_string(),
+        );
+    }
+    restore_files(src, project, target, local.as_ref(), opts.dry_run, report)?;
+    restore_board(
+        src,
+        project,
+        target,
+        local.as_ref(),
+        opts.dry_run,
+        now,
+        report,
+    )?;
     restore_plans(src, project, target, opts.dry_run, report)?;
 
     if !opts.dry_run {
-        crate::config::ensure_agent_status_dir(target);
+        // Same guards as every other write under the target.
+        let status_rel = Path::new(".bork/agent-status/x");
+        if has_symlinked_parent(target, status_rel)
+            || checkout_ancestor(target, status_rel).is_some()
+        {
+            report.warnings.push(
+                "didn't create .bork/agent-status/: .bork/ is a symlink or checkout".to_string(),
+            );
+        } else {
+            crate::config::ensure_agent_status_dir(target);
+        }
         crate::global_config::register_project(&project.name, target)
             .context("registering the project in projects.json")?;
         if let Some(label) = &project.label {
@@ -457,14 +512,15 @@ fn restore_files(
     src: &Path,
     project: &ProjectManifest,
     target: &Path,
+    local: Option<&AppState>,
     dry_run: bool,
     report: &mut ProjectReport,
 ) -> anyhow::Result<()> {
     // Checkouts at the target (main/, worktrees, anything with a `.git`),
     // even ones that were plain container dirs at backup time: archived
     // files must never land on uncommitted work.
-    let local = local_board(target).unwrap_or_default();
-    let checkouts = super::select::worktree_dirs(target, &[], &local);
+    let empty = AppState::default();
+    let checkouts = super::select::worktree_dirs(target, &[], local.unwrap_or(&empty));
     for rel in &project.files {
         if rel == STATE_FILE || rel.starts_with(&format!("{ISSUES_DIR}/")) {
             continue;
@@ -513,6 +569,7 @@ fn restore_board(
     src: &Path,
     project: &ProjectManifest,
     target: &Path,
+    local: Option<&AppState>,
     dry_run: bool,
     now: u64,
     report: &mut ProjectReport,
@@ -555,13 +612,12 @@ fn restore_board(
         return Ok(());
     };
     // Only the board being replaced can vouch for a session still existing.
-    let local = local_board(target);
     let branches: HashMap<&str, &str> = project
         .issues
         .iter()
         .filter_map(|i| Some((i.id.as_str(), i.branch.as_deref()?)))
         .collect();
-    report.cleared_worktrees = rewrite_state(&mut state, target, local.as_ref(), now)
+    report.cleared_worktrees = rewrite_state(&mut state, target, local, now)
         .into_iter()
         .map(|id| {
             let branch = branches.get(id.as_str()).map(|b| b.to_string());
@@ -570,7 +626,7 @@ fn restore_board(
         .collect();
     report.issues = state.issues.len();
     report.board_restored = true;
-    if let Some(local) = &local {
+    if let Some(local) = local {
         report.dropped_issues = local
             .issues
             .iter()
@@ -772,7 +828,11 @@ fn restore_repo(
     }
     if let Some(branch) = &branch {
         if let Err(err) = checkout(&main, branch) {
-            warnings.push(format!("could not check out {branch}: {err:#}"));
+            return RepoOutcome::WrongBranch {
+                url,
+                branch: branch.clone(),
+                error: format!("{err:#}"),
+            };
         }
     }
     RepoOutcome::Cloned { url, branch }
@@ -991,7 +1051,7 @@ impl Report {
     pub fn failed(&self) -> bool {
         self.projects
             .iter()
-            .any(|p| p.error.is_some() || matches!(p.repo, Some(RepoOutcome::Failed { .. })))
+            .any(|p| p.error.is_some() || p.repo.as_ref().is_some_and(RepoOutcome::is_failure))
             || matches!(self.global_config, GlobalConfigOutcome::Failed(_))
     }
 
@@ -1031,6 +1091,9 @@ impl Report {
                 RepoOutcome::Failed { url, error } => {
                     format!("clone of {url} failed ({error}); clone it into main/ yourself")
                 }
+                RepoOutcome::WrongBranch { url, branch, error } => format!(
+                    "cloned {url}, but couldn't check out {branch} ({error}); main/ is on the remote's default branch"
+                ),
             });
             if let Some(repo) = repo {
                 let _ = writeln!(out, "  repo:     {repo}");
@@ -1463,6 +1526,63 @@ mod tests {
             import(&file, &force).unwrap();
             let state = crate::config::load_state(&dest.path().join("demo"));
             assert!(state.issues.iter().all(|i| i.sessions.is_empty()));
+        });
+    }
+
+    #[test]
+    fn warns_about_an_unreadable_local_board() {
+        let out = tempfile::tempdir().unwrap();
+        let file = demo_archive(out.path());
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        write(&dest.path().join("demo/.bork/state.json"), "{ truncated");
+        crate::global_config::with_test_config_home(home.path(), || {
+            let force = Options {
+                force: true,
+                dry_run: true,
+                ..opts(dest.path())
+            };
+            let report = import(&file, &force).unwrap();
+            let p = &report.projects[0];
+            assert!(
+                p.warnings.iter().any(|w| w.contains("state.json.corrupt")),
+                "{:?}",
+                p.warnings
+            );
+        });
+    }
+
+    #[test]
+    fn dry_run_flags_targets_that_differ_only_in_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = crafted_archive(
+            dir.path(),
+            serde_json::json!([
+                project_json("Demo", "a", &[]),
+                project_json("demo", "b", &[])
+            ]),
+            &[],
+        );
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            let dry = Options {
+                dry_run: true,
+                ..opts(dest.path())
+            };
+            let report = import(&file, &dry).unwrap();
+            assert!(report.projects[0]
+                .warnings
+                .iter()
+                .all(|w| !w.contains("case-insensitive")));
+            assert!(
+                report.projects[1]
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("case-insensitive")),
+                "{:?}",
+                report.projects[1].warnings
+            );
         });
     }
 
@@ -2231,6 +2351,71 @@ mod tests {
             assert_eq!(registry.len(), 1);
             assert_eq!(registry[0].path, target);
             assert_eq!(registry[0].label.as_deref(), Some("Demo"));
+        });
+    }
+
+    #[test]
+    fn a_missing_default_branch_is_reported_as_a_failure() {
+        let work = tempfile::tempdir().unwrap();
+        let seed = work.path().join("seed");
+        let origin = work.path().join("origin.git");
+        fs::create_dir_all(&seed).unwrap();
+        git(&seed, &["init", "-q", "-b", "trunk"]);
+        git(&seed, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(
+            work.path(),
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                seed.to_str().unwrap(),
+                origin.to_str().unwrap(),
+            ],
+        );
+        let mut project = project_json("demo", "demo", &[]);
+        project["repo"] = serde_json::json!({
+            "clone_url": origin.to_str().unwrap(),
+            "remotes": [{"name": "origin", "url": origin.to_str().unwrap()}],
+            "default_branch": "old-default",
+        });
+        let file = crafted_archive(work.path(), serde_json::json!([project]), &[]);
+        let home = work.path().join("home");
+        let dest = work.path().join("dest");
+        crate::global_config::with_test_config_home(&home, || {
+            let report = import(&file, &opts(&dest)).unwrap();
+            let p = &report.projects[0];
+            assert!(
+                matches!(&p.repo, Some(RepoOutcome::WrongBranch { branch, .. }) if branch == "old-default"),
+                "{:?}",
+                p.repo
+            );
+            assert!(report.failed());
+            assert!(report.render().contains("couldn't check out old-default"));
+            assert_eq!(
+                git_out(&dest.join("demo/main"), &["branch", "--show-current"]),
+                "trunk"
+            );
+        });
+    }
+
+    #[test]
+    fn nothing_is_created_through_a_symlinked_bork_dir() {
+        let out = tempfile::tempdir().unwrap();
+        let file = demo_archive(out.path());
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = dest.path().join("demo");
+        fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(outside.path(), target.join(".bork")).unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            let force = Options {
+                force: true,
+                ..opts(dest.path())
+            };
+            let report = import(&file, &force).unwrap();
+            assert!(!report.projects[0].board_restored);
+            assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
         });
     }
 
