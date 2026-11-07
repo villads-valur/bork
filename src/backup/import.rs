@@ -5,7 +5,8 @@
 //! yet), restore the board and container files, move each worktree plan to
 //! `plans/<issue-id>/planning.md` and register the project. Worktrees are not
 //! recreated; issues that had one lose the link and get reopened from their
-//! pushed branches later.
+//! pushed branches later. Agent sessions are dropped unless the board being
+//! replaced still has them, since transcripts aren't backed up.
 //!
 //! Nothing is overwritten without `force`, and even then `main/` and existing
 //! worktrees are never deleted, only the restored files are replaced, so
@@ -126,14 +127,6 @@ pub struct Report {
     pub dry_run: bool,
     pub projects: Vec<ProjectReport>,
     pub global_config: GlobalConfigOutcome,
-}
-
-impl Report {
-    /// Whether any project failed part-way.
-    pub fn failed(&self) -> bool {
-        self.projects.iter().any(|p| p.error.is_some())
-            || matches!(self.global_config, GlobalConfigOutcome::Failed(_))
-    }
 }
 
 /// Restore projects from the backup `file`.
@@ -364,10 +357,6 @@ fn restore_project(
             project.archive_dir
         );
     }
-    // Sessions only survive when restoring over the same live project.
-    let keep_sessions = fs::symlink_metadata(target).is_ok()
-        && crate::global_config::normalize_path(target)
-            == crate::global_config::normalize_path(&project.path);
 
     if !opts.dry_run {
         fs::create_dir_all(target).with_context(|| {
@@ -378,14 +367,35 @@ fn restore_project(
         })?;
     }
     report.repo = restore_repo(project, target, opts.dry_run, &mut report.warnings);
+    restore_files(&src, project, target, opts.dry_run, report)?;
+    restore_board(&src, project, target, opts.dry_run, now, report)?;
+    restore_plans(&src, project, target, opts.dry_run, report)?;
 
-    let mut plan_files = Vec::new();
-    for rel in &project.files {
-        if rel == STATE_FILE {
-            continue;
+    if !opts.dry_run {
+        crate::config::ensure_agent_status_dir(target);
+        crate::global_config::register_project(&project.name, target)
+            .context("registering the project in projects.json")?;
+        if let Some(label) = &project.label {
+            if let Err(err) = crate::global_config::set_project_label(target, Some(label)) {
+                report
+                    .warnings
+                    .push(format!("kept the name without label {label:?}: {err:#}"));
+            }
         }
-        if rel.starts_with(&format!("{ISSUES_DIR}/")) {
-            plan_files.push(rel);
+    }
+    Ok(())
+}
+
+/// Container files from the manifest, except the board and worktree plans.
+fn restore_files(
+    src: &Path,
+    project: &ProjectManifest,
+    target: &Path,
+    dry_run: bool,
+    report: &mut ProjectReport,
+) -> anyhow::Result<()> {
+    for rel in &project.files {
+        if rel == STATE_FILE || rel.starts_with(&format!("{ISSUES_DIR}/")) {
             continue;
         }
         let Some(rel_path) = plain_relative(rel) else {
@@ -393,7 +403,7 @@ fn restore_project(
             continue;
         };
         // A live worktree's plan is newer than the copy saved in `plans/`;
-        // it's placed below instead.
+        // `restore_plans` places it instead.
         let superseded = rel
             .strip_prefix("plans/")
             .and_then(|rest| rest.strip_suffix(&format!("/{PLAN_NAME}")))
@@ -409,61 +419,84 @@ fn restore_project(
             report.kept_files.push(rel.clone());
             continue;
         }
-        match copy_entry(&src, &rel_path, target, &rel_path, opts.dry_run)? {
-            Copied::Yes => report.files.push(rel.clone()),
-            Copied::Missing => report
-                .warnings
-                .push(format!("{rel} is missing from the backup")),
-            Copied::Unsafe => report.warnings.push(format!(
-                "skipped {rel}: a directory on its path is a symlink"
-            )),
+        if copy_reported(src, rel, target, &rel_path, dry_run, report)? {
+            report.files.push(rel.clone());
         }
     }
+    Ok(())
+}
 
+/// The board, rewritten for a machine without the worktrees (see
+/// [`rewrite_state`]). A missing or unreadable board is a warning.
+fn restore_board(
+    src: &Path,
+    project: &ProjectManifest,
+    target: &Path,
+    dry_run: bool,
+    now: u64,
+    report: &mut ProjectReport,
+) -> anyhow::Result<()> {
     let state_rel = Path::new(STATE_FILE);
-    let archived_board = fs::symlink_metadata(src.join(state_rel)).is_ok_and(|m| m.is_file())
-        && !has_symlinked_parent(&src, state_rel);
-    if !archived_board {
+    let archived = fs::symlink_metadata(src.join(state_rel)).is_ok_and(|m| m.is_file())
+        && !has_symlinked_parent(src, state_rel);
+    if !archived {
         report
             .warnings
             .push("the backup has no board for this project".to_string());
-    } else if has_symlinked_parent(target, state_rel) {
+        return Ok(());
+    }
+    if has_symlinked_parent(target, state_rel) {
         report
             .warnings
             .push("skipped the board: .bork/ at the target is a symlink".to_string());
-    } else {
-        match crate::config::try_load_state(&src) {
-            Some(mut state) => {
-                let branches: HashMap<&str, &str> = project
-                    .issues
-                    .iter()
-                    .filter_map(|i| Some((i.id.as_str(), i.branch.as_deref()?)))
-                    .collect();
-                report.cleared_worktrees = rewrite_state(&mut state, target, keep_sessions, now)
-                    .into_iter()
-                    .map(|id| {
-                        let branch = branches.get(id.as_str()).map(|b| b.to_string());
-                        (id, branch)
-                    })
-                    .collect();
-                report.issues = state.issues.len();
-                report.board_restored = true;
-                if !opts.dry_run {
-                    crate::config::save_state(&state, target)?;
-                }
-            }
-            None => report
-                .warnings
-                .push("the board in the backup is unreadable; skipped it".to_string()),
-        }
+        return Ok(());
     }
+    let Some(mut state) = crate::config::try_load_state(src) else {
+        report
+            .warnings
+            .push("the board in the backup is unreadable; skipped it".to_string());
+        return Ok(());
+    };
+    // Only the board being replaced can vouch for a session still existing.
+    let local = fs::symlink_metadata(target.join(state_rel))
+        .is_ok_and(|m| m.is_file())
+        .then(|| crate::config::try_load_state(target))
+        .flatten();
+    let branches: HashMap<&str, &str> = project
+        .issues
+        .iter()
+        .filter_map(|i| Some((i.id.as_str(), i.branch.as_deref()?)))
+        .collect();
+    report.cleared_worktrees = rewrite_state(&mut state, target, local.as_ref(), now)
+        .into_iter()
+        .map(|id| {
+            let branch = branches.get(id.as_str()).map(|b| b.to_string());
+            (id, branch)
+        })
+        .collect();
+    report.issues = state.issues.len();
+    report.board_restored = true;
+    if !dry_run {
+        crate::config::save_state(&state, target)?;
+    }
+    Ok(())
+}
 
-    for rel in plan_files {
+/// `_issues/<id>/planning.md` to `plans/<id>/planning.md`, keeping any plan
+/// already there.
+fn restore_plans(
+    src: &Path,
+    project: &ProjectManifest,
+    target: &Path,
+    dry_run: bool,
+    report: &mut ProjectReport,
+) -> anyhow::Result<()> {
+    for rel in &project.files {
         let parts: Vec<&str> = rel.split('/').collect();
-        let [_, id, file] = parts[..] else {
+        let [ISSUES_DIR, id, PLAN_NAME] = parts[..] else {
             continue;
         };
-        if !is_plain_component(id) || file != PLAN_NAME {
+        if !is_plain_component(id) {
             continue;
         }
         let dest_rel = Path::new("plans").join(id).join(PLAN_NAME);
@@ -471,30 +504,30 @@ fn restore_project(
             report.kept_plans.push(id.to_string());
             continue;
         }
-        match copy_entry(&src, Path::new(rel), target, &dest_rel, opts.dry_run)? {
-            Copied::Yes => report.plans.push(id.to_string()),
-            Copied::Missing => report
-                .warnings
-                .push(format!("{rel} is missing from the backup")),
-            Copied::Unsafe => report.warnings.push(format!(
-                "skipped {rel}: a directory on its path is a symlink"
-            )),
-        }
-    }
-
-    if !opts.dry_run {
-        crate::config::ensure_agent_status_dir(target);
-        crate::global_config::register_project(&project.name, target)
-            .context("registering the project in projects.json")?;
-        if let Some(label) = &project.label {
-            if let Err(err) = crate::global_config::set_project_label(target, Some(label)) {
-                report
-                    .warnings
-                    .push(format!("kept the name without label {label:?}: {err:#}"));
-            }
+        if copy_reported(src, rel, target, &dest_rel, dry_run, report)? {
+            report.plans.push(id.to_string());
         }
     }
     Ok(())
+}
+
+/// [`copy_entry`] with a skipped copy turned into a report warning. Returns
+/// whether the file was (or would be) copied.
+fn copy_reported(
+    src: &Path,
+    rel: &str,
+    target: &Path,
+    dest_rel: &Path,
+    dry_run: bool,
+    report: &mut ProjectReport,
+) -> anyhow::Result<bool> {
+    let warning = match copy_entry(src, Path::new(rel), target, dest_rel, dry_run)? {
+        Copied::Yes => return Ok(true),
+        Copied::Missing => format!("{rel} is missing from the backup"),
+        Copied::Unsafe => format!("skipped {rel}: a directory on its path is a symlink"),
+    };
+    report.warnings.push(warning);
+    Ok(false)
 }
 
 /// Clone the repo into `<target>/main` unless something is already there.
@@ -583,13 +616,14 @@ fn checkout(repo: &Path, branch: &str) -> anyhow::Result<()> {
 /// Prepare a backed-up board for a machine without its worktrees. An issue
 /// whose worktree isn't at `target` loses the link (like a prune: `pruned_at`
 /// set, setup to re-run) and its agent sessions. Other sessions are kept only
-/// with `keep_sessions` (restoring over the same live project): transcripts
-/// aren't backed up, and OpenCode can't tell a dead session from a live one.
-/// Everything else is kept. Returns the ids whose worktree was cleared.
+/// when `local` (the board being replaced at the target) holds the same id
+/// for that issue and agent: transcripts aren't backed up, and OpenCode can't
+/// tell a dead session from a live one. Everything else is kept. Returns the
+/// ids whose worktree was cleared.
 pub fn rewrite_state(
     state: &mut AppState,
     target: &Path,
-    keep_sessions: bool,
+    local: Option<&AppState>,
     now: u64,
 ) -> Vec<String> {
     let mut cleared = Vec::new();
@@ -604,9 +638,12 @@ pub fn rewrite_state(
             issue.setup_ran = false;
             issue.sessions.clear();
             cleared.push(issue.id.clone());
-        } else if !keep_sessions {
-            issue.sessions.clear();
+            continue;
         }
+        let local_issue = local.and_then(|board| board.issues.iter().find(|i| i.id == issue.id));
+        issue
+            .sessions
+            .retain(|agent, id| local_issue.is_some_and(|i| i.sessions.get(agent) == Some(&*id)));
     }
     cleared
 }
@@ -717,6 +754,12 @@ fn restore_global_config(
 }
 
 impl Report {
+    /// Whether any project failed part-way.
+    pub fn failed(&self) -> bool {
+        self.projects.iter().any(|p| p.error.is_some())
+            || matches!(self.global_config, GlobalConfigOutcome::Failed(_))
+    }
+
     /// Human-readable summary, one block per project.
     pub fn render(&self) -> String {
         let would = |done: &str, planned: &str| {
@@ -1056,7 +1099,13 @@ mod tests {
         ]);
         state.issues[0].pruned_at = None;
 
-        let cleared = rewrite_state(&mut state, &target, true, 42);
+        let mut local = state.clone();
+        // A session the local board doesn't know is dead.
+        local.issues[2].sessions.clear();
+        local.issues[2]
+            .sessions
+            .insert(AgentKind::Claude, "other".to_string());
+        let cleared = rewrite_state(&mut state, &target, Some(&local), 42);
 
         assert_eq!(cleared, vec!["demo-1".to_string()]);
         let gone = &state.issues[0];
@@ -1067,16 +1116,15 @@ mod tests {
         assert_eq!(gone.prompt.as_deref(), Some("prompt demo-1"));
         assert_eq!(gone.column, Column::InProgress);
         assert_eq!(gone.linked_issues, vec!["demo-9".to_string()]);
-        // Restoring over the live project: present worktrees and worktree-less
-        // issues keep their sessions.
+        // Sessions the local board still has survive.
         assert_eq!(state.issues[1].worktree.as_deref(), Some("demo-2-b"));
         assert!(state.issues[1].setup_ran);
         assert_eq!(state.issues[1].sessions.len(), 1);
-        assert_eq!(state.issues[2].sessions.len(), 1);
+        assert!(state.issues[2].sessions.is_empty());
 
         // A fresh restore: every session goes, transcripts aren't backed up.
         let mut fresh = board(&[("demo-2", Some("demo-2-b")), ("demo-3", None)]);
-        assert!(rewrite_state(&mut fresh, &target, false, 42).is_empty());
+        assert!(rewrite_state(&mut fresh, &target, None, 42).is_empty());
         assert!(fresh.issues.iter().all(|i| i.sessions.is_empty()));
         assert_eq!(fresh.issues[1].pruned_at, None);
     }
@@ -1132,6 +1180,24 @@ mod tests {
                 read(&crate::global_config::global_config_dir().join("config.toml"))
                     .contains("[backup]")
             );
+        });
+    }
+
+    #[test]
+    fn a_forced_rerun_does_not_bring_back_dead_sessions() {
+        let out = tempfile::tempdir().unwrap();
+        let file = demo_archive(out.path());
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            import(&file, &opts(dest.path())).unwrap();
+            let force = Options {
+                force: true,
+                ..opts(dest.path())
+            };
+            import(&file, &force).unwrap();
+            let state = crate::config::load_state(&dest.path().join("demo"));
+            assert!(state.issues.iter().all(|i| i.sessions.is_empty()));
         });
     }
 
