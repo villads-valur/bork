@@ -1309,8 +1309,9 @@ fn run_import_command(
     let report = backup::import::import(&cwd.join(file), &opts)?;
     println!("{}", report.render());
     if !dry_run && report.any_restored() {
-        // Same as `bork init`: a fresh machine needs the agent hooks too.
-        if let Err(err) = external::hooks::install() {
+        // Like `bork init`, a fresh machine needs the agent hooks. Project
+        // skills came back with the restored files, so they're left alone.
+        if let Err(err) = external::hooks::install_agent_hooks() {
             eprintln!("Warning: hook installation failed: {err}");
             eprintln!("You can run 'bork install' later to set up hooks.");
         }

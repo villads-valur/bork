@@ -410,6 +410,21 @@ fn claim_target(
             target.display()
         );
     }
+    // An existing target inside a repo's working tree could have uncommitted
+    // files the restore would overwrite. A new one has nothing to lose.
+    if fs::symlink_metadata(target).is_ok() {
+        if let Some(repo) = target
+            .ancestors()
+            .skip(1)
+            .find(|dir| fs::symlink_metadata(dir.join(".git")).is_ok())
+        {
+            bail!(
+                "{} is inside the git checkout at {}; restore somewhere else",
+                target.display(),
+                repo.display()
+            );
+        }
+    }
     if !dry_run {
         fs::create_dir_all(target).with_context(|| {
             format!(
@@ -624,10 +639,10 @@ fn restore_board(
             (id, branch)
         })
         .collect();
-    report.issues = state.issues.len();
-    report.board_restored = true;
+    let mut dropped = Vec::new();
+    let mut previous = None;
     if let Some(local) = local {
-        report.dropped_issues = local
+        dropped = local
             .issues
             .iter()
             .filter(|old| !state.issues.iter().any(|i| i.id == old.id))
@@ -638,17 +653,22 @@ fn restore_board(
         // saves nothing, so a retry can't bury the first copy.
         let unchanged = serde_json::to_value(local)? == serde_json::to_value(&state)?;
         if !unchanged {
-            let previous = unused_path(&target.join(format!(".bork/state.json.pre-import-{now}")));
+            let path = unused_path(&target.join(format!(".bork/state.json.pre-import-{now}")));
             if !dry_run {
-                fs::copy(target.join(state_rel), &previous)
-                    .with_context(|| format!("saving the old board to {}", previous.display()))?;
+                fs::copy(target.join(state_rel), &path)
+                    .with_context(|| format!("saving the old board to {}", path.display()))?;
             }
-            report.previous_board = Some(previous);
+            previous = Some(path);
         }
     }
+    report.previous_board = previous;
     if !dry_run {
         crate::config::save_state(&state, target)?;
     }
+    // Only now: a failed save must not read as a restored board.
+    report.issues = state.issues.len();
+    report.board_restored = true;
+    report.dropped_issues = dropped;
     Ok(())
 }
 
@@ -856,7 +876,8 @@ fn checkout(repo: &Path, branch: &str) -> anyhow::Result<()> {
         return Ok(());
     }
     let output = git()
-        .args(["checkout", "-q", branch])
+        // `--` keeps a file named like the branch from making it ambiguous.
+        .args(["checkout", "-q", branch, "--"])
         .output()
         .context("running git checkout")?;
     if !output.status.success() {
@@ -2074,6 +2095,33 @@ mod tests {
             let error = report.projects[0].error.clone().unwrap_or_default();
             assert!(error.contains("git checkout"), "{error}");
             assert!(!dest.path().join("demo/AGENTS.md").exists());
+        });
+    }
+
+    #[test]
+    fn refuses_an_existing_target_inside_a_checkout() {
+        let out = tempfile::tempdir().unwrap();
+        let file = demo_archive(out.path());
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        fs::create_dir_all(repo.path().join(".git")).unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            // A new directory inside a repo has nothing to overwrite.
+            let fresh = import(&file, &opts(repo.path())).unwrap();
+            assert!(fresh.projects[0].error.is_none());
+
+            write(&repo.path().join("demo/AGENTS.md"), "uncommitted work");
+            let force = Options {
+                force: true,
+                ..opts(repo.path())
+            };
+            let report = import(&file, &force).unwrap();
+            let error = report.projects[0].error.clone().unwrap_or_default();
+            assert!(error.contains("inside the git checkout"), "{error}");
+            assert_eq!(
+                read(&repo.path().join("demo/AGENTS.md")),
+                "uncommitted work"
+            );
         });
     }
 

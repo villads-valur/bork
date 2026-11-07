@@ -133,11 +133,18 @@ const CODEX_HOOKS: &str = r#"{
 /// Iterates `AgentKind::ALL` through the provider registry so a new harness
 /// with hooks is picked up without editing a hand-written call list here.
 pub fn install() -> anyhow::Result<()> {
+    install_agent_hooks()?;
+    install_skills();
+    println!("bork hooks installed successfully");
+    Ok(())
+}
+
+/// Only the global agent hooks, without touching any project's skills.
+/// For `bork import`, which restores each project's skills from the backup.
+pub fn install_agent_hooks() -> anyhow::Result<()> {
     for kind in crate::types::AgentKind::ALL {
         crate::external::agent::provider(kind).install_hooks()?;
     }
-    install_skills();
-    println!("bork hooks installed successfully");
     Ok(())
 }
 
