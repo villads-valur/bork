@@ -1260,6 +1260,7 @@ fn run_backup_command(project: Option<&str>, dry_run: bool) -> anyhow::Result<()
         for entry in &plan.entries {
             println!("  {}", entry.path);
         }
+        warn_local_only_repos(&plan.local_only_repos);
         return Ok(());
     }
 
@@ -1278,7 +1279,22 @@ fn run_backup_command(project: Option<&str>, dry_run: bool) -> anyhow::Result<()
         format_size(outcome.size),
         outcome.projects.join(", ")
     );
+    warn_local_only_repos(&outcome.local_only_repos);
     Ok(())
+}
+
+/// Skipped nested repos aren't backed up; flag the ones with no remote,
+/// since their content exists nowhere else.
+fn warn_local_only_repos(repos: &[PathBuf]) {
+    if repos.is_empty() {
+        return;
+    }
+    eprintln!(
+        "warning: these git repos are skipped and have no remote, so nothing else holds them:"
+    );
+    for repo in repos {
+        eprintln!("  {}", repo.display());
+    }
 }
 
 fn run_backup_status() -> anyhow::Result<()> {
@@ -1290,6 +1306,7 @@ fn run_backup_status() -> anyhow::Result<()> {
         ),
         None => println!("path: not set (set `path` under [backup] in ~/.config/bork/config.toml)"),
     }
+    println!("this machine: {}", backup::backup_file_name());
 
     println!("projects:");
     for entry in global_config::list_projects() {
@@ -1324,6 +1341,12 @@ fn run_backup_status() -> anyhow::Result<()> {
             String::new()
         };
         println!("  {}: {result}{size}", file.display());
+        if !s.local_only_repos.is_empty() {
+            println!("    skipped repos with no remote (not backed up anywhere):");
+            for repo in &s.local_only_repos {
+                println!("      {}", repo.display());
+            }
+        }
     }
     Ok(())
 }

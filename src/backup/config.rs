@@ -52,7 +52,7 @@ impl BackupLayer {
 /// Where the backup file is written (global config).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackupSettings {
-    /// Folder holding `bork-backup.tar.gz`, `~` expanded. `None` when unset.
+    /// Folder holding the `bork-backup-<host>*.tar.gz` files, `~` expanded. `None` when unset.
     pub path: Option<PathBuf>,
 }
 
