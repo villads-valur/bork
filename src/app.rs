@@ -3510,6 +3510,59 @@ mod tests {
         assert_eq!(app.project().attention_count(), 1);
     }
 
+    #[test]
+    fn hidden_project_counts_the_pr_of_an_unassigned_matching_worktree() {
+        let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
+        let pr = test_pr(7, "bork-1/task");
+        let live = &mut app.project_mut().live;
+        live.background_branches
+            .insert("bork-1-task".into(), "bork-1/task".into());
+        live.pr_statuses.insert("bork-1/task".into(), pr.clone());
+        live.user_prs = vec![pr];
+
+        let project = app.project();
+        assert_eq!(project.branch_for(&project.issues[0]), Some("bork-1/task"));
+        assert_eq!(
+            crate::github_poll::Targets::for_project(project).branches,
+            vec![("bork-1/task".to_string(), 1)]
+        );
+        assert_eq!(project.attention_count(), 1);
+        assert_eq!(project.issues[0].worktree, None);
+    }
+
+    #[test]
+    fn hidden_project_resolves_an_assigned_worktree_from_background_branches() {
+        let mut issue = test_issue("bork-1", Column::InProgress);
+        issue.worktree = Some("bork-1-clone".into());
+        let mut app = test_app(vec![issue]);
+        app.project_mut()
+            .live
+            .background_branches
+            .insert("bork-1-clone".into(), "bork-1/clone".into());
+
+        let project = app.project();
+        assert_eq!(project.branch_for(&project.issues[0]), Some("bork-1/clone"));
+    }
+
+    #[test]
+    fn background_branches_never_assign_or_clear_worktrees() {
+        let mut assigned = test_issue("bork-1", Column::InProgress);
+        assigned.worktree = Some("bork-1-clone".into());
+        let mut app = test_app(vec![assigned, test_issue("bork-2", Column::InProgress)]);
+        let live = &mut app.project_mut().live;
+        // Left over from the last full poll before the project was hidden.
+        live.worktree_branches
+            .insert("bork-1-clone".into(), "bork-1/clone".into());
+        live.background_branches
+            .insert("bork-2-task".into(), "bork-2/task".into());
+
+        assert!(!app.project_mut().auto_assign_worktrees());
+        assert!(!app.project_mut().clear_stale_worktrees());
+        let issues = &app.project().issues;
+        assert_eq!(issues[0].worktree.as_deref(), Some("bork-1-clone"));
+        assert_eq!(issues[1].worktree, None);
+    }
+
     fn comments_of(app: &App) -> u32 {
         app.project().unresolved_comments(&app.project().issues[0])
     }

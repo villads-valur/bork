@@ -3300,6 +3300,44 @@ mod tests {
     }
 
     #[test]
+    fn background_drain_keeps_branches_out_of_the_worktree_map() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = config::AppConfig {
+            project_name: "bork".to_string(),
+            project_root: dir.path().to_path_buf(),
+            ..config::AppConfig::default()
+        };
+        let mut project = Project::new(config, config::AppState::default());
+        project
+            .live
+            .worktree_branches
+            .insert("bork-1-clone".into(), "bork-1/clone".into());
+
+        let (pr_tx, pr_rx) = mpsc::channel();
+        let (pr_wake_tx, _pr_wake_rx) = mpsc::channel();
+        let (branch_tx, branch_rx) = mpsc::channel();
+        let (branch_stop_tx, _branch_stop_rx) = mpsc::channel();
+        let worker = BackgroundPrWorker {
+            pr_rx,
+            pr_wake_tx,
+            targets: Arc::new(Mutex::new(github_poll::Targets::for_project(&project))),
+            branch_rx,
+            _branch_stop_tx: branch_stop_tx,
+        };
+        let branches = HashMap::from([("bork-2-task".to_string(), "bork-2/task".to_string())]);
+        branch_tx.send(branches.clone()).unwrap();
+        pr_tx.send(PrPollResult::default()).unwrap();
+
+        assert!(drain_background_pr_worker(&mut project, &worker));
+        assert_eq!(project.live.background_branches, branches);
+        assert_eq!(
+            project.live.worktree_branches,
+            HashMap::from([("bork-1-clone".to_string(), "bork-1/clone".to_string())])
+        );
+        assert!(project.live.pr_poll_done);
+    }
+
+    #[test]
     fn flush_project_state_merges_external_issue_before_save() {
         let dir = tempfile::TempDir::new().unwrap();
         let config = config::AppConfig {

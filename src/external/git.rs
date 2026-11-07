@@ -520,6 +520,70 @@ detached
         assert_eq!(map["x"], "feature/foo");
     }
 
+    fn git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+
+    fn init_repo(dir: &Path, branch: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "-q", "-b", branch]);
+        git(
+            dir,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        );
+    }
+
+    #[test]
+    fn list_project_branches_covers_worktrees_and_independent_clones() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        init_repo(&root.join("main"), "main");
+        git(
+            &root.join("main"),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "bork-1/task",
+                "../bork-1-task",
+            ],
+        );
+        init_repo(&root.join("bork-2-clone"), "bork-2/clone");
+        std::fs::create_dir_all(root.join(".bork")).unwrap();
+        std::fs::create_dir_all(root.join("plans")).unwrap();
+
+        let branches = list_project_branches(root);
+
+        assert_eq!(branches.get("main").map(String::as_str), Some("main"));
+        assert_eq!(
+            branches.get("bork-1-task").map(String::as_str),
+            Some("bork-1/task")
+        );
+        assert_eq!(
+            branches.get("bork-2-clone").map(String::as_str),
+            Some("bork-2/clone")
+        );
+        assert_eq!(branches.len(), 3);
+    }
+
     #[test]
     fn test_poll_skips_classified_worktrees() {
         let pool = GitStatusPool::new(2);
