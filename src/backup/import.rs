@@ -86,6 +86,10 @@ pub struct ProjectReport {
     pub kept_plans: Vec<String>,
     /// Files under `plans/` that already existed at the target and were kept.
     pub kept_files: Vec<String>,
+    /// Issues on the replaced local board that the backup doesn't have.
+    pub dropped_issues: Vec<String>,
+    /// Where the replaced local board was saved, when there was one.
+    pub previous_board: Option<PathBuf>,
     pub warnings: Vec<String>,
     /// Set when restoring this project stopped part-way; the rest of the
     /// import still ran.
@@ -106,6 +110,8 @@ impl ProjectReport {
             plans: Vec::new(),
             kept_plans: Vec::new(),
             kept_files: Vec::new(),
+            dropped_issues: Vec::new(),
+            previous_board: None,
             warnings: Vec::new(),
             error: None,
         }
@@ -323,7 +329,9 @@ fn check_names(projects: &[&ProjectManifest], targets: &[PathBuf]) -> anyhow::Re
             );
         }
     }
-    let registry = crate::global_config::list_projects();
+    // An unreadable registry must stop the import: registering would
+    // otherwise replace it with just the restored projects.
+    let registry = crate::global_config::try_list_projects()?;
     for (project, target) in projects.iter().zip(targets) {
         let target = crate::global_config::normalize_path(target);
         let clash = registry.iter().find(|entry| {
@@ -432,6 +440,11 @@ fn restore_files(
     dry_run: bool,
     report: &mut ProjectReport,
 ) -> anyhow::Result<()> {
+    // Checkouts at the target (main/, worktrees, anything with a `.git`),
+    // even ones that were plain container dirs at backup time: archived
+    // files must never land on uncommitted work.
+    let local = local_board(target).unwrap_or_default();
+    let checkouts = super::select::worktree_dirs(target, &[], &local);
     for rel in &project.files {
         if rel == STATE_FILE || rel.starts_with(&format!("{ISSUES_DIR}/")) {
             continue;
@@ -440,19 +453,19 @@ fn restore_files(
             report.warnings.push(format!("skipped unsafe path {rel:?}"));
             continue;
         };
+        let top = rel.split('/').next().unwrap_or_default();
+        if checkouts.contains(top) {
+            report.warnings.push(format!(
+                "skipped {rel}: {top}/ is a git checkout at the target"
+            ));
+            continue;
+        }
         // A live worktree's plan is newer than the copy saved in `plans/`;
         // `restore_plans` places it instead.
         let superseded = rel
             .strip_prefix("plans/")
             .and_then(|rest| rest.strip_suffix(&format!("/{PLAN_NAME}")))
-            .is_some_and(|id| {
-                let worktree_plan = format!("{ISSUES_DIR}/{id}/{PLAN_NAME}");
-                // Only when that copy is really there; otherwise the saved
-                // plan is the one to restore.
-                project.files.contains(&worktree_plan)
-                    && fs::symlink_metadata(src.join(&worktree_plan)).is_ok_and(|m| m.is_file())
-                    && !has_symlinked_parent(src, Path::new(&worktree_plan))
-            });
+            .is_some_and(|id| worktree_plan_available(src, project, id));
         if superseded {
             continue;
         }
@@ -500,10 +513,7 @@ fn restore_board(
         return Ok(());
     };
     // Only the board being replaced can vouch for a session still existing.
-    let local = fs::symlink_metadata(target.join(state_rel))
-        .is_ok_and(|m| m.is_file())
-        .then(|| crate::config::try_load_state(target))
-        .flatten();
+    let local = local_board(target);
     let branches: HashMap<&str, &str> = project
         .issues
         .iter()
@@ -518,10 +528,42 @@ fn restore_board(
         .collect();
     report.issues = state.issues.len();
     report.board_restored = true;
+    if let Some(local) = &local {
+        report.dropped_issues = local
+            .issues
+            .iter()
+            .filter(|old| !state.issues.iter().any(|i| i.id == old.id))
+            .map(|old| old.id.clone())
+            .collect();
+        // A mistaken --force over a live project stays recoverable.
+        let previous = target.join(".bork/state.json.pre-import");
+        if !dry_run {
+            fs::copy(target.join(state_rel), &previous)
+                .with_context(|| format!("saving the old board to {}", previous.display()))?;
+        }
+        report.previous_board = Some(previous);
+    }
     if !dry_run {
         crate::config::save_state(&state, target)?;
     }
     Ok(())
+}
+
+/// The board at `target`, when it has a readable one.
+fn local_board(target: &Path) -> Option<AppState> {
+    fs::symlink_metadata(target.join(STATE_FILE))
+        .is_ok_and(|m| m.is_file())
+        .then(|| crate::config::try_load_state(target))
+        .flatten()
+}
+
+/// Whether the archive really holds the worktree plan for issue `id`. When it
+/// doesn't, the copy saved in `plans/<id>/` is the one to restore.
+fn worktree_plan_available(src: &Path, project: &ProjectManifest, id: &str) -> bool {
+    let rel = format!("{ISSUES_DIR}/{id}/{PLAN_NAME}");
+    project.files.contains(&rel)
+        && fs::symlink_metadata(src.join(&rel)).is_ok_and(|m| m.is_file())
+        && !has_symlinked_parent(src, Path::new(&rel))
 }
 
 /// `_issues/<id>/planning.md` to `plans/<id>/planning.md`, keeping any plan
@@ -539,6 +581,18 @@ fn restore_plans(
             continue;
         };
         if !is_plain_component(id) {
+            continue;
+        }
+        if !worktree_plan_available(src, project, id) {
+            let saved = format!("plans/{id}/{PLAN_NAME}");
+            let fallback = if project.files.contains(&saved) {
+                "; using the plan saved in plans/ instead"
+            } else {
+                ""
+            };
+            report
+                .warnings
+                .push(format!("{rel} is missing from the backup{fallback}"));
             continue;
         }
         let dest_rel = Path::new("plans").join(id).join(PLAN_NAME);
@@ -811,9 +865,11 @@ fn restore_global_config(
 }
 
 impl Report {
-    /// Whether any project failed part-way.
+    /// Whether any project failed part-way or couldn't be cloned.
     pub fn failed(&self) -> bool {
-        self.projects.iter().any(|p| p.error.is_some())
+        self.projects
+            .iter()
+            .any(|p| p.error.is_some() || matches!(p.repo, Some(RepoOutcome::Failed { .. })))
             || matches!(self.global_config, GlobalConfigOutcome::Failed(_))
     }
 
@@ -864,6 +920,22 @@ impl Report {
                     "  board:    {} {}",
                     would("restored", "would restore"),
                     count(p.issues, "issue")
+                );
+            }
+            if !p.dropped_issues.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "  board:    {} not in the backup: {}",
+                    would("dropped", "would drop"),
+                    p.dropped_issues.join(", ")
+                );
+            }
+            if let Some(previous) = &p.previous_board {
+                let _ = writeln!(
+                    out,
+                    "  board:    old board {} {}",
+                    would("saved to", "would be saved to"),
+                    previous.display()
                 );
             }
             if !p.cleared_worktrees.is_empty() {
@@ -1314,6 +1386,12 @@ mod tests {
         let outside = dest_root.join("outside");
         write(&outside.join("settings.json"), "outside settings");
         std::os::unix::fs::symlink(&outside, target.join(".claude")).unwrap();
+        // A local board with an issue created after the backup.
+        crate::config::save_state(
+            &board(&[("demo-1", Some("demo-1-a")), ("demo-7", None)]),
+            &target,
+        )
+        .unwrap();
         crate::global_config::with_test_config_home(home.path(), || {
             let global = crate::global_config::global_config_dir().join("config.toml");
             write(&global, "mine = true\n");
@@ -1326,9 +1404,17 @@ mod tests {
                 force: true,
                 ..opts(&dest_root)
             };
-            for _ in 0..2 {
+            for run in 0..2 {
                 let report = import(&file, &force).unwrap();
                 let p = &report.projects[0];
+                let previous = target.join(".bork/state.json.pre-import");
+                assert_eq!(p.previous_board.as_ref(), Some(&previous));
+                if run == 0 {
+                    assert_eq!(p.dropped_issues, vec!["demo-7".to_string()]);
+                    assert!(read(&previous).contains("demo-7"));
+                } else {
+                    assert!(p.dropped_issues.is_empty());
+                }
                 assert_eq!(p.repo, Some(RepoOutcome::KeptExisting));
                 assert!(p.cleared_worktrees.is_empty());
                 assert_eq!(p.kept_plans, vec!["demo-1".to_string()]);
@@ -1584,11 +1670,78 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let dest = tempfile::tempdir().unwrap();
         crate::global_config::with_test_config_home(home.path(), || {
-            import(&file, &opts(dest.path())).unwrap();
+            let dry = import(
+                &file,
+                &Options {
+                    dry_run: true,
+                    ..opts(dest.path())
+                },
+            )
+            .unwrap();
+            let report = import(&file, &opts(dest.path())).unwrap();
             assert_eq!(
                 read(&dest.path().join("demo/plans/demo-1/planning.md")),
                 "saved plan"
             );
+            // Dry run and real run tell the same story.
+            for p in [&dry.projects[0], &report.projects[0]] {
+                assert!(p.kept_plans.is_empty());
+                assert_eq!(p.files, vec!["plans/demo-1/planning.md".to_string()]);
+                assert!(
+                    p.warnings
+                        .iter()
+                        .any(|w| w.contains("using the plan saved")),
+                    "{:?}",
+                    p.warnings
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn never_writes_into_a_checkout_at_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("notes.md");
+        write(&notes, "old container notes");
+        let file = crafted_archive(
+            dir.path(),
+            serde_json::json!([project_json("demo", "demo", &["scratch/README.md"])]),
+            &[("projects/demo/scratch/README.md", &notes)],
+        );
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let scratch = dest.path().join("demo/scratch");
+        write(&scratch.join(".git"), "gitdir: elsewhere");
+        write(&scratch.join("README.md"), "uncommitted work");
+        crate::global_config::with_test_config_home(home.path(), || {
+            let force = Options {
+                force: true,
+                ..opts(dest.path())
+            };
+            let report = import(&file, &force).unwrap();
+            assert_eq!(read(&scratch.join("README.md")), "uncommitted work");
+            let p = &report.projects[0];
+            assert!(
+                p.warnings.iter().any(|w| w.contains("git checkout")),
+                "{:?}",
+                p.warnings
+            );
+        });
+    }
+
+    #[test]
+    fn an_unreadable_registry_stops_the_import() {
+        let out = tempfile::tempdir().unwrap();
+        let file = demo_archive(out.path());
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            let registry = crate::global_config::global_config_dir().join("projects.json");
+            write(&registry, "{ not json");
+            let err = import(&file, &opts(dest.path())).unwrap_err();
+            assert!(format!("{err:#}").contains("projects.json"), "{err:#}");
+            assert_eq!(read(&registry), "{ not json");
+            assert!(!dest.path().join("demo").exists());
         });
     }
 
@@ -1858,6 +2011,8 @@ mod tests {
                 p.repo
             );
             assert!(report.render().contains("clone it into main/ yourself"));
+            // A project without its code isn't usable: the CLI exits non-zero.
+            assert!(report.failed());
             assert_eq!(
                 crate::config::load_state(&dest.path().join("demo"))
                     .issues
