@@ -19,6 +19,7 @@ pub mod archive;
 pub mod config;
 pub mod import;
 pub mod manifest;
+pub mod schedule;
 pub mod select;
 pub mod status;
 
@@ -326,7 +327,6 @@ pub fn run(selection: &Selection) -> anyhow::Result<Option<Outcome>> {
 /// true when `~/.config/bork/backup.json` has no successful full backup
 /// ([`full_backup_file`]) or the last one is at least
 /// [`BACKUP_MAX_AGE_SECS`] old. Explicit `bork backup` calls run regardless.
-#[cfg_attr(not(test), allow(dead_code))] // Used by the TUI worker in a follow-up
 pub fn is_due(now: u64) -> bool {
     let file = full_backup_file();
     is_due_at(&status::read(&status::status_path()), file.as_deref(), now)

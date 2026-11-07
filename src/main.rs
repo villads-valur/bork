@@ -406,6 +406,92 @@ fn spawn_linear_worker(
     rx
 }
 
+/// Daily backup of every opted-in project. Sends the recorded status right
+/// away, checks `STARTUP_DELAY` after startup and then hourly whether a
+/// backup is due, and runs one when it is (or when woken by "back up now").
+/// `backup::run` holds the backup flock, so a concurrent `bork backup`
+/// serializes with it.
+fn spawn_backup_worker(
+    suspended: Arc<AtomicBool>,
+    wake_rx: mpsc::Receiver<()>,
+) -> mpsc::Receiver<backup::schedule::Report> {
+    use backup::schedule::{self, Report};
+
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        // Keyed by the resolved path, like `backup::run` records it.
+        let record_for = |file: &Path| {
+            backup::status::read(&backup::status::status_path())
+                .archives
+                .get(file)
+                .cloned()
+        };
+
+        // An unreadable registry or project config is an error, not "off".
+        let enabled = || {
+            global_config::try_list_projects()
+                .map_err(|err| format!("{err:#}"))
+                .and_then(|projects| {
+                    schedule::any_enabled(projects.iter().map(|entry| {
+                        backup::config::project_enabled(&global_config::normalize_path(&entry.path))
+                    }))
+                })
+        };
+
+        if let Some(file) = backup::full_backup_file() {
+            let record = record_for(&file);
+            let report =
+                schedule::startup_report(schedule::blocked(true, enabled()), record.as_ref());
+            if tx.send(report).is_err() {
+                return;
+            }
+        }
+
+        // A failed attempt `backup::run` couldn't record (e.g. an unusable
+        // backup.lock) still needs the hourly retry.
+        let mut last_attempt_failed = false;
+        let mut wait = schedule::STARTUP_DELAY;
+        loop {
+            let manual = match sleep_until_wake(&wake_rx, wait) {
+                WakeReason::Disconnected => break,
+                WakeReason::Woken => true,
+                WakeReason::Timeout => false,
+            };
+            wait = schedule::CHECK_INTERVAL;
+            wait_while_suspended(&suspended);
+
+            let file = backup::full_backup_file();
+            let check = schedule::decide(
+                schedule::blocked(file.is_some(), enabled()),
+                manual,
+                || {
+                    let last = file.as_deref().and_then(record_for);
+                    schedule::retry_or_due(
+                        last.as_ref(),
+                        backup::is_due(app::unix_now()),
+                        last_attempt_failed,
+                    )
+                },
+                || {
+                    backup::run(&backup::Selection::All)
+                        .map(|outcome| outcome.map(|o| o.written))
+                        .map_err(|err| format!("{err:#}"))
+                },
+            );
+            last_attempt_failed = matches!(check, schedule::Check::Ran(Err(_)));
+            let record = file.as_deref().and_then(record_for);
+            let indicator = schedule::indicator(&check, record.as_ref());
+            let report = Report::new(indicator, manual.then_some(check), false, record.as_ref());
+            if tx.send(report).is_err() {
+                break;
+            }
+        }
+    });
+
+    rx
+}
+
 fn spawn_pr_poll_worker(
     main_worktree: PathBuf,
     targets: Arc<Mutex<github_poll::Targets>>,
@@ -2072,6 +2158,8 @@ struct SharedWorkers {
     linear_wake_tx: mpsc::Sender<()>,
     linear_wake_rx: Option<mpsc::Receiver<()>>,
     tuicr_rx: Option<mpsc::Receiver<external::tuicr::DraftComments>>,
+    backup_rx: mpsc::Receiver<backup::schedule::Report>,
+    backup_wake_tx: mpsc::Sender<()>,
     shutdown: Arc<AtomicBool>,
     /// While set, all pollers idle instead of spawning subprocesses. Used when
     /// the terminal is handed over to a tmux popup or external editor.
@@ -2105,6 +2193,9 @@ fn spawn_shared_workers() -> SharedWorkers {
 
     let (linear_wake_tx, linear_wake_rx) = mpsc::channel::<()>();
 
+    let (backup_wake_tx, backup_wake_rx) = mpsc::channel::<()>();
+    let backup_rx = spawn_backup_worker(poll_suspended.clone(), backup_wake_rx);
+
     SharedWorkers {
         tmux_rx,
         tmux_wake_tx,
@@ -2114,6 +2205,8 @@ fn spawn_shared_workers() -> SharedWorkers {
         linear_wake_tx,
         linear_wake_rx: Some(linear_wake_rx),
         tuicr_rx: None,
+        backup_rx,
+        backup_wake_tx,
         shutdown,
         poll_suspended,
     }
@@ -2705,6 +2798,22 @@ fn run_tui() -> anyhow::Result<()> {
     // that stays wrong would otherwise re-raise the same warning forever.
     let mut last_linear_error: Option<String> = None;
     let mut state_poll_counter: usize = 0;
+    // Cleared if the backup worker thread dies (a panic), so a pending
+    // "back up now" doesn't spin forever.
+    let mut backup_worker_alive = true;
+    let mut last_backup_status_mtime = fs::metadata(backup::status::status_path())
+        .and_then(|meta| meta.modified())
+        .ok();
+    // The full backup's record as last seen by that poll, so writes for
+    // other archives (`bork backup --project`) are ignored.
+    let full_backup_record = || {
+        backup::full_backup_file().and_then(|file| {
+            backup::status::read(&backup::status::status_path())
+                .archives
+                .remove(&file)
+        })
+    };
+    let mut last_full_backup_record = full_backup_record();
 
     // --- Main event loop ---
     loop {
@@ -2751,6 +2860,7 @@ fn run_tui() -> anyhow::Result<()> {
                             action_tx: &action_tx,
                             pr_wake_tx: &active_workers.pr_wake_tx,
                             linear_wake_tx: &shared.linear_wake_tx,
+                            backup_wake_tx: &shared.backup_wake_tx,
                             git_wake_tx: &active_workers.git_wake_tx,
                             reload_tx: &reload_tx,
                         };
@@ -3105,6 +3215,22 @@ fn run_tui() -> anyhow::Result<()> {
             }
         }
 
+        // --- Backup worker ---
+        if backup_worker_alive {
+            loop {
+                match shared.backup_rx.try_recv() {
+                    Ok(report) => needs_redraw |= app.apply_backup_report(report),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        backup_worker_alive = false;
+                        app.backup_worker_stopped();
+                        needs_redraw = true;
+                        break;
+                    }
+                }
+            }
+        }
+
         // --- tuicr: check availability ---
         if let Ok(true) = tuicr_check_rx.try_recv() {
             for p in &mut app.projects {
@@ -3268,6 +3394,33 @@ fn run_tui() -> anyhow::Result<()> {
         state_poll_counter += 1;
         if state_poll_counter >= STATE_POLL_TICKS {
             state_poll_counter = 0;
+
+            // The 48h backup warning depends on the clock, not on a worker
+            // report (the worker may be blocked on the backup lock).
+            needs_redraw |= app.refresh_backup_warning(app::unix_now());
+
+            // Pick up `bork backup` runs from the CLI without waiting for
+            // the hourly check.
+            let status_mtime = fs::metadata(backup::status::status_path())
+                .and_then(|meta| meta.modified())
+                .ok();
+            if status_mtime != last_backup_status_mtime {
+                last_backup_status_mtime = status_mtime;
+                let record = full_backup_record();
+                if let Some(indicator) = backup::schedule::on_status_change(
+                    &app.backup,
+                    last_full_backup_record.as_ref(),
+                    record.as_ref(),
+                ) {
+                    needs_redraw |= app.apply_backup_report(backup::schedule::Report::new(
+                        indicator,
+                        None,
+                        false,
+                        record.as_ref(),
+                    ));
+                }
+                last_full_backup_record = record;
+            }
 
             // Pick up `bork update --check` runs from other terminals.
             let mtime = update::cache_mtime_secs();

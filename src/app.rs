@@ -2105,6 +2105,17 @@ pub struct App {
     pub debug_inspector_json: Option<String>,
     pub debug_inspector_scroll: usize,
     pub update_available: bool,
+    /// Latest backup worker status; only warnings render.
+    pub backup: crate::backup::schedule::BackupIndicator,
+    /// A "back up now" is in flight (owns one `busy_count`).
+    pub backup_manual_pending: bool,
+    /// Skipped no-remote repos from the last successful report, so the
+    /// warning about them shows once per change (and once per TUI session,
+    /// since this starts empty).
+    pub backup_local_only: Vec<std::path::PathBuf>,
+    /// Header warning derived from `backup` and the clock; refreshed by
+    /// `refresh_backup_warning` so rendering stays pure.
+    pub backup_warning: Option<String>,
 }
 
 impl App {
@@ -2143,6 +2154,10 @@ impl App {
             debug_inspector_json: None,
             debug_inspector_scroll: 0,
             update_available: false,
+            backup: Default::default(),
+            backup_manual_pending: false,
+            backup_warning: None,
+            backup_local_only: Vec::new(),
         }
     }
 
@@ -2388,6 +2403,94 @@ impl App {
         self.message = Some((msg.into(), kind));
         self.message_set_at = Some(Instant::now());
         self.message_ttl = ttl;
+    }
+
+    /// Fold a backup worker report in. A new failure from a real check goes
+    /// to the status bar (unless the manual result already says so) and to
+    /// `.bork/errors.log` of every loaded project not opted out; the
+    /// startup baseline and routine successes stay silent. A changed list of
+    /// skipped no-remote repos is warned about once (and always in a manual
+    /// result). Returns whether to redraw.
+    pub fn apply_backup_report(&mut self, report: crate::backup::schedule::Report) -> bool {
+        use crate::backup::schedule;
+
+        let mut redraw = false;
+        // Only a working backup says what it skipped; a failure or Off
+        // period keeps the last list, so the next success doesn't re-warn.
+        let mut skipped_warning = None;
+        if matches!(report.indicator, schedule::BackupIndicator::Ok { .. }) {
+            skipped_warning =
+                schedule::local_only_warning(&self.backup_local_only, &report.local_only_repos);
+            self.backup_local_only = report.local_only_repos.clone();
+        }
+        if let Some(check) = &report.manual {
+            self.finish_manual_backup();
+            let (message, is_error) = schedule::manual_message(check);
+            if is_error {
+                self.set_error(message);
+            } else if report.local_only_repos.is_empty() {
+                self.set_message(message);
+            } else {
+                let skipped = schedule::local_only_summary(&report.local_only_repos);
+                self.set_warning(format!("{message}. {skipped}"));
+            }
+            redraw = true;
+        } else if let Some(warning) = skipped_warning {
+            self.set_warning(warning);
+            redraw = true;
+        }
+        let failure = if report.baseline {
+            None
+        } else {
+            schedule::failure_to_report(&self.backup, &report.indicator)
+        };
+        if let Some(error) = failure {
+            let line = format!("backup failed: {error}");
+            for project in &self.projects {
+                let root = &project.config.project_root;
+                // An unreadable config may be the failure itself, so only
+                // projects that are definitely off are skipped.
+                if !matches!(crate::backup::config::project_enabled(root), Ok(false)) {
+                    crate::config::append_error_log(root, std::slice::from_ref(&line));
+                }
+            }
+            if report.manual.is_none() {
+                self.set_error(format!("Backup failed: {error}"));
+            }
+            redraw = true;
+        }
+        if self.backup != report.indicator {
+            self.backup = report.indicator;
+            redraw = true;
+        }
+        redraw |= self.refresh_backup_warning(unix_now());
+        redraw
+    }
+
+    /// Recompute the header's backup warning for `now` (the 48h warning
+    /// depends on the clock). Returns whether it changed.
+    pub fn refresh_backup_warning(&mut self, now: u64) -> bool {
+        let warning = crate::backup::schedule::warning_text(&self.backup, now);
+        if warning == self.backup_warning {
+            return false;
+        }
+        self.backup_warning = warning;
+        true
+    }
+
+    /// Release a pending "back up now" and its spinner, if any.
+    fn finish_manual_backup(&mut self) {
+        if self.backup_manual_pending {
+            self.backup_manual_pending = false;
+            self.busy_count = self.busy_count.saturating_sub(1);
+        }
+    }
+
+    /// The backup worker thread is gone (it panicked): release a pending
+    /// "back up now" and say so, since no more reports will come.
+    pub fn backup_worker_stopped(&mut self) {
+        self.finish_manual_backup();
+        self.set_error(crate::backup::schedule::WORKER_STOPPED);
     }
 
     pub fn set_message(&mut self, msg: impl Into<String>) {
@@ -3454,6 +3557,289 @@ mod tests {
 
         assert!(!app.attention_filter_active());
         assert!(!app.find_project(&ids[1]).unwrap().attention_filter);
+    }
+
+    fn header_text(app: &App) -> String {
+        header_text_at(app, 100)
+    }
+
+    fn header_text_at(app: &App, width: u16) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 1)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::status_bar::render_header(frame, app, frame.area()))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn header_shows_backup_warnings_only() {
+        use crate::backup::schedule::{BackupIndicator, OffReason};
+
+        let mut app = test_app(Vec::new());
+        for quiet in [
+            BackupIndicator::Unknown,
+            BackupIndicator::Off(OffReason::NoPath),
+            BackupIndicator::Ok {
+                last_success_at: Some(unix_now()),
+            },
+            BackupIndicator::Ok {
+                last_success_at: None,
+            },
+        ] {
+            app.backup = quiet;
+            app.refresh_backup_warning(unix_now());
+            assert!(!header_text(&app).contains("backup"));
+        }
+
+        app.backup = BackupIndicator::Ok {
+            last_success_at: Some(unix_now() - 3 * 24 * 60 * 60),
+        };
+        app.refresh_backup_warning(unix_now());
+        assert!(header_text(&app).contains("no backup in 3d (B to back up)"));
+
+        app.backup = BackupIndicator::Failed {
+            error: "tar failed".into(),
+            last_success_at: Some(unix_now()),
+        };
+        app.refresh_backup_warning(unix_now());
+        assert!(header_text(&app).contains("backup failed (B to retry)"));
+
+        app.backup = BackupIndicator::Failed {
+            error: "tar failed".into(),
+            last_success_at: Some(unix_now() - 3 * 24 * 60 * 60),
+        };
+        app.refresh_backup_warning(unix_now());
+        assert!(header_text(&app).contains("backup failed, none in 3d (B to retry)"));
+    }
+
+    fn backup_report(
+        indicator: crate::backup::schedule::BackupIndicator,
+        manual: Option<crate::backup::schedule::Check>,
+        baseline: bool,
+    ) -> crate::backup::schedule::Report {
+        crate::backup::schedule::Report {
+            indicator,
+            manual,
+            baseline,
+            ..Default::default()
+        }
+    }
+
+    fn backup_failure(error: &str) -> crate::backup::schedule::BackupIndicator {
+        crate::backup::schedule::BackupIndicator::Failed {
+            error: error.into(),
+            last_success_at: Some(1),
+        }
+    }
+
+    /// An app whose only project lives in a temp dir with backups enabled,
+    /// so failures land in its errors.log.
+    fn backup_app(dir: &std::path::Path) -> App {
+        std::fs::create_dir_all(dir.join(".bork")).unwrap();
+        std::fs::write(dir.join(".bork/config.toml"), "[backup]\nenabled = true\n").unwrap();
+        let mut config = test_config();
+        config.project_root = dir.to_path_buf();
+        App::new(config, AppState::default())
+    }
+
+    fn error_log(dir: &std::path::Path) -> String {
+        std::fs::read_to_string(crate::config::error_log_path(dir)).unwrap_or_default()
+    }
+
+    #[test]
+    fn backup_failure_reports_once_until_it_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = backup_app(dir.path());
+
+        assert!(app.apply_backup_report(backup_report(backup_failure("a"), None, false)));
+        assert_eq!(
+            app.message,
+            Some(("Backup failed: a".into(), MessageKind::Error))
+        );
+        app.message = None;
+
+        // The hourly check failing the same way stays quiet.
+        assert!(!app.apply_backup_report(backup_report(backup_failure("a"), None, false)));
+        assert_eq!(app.message, None);
+        assert_eq!(error_log(dir.path()).matches("backup failed: a").count(), 1);
+
+        app.apply_backup_report(backup_report(backup_failure("b"), None, false));
+        assert_eq!(error_log(dir.path()).matches("backup failed: b").count(), 1);
+    }
+
+    #[test]
+    fn an_unreadable_project_config_still_gets_the_log_line() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".bork/config.toml")).unwrap();
+        let mut config = test_config();
+        config.project_root = dir.path().to_path_buf();
+        let mut app = App::new(config, AppState::default());
+
+        app.apply_backup_report(backup_report(backup_failure("reading config"), None, false));
+
+        assert_eq!(
+            error_log(dir.path())
+                .matches("backup failed: reading config")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn startup_baseline_does_not_re_report_an_old_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = backup_app(dir.path());
+
+        assert!(app.apply_backup_report(backup_report(backup_failure("old"), None, true)));
+        assert_eq!(app.backup, backup_failure("old"));
+        assert_eq!(app.message, None);
+        assert_eq!(error_log(dir.path()), "");
+
+        // The first real check failing the same way is not new either.
+        app.apply_backup_report(backup_report(backup_failure("old"), None, false));
+        assert_eq!(app.message, None);
+        assert_eq!(error_log(dir.path()), "");
+    }
+
+    #[test]
+    fn skipped_repos_warn_once_per_change_and_in_manual_results() {
+        use crate::backup::schedule::{BackupIndicator, Check, Report};
+
+        let ok = BackupIndicator::Ok {
+            last_success_at: Some(1),
+        };
+        let skipped = vec![std::path::PathBuf::from("/p/plans/scratch")];
+        let mut app = test_app(Vec::new());
+
+        app.apply_backup_report(Report {
+            indicator: ok.clone(),
+            local_only_repos: skipped.clone(),
+            ..Default::default()
+        });
+        assert_eq!(
+            app.message,
+            Some((
+                "Backup skips 1 git repo with no remote: /p/plans/scratch".into(),
+                MessageKind::Warning
+            ))
+        );
+
+        // The hourly check with the same list stays quiet.
+        app.message = None;
+        app.apply_backup_report(Report {
+            indicator: ok.clone(),
+            local_only_repos: skipped.clone(),
+            ..Default::default()
+        });
+        assert_eq!(app.message, None);
+
+        // A failure in between doesn't make the next success warn again.
+        app.apply_backup_report(Report {
+            indicator: BackupIndicator::Failed {
+                error: "tar failed".into(),
+                last_success_at: Some(1),
+            },
+            ..Default::default()
+        });
+        app.message = None;
+        app.apply_backup_report(Report {
+            indicator: ok.clone(),
+            local_only_repos: skipped.clone(),
+            ..Default::default()
+        });
+        assert_eq!(app.message, None);
+
+        // `B` always says it.
+        app.apply_backup_report(Report {
+            indicator: ok,
+            manual: Some(Check::Ran(Ok(Some(true)))),
+            local_only_repos: skipped,
+            ..Default::default()
+        });
+        assert_eq!(
+            app.message,
+            Some((
+                "Backup written. Backup skips 1 git repo with no remote: /p/plans/scratch".into(),
+                MessageKind::Warning
+            ))
+        );
+    }
+
+    #[test]
+    fn a_stopped_backup_worker_releases_the_spinner() {
+        let mut app = test_app(Vec::new());
+        app.backup_manual_pending = true;
+        app.begin_busy();
+
+        app.backup_worker_stopped();
+
+        assert!(!app.backup_manual_pending);
+        assert_eq!(app.busy_count, 0);
+        assert!(matches!(app.message, Some((_, MessageKind::Error))));
+    }
+
+    #[test]
+    fn manual_backup_releases_the_spinner_and_shows_the_result() {
+        use crate::backup::schedule::{BackupIndicator, Check};
+
+        let mut app = test_app(Vec::new());
+        app.backup_manual_pending = true;
+        app.begin_busy();
+
+        app.apply_backup_report(backup_report(
+            BackupIndicator::Ok {
+                last_success_at: Some(1),
+            },
+            Some(Check::Ran(Ok(Some(true)))),
+            false,
+        ));
+        assert!(!app.backup_manual_pending);
+        assert_eq!(app.busy_count, 0);
+        assert_eq!(
+            app.message,
+            Some(("Backup written".into(), MessageKind::Info))
+        );
+
+        // A manual failure shows the manual message, not a second flash.
+        app.apply_backup_report(backup_report(
+            backup_failure("tar failed"),
+            Some(Check::Ran(Err("tar failed".into()))),
+            false,
+        ));
+        assert_eq!(app.busy_count, 0);
+        assert_eq!(
+            app.message,
+            Some(("Backup failed: tar failed".into(), MessageKind::Error))
+        );
+    }
+
+    #[test]
+    fn narrow_header_drops_the_backup_hint_before_the_title() {
+        let mut app = test_app(Vec::new());
+        app.backup = crate::backup::schedule::BackupIndicator::Failed {
+            error: "x".into(),
+            last_success_at: Some(unix_now()),
+        };
+        app.refresh_backup_warning(unix_now());
+        let title = format!(" BORK - {} ", app.active_project().display_name());
+        let full = " \u{26a0} backup failed (B to retry) ";
+        let compact = " \u{26a0} backup failed ";
+
+        let width = (title.chars().count() + compact.chars().count()) as u16;
+        let text = header_text_at(&app, width);
+        assert!(text.starts_with(&title), "{text:?}");
+        assert!(text.ends_with(compact), "{text:?}");
+        assert!(!text.contains("B to retry"));
+
+        let wide = header_text_at(&app, (title.chars().count() + full.chars().count()) as u16);
+        assert!(wide.starts_with(&title) && wide.ends_with(full), "{wide:?}");
     }
 
     fn footer_text(app: &App) -> String {

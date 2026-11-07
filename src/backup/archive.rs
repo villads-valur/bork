@@ -91,7 +91,7 @@ pub fn write(dest: &Path, manifest: &[u8], contents: &Contents) -> anyhow::Resul
         .file_name()
         .and_then(|n| n.to_str())
         .context("invalid backup file name")?;
-    let tmp = dir.join(format!(".{name}.tmp.{}", std::process::id()));
+    let tmp = dir.join(format!(".{name}{TMP_INFIX}{}", std::process::id()));
 
     let result = (|| {
         let mut top: Vec<String> = fs::read_dir(&staging.0)?
@@ -230,17 +230,26 @@ fn stage_file(staging: &Path, path: &str, bytes: &[u8], mode: u32) -> anyhow::Re
 /// during `bork import`.
 pub(super) struct Staging(pub(super) PathBuf);
 
+/// The in-progress backup file is `.<file name>{TMP_INFIX}<pid>`.
+pub const TMP_INFIX: &str = ".tmp.";
+/// The staging dir is `{STAGING_PREFIX}<pid>-<nanos><n>` under the temp dir
+/// (nanos zero-padded, `n` a per-process counter).
+pub const STAGING_PREFIX: &str = "bork-backup-";
+
 impl Staging {
     pub(super) fn new() -> anyhow::Result<Self> {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
-        // The counter keeps two dirs made in the same instant apart.
+        // The counter keeps two dirs made in the same instant apart. It joins
+        // the nanos digit run, which `schedule::same_error` masks.
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("bork-backup-{}-{nanos}-{n}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "{STAGING_PREFIX}{}-{nanos:09}{n}",
+            std::process::id()
+        ));
         fs::create_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
         Ok(Self(dir))
