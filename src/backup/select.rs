@@ -4,6 +4,9 @@
 //! worktrees and ephemeral files. From `.bork/` only the board state and the
 //! project config are kept. Each issue worktree contributes only its
 //! gitignored `.claude/planning.md`, stored per issue id.
+//!
+//! Read errors other than "not found" fail the selection: a backup that
+//! silently misses files is worse than one that reports it couldn't run.
 
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
@@ -20,36 +23,13 @@ use crate::config::AppState;
 /// these are what bork itself reads.
 pub const BORK_FILES: &[&str] = &[".bork/state.json", ".bork/config.toml"];
 
-/// Destination subdirectory holding issue plans (`_issues/<issue-id>/planning.md`).
-/// The underscore keeps it clear of container entries.
+/// Archive subdirectory (per project) holding issue plans
+/// (`_issues/<issue-id>/planning.md`). The underscore keeps it clear of
+/// container entries.
 pub const ISSUES_DIR: &str = "_issues";
 
 /// Plan file inside a worktree, relative to the worktree root.
 pub const PLAN_FILE: &str = ".claude/planning.md";
-
-/// Absolute paths of all worktrees of `<project_root>/main`, from
-/// `git worktree list --porcelain`. Empty when git fails.
-pub fn git_worktree_paths(project_root: &Path) -> Vec<PathBuf> {
-    let output = crate::external::git_command()
-        .arg("-C")
-        .arg(project_root.join("main"))
-        .args(["worktree", "list", "--porcelain"])
-        .output();
-    match output {
-        Ok(out) if out.status.success() => {
-            parse_worktree_paths(&String::from_utf8_lossy(&out.stdout))
-        }
-        _ => Vec::new(),
-    }
-}
-
-fn parse_worktree_paths(porcelain: &str) -> Vec<PathBuf> {
-    porcelain
-        .lines()
-        .filter_map(|line| line.strip_prefix("worktree "))
-        .map(PathBuf::from)
-        .collect()
-}
 
 /// An issue id usable as one plain directory name.
 pub fn is_plain_component(name: &str) -> bool {
@@ -290,16 +270,6 @@ mod tests {
             ])
         );
         assert!(!worktrees.contains("x"));
-    }
-
-    #[test]
-    fn parses_worktree_paths() {
-        let out =
-            "worktree /p/main\nHEAD a\nbranch refs/heads/main\n\nworktree /p/x\nHEAD b\ndetached\n";
-        assert_eq!(
-            parse_worktree_paths(out),
-            vec![PathBuf::from("/p/main"), PathBuf::from("/p/x")]
-        );
     }
 
     #[test]

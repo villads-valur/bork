@@ -478,56 +478,39 @@ Both keys accept a single shell command line and can live in either config layer
 
 ### Backups
 
-`bork backup` copies what git doesn't cover to a folder, ideally a synced one such as iCloud Drive, so a fresh agent can pick up the work after a wipe. That covers the board, container docs (`AGENTS.md`, `plans/`, `.claude/`, `.agents/`, `opencode.jsonc`) and each issue's gitignored `.claude/planning.md`. Code in worktrees and agent transcripts are not backed up. Nothing is backed up until a project opts in:
+`bork backup` writes one file, `<path>/bork-backup.tar.gz`, holding what git doesn't cover: each opted-in project's board, container docs (`AGENTS.md`, `plans/`, `.claude/`, `.agents/`, `opencode.jsonc`) and the `.claude/planning.md` of every live issue worktree, plus your global `projects.json` and `config.toml`. Point `path` at a synced folder such as iCloud Drive and a wiped machine can get its boards and plans back. Code in worktrees and agent transcripts are not backed up.
 
 ```toml
-# <project>/.bork/config.toml
+# ~/.config/bork/config.toml
 [backup]
-enabled = true                                                       # per-project opt-in (only read from the project file)
-path = "~/Library/Mobile Documents/com~apple~CloudDocs/bork-backups" # absolute or ~/; each project lands in <path>/<project_name>/
-interval_minutes = 15                                                # reserved for the upcoming automatic backups in the TUI
+path = "~/Library/Mobile Documents/com~apple~CloudDocs/bork"  # absolute or ~/
+interval_minutes = 2                                           # for automatic backups in the TUI (coming)
+
+# <project>/.bork/config.toml: nothing is backed up until a project opts in
+[backup]
+enabled = true
 ```
-
-`path` and `interval_minutes` can be set in `~/.config/bork/config.toml` as defaults; a project's own values win. When the global `[backup]` has a `path`, `projects.json` and the global `config.toml` are backed up to `<path>/_global/`. Only opt in projects whose files are allowed in that folder.
-
-What lands in `<path>/<project_name>/`:
-
-- `.bork/state.json` and `.bork/config.toml` (latest only, no history)
-- every container entry that isn't `main/` or a worktree; ephemeral files (`.DS_Store`, `*.lock`, temp files) are skipped
-- `_issues/<issue-id>/planning.md`, copied from each issue worktree's `.claude/planning.md`
-
-The folder mirrors the project: files removed from the project are removed from the backup. Issue plans are the exception. An archived or pruned issue keeps its plan in the backup, which is only dropped once the issue is deleted from the board.
-
-For now backups only run when you call `bork backup`; a later version runs them automatically in the TUI every `interval_minutes`.
-
-Each backup folder holds a `.bork-backup-source` file naming the project it belongs to. Bork only writes into an empty folder or one that names the same project, so a backup can never overwrite another project's backup or an unrelated folder. It also refuses a `path` that overlaps the project or any registered project. If you move a project, delete the old backup folder's `.bork-backup-source` (or the folder) so the next backup can claim it. A file bork can't read fails the run instead of being dropped from the backup, and a missing `.bork/state.json` never removes the backed-up board or saved issue plans.
 
 ```bash
-bork backup                     # all opted-in projects + global files
-bork backup --project bork      # one project
-bork backup --dry-run           # print destinations and file lists, write nothing
-bork backup status              # settings and last result per project
+bork backup                     # all opted-in projects -> <path>/bork-backup.tar.gz
+bork backup --project bork      # just one project -> <path>/bork-backup-bork.tar.gz
+bork backup --dry-run           # print the file path and its contents, write nothing
+bork backup status              # opted-in projects, last run, result and size per file
 ```
 
-The last result is stored in `<project>/.bork/backup.json` (`~/.config/bork/backup.json` for the global files).
+The file is replaced atomically and left untouched when nothing changed since the last backup. A file bork can't read fails the run and keeps the previous backup. The last result per file is stored in `~/.config/bork/backup.json`.
 
 #### Restoring
 
-There is no restore command; copy the files back by hand:
+`bork import <file>` (coming) restores from the backup file: it clones each project's repo, puts the board and container files back, and registers the projects. To look inside a backup by hand:
 
-1. Install bork, then copy `<path>/_global/config.toml` (and `projects.json` if your project paths are unchanged) into `~/.config/bork/`.
-2. Recreate each project with `bork init <repo> <directory>`, then copy the backup over it, leaving out the issue plans:
+```bash
+tar -tzf bork-backup.tar.gz                       # list the contents
+tar -xzOf bork-backup.tar.gz manifest.json        # projects, repos, issues
+tar -xzf bork-backup.tar.gz -C /tmp/bork-restore  # extract everything
+```
 
-   ```bash
-   rsync -a --exclude _issues --exclude .bork-backup-source "<path>/<project_name>/" <container>/
-   ```
-
-3. For each issue you want to continue, create its worktree with `bork worktree <issue-id> <slug>` and copy its plan back:
-
-   ```bash
-   mkdir -p <container>/<worktree>/.claude
-   cp "<path>/<project_name>/_issues/<issue-id>/planning.md" <container>/<worktree>/.claude/
-   ```
+Inside, `manifest.json` describes each project (path, clone URL, default branch, issues), `projects/<name>/` holds its files with worktree plans under `_issues/<issue-id>/planning.md`, and `_global/` holds the global config.
 
 ### Agent Configuration Notes
 

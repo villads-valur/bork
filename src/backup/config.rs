@@ -1,23 +1,24 @@
-//! `[backup]` config section, layered global → project like the rest of
-//! `config.toml`, with one exception: `enabled` is only read from the project
-//! file, so nothing is backed up until a project opts in.
+//! `[backup]` config. `enabled` is the per-project opt-in and is only read
+//! from `<project>/.bork/config.toml`. `path` and `interval_minutes` describe
+//! the single backup file, so they are only read from the global
+//! `~/.config/bork/config.toml`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::toml_lite::{self, Table};
 
-pub const DEFAULT_INTERVAL_MINUTES: u64 = 15;
+pub const DEFAULT_INTERVAL_MINUTES: u64 = 2;
 
-/// One config layer; `None` means "inherit".
+/// One config file's `[backup]` keys; `None` when unset.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PartialBackupConfig {
+pub struct BackupLayer {
     pub enabled: Option<bool>,
     pub path: Option<String>,
     pub interval_minutes: Option<u64>,
 }
 
-impl PartialBackupConfig {
+impl BackupLayer {
     pub fn from_table(table: &Table) -> Self {
         Self {
             enabled: table.get("backup.enabled").and_then(|v| v.as_bool()),
@@ -41,54 +42,33 @@ impl PartialBackupConfig {
     }
 }
 
-/// Resolved backup settings for one scope (a project, or the global files).
+/// Where and how often the backup file is written (global config).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BackupConfig {
-    pub enabled: bool,
-    /// Destination folder, `~` expanded. `None` when no layer sets a path.
+pub struct BackupSettings {
+    /// Folder holding `bork-backup.tar.gz`, `~` expanded. `None` when unset.
     pub path: Option<PathBuf>,
-    /// How often the background worker runs a backup.
+    /// How often the TUI worker runs a backup.
     pub interval_minutes: u64,
 }
 
-impl BackupConfig {
-    /// Merge the global and project layers. Only the project layer can turn
-    /// backups on.
-    pub fn resolve(global: &PartialBackupConfig, project: &PartialBackupConfig) -> Self {
+impl BackupSettings {
+    pub fn from_layer(global: &BackupLayer) -> Self {
         Self {
-            enabled: project.enabled.unwrap_or(false),
-            path: project
-                .path
-                .as_deref()
-                .or(global.path.as_deref())
-                .map(expand_tilde),
-            interval_minutes: project
-                .interval_minutes
-                .or(global.interval_minutes)
-                .unwrap_or(DEFAULT_INTERVAL_MINUTES),
+            path: global.path.as_deref().map(expand_tilde),
+            interval_minutes: global.interval_minutes.unwrap_or(DEFAULT_INTERVAL_MINUTES),
         }
     }
-
-    /// Settings for the global files (`projects.json`, global `config.toml`).
-    /// They are backed up whenever the global layer has a path.
-    pub fn resolve_global(global: &PartialBackupConfig) -> Self {
-        let mut resolved = Self::resolve(global, &PartialBackupConfig::default());
-        resolved.enabled = resolved.path.is_some();
-        resolved
-    }
 }
 
-pub fn load_global_layer() -> PartialBackupConfig {
-    PartialBackupConfig::from_file(&crate::config::global_config_path())
+pub fn load_settings() -> BackupSettings {
+    BackupSettings::from_layer(&BackupLayer::from_file(&crate::config::global_config_path()))
 }
 
-pub fn load_project_layer(project_root: &Path) -> PartialBackupConfig {
-    PartialBackupConfig::from_file(&crate::config::config_path(project_root))
-}
-
-/// Resolved backup config for a project (global + project layers).
-pub fn load_for_project(project_root: &Path) -> BackupConfig {
-    BackupConfig::resolve(&load_global_layer(), &load_project_layer(project_root))
+/// Whether the project opted in to backups (project file only, default off).
+pub fn project_enabled(project_root: &Path) -> bool {
+    BackupLayer::from_file(&crate::config::config_path(project_root))
+        .enabled
+        .unwrap_or(false)
 }
 
 pub fn expand_tilde(path: &str) -> PathBuf {
@@ -113,8 +93,8 @@ fn expand_tilde_with(path: &str, home: Option<&Path>) -> PathBuf {
 mod tests {
     use super::*;
 
-    fn layer(contents: &str) -> PartialBackupConfig {
-        PartialBackupConfig::from_table(&toml_lite::parse(contents))
+    fn layer(contents: &str) -> BackupLayer {
+        BackupLayer::from_table(&toml_lite::parse(contents))
     }
 
     #[test]
@@ -125,12 +105,12 @@ project_name = "x"
 
 [backup]
 enabled = true
-path = "~/Backups/bork"
+path = "~/Backups"
 interval_minutes = 30
 "#,
         );
         assert_eq!(p.enabled, Some(true));
-        assert_eq!(p.path.as_deref(), Some("~/Backups/bork"));
+        assert_eq!(p.path.as_deref(), Some("~/Backups"));
         assert_eq!(p.interval_minutes, Some(30));
     }
 
@@ -147,35 +127,23 @@ interval_minutes = 30
     }
 
     #[test]
-    fn disabled_by_default() {
-        let resolved = BackupConfig::resolve(&layer(""), &layer(""));
-        assert!(!resolved.enabled);
-        assert_eq!(resolved.path, None);
-        assert_eq!(resolved.interval_minutes, DEFAULT_INTERVAL_MINUTES);
+    fn settings_defaults() {
+        let settings = BackupSettings::from_layer(&layer(""));
+        assert_eq!(settings.path, None);
+        assert_eq!(settings.interval_minutes, 2);
     }
 
     #[test]
-    fn global_enabled_does_not_opt_projects_in() {
-        let global = layer("[backup]\nenabled = true\npath = \"/b\"\n");
-        let resolved = BackupConfig::resolve(&global, &layer(""));
-        assert!(!resolved.enabled);
-        assert_eq!(resolved.path, Some(PathBuf::from("/b")));
-    }
-
-    #[test]
-    fn project_overrides_global() {
-        let global = layer("[backup]\npath = \"/personal\"\ninterval_minutes = 60\n");
-        let project = layer("[backup]\nenabled = true\npath = \"/other\"\n");
-        let resolved = BackupConfig::resolve(&global, &project);
-        assert!(resolved.enabled);
-        assert_eq!(resolved.path, Some(PathBuf::from("/other")));
-        assert_eq!(resolved.interval_minutes, 60);
-    }
-
-    #[test]
-    fn global_scope_enabled_by_path() {
-        assert!(!BackupConfig::resolve_global(&layer("")).enabled);
-        assert!(BackupConfig::resolve_global(&layer("[backup]\npath = \"/b\"\n")).enabled);
+    fn project_opt_in_is_project_file_only() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!project_enabled(dir.path()));
+        std::fs::create_dir_all(dir.path().join(".bork")).unwrap();
+        std::fs::write(
+            dir.path().join(".bork/config.toml"),
+            "[backup]\nenabled = true\n",
+        )
+        .unwrap();
+        assert!(project_enabled(dir.path()));
     }
 
     #[test]
