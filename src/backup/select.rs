@@ -2,7 +2,8 @@
 //!
 //! Everything at the container root is backed up except `main/`, issue
 //! worktrees and ephemeral files. From `.bork/` only the board state and the
-//! project config are kept.
+//! project config are kept. Each issue worktree contributes only its
+//! gitignored `.claude/planning.md`, stored per issue id.
 
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
@@ -13,6 +14,61 @@ use crate::config::AppState;
 /// Files inside `.bork/` worth restoring. Everything else there is derived or
 /// ephemeral (agent-status/, github-cache.json, errors.log, locks, temps).
 const BORK_FILES: &[&str] = &["state.json", "config.toml"];
+
+/// Destination subdirectory holding issue plans (`_issues/<issue-id>/planning.md`).
+/// The underscore keeps it clear of container entries.
+pub const ISSUES_DIR: &str = "_issues";
+
+/// Plan file inside a worktree, relative to the worktree root.
+pub const PLAN_FILE: &str = ".claude/planning.md";
+
+/// Absolute paths of all worktrees of `<project_root>/main`, from
+/// `git worktree list --porcelain`. Empty when git fails.
+pub fn git_worktree_paths(project_root: &Path) -> Vec<PathBuf> {
+    let output = crate::external::git_command()
+        .arg("-C")
+        .arg(project_root.join("main"))
+        .args(["worktree", "list", "--porcelain"])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => {
+            parse_worktree_paths(&String::from_utf8_lossy(&out.stdout))
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn parse_worktree_paths(porcelain: &str) -> Vec<PathBuf> {
+    porcelain
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// An issue id usable as one plain directory name.
+pub fn is_plain_component(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\0')
+}
+
+/// `(issue_id, plan path)` for every issue whose worktree currently has a plan.
+pub fn issue_plans(project_root: &Path, state: &AppState) -> Vec<(String, PathBuf)> {
+    let mut plans: Vec<(String, PathBuf)> = state
+        .issues
+        .iter()
+        .filter(|issue| is_plain_component(&issue.id))
+        .filter_map(|issue| {
+            let worktree = issue
+                .worktree
+                .as_deref()
+                .filter(|w| is_plain_component(w))?;
+            let plan = project_root.join(worktree).join(PLAN_FILE);
+            plan.is_file().then(|| (issue.id.clone(), plan))
+        })
+        .collect();
+    plans.sort();
+    plans
+}
 
 /// Top-level directory names of every worktree in the container, from three
 /// sources so a stale or partial one can't leak a checkout into the backup:
@@ -90,7 +146,8 @@ pub fn select_files(project_root: &Path, worktrees: &HashSet<String>) -> Vec<Pat
         let Some(name) = entry.file_name().to_str().map(String::from) else {
             continue;
         };
-        if name == ".bork" || worktrees.contains(&name) || is_ephemeral(&name) {
+        if name == ".bork" || name == ISSUES_DIR || worktrees.contains(&name) || is_ephemeral(&name)
+        {
             continue;
         }
         walk(project_root, Path::new(&name), &mut out);
@@ -215,6 +272,46 @@ mod tests {
             ])
         );
         assert!(!worktrees.contains("x"));
+    }
+
+    #[test]
+    fn parses_worktree_paths() {
+        let out =
+            "worktree /p/main\nHEAD a\nbranch refs/heads/main\n\nworktree /p/x\nHEAD b\ndetached\n";
+        assert_eq!(
+            parse_worktree_paths(out),
+            vec![PathBuf::from("/p/main"), PathBuf::from("/p/x")]
+        );
+    }
+
+    #[test]
+    fn finds_issue_plans_in_worktrees() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        touch(root, "p-1-a/.claude/planning.md");
+        touch(root, "p-2-b/src/lib.rs");
+        touch(root, "_issues/stale");
+
+        let mut state = AppState::default();
+        for (id, wt) in [
+            ("p-1", Some("p-1-a")),
+            ("p-2", Some("p-2-b")),
+            ("p-3", None),
+            ("../x", Some("p-1-a")),
+        ] {
+            let mut issue = Issue::new(id, "t", Column::InProgress, AgentKind::Claude);
+            issue.worktree = wt.map(String::from);
+            state.issues.push(issue);
+        }
+
+        assert_eq!(
+            issue_plans(root, &state),
+            vec![("p-1".to_string(), root.join("p-1-a/.claude/planning.md"))]
+        );
+        // `_issues` in the container is never picked up as a container entry.
+        assert!(select_files(root, &HashSet::new())
+            .iter()
+            .all(|p| !p.starts_with(ISSUES_DIR)));
     }
 
     #[test]

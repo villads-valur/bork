@@ -19,10 +19,6 @@ pub struct BackupStatus {
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// Push problem in git mode. The local commit still counts as a success.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub warning: Option<String>,
-    pub destination: String,
     /// Directory this scope was written to (`<path>/<scope>`).
     pub target: PathBuf,
     pub files: usize,

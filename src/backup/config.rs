@@ -9,50 +9,18 @@ use crate::toml_lite::{self, Table};
 
 pub const DEFAULT_INTERVAL_MINUTES: u64 = 15;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Destination {
-    /// Plain mirror copy into a folder (e.g. iCloud Drive, Dropbox).
-    #[default]
-    Folder,
-    /// A local git clone: commit when something changed, push if it has a remote.
-    Git,
-}
-
-impl Destination {
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "folder" | "dir" | "directory" => Some(Self::Folder),
-            "git" => Some(Self::Git),
-            _ => None,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Folder => "folder",
-            Self::Git => "git",
-        }
-    }
-}
-
 /// One config layer; `None` means "inherit".
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PartialBackupConfig {
     pub enabled: Option<bool>,
-    pub destination: Option<Destination>,
     pub path: Option<String>,
     pub interval_minutes: Option<u64>,
-    pub wip: Option<bool>,
 }
 
 impl PartialBackupConfig {
     pub fn from_table(table: &Table) -> Self {
         Self {
             enabled: table.get("backup.enabled").and_then(|v| v.as_bool()),
-            destination: table
-                .get("backup.destination")
-                .and_then(|v| v.as_str())
-                .and_then(Destination::parse),
             path: table
                 .get("backup.path")
                 .and_then(|v| v.as_str())
@@ -62,7 +30,6 @@ impl PartialBackupConfig {
             interval_minutes: table
                 .get("backup.interval_minutes")
                 .and_then(|v| v.as_u64()),
-            wip: table.get("backup.wip").and_then(|v| v.as_bool()),
         }
     }
 
@@ -78,11 +45,10 @@ impl PartialBackupConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackupConfig {
     pub enabled: bool,
-    pub destination: Destination,
-    /// Destination root, `~` expanded. `None` when no layer sets a path.
+    /// Destination folder, `~` expanded. `None` when no layer sets a path.
     pub path: Option<PathBuf>,
+    /// How often the background worker runs a backup.
     pub interval_minutes: u64,
-    pub wip: bool,
 }
 
 impl BackupConfig {
@@ -91,10 +57,6 @@ impl BackupConfig {
     pub fn resolve(global: &PartialBackupConfig, project: &PartialBackupConfig) -> Self {
         Self {
             enabled: project.enabled.unwrap_or(false),
-            destination: project
-                .destination
-                .or(global.destination)
-                .unwrap_or_default(),
             path: project
                 .path
                 .as_deref()
@@ -104,7 +66,6 @@ impl BackupConfig {
                 .interval_minutes
                 .or(global.interval_minutes)
                 .unwrap_or(DEFAULT_INTERVAL_MINUTES),
-            wip: project.wip.or(global.wip).unwrap_or(true),
         }
     }
 
@@ -164,41 +125,33 @@ project_name = "x"
 
 [backup]
 enabled = true
-destination = "git"
 path = "~/Backups/bork"
 interval_minutes = 30
-wip = false
 "#,
         );
         assert_eq!(p.enabled, Some(true));
-        assert_eq!(p.destination, Some(Destination::Git));
         assert_eq!(p.path.as_deref(), Some("~/Backups/bork"));
         assert_eq!(p.interval_minutes, Some(30));
-        assert_eq!(p.wip, Some(false));
     }
 
     #[test]
     fn dotted_keys_work_too() {
-        let p = layer("backup.enabled = true\nbackup.destination = \"folder\"\n");
+        let p = layer("backup.enabled = true\nbackup.path = \"/b\"\n");
         assert_eq!(p.enabled, Some(true));
-        assert_eq!(p.destination, Some(Destination::Folder));
+        assert_eq!(p.path.as_deref(), Some("/b"));
     }
 
     #[test]
-    fn unknown_destination_and_empty_path_are_ignored() {
-        let p = layer("[backup]\ndestination = \"s3\"\npath = \"\"\n");
-        assert_eq!(p.destination, None);
-        assert_eq!(p.path, None);
+    fn empty_path_is_ignored() {
+        assert_eq!(layer("[backup]\npath = \"\"\n").path, None);
     }
 
     #[test]
     fn disabled_by_default() {
         let resolved = BackupConfig::resolve(&layer(""), &layer(""));
         assert!(!resolved.enabled);
-        assert_eq!(resolved.destination, Destination::Folder);
         assert_eq!(resolved.path, None);
         assert_eq!(resolved.interval_minutes, DEFAULT_INTERVAL_MINUTES);
-        assert!(resolved.wip);
     }
 
     #[test]
@@ -211,14 +164,12 @@ wip = false
 
     #[test]
     fn project_overrides_global() {
-        let global = layer("[backup]\ndestination = \"git\"\npath = \"/personal\"\nwip = false\n");
-        let project =
-            layer("[backup]\nenabled = true\ndestination = \"folder\"\npath = \"/work\"\n");
+        let global = layer("[backup]\npath = \"/personal\"\ninterval_minutes = 60\n");
+        let project = layer("[backup]\nenabled = true\npath = \"/other\"\n");
         let resolved = BackupConfig::resolve(&global, &project);
         assert!(resolved.enabled);
-        assert_eq!(resolved.destination, Destination::Folder);
-        assert_eq!(resolved.path, Some(PathBuf::from("/work")));
-        assert!(!resolved.wip);
+        assert_eq!(resolved.path, Some(PathBuf::from("/other")));
+        assert_eq!(resolved.interval_minutes, 60);
     }
 
     #[test]

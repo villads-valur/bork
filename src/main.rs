@@ -643,7 +643,7 @@ enum Command {
         check: bool,
     },
 
-    /// Back up board state and container files of opted-in projects
+    /// Back up board state, container files and issue plans of opted-in projects
     #[command(args_conflicts_with_subcommands = true)]
     Backup {
         #[command(subcommand)]
@@ -1240,12 +1240,7 @@ fn run_backup_command(project: Option<&str>, dry_run: bool) -> anyhow::Result<()
             println!("Nothing to back up. Opt a project in with `enabled = true` and a `path` under [backup] in .bork/config.toml.");
         }
         for plan in &plans {
-            println!(
-                "{} -> {} ({})",
-                plan.scope,
-                plan.target().display(),
-                plan.config.destination.as_str()
-            );
+            println!("{} -> {}", plan.scope, plan.target().display());
             for entry in &plan.entries {
                 println!("  {}", entry.rel.display());
             }
@@ -1255,8 +1250,8 @@ fn run_backup_command(project: Option<&str>, dry_run: bool) -> anyhow::Result<()
 
     if let Some(name) = project {
         let root = resolve_start_project_root(Some(name))?;
-        let outcome = backup::run_project(&root)?;
-        print_backup_outcome(name, &outcome);
+        let report = backup::run_project(&root)?;
+        print_backup_report(name, &report);
         return Ok(());
     }
 
@@ -1272,7 +1267,7 @@ fn run_backup_command(project: Option<&str>, dry_run: bool) -> anyhow::Result<()
         .chain(global.map(|result| (backup::GLOBAL_SCOPE.to_string(), result)));
     for (name, result) in results {
         match result {
-            Ok(outcome) => print_backup_outcome(&name, &outcome),
+            Ok(report) => print_backup_report(&name, &report),
             Err(err) => {
                 failures += 1;
                 eprintln!("{name}: failed: {err:#}");
@@ -1294,32 +1289,17 @@ fn backup_targets() -> Vec<(String, PathBuf)> {
         .collect()
 }
 
-fn print_backup_outcome(name: &str, outcome: &backup::RunOutcome) {
-    use backup::git_dest::PushOutcome;
-
-    let report = &outcome.report;
-    let mut line = if report.changed() {
-        format!(
+fn print_backup_report(name: &str, report: &backup::mirror::MirrorReport) {
+    if report.changed() {
+        println!(
             "{name}: {} written, {} removed, {} unchanged",
             report.written.len(),
             report.removed.len(),
             report.unchanged
-        )
+        );
     } else {
-        format!("{name}: up to date ({} files)", report.unchanged)
-    };
-    if outcome.committed {
-        line.push_str(", committed");
+        println!("{name}: up to date ({} files)", report.unchanged);
     }
-    match &outcome.push {
-        Some(PushOutcome::Pushed { remote }) => line.push_str(&format!(", pushed to {remote}")),
-        Some(PushOutcome::Failed { remote, error }) => {
-            line.push_str(&format!(", push to {remote} failed: {error}"))
-        }
-        Some(PushOutcome::NoRemote) => line.push_str(", no remote"),
-        Some(PushOutcome::UpToDate) | None => {}
-    }
-    println!("{line}");
 }
 
 fn run_backup_status() -> anyhow::Result<()> {
@@ -1344,17 +1324,11 @@ fn run_backup_status() -> anyhow::Result<()> {
         let dest = cfg
             .path
             .as_ref()
-            .map(|p| format!("{} {}", cfg.destination.as_str(), p.display()))
+            .map(|p| p.display().to_string())
             .unwrap_or_else(|| "no path configured".to_string());
         let result = match last {
             None => "never run".to_string(),
-            Some(s) if s.ok => {
-                let mut text = format!("ok {} ago", format_age(now.saturating_sub(s.last_run_at)));
-                if let Some(warning) = s.warning {
-                    text.push_str(&format!(" (warning: {warning})"));
-                }
-                text
-            }
+            Some(s) if s.ok => format!("ok {} ago", format_age(now.saturating_sub(s.last_run_at))),
             Some(s) => {
                 let since = s
                     .last_success_at
