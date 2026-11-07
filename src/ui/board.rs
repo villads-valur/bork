@@ -152,12 +152,8 @@ fn render_column(
         return;
     }
 
-    let viewport_start = if selected_row < max_cards {
-        0
-    } else {
-        selected_row - max_cards + 1
-    };
-    let viewport_end = (viewport_start + max_cards).min(count);
+    let (viewport_start, viewport_end) =
+        compute_viewport(selected_row, count, max_cards, card_h, inner.height);
 
     let has_above = viewport_start > 0;
     let has_below = viewport_end < count;
@@ -214,5 +210,90 @@ fn render_column(
         ));
         let indicator_area = Rect::new(inner.x, indicator_y, inner.width, 1);
         frame.render_widget(Paragraph::new(indicator), indicator_area);
+    }
+}
+
+/// Compute the `[start, end)` window of cards to render, keeping
+/// `selected_row` visible.
+///
+/// `max_cards` is `inner_height / card_h` (a floor division), which leaves no
+/// room for the "N more above" indicator row drawn whenever the window is
+/// scrolled past row 0. When there isn't slack to absorb that row, the
+/// window drops its top card to free a full card's height — more than the
+/// single row the indicator needs, but the smallest unit available. Skipped
+/// when `selected_row` is already the window's top row: keeping the
+/// selection visible outranks the indicator.
+fn compute_viewport(
+    selected_row: usize,
+    count: usize,
+    max_cards: usize,
+    card_h: u16,
+    inner_height: u16,
+) -> (usize, usize) {
+    let mut start = if selected_row < max_cards {
+        0
+    } else {
+        selected_row - max_cards + 1
+    };
+    let end = (start + max_cards).min(count);
+
+    if start > 0 {
+        let rows_needed = (end - start) as u16 * card_h + 1;
+        if rows_needed > inner_height && start < selected_row {
+            start += 1;
+        }
+    }
+
+    (start, end)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn viewport_with_slack_needs_no_shrink() {
+        // inner_height has slack beyond max_cards * card_h (29 vs 28), which
+        // covers the above-indicator's row for free.
+        let (start, end) = compute_viewport(9, 10, 4, 7, 29);
+        assert_eq!((start, end), (6, 10));
+    }
+
+    #[test]
+    fn viewport_without_slack_shrinks_for_the_above_indicator_row() {
+        // 10 issues, 4-card window, scrolled to the last row, zero slack
+        // (28 == 4 * 7): the naive window leaves no room for the "more
+        // above" indicator, so it drops to 3 cards to free one.
+        let (start, end) = compute_viewport(9, 10, 4, 7, 28);
+        assert_eq!((start, end), (7, 10));
+    }
+
+    #[test]
+    fn viewport_no_scroll_needed_is_unaffected() {
+        // Everything fits already (count <= max_cards): no indicator row is
+        // ever drawn, so nothing should shrink.
+        let (start, end) = compute_viewport(4, 5, 10, 7, 70);
+        assert_eq!((start, end), (0, 5));
+    }
+
+    /// Mirrors `render_column`'s per-card row math to prove the selected
+    /// card's `card_y + card_h` always stays within `inner_height`. Before
+    /// this fix, scrolling to the last card in a zero-slack column computed
+    /// a window whose bottom card overflowed once the above-indicator was
+    /// drawn, and the render loop's overflow guard silently dropped it — the
+    /// selection simply never appeared.
+    #[test]
+    fn selected_card_row_never_overflows_inner_height() {
+        let (max_cards, card_h, inner_height) = (4u16, 7u16, 28u16);
+        let (start, end) = compute_viewport(9, 10, max_cards as usize, card_h, inner_height);
+        let has_above = start > 0;
+        let y_offset = if has_above { 1 } else { 0 };
+        let selected_visible_idx = (9 - start) as u16;
+        let card_y = y_offset + selected_visible_idx * card_h;
+        assert!(end > 9, "selection must stay inside the rendered window");
+        assert!(
+            card_y + card_h <= inner_height,
+            "selected card at row {card_y} (height {card_h}) overflows inner_height {inner_height}"
+        );
     }
 }
