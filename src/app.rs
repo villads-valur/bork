@@ -2383,7 +2383,7 @@ impl App {
 
     /// Fold a backup worker report in. A new failure from a real check goes
     /// to the status bar (unless the manual result already says so) and to
-    /// `.bork/errors.log` of every loaded project with backups on; the
+    /// `.bork/errors.log` of every loaded project not opted out; the
     /// startup baseline and routine successes stay silent. Returns whether
     /// to redraw.
     pub fn apply_backup_report(&mut self, report: crate::backup::schedule::Report) -> bool {
@@ -2391,10 +2391,7 @@ impl App {
 
         let mut redraw = false;
         if let Some(check) = &report.manual {
-            if self.backup_manual_pending {
-                self.backup_manual_pending = false;
-                self.busy_count = self.busy_count.saturating_sub(1);
-            }
+            self.finish_manual_backup();
             let (message, is_error) = schedule::manual_message(check);
             if is_error {
                 self.set_error(message);
@@ -2412,7 +2409,9 @@ impl App {
             let line = format!("backup failed: {error}");
             for project in &self.projects {
                 let root = &project.config.project_root;
-                if matches!(crate::backup::config::project_enabled(root), Ok(true)) {
+                // An unreadable config may be the failure itself, so only
+                // projects that are definitely off are skipped.
+                if !matches!(crate::backup::config::project_enabled(root), Ok(false)) {
                     crate::config::append_error_log(root, std::slice::from_ref(&line));
                 }
             }
@@ -2428,13 +2427,18 @@ impl App {
         redraw
     }
 
-    /// The backup worker thread is gone (it panicked): release a pending
-    /// "back up now" and say so, since no more reports will come.
-    pub fn backup_worker_stopped(&mut self) {
+    /// Release a pending "back up now" and its spinner, if any.
+    fn finish_manual_backup(&mut self) {
         if self.backup_manual_pending {
             self.backup_manual_pending = false;
             self.busy_count = self.busy_count.saturating_sub(1);
         }
+    }
+
+    /// The backup worker thread is gone (it panicked): release a pending
+    /// "back up now" and say so, since no more reports will come.
+    pub fn backup_worker_stopped(&mut self) {
+        self.finish_manual_backup();
         self.set_error(crate::backup::schedule::WORKER_STOPPED);
     }
 
@@ -3612,6 +3616,24 @@ mod tests {
 
         app.apply_backup_report(backup_report(backup_failure("b"), None, false));
         assert_eq!(error_log(dir.path()).matches("backup failed: b").count(), 1);
+    }
+
+    #[test]
+    fn an_unreadable_project_config_still_gets_the_log_line() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".bork/config.toml")).unwrap();
+        let mut config = test_config();
+        config.project_root = dir.path().to_path_buf();
+        let mut app = App::new(config, AppState::default());
+
+        app.apply_backup_report(backup_report(backup_failure("reading config"), None, false));
+
+        assert_eq!(
+            error_log(dir.path())
+                .matches("backup failed: reading config")
+                .count(),
+            1
+        );
     }
 
     #[test]
