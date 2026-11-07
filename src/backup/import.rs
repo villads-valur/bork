@@ -1059,7 +1059,8 @@ mod tests {
             })
             .collect();
         let file = dir.join("crafted.tar.gz");
-        super::super::archive::write(&file, manifest.to_string().as_bytes(), &entries).unwrap();
+        let contents = super::super::archive::load(&entries).unwrap();
+        super::super::archive::write(&file, manifest.to_string().as_bytes(), &contents).unwrap();
         file
     }
 
