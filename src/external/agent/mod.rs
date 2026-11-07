@@ -2187,6 +2187,18 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_setup_blocks_the_launch() {
+        let root = tempfile::TempDir::new().unwrap();
+        let config = setup_config(root.path(), "touch started; kill -INT $$; touch finished");
+        let issue = issue_in_worktree(root.path());
+
+        let err = prepare_launch(&issue, &config, &root.path().join("status")).unwrap_err();
+        assert!(err.to_string().contains("interrupted"), "{err}");
+        assert!(root.path().join("bork-1/started").exists());
+        assert!(!root.path().join("bork-1/finished").exists());
+    }
+
+    #[test]
     fn setup_skipped_once_it_ran_for_the_worktree() {
         let root = tempfile::TempDir::new().unwrap();
         let config = setup_config(root.path(), "exit 7");
