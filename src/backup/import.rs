@@ -116,6 +116,7 @@ pub enum GlobalConfigOutcome {
     /// or `--project` was given.
     Skipped,
     Restored(PathBuf),
+    Failed(String),
     /// The user already has one and `force` was off.
     KeptExisting(PathBuf),
 }
@@ -131,6 +132,7 @@ impl Report {
     /// Whether any project failed part-way.
     pub fn failed(&self) -> bool {
         self.projects.iter().any(|p| p.error.is_some())
+            || matches!(self.global_config, GlobalConfigOutcome::Failed(_))
     }
 }
 
@@ -161,7 +163,9 @@ pub fn import(file: &Path, opts: &Options) -> anyhow::Result<Report> {
     let global_config = if opts.project.is_some() {
         GlobalConfigOutcome::Skipped
     } else {
-        restore_global_config(dir, &manifest, opts)?
+        // The projects are already restored; their summary must still print.
+        restore_global_config(dir, &manifest, opts)
+            .unwrap_or_else(|err| GlobalConfigOutcome::Failed(format!("{err:#}")))
     };
 
     Ok(Report {
@@ -281,7 +285,8 @@ pub fn resolve_target(project: &ProjectManifest, root: Option<&Path>) -> anyhow:
 fn check_targets(targets: &[PathBuf], force: bool) -> anyhow::Result<()> {
     let mut seen = HashSet::new();
     for target in targets {
-        if !seen.insert(target) {
+        // Case-insensitive, since macOS file systems usually are.
+        if !seen.insert(target.to_string_lossy().to_lowercase()) {
             bail!(
                 "two projects would be restored to {}; use --project to pick one",
                 target.display()
@@ -309,6 +314,15 @@ fn check_targets(targets: &[PathBuf], force: bool) -> anyhow::Result<()> {
 /// at another path: issue ids and tmux sessions are built from the name, so
 /// the two boards would share agent sessions.
 fn check_names(projects: &[&ProjectManifest], targets: &[PathBuf]) -> anyhow::Result<()> {
+    let mut names = HashSet::new();
+    for project in projects {
+        if !names.insert(project.name.as_str()) {
+            bail!(
+                "the backup holds two projects named '{}'; use --project with a label to pick one",
+                project.name
+            );
+        }
+    }
     let registry = crate::global_config::list_projects();
     for (project, target) in projects.iter().zip(targets) {
         let target = crate::global_config::normalize_path(target);
@@ -341,13 +355,27 @@ fn restore_project(
         bail!("invalid archive dir {:?}", project.archive_dir);
     }
     let src = extracted.join(PROJECTS_DIR).join(&project.archive_dir);
+    if has_symlinked_parent(
+        extracted,
+        &Path::new(PROJECTS_DIR).join(&project.archive_dir).join("x"),
+    ) {
+        bail!(
+            "projects/{} in the backup is a symlink",
+            project.archive_dir
+        );
+    }
     // Sessions only survive when restoring over the same live project.
     let keep_sessions = fs::symlink_metadata(target).is_ok()
         && crate::global_config::normalize_path(target)
             == crate::global_config::normalize_path(&project.path);
 
     if !opts.dry_run {
-        fs::create_dir_all(target).with_context(|| format!("creating {}", target.display()))?;
+        fs::create_dir_all(target).with_context(|| {
+            format!(
+                "creating {} (pass --root to restore somewhere else)",
+                target.display()
+            )
+        })?;
     }
     report.repo = restore_repo(project, target, opts.dry_run, &mut report.warnings);
 
@@ -364,6 +392,18 @@ fn restore_project(
             report.warnings.push(format!("skipped unsafe path {rel:?}"));
             continue;
         };
+        // A live worktree's plan is newer than the copy saved in `plans/`;
+        // it's placed below instead.
+        let superseded = rel
+            .strip_prefix("plans/")
+            .and_then(|rest| rest.strip_suffix(&format!("/{PLAN_NAME}")))
+            .is_some_and(|id| {
+                let worktree_plan = format!("{ISSUES_DIR}/{id}/{PLAN_NAME}");
+                project.files.contains(&worktree_plan)
+            });
+        if superseded {
+            continue;
+        }
         // Plans are the work itself; a local copy is newer than the backup.
         if rel_path.starts_with("plans") && fs::symlink_metadata(target.join(&rel_path)).is_ok() {
             report.kept_files.push(rel.clone());
@@ -482,17 +522,26 @@ fn restore_repo(
             error: format!("{err:#}"),
         };
     }
+    let git_ok = |args: &[&str]| {
+        crate::external::git_command()
+            .arg("-C")
+            .arg(&main)
+            .args(args)
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+    // `git clone` names the remote `origin`; give it back its recorded name.
+    let cloned_from = project.repo.remotes.iter().find(|r| r.url == url);
+    if let Some(remote) = cloned_from.filter(|r| r.name != "origin") {
+        if !git_ok(&["remote", "rename", "origin", &remote.name]) {
+            warnings.push(format!("could not rename remote origin to {}", remote.name));
+        }
+    }
     for remote in &project.repo.remotes {
         if remote.url == url || remote.name == "origin" {
             continue;
         }
-        let added = crate::external::git_command()
-            .arg("-C")
-            .arg(&main)
-            .args(["remote", "add", &remote.name, &remote.url])
-            .output()
-            .is_ok_and(|o| o.status.success());
-        if !added {
+        if !git_ok(&["remote", "add", &remote.name, &remote.url]) {
             warnings.push(format!(
                 "could not add remote {} ({})",
                 remote.name, remote.url
@@ -786,6 +835,9 @@ impl Report {
                     would("restored", "would restore"),
                     path.display()
                 );
+            }
+            GlobalConfigOutcome::Failed(error) => {
+                let _ = writeln!(out, "global config: not restored: {error}");
             }
             GlobalConfigOutcome::KeptExisting(path) => {
                 let _ = writeln!(
@@ -1289,6 +1341,82 @@ mod tests {
     }
 
     #[test]
+    fn refuses_a_symlinked_project_dir_in_the_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        write(&outside.join("secret.md"), "not in the backup");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let file = crafted_archive(
+            dir.path(),
+            serde_json::json!([project_json("demo", "demo", &["secret.md"])]),
+            &[("projects/demo", &link)],
+        );
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            let report = import(&file, &opts(dest.path())).unwrap();
+            let error = report.projects[0].error.as_deref().unwrap_or_default();
+            assert!(error.contains("symlink"), "{error}");
+            assert!(!dest.path().join("demo/secret.md").exists());
+        });
+    }
+
+    #[test]
+    fn refuses_targets_and_names_that_collide() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = crafted_archive(
+            dir.path(),
+            serde_json::json!([
+                project_json("Demo", "Demo", &[]),
+                project_json("demo", "demo-2", &[]),
+            ]),
+            &[],
+        );
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            let err = import(&file, &opts(dest.path())).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("two projects would be restored"),
+                "{err:#}"
+            );
+
+            let mut a: ProjectManifest =
+                serde_json::from_value(project_json("demo", "demo", &[])).unwrap();
+            let b = a.clone();
+            a.path = PathBuf::from("/elsewhere/demo");
+            let err = check_names(&[&a, &b], &[a.path.clone(), b.path.clone()]).unwrap_err();
+            assert!(format!("{err:#}").contains("two projects named"), "{err:#}");
+        });
+    }
+
+    #[test]
+    fn a_failed_global_config_still_returns_the_report() {
+        let out = tempfile::tempdir().unwrap();
+        let file = demo_archive(out.path());
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            // A directory where the config file goes can't be replaced.
+            fs::create_dir_all(crate::global_config::global_config_dir().join("config.toml/x"))
+                .unwrap();
+            let force = Options {
+                force: true,
+                ..opts(dest.path())
+            };
+            let report = import(&file, &force).unwrap();
+            assert!(matches!(
+                report.global_config,
+                GlobalConfigOutcome::Failed(_)
+            ));
+            assert!(report.failed());
+            assert!(report.projects[0].error.is_none());
+            assert!(report.render().contains("global config: not restored"));
+        });
+    }
+
+    #[test]
     fn keeps_an_existing_global_config_and_filters_projects() {
         let out = tempfile::tempdir().unwrap();
         let file = demo_archive(out.path());
@@ -1380,10 +1508,14 @@ mod tests {
                     main.to_str().unwrap(),
                 ],
             );
+            // No `origin`: the clone has to give `fork` its name back.
+            git(&main, &["remote", "rename", "origin", "fork"]);
             git(
                 &main,
                 &["remote", "add", "upstream", "https://example.com/up.git"],
             );
+            // An older saved plan loses to the live worktree's plan.
+            write(&root.join("plans/demo-1/planning.md"), "old saved plan");
             let wt = root.join("demo-1-fix");
             git(
                 &main,
@@ -1424,6 +1556,14 @@ mod tests {
             assert_eq!(
                 git_out(&target.join("main"), &["remote", "get-url", "upstream"]),
                 "https://example.com/up.git"
+            );
+            assert_eq!(
+                git_out(&target.join("main"), &["remote", "get-url", "fork"]),
+                origin.to_str().unwrap()
+            );
+            assert_eq!(
+                git_out(&target.join("main"), &["remote", "get-url", "origin"]),
+                ""
             );
             assert_eq!(
                 git_out(&target.join("main"), &["symbolic-ref", "--short", "HEAD"]),
