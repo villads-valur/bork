@@ -2792,9 +2792,15 @@ fn run_tui() -> anyhow::Result<()> {
         }
 
         if let Some(ref rx) = activity_rx {
+            // Focused and swimlane projects get fresher statuses from their own
+            // workers, applied under `keep_selection`; only fill in the rest.
             while let Ok(mut statuses) = rx.try_recv() {
                 for project in &mut app.projects {
-                    let Some(project_statuses) = statuses.remove(&project.id()) else {
+                    let id = project.id();
+                    if id == app.focused_project || swimlane_workers.contains_key(&id) {
+                        continue;
+                    }
+                    let Some(project_statuses) = statuses.remove(&id) else {
                         continue;
                     };
                     if project.live.agent_statuses != project_statuses {
