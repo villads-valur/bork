@@ -206,7 +206,7 @@ pub fn append_error_log(project_root: &Path, lines: &[String]) {
     }
 }
 
-fn config_path(project_root: &Path) -> PathBuf {
+pub(crate) fn config_path(project_root: &Path) -> PathBuf {
     config_dir(project_root).join("config.toml")
 }
 

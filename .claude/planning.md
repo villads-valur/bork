@@ -1,18 +1,33 @@
-# bork-196: automatic stack reviews
+# bork-13: Backup core (config, `bork backup` CLI, board + container files)
 
-Follow-up to merged PR #133. New branch/PR only.
+Part of bork-7 (plans/bork-7/planning.md in the container).
 
-- Fetch direct personal review requests and stack numbers atomically; paginate and dedupe.
-- Resolve each referenced stack once before importing it. Unknown membership must not become standalone cards.
-- One card per stack; existing attachments win. Preserve edited/manual cards and consolidate safe automatic imports.
-- Complete/reopen automatic stack cards based on outstanding member requests.
-- Add stack_review_prompt to global/project config and CLI; append ordered membership and requested markers.
-- Preserve background discovery, error/backoff/cache behavior, and explicit individual picker workflow.
-- Test transitions, pagination/duplicates/failures, config precedence; rebuild debug, commit/push new PR.
+## Module layout
+- `src/backup/mod.rs`: public API (`plan_project`, `run_project`, `run_global`, `run_all`), outcome types, WIP extension point
+- `src/backup/config.rs`: `[backup]` section, read from global + project `config.toml` via `toml_lite`
+- `src/backup/select.rs`: which container files get backed up (worktree detection + ephemeral excludes)
+- `src/backup/manifest.rs`: `manifest.json` v1 (remotes, default branch, worktrees with HEAD + WIP ref)
+- `src/backup/mirror.rs`: mirror a file list into `<dest>/<project>/` (copy changed, delete stale, atomic copies)
+- `src/backup/git_dest.rs`: git destination (init if missing, stage subdir, commit only if changed, push if remote, never force)
+- `src/backup/status.rs`: `.bork/backup.json` last-run record
+- CLI in `main.rs`: `bork backup [--project <name>] [--dry-run]`, `bork backup status`
 
-Implemented and validated: 973 tests passed, 2 ignored; formatting and Clippy clean; debug binary rebuilt at target/debug/bork.
-Live check done: GraphQL `PullRequest.stack` works, direct requests come back with stack numbers, and the Legora board stayed clean on restart (cards with agent work were left alone).
+## Config semantics
+- `enabled` is only honoured from the project layer (per-project opt-in), default false
+- `destination`, `path`, `interval_minutes`, `wip`: project overrides global
+- Global files (`projects.json`, `config.toml`) go to `<global path>/_global/` when global `[backup]` has a `path`
+- `path` supports `~` expansion
 
-Fixed the review queue flood: use user-review-requested instead of team-inclusive review-requested. Read-only inspection found 59 new cards in Legora. Regression test covers moving extra automatic cards to Done after successful discovery while preserving manual cards and retaining state on failed discovery. Legora state was not edited.
+## Selection
+- Container: every top-level entry except `.bork/`, `main/`, worktree dirs (union of `git worktree list` paths, `issue.worktree` names in state, and dirs containing a `.git` entry), ephemeral names (`.DS_Store`, `*.lock`, `*.tmp`, `*.tmp.<pid>`, `*.corrupt`)
+- `.bork/`: only `state.json` and `config.toml`
+- Symlinks are copied as symlinks
 
-Fixed hidden requests: a card with your work on it (or any Done card) used to block the stack card and also stop the individual import, so the request never showed. Done cards are now ignored, and blocked requests fall back to individual cards.
+## Manifest
+No timestamps inside, so git mode only commits on real change.
+
+## Status
+- [x] Plan
+- [x] Implement + tests
+- [x] Docs (CLAUDE.md, README)
+- [ ] verify.sh, PR, attach

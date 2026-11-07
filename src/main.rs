@@ -1,6 +1,7 @@
 mod agent_config;
 mod app;
 mod attention;
+mod backup;
 mod config;
 mod dialog_state;
 mod error;
@@ -642,6 +643,21 @@ enum Command {
         check: bool,
     },
 
+    /// Back up board state and container files of opted-in projects
+    #[command(args_conflicts_with_subcommands = true)]
+    Backup {
+        #[command(subcommand)]
+        command: Option<BackupCommand>,
+
+        /// Only back up this project (name, label or path); skips the global files
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Print the resolved destination and file list without writing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Prune stale worktrees from the project on disk.
     Prune {
         /// Print what would be removed without touching anything
@@ -660,6 +676,12 @@ enum Command {
         #[arg(long)]
         exclude: Vec<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum BackupCommand {
+    /// Show backup settings and the last result per registered project
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -1040,6 +1062,15 @@ fn main() -> anyhow::Result<()> {
                 update::run_update()
             }
         }
+        Some(Command::Backup {
+            command: Some(BackupCommand::Status),
+            ..
+        }) => run_backup_status(),
+        Some(Command::Backup {
+            command: None,
+            project,
+            dry_run,
+        }) => run_backup_command(project.as_deref(), dry_run),
         Some(Command::Prune {
             dry_run,
             yes,
@@ -1168,6 +1199,169 @@ fn run_prune_command(
         );
     }
     Ok(())
+}
+
+fn run_backup_command(project: Option<&str>, dry_run: bool) -> anyhow::Result<()> {
+    if dry_run {
+        let plans = match project {
+            Some(name) => vec![backup::plan_project(&resolve_start_project_root(Some(
+                name,
+            ))?)?],
+            None => backup_targets()
+                .into_iter()
+                .filter_map(|(name, path)| match backup::plan_project(&path) {
+                    Ok(plan) => Some(plan),
+                    Err(err) => {
+                        eprintln!("{name}: {err:#}");
+                        None
+                    }
+                })
+                .chain(backup::plan_global())
+                .collect(),
+        };
+        if plans.is_empty() {
+            println!("Nothing to back up. Opt a project in with `enabled = true` and a `path` under [backup] in .bork/config.toml.");
+        }
+        for plan in &plans {
+            println!(
+                "{} -> {} ({})",
+                plan.scope,
+                plan.target().display(),
+                plan.config.destination.as_str()
+            );
+            for entry in &plan.entries {
+                println!("  {}", entry.rel.display());
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(name) = project {
+        let root = resolve_start_project_root(Some(name))?;
+        let outcome = backup::run_project(&root)?;
+        print_backup_outcome(name, &outcome);
+        return Ok(());
+    }
+
+    let (projects, global) = backup::run_all();
+    if projects.is_empty() && global.is_none() {
+        println!("Nothing to back up. Opt a project in with `enabled = true` and a `path` under [backup] in .bork/config.toml.");
+        return Ok(());
+    }
+    let mut failures = 0;
+    let results = projects
+        .into_iter()
+        .map(|run| (run.name, run.result))
+        .chain(global.map(|result| (backup::GLOBAL_SCOPE.to_string(), result)));
+    for (name, result) in results {
+        match result {
+            Ok(outcome) => print_backup_outcome(&name, &outcome),
+            Err(err) => {
+                failures += 1;
+                eprintln!("{name}: failed: {err:#}");
+            }
+        }
+    }
+    if failures > 0 {
+        anyhow::bail!("{failures} backup(s) failed");
+    }
+    Ok(())
+}
+
+/// Registered projects that opted in to backups, as (name, path).
+fn backup_targets() -> Vec<(String, PathBuf)> {
+    global_config::list_projects()
+        .into_iter()
+        .filter(|p| backup::config::load_for_project(&p.path).enabled)
+        .map(|p| (p.name, p.path))
+        .collect()
+}
+
+fn print_backup_outcome(name: &str, outcome: &backup::RunOutcome) {
+    use backup::git_dest::PushOutcome;
+
+    let report = &outcome.report;
+    let mut line = if report.changed() {
+        format!(
+            "{name}: {} written, {} removed, {} unchanged",
+            report.written.len(),
+            report.removed.len(),
+            report.unchanged
+        )
+    } else {
+        format!("{name}: up to date ({} files)", report.unchanged)
+    };
+    if outcome.committed {
+        line.push_str(", committed");
+    }
+    match &outcome.push {
+        Some(PushOutcome::Pushed { remote }) => line.push_str(&format!(", pushed to {remote}")),
+        Some(PushOutcome::Failed { remote, error }) => {
+            line.push_str(&format!(", push to {remote} failed: {error}"))
+        }
+        Some(PushOutcome::NoRemote) => line.push_str(", no remote"),
+        Some(PushOutcome::UpToDate) | None => {}
+    }
+    println!("{line}");
+}
+
+fn run_backup_status() -> anyhow::Result<()> {
+    let now = app::unix_now();
+    let rows = global_config::list_projects()
+        .into_iter()
+        .map(|p| {
+            let cfg = backup::config::load_for_project(&p.path);
+            let last = backup::status::read(&backup::status::project_status_path(&p.path));
+            (p.name, cfg, last)
+        })
+        .chain(backup::plan_global().map(|plan| {
+            let last = backup::status::read(&backup::status::global_status_path());
+            (backup::GLOBAL_SCOPE.to_string(), plan.config, last)
+        }));
+
+    for (name, cfg, last) in rows {
+        if !cfg.enabled {
+            println!("{name}: off");
+            continue;
+        }
+        let dest = cfg
+            .path
+            .as_ref()
+            .map(|p| format!("{} {}", cfg.destination.as_str(), p.display()))
+            .unwrap_or_else(|| "no path configured".to_string());
+        let result = match last {
+            None => "never run".to_string(),
+            Some(s) if s.ok => {
+                let mut text = format!("ok {} ago", format_age(now.saturating_sub(s.last_run_at)));
+                if let Some(warning) = s.warning {
+                    text.push_str(&format!(" (warning: {warning})"));
+                }
+                text
+            }
+            Some(s) => {
+                let since = s
+                    .last_success_at
+                    .map(|t| format!(", last success {} ago", format_age(now.saturating_sub(t))))
+                    .unwrap_or_default();
+                format!(
+                    "FAILED {} ago: {}{since}",
+                    format_age(now.saturating_sub(s.last_run_at)),
+                    s.error.unwrap_or_default()
+                )
+            }
+        };
+        println!("{name}: {dest}, {result}");
+    }
+    Ok(())
+}
+
+fn format_age(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m", secs / 60),
+        3600..86_400 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86_400),
+    }
 }
 
 fn run_project_command(command: ProjectCommand) -> anyhow::Result<()> {

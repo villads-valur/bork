@@ -472,6 +472,33 @@ teardown_script = "docker compose down"
 
 Both keys accept a single shell command line and can live in either config layer. Scripts should be idempotent — setup may run again if a session is recreated for an existing worktree.
 
+### Backups
+
+`bork backup` copies what git doesn't cover (the board, container files like `AGENTS.md`, `plans/`, `.claude/`, `.agents/`) to a folder or a git repo, so a wiped laptop can be restored. Nothing is backed up until a project opts in:
+
+```toml
+# <project>/.bork/config.toml
+[backup]
+enabled = true              # per-project opt-in (only read from the project file)
+destination = "git"         # "git" (local clone: commit if changed, push if it has a remote) or "folder" (plain mirror)
+path = "~/Backups/bork"     # git clone or folder; each project lands in <path>/<project_name>/
+interval_minutes = 15       # for the background worker
+wip = true                  # snapshot worktree WIP to hidden refs
+```
+
+`destination`, `path`, `interval_minutes` and `wip` can be set in `~/.config/bork/config.toml` as defaults; a project's own values win, so a work project can point at a different destination than personal ones. When the global `[backup]` has a `path`, `projects.json` and the global `config.toml` are backed up to `<path>/_global/`.
+
+Per project the backup holds `.bork/state.json`, `.bork/config.toml`, every container entry that isn't `main/` or a worktree (ephemeral files such as `.DS_Store`, `*.lock` and temp files are skipped), and a versioned `manifest.json` with the repo remotes, default branch and each worktree's branch and HEAD for `bork restore`. Folder mode removes files from `<path>/<project_name>/` that no longer exist in the project. Git mode never force pushes; a rejected push keeps the local commit and shows up as a warning.
+
+```bash
+bork backup                     # all opted-in projects + global files
+bork backup --project bork      # one project
+bork backup --dry-run           # print destinations and file lists, write nothing
+bork backup status              # settings and last result per project
+```
+
+The last result is stored in `<project>/.bork/backup.json` (`~/.config/bork/backup.json` for the global files).
+
 ### Agent Configuration Notes
 
 The new/edit issue dialog hides the Agent field when only one agent is available. Pi has a single mode and no built-in mode flags; its general launch args still apply, and mode overrides can supply additional flags.
