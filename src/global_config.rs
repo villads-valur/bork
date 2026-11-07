@@ -248,6 +248,23 @@ pub fn list_projects() -> Vec<ProjectEntry> {
     load_global_config().projects
 }
 
+/// Like [`list_projects`], but an unreadable or corrupt `projects.json` is an
+/// error instead of an empty list (a missing file is still empty). For
+/// callers where "no projects" must not be mistaken for a read failure.
+pub fn try_list_projects() -> anyhow::Result<Vec<ProjectEntry>> {
+    let path = global_config_path();
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(anyhow::Error::new(err).context(format!("reading {}", path.display())))
+        }
+    };
+    let config: GlobalConfig = serde_json::from_str(&contents)
+        .map_err(|err| anyhow::anyhow!("parsing {}: {err}", path.display()))?;
+    Ok(config.projects)
+}
+
 #[derive(Default)]
 pub struct ReloadResult {
     pub new_projects: Vec<(AppConfig, AppState)>,

@@ -1,6 +1,7 @@
 mod agent_config;
 mod app;
 mod attention;
+mod backup;
 mod config;
 mod dialog_state;
 mod error;
@@ -647,6 +648,21 @@ enum Command {
         check: bool,
     },
 
+    /// Write boards, container docs and issue plans of opted-in projects to one backup file
+    #[command(args_conflicts_with_subcommands = true)]
+    Backup {
+        #[command(subcommand)]
+        command: Option<BackupCommand>,
+
+        /// Write a separate file with only this project (name, label or path)
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Print the backup file path and its contents without writing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Prune stale worktrees from the project on disk.
     Prune {
         /// Print what would be removed without touching anything
@@ -665,6 +681,12 @@ enum Command {
         #[arg(long)]
         exclude: Vec<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum BackupCommand {
+    /// Show backup settings, opted-in projects and the last result per file
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -1062,6 +1084,15 @@ fn main() -> anyhow::Result<()> {
                 update::run_update()
             }
         }
+        Some(Command::Backup {
+            command: Some(BackupCommand::Status),
+            ..
+        }) => run_backup_status(),
+        Some(Command::Backup {
+            command: None,
+            project,
+            dry_run,
+        }) => run_backup_command(project.as_deref(), dry_run),
         Some(Command::Prune {
             dry_run,
             yes,
@@ -1190,6 +1221,132 @@ fn run_prune_command(
         );
     }
     Ok(())
+}
+
+const NOTHING_TO_BACK_UP: &str = "Nothing to back up. Opt a project in with `enabled = true` under [backup] in its .bork/config.toml.";
+
+fn run_backup_command(project: Option<&str>, dry_run: bool) -> anyhow::Result<()> {
+    let selection = match project {
+        Some(name) => backup::Selection::Project(lookup_project_root(name)?),
+        None => backup::Selection::All,
+    };
+
+    if dry_run {
+        let Some(plan) = backup::plan(&selection)? else {
+            println!("{NOTHING_TO_BACK_UP}");
+            return Ok(());
+        };
+        println!("{}", plan.file.display());
+        println!("  {}", backup::manifest::MANIFEST_FILE);
+        for entry in &plan.entries {
+            println!("  {}", entry.path);
+        }
+        warn_local_only_repos(&plan.local_only_repos);
+        return Ok(());
+    }
+
+    let Some(outcome) = backup::run(&selection)? else {
+        println!("{NOTHING_TO_BACK_UP}");
+        return Ok(());
+    };
+    let what = if outcome.written {
+        "wrote"
+    } else {
+        "unchanged"
+    };
+    println!(
+        "{what} {} ({}, {})",
+        outcome.file.display(),
+        format_size(outcome.size),
+        outcome.projects.join(", ")
+    );
+    warn_local_only_repos(&outcome.local_only_repos);
+    Ok(())
+}
+
+/// Skipped nested repos aren't backed up; flag the ones with no remote,
+/// since their content exists nowhere else.
+fn warn_local_only_repos(repos: &[PathBuf]) {
+    if repos.is_empty() {
+        return;
+    }
+    eprintln!(
+        "warning: these git repos are skipped and have no remote, so nothing else holds them:"
+    );
+    for repo in repos {
+        eprintln!("  {}", repo.display());
+    }
+}
+
+fn run_backup_status() -> anyhow::Result<()> {
+    let settings = backup::config::load_settings();
+    match &settings.path {
+        Some(path) => println!(
+            "path: {} (backed up daily, and on `bork backup`)",
+            path.display()
+        ),
+        None => println!("path: not set (set `path` under [backup] in ~/.config/bork/config.toml)"),
+    }
+    println!("this machine: {}", backup::backup_file_name());
+
+    println!("projects:");
+    for entry in global_config::list_projects() {
+        match backup::config::project_enabled(&entry.path) {
+            Ok(true) => println!("  {}: on", entry.name),
+            Ok(false) => println!("  {}: off", entry.name),
+            Err(err) => println!("  {}: unknown ({err:#})", entry.name),
+        }
+    }
+
+    let records = backup::status::read(&backup::status::status_path()).archives;
+    if records.is_empty() {
+        println!("no backups yet");
+        return Ok(());
+    }
+    let now = app::unix_now();
+    println!("files:");
+    for (file, s) in records {
+        let ago = format_age(now.saturating_sub(s.last_run_at));
+        let result = if s.ok {
+            format!("ok {ago} ago")
+        } else {
+            let since = s
+                .last_success_at
+                .map(|t| format!(", last success {} ago", format_age(now.saturating_sub(t))))
+                .unwrap_or_default();
+            format!("FAILED {ago} ago: {}{since}", s.error.unwrap_or_default())
+        };
+        let size = if s.last_success_at.is_some() {
+            format!(", {} ({})", format_size(s.size), s.projects.join(", "))
+        } else {
+            String::new()
+        };
+        println!("  {}: {result}{size}", file.display());
+        if !s.local_only_repos.is_empty() {
+            println!("    skipped repos with no remote (not backed up anywhere):");
+            for repo in &s.local_only_repos {
+                println!("      {}", repo.display());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn format_age(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m", secs / 60),
+        3600..86_400 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86_400),
+    }
+}
+
+fn format_size(bytes: u64) -> String {
+    match bytes {
+        0..1024 => format!("{bytes} B"),
+        1024..1_048_576 => format!("{:.1} KB", bytes as f64 / 1024.0),
+        _ => format!("{:.1} MB", bytes as f64 / 1_048_576.0),
+    }
 }
 
 fn run_project_command(command: ProjectCommand) -> anyhow::Result<()> {
@@ -1606,6 +1763,12 @@ fn resolve_start_project_root(project: Option<&str>) -> anyhow::Result<PathBuf> 
         return Ok(config::find_project_root());
     };
 
+    global_config::prune_stale_projects();
+    lookup_project_root(project)
+}
+
+/// Resolve a project path, name or label without touching the registry.
+fn lookup_project_root(project: &str) -> anyhow::Result<PathBuf> {
     let project_path = Path::new(project);
     if project_path.exists() {
         if let Some(root) = find_project_root_from(project_path) {
@@ -1613,9 +1776,9 @@ fn resolve_start_project_root(project: Option<&str>) -> anyhow::Result<PathBuf> 
         }
     }
 
-    global_config::prune_stale_projects();
     global_config::list_projects()
         .into_iter()
+        .filter(|entry| entry.path.exists())
         .find(|entry| entry.name == project || entry.label.as_deref() == Some(project))
         .map(|entry| entry.path)
         .ok_or_else(|| anyhow::anyhow!("Project '{}' not found", project))

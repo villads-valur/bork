@@ -66,6 +66,13 @@ src/
 ├── init.rs           # `bork init` subcommand (clone repo, scaffold .bork/ directory)
 ├── lock.rs           # Single-instance PID file lock + signal handlers (SIGTERM, SIGHUP)
 ├── worktree.rs       # `bork worktree` subcommand (create git worktree, register with state)
+├── backup/           # Backups (library; `bork backup` CLI in main.rs is a thin layer)
+│   ├── mod.rs        # Selection, plan/run (one tar.gz, skip when unchanged), is_due, save_issue_plan
+│   ├── config.rs     # `[backup]`: enabled (project file), path (global file)
+│   ├── manifest.rs   # Public manifest.json types (archive contract for `bork import`) + repo facts
+│   ├── archive.rs    # Staging copy + system `tar -czf`, atomic rename, content fingerprint
+│   ├── select.rs     # Container file selection, worktree detection, ephemeral excludes, issue plans
+│   └── status.rs     # Last result per backup file (~/.config/bork/backup.json)
 ├── input/
 │   ├── mod.rs
 │   ├── action.rs     # Action enum (~70 variants)
@@ -144,6 +151,17 @@ State lives in `.bork/` at the container root. Config is detected by walking up 
 - `~/.config/bork/bork.pid` — flock-based single instance lock
 
 Legacy: `~/.config/bork/agents.toml` is no longer read (bork-119). A one-line stderr warning is printed if it still exists.
+
+## Backups
+
+- One file per Mac: `bork backup` writes `<path>/bork-backup-<host>.tar.gz` with every registered, opted-in project plus `_global/` (`projects.json`, `config.toml`); `--project` writes `bork-backup-<host>--<name>.tar.gz` with just that project. `<host>` is `backup::host_name()` (macOS LocalHostName via `scutil`, else gethostname's first label; lowercased, `[a-z0-9-]`, never `--`, cached per process) and is recorded in the manifest. Never spell the file name: use `backup::backup_file_name()` / `backup::full_backup_file()` (worker, import). Built with the system `tar` from a private staging dir, then renamed into place.
+- Config: `[backup] enabled = true` is the per-project opt-in (project file only). `path` (absolute or `~/`) is global-only. No schedule setting.
+- Schedule: once a day automatically plus explicit `bork backup`. `backup::is_due(now)` is true when `~/.config/bork/backup.json` has no successful full backup (`backup::full_backup_file()`) or the last success is 24h+ old (`BACKUP_MAX_AGE_SECS`); the TUI worker (follow-up) checks it.
+- Layout and manifest: see the module docs in `backup/manifest.rs`. Those serde types are the contract for `bork import`; add fields with `#[serde(default)]` and only bump `MANIFEST_VERSION` for breaking changes.
+- Per project: `.bork/state.json` + `.bork/config.toml` (symlinks followed), every container entry except `main/`, worktrees (union of `git worktree list`, `issue.worktree` and dirs with a `.git` entry), nested checkouts at any depth (dirs with a `.git` entry) and ephemeral files, plus each live worktree's `.claude/planning.md` as `_issues/<issue-id>/planning.md`. Skipped checkouts (nested at any depth, or standalone top-level clones with a `.git` dir) that have no remote are reported as `local_only_repos` in the plan, outcome and status record, and printed as a warning by the CLI.
+- Unchanged content (fingerprint over manifest without `created_at` + every file) skips the write. Read errors other than NotFound fail the run and keep the previous file. The path may not be inside a registered project.
+- `backup::save_issue_plan(root, issue_id, worktree_dir)` copies a worktree's plan into the container's `plans/<issue-id>/planning.md` before removal (no-op when backups are off); the archive/delete/prune paths call it (follow-up).
+- Runs are serialized with a required flock on `~/.config/bork/backup.lock`.
 
 ## Build & Run
 
