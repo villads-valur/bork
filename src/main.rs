@@ -1308,7 +1308,7 @@ fn run_import_command(
     };
     let report = backup::import::import(&cwd.join(file), &opts)?;
     println!("{}", report.render());
-    if !dry_run {
+    if !dry_run && report.any_restored() {
         // Same as `bork init`: a fresh machine needs the agent hooks too.
         if let Err(err) = external::hooks::install() {
             eprintln!("Warning: hook installation failed: {err}");

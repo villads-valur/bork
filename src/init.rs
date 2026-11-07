@@ -72,7 +72,7 @@ pub fn extract_repo_name(repo: &str) -> anyhow::Result<String> {
 /// output. Shared by `bork init` and `bork import`.
 pub fn clone_repo(url: &str, main_dir: &Path) -> anyhow::Result<()> {
     let status = crate::external::git_command()
-        .args(["clone", "--progress", url])
+        .args(["clone", "--progress", "--", url])
         .arg(main_dir)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())

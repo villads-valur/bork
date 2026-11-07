@@ -123,7 +123,12 @@ pub enum GlobalConfigOutcome {
     /// Nothing to restore: single-project archive, no global config in it,
     /// or `--project` was given.
     Skipped,
-    Restored(PathBuf),
+    Restored {
+        path: PathBuf,
+        /// Where the replaced config was saved, when `--force` replaced a
+        /// different one.
+        previous: Option<PathBuf>,
+    },
     Failed(String),
     /// The user already has one and `force` was off.
     KeptExisting(PathBuf),
@@ -527,6 +532,22 @@ fn restore_board(
             .push("skipped the board: .bork/ at the target is a symlink".to_string());
         return Ok(());
     }
+    if let Some(dir) = checkout_ancestor(target, state_rel) {
+        report.warnings.push(format!(
+            "skipped the board: {}/ is a git checkout at the target",
+            dir.display()
+        ));
+        return Ok(());
+    }
+    // Saving would replace the link with a plain file and cut the board
+    // loose from wherever it really lives.
+    if fs::symlink_metadata(target.join(state_rel)).is_ok_and(|m| m.file_type().is_symlink()) {
+        report.warnings.push(
+            "kept the board: .bork/state.json is a symlink at the target; restore it by hand if needed"
+                .to_string(),
+        );
+        return Ok(());
+    }
     let Some(mut state) = crate::config::try_load_state(src) else {
         report
             .warnings
@@ -650,6 +671,13 @@ fn restore_plans(
             report.kept_plans.push(id.to_string());
             continue;
         }
+        if let Some(dir) = checkout_ancestor(target, &dest_rel) {
+            report.warnings.push(format!(
+                "skipped {rel}: {}/ is a git checkout at the target",
+                dir.display()
+            ));
+            continue;
+        }
         if copy_reported(src, rel, target, &dest_rel, dry_run, report)? {
             report.plans.push(id.to_string());
         }
@@ -718,7 +746,7 @@ fn restore_repo(
         .iter()
         .find(|r| r.name == "origin" && r.url == url)
         .or_else(|| project.repo.remotes.iter().find(|r| r.url == url));
-    if let Some(remote) = cloned_from.filter(|r| r.name != "origin") {
+    if let Some(remote) = cloned_from.filter(|r| r.name != "origin" && !r.name.starts_with('-')) {
         if !git_ok(&["remote", "rename", "origin", &remote.name]) {
             warnings.push(format!("could not rename remote origin to {}", remote.name));
         }
@@ -728,7 +756,14 @@ fn restore_repo(
         if remote.name == cloned_name {
             continue;
         }
-        if !git_ok(&["remote", "add", &remote.name, &remote.url]) {
+        if remote.name.starts_with('-') {
+            warnings.push(format!(
+                "skipped remote {:?}: not a valid name",
+                remote.name
+            ));
+            continue;
+        }
+        if !git_ok(&["remote", "add", "--", &remote.name, &remote.url]) {
             warnings.push(format!(
                 "could not add remote {} ({})",
                 remote.name, remote.url
@@ -745,6 +780,9 @@ fn restore_repo(
 
 /// Check out `branch` in `repo` unless it's already the current branch.
 fn checkout(repo: &Path, branch: &str) -> anyhow::Result<()> {
+    if branch.starts_with('-') {
+        bail!("{branch:?} is not a valid branch name");
+    }
     let git = || {
         let mut cmd = crate::external::git_command();
         cmd.arg("-C").arg(repo);
@@ -856,9 +894,16 @@ fn copy_entry(
     if !file_type.is_symlink() && !file_type.is_file() {
         return Ok(Copied::Missing);
     }
-    // A file over a symlink would silently cut it loose from what it links to.
-    if file_type.is_file() && fs::symlink_metadata(dest).is_ok_and(|m| m.file_type().is_symlink()) {
-        return Ok(Copied::KeptLink);
+    // Replacing a symlink at the target would cut it loose from what it
+    // links to. The same link as in the backup is already restored.
+    if fs::symlink_metadata(dest).is_ok_and(|m| m.file_type().is_symlink()) {
+        let same_link =
+            file_type.is_symlink() && fs::read_link(dest).ok() == fs::read_link(&src).ok();
+        return Ok(if same_link {
+            Copied::Yes
+        } else {
+            Copied::KeptLink
+        });
     }
     if dry_run {
         return Ok(Copied::Yes);
@@ -902,6 +947,24 @@ fn restore_global_config(
     if !opts.force && fs::symlink_metadata(&dest).is_ok() {
         return Ok(GlobalConfigOutcome::KeptExisting(dest));
     }
+    // Like the board: a config that --force replaces stays recoverable.
+    let source = extracted.join(&rel);
+    let replaced = fs::symlink_metadata(&dest).is_ok_and(|m| m.is_file())
+        && fs::read(&dest).ok() != fs::read(&source).ok();
+    let previous = replaced.then(|| {
+        unused_path(&dir.join(format!(
+            "{GLOBAL_CONFIG}.pre-import-{}",
+            crate::app::unix_now()
+        )))
+    });
+    if let (Some(previous), false) = (&previous, opts.dry_run) {
+        if !has_symlinked_parent(extracted, Path::new(&rel))
+            && fs::symlink_metadata(&source).is_ok_and(|m| m.is_file())
+        {
+            fs::copy(&dest, previous)
+                .with_context(|| format!("saving the old config to {}", previous.display()))?;
+        }
+    }
     match copy_entry(
         extracted,
         Path::new(&rel),
@@ -909,13 +972,21 @@ fn restore_global_config(
         Path::new(GLOBAL_CONFIG),
         opts.dry_run,
     )? {
-        Copied::Yes => Ok(GlobalConfigOutcome::Restored(dest)),
+        Copied::Yes => Ok(GlobalConfigOutcome::Restored {
+            path: dest,
+            previous,
+        }),
         Copied::KeptLink => Ok(GlobalConfigOutcome::KeptExisting(dest)),
         Copied::Missing | Copied::Unsafe => Ok(GlobalConfigOutcome::Skipped),
     }
 }
 
 impl Report {
+    /// Whether at least one project was restored without an error.
+    pub fn any_restored(&self) -> bool {
+        self.projects.iter().any(|p| p.error.is_none())
+    }
+
     /// Whether any project failed part-way or couldn't be cloned.
     pub fn failed(&self) -> bool {
         self.projects
@@ -1055,13 +1126,21 @@ impl Report {
         }
         match &self.global_config {
             GlobalConfigOutcome::Skipped => {}
-            GlobalConfigOutcome::Restored(path) => {
+            GlobalConfigOutcome::Restored { path, previous } => {
                 let _ = writeln!(
                     out,
                     "global config: {} {}",
                     would("restored", "would restore"),
                     path.display()
                 );
+                if let Some(previous) = previous {
+                    let _ = writeln!(
+                        out,
+                        "global config: old one {} {}",
+                        would("saved to", "would be saved to"),
+                        previous.display()
+                    );
+                }
             }
             GlobalConfigOutcome::Failed(error) => {
                 let _ = writeln!(out, "global config: not restored: {error}");
@@ -1360,7 +1439,7 @@ mod tests {
             assert_eq!(registry[0].path, target);
             assert!(matches!(
                 report.global_config,
-                GlobalConfigOutcome::Restored(_)
+                GlobalConfigOutcome::Restored { .. }
             ));
             assert!(
                 read(&crate::global_config::global_config_dir().join("config.toml"))
@@ -1498,8 +1577,15 @@ mod tests {
             let state = crate::config::load_state(&target);
             assert_eq!(state.issues[0].worktree.as_deref(), Some("demo-1-a"));
             assert_eq!(crate::global_config::list_projects().len(), 1);
-            // --force also replaces the global config.
+            // --force also replaces the global config, keeping the old one.
             assert!(read(&global).contains("[backup]"));
+            let saved: Vec<_> = fs::read_dir(global.parent().unwrap())
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| p.to_string_lossy().contains("config.toml.pre-import-"))
+                .collect();
+            assert_eq!(saved.len(), 1, "{saved:?}");
+            assert_eq!(read(&saved[0]), "mine = true\n");
         });
     }
 
@@ -1819,6 +1905,31 @@ mod tests {
     }
 
     #[test]
+    fn leaves_checkouts_at_bork_and_plans_alone() {
+        let out = tempfile::tempdir().unwrap();
+        let file = demo_archive(out.path());
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let target = dest.path().join("demo");
+        fs::create_dir_all(target.join(".bork/.git")).unwrap();
+        fs::create_dir_all(target.join("plans/.git")).unwrap();
+        crate::config::save_state(&board(&[("demo-7", None)]), &target).unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            let force = Options {
+                force: true,
+                ..opts(dest.path())
+            };
+            let report = import(&file, &force).unwrap();
+            let p = &report.projects[0];
+            assert!(!p.board_restored);
+            assert!(p.plans.is_empty());
+            assert_eq!(crate::config::load_state(&target).issues[0].id, "demo-7");
+            assert!(!target.join("plans/demo-1/planning.md").exists());
+            assert!(!target.join("plans/demo-2/planning.md").exists());
+        });
+    }
+
+    #[test]
     fn refuses_a_symlinked_or_checkout_target() {
         let out = tempfile::tempdir().unwrap();
         let file = demo_archive(out.path());
@@ -1876,6 +1987,12 @@ mod tests {
         let target = dest.path().join("demo");
         fs::create_dir_all(&target).unwrap();
         std::os::unix::fs::symlink(&agents, target.join("AGENTS.md")).unwrap();
+        // The backup has CLAUDE.md -> AGENTS.md; the target links elsewhere.
+        std::os::unix::fs::symlink("local-rules.md", target.join("CLAUDE.md")).unwrap();
+        let board = dotfiles.path().join("state.json");
+        write(&board, r#"{"issues":[]}"#);
+        fs::create_dir_all(target.join(".bork")).unwrap();
+        std::os::unix::fs::symlink(&board, target.join(".bork/state.json")).unwrap();
         crate::global_config::with_test_config_home(home.path(), || {
             let global_link = crate::global_config::global_config_dir().join("config.toml");
             fs::create_dir_all(global_link.parent().unwrap()).unwrap();
@@ -1896,6 +2013,16 @@ mod tests {
                 .file_type()
                 .is_symlink());
             assert_eq!(read(&agents), "dotfiles agents");
+            assert_eq!(
+                fs::read_link(target.join("CLAUDE.md")).unwrap(),
+                PathBuf::from("local-rules.md")
+            );
+            assert!(!p.board_restored);
+            assert!(fs::symlink_metadata(target.join(".bork/state.json"))
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(read(&board), r#"{"issues":[]}"#);
             assert!(matches!(
                 report.global_config,
                 GlobalConfigOutcome::KeptExisting(_)
