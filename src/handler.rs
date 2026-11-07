@@ -4891,6 +4891,36 @@ mod tests {
         assert!(!root.path().join("bork-1-slug").exists());
     }
 
+    #[test]
+    fn a_forced_archive_warns_about_a_teardown_it_went_past() {
+        let (root, mut config) = project_with_dirty_worktree();
+        config.teardown_script = Some("exit 3".into());
+        let project_id = root.path().to_path_buf();
+
+        let result = archive_to_result(
+            &config,
+            project_id.clone(),
+            "bork-1".into(),
+            &unique_session(),
+            Some("bork-1-slug"),
+            Removal::Force,
+        );
+
+        assert_eq!(result.message_kind, MessageKind::Warning);
+        assert!(
+            result
+                .message
+                .ends_with(", but its teardown script failed (exit 3)"),
+            "{}",
+            result.message
+        );
+        assert_eq!(
+            result.issues_to_archive,
+            vec![(project_id, "bork-1".to_string())]
+        );
+        assert!(!root.path().join("bork-1-slug").exists());
+    }
+
     fn offer(app: &mut App, offers: Vec<(ProjectId, String, ForceRequired)>) -> bool {
         queue_force_archive(app, offers);
         show_queued_force_archive(app)
