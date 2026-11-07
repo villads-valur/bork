@@ -33,6 +33,7 @@ use self::archive::ArchiveEntry;
 use self::manifest::{Manifest, ProjectManifest, GLOBAL_DIR, MANIFEST_VERSION, PROJECTS_DIR};
 use self::select::{ISSUES_DIR, PLAN_FILE};
 use self::status::ArchiveStatus;
+use crate::config::AppState;
 
 /// File name of the full backup.
 pub const BACKUP_FILE: &str = "bork-backup.tar.gz";
@@ -330,9 +331,16 @@ fn project_part(
     }
     let prefix = format!("{PROJECTS_DIR}/{archive_dir}");
 
-    // A missing or corrupt board still backs up everything else; the raw
-    // state.json is copied as-is when present.
-    let board = crate::config::try_load_state(root).unwrap_or_default();
+    // A corrupt board fails the run (keeping the previous backup) instead of
+    // reading as empty, which would drop every issue and plan from the new
+    // file. A project without a board yet backs up everything else.
+    let state_file = root.join(".bork/state.json");
+    let board = if select::is_existing_file(&state_file)? {
+        crate::config::try_load_state(root)
+            .with_context(|| format!("{} can't be read or parsed", state_file.display()))?
+    } else {
+        AppState::default()
+    };
     let facts = manifest::RepoFacts::gather(root);
     let worktrees = select::worktree_dirs(root, &facts.worktree_paths(), &board);
 
@@ -379,7 +387,8 @@ fn project_part(
 /// same file. Returns the outcome and the content fingerprint.
 fn write_plan(plan: &Plan) -> anyhow::Result<(Outcome, String)> {
     // `created_at` is still 0 here, so the fingerprint only tracks content.
-    let fingerprint = archive::fingerprint(&serde_json::to_vec(&plan.manifest)?, &plan.entries)?;
+    let contents = archive::load(&plan.entries)?;
+    let fingerprint = archive::fingerprint(&serde_json::to_vec(&plan.manifest)?, &contents);
     let projects: Vec<String> = plan
         .manifest
         .projects
@@ -405,7 +414,7 @@ fn write_plan(plan: &Plan) -> anyhow::Result<(Outcome, String)> {
     manifest.created_at = crate::app::unix_now();
     let mut json = serde_json::to_vec_pretty(&manifest)?;
     json.push(b'\n');
-    let size = archive::write(&plan.file, &json, &plan.entries)?;
+    let size = archive::write(&plan.file, &json, &contents)?;
     let outcome = Outcome {
         file: plan.file.clone(),
         size,
@@ -1107,6 +1116,30 @@ mod tests {
             fs::read_to_string(outside.path().join("demo-1/planning.md")).unwrap(),
             "outside"
         );
+    }
+
+    #[test]
+    fn corrupt_board_fails_and_keeps_the_previous_archive() {
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            set_global_path(dest.path());
+            let demo = project("demo", true);
+            let root = demo.path();
+            save_board(root, &[("demo-1", Some("demo-1-a"))]);
+            write(&root.join("demo-1-a/.git"), "gitdir: x");
+            write(&root.join("demo-1-a/.claude/planning.md"), "plan");
+            let first = run(&Selection::All).unwrap().unwrap();
+
+            write(&root.join(".bork/state.json"), "{ corrupt");
+            let err = run(&Selection::All).unwrap_err();
+            assert!(format!("{err:#}").contains("state.json"), "{err:#}");
+            assert!(
+                list(&first.file).contains(&"projects/demo/_issues/demo-1/planning.md".to_string())
+            );
+            assert_eq!(fs::metadata(&first.file).unwrap().len(), first.size);
+            assert!(!status::read(&status::status_path()).archives[&first.file].ok);
+        });
     }
 
     #[test]

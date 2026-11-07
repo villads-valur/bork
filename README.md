@@ -498,7 +498,7 @@ bork backup --dry-run           # print the file path and its contents, write no
 bork backup status              # opted-in projects, last run, result and size per file
 ```
 
-Backups run once a day automatically while the TUI is open (coming) and whenever you run `bork backup`. The file is replaced atomically and left untouched when nothing changed since the last backup. A file bork can't read fails the run and keeps the previous backup. The last result per file is stored in `~/.config/bork/backup.json`.
+Backups run once a day automatically while the TUI is open (coming) and whenever you run `bork backup`. The file is replaced atomically and left untouched when nothing changed since the last backup. A file bork can't read (or a corrupt `.bork/state.json`) fails the run and keeps the previous backup. The last result per file is stored in `~/.config/bork/backup.json`.
 
 #### Restoring
 
