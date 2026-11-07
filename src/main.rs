@@ -665,8 +665,9 @@ enum Command {
 
     /// Restore projects, boards and plans from a `bork backup` file
     Import {
-        /// Path to a backup file written by `bork backup` (any name)
-        file: PathBuf,
+        /// Path to a backup file written by `bork backup` (any name). Defaults
+        /// to this Mac's backup file in the configured backup path.
+        file: Option<PathBuf>,
 
         /// Only restore this project (name or label in the backup)
         #[arg(long)]
@@ -1122,7 +1123,7 @@ fn main() -> anyhow::Result<()> {
             root,
             force,
             dry_run,
-        }) => run_import_command(&file, project, root, force, dry_run),
+        }) => run_import_command(file.as_deref(), project, root, force, dry_run),
         Some(Command::Prune {
             dry_run,
             yes,
@@ -1271,6 +1272,7 @@ fn run_backup_command(project: Option<&str>, dry_run: bool) -> anyhow::Result<()
         for entry in &plan.entries {
             println!("  {}", entry.path);
         }
+        warn_local_only_repos(&plan.local_only_repos);
         return Ok(());
     }
 
@@ -1289,11 +1291,12 @@ fn run_backup_command(project: Option<&str>, dry_run: bool) -> anyhow::Result<()
         format_size(outcome.size),
         outcome.projects.join(", ")
     );
+    warn_local_only_repos(&outcome.local_only_repos);
     Ok(())
 }
 
 fn run_import_command(
-    file: &Path,
+    file: Option<&Path>,
     project: Option<String>,
     root: Option<PathBuf>,
     force: bool,
@@ -1306,7 +1309,13 @@ fn run_import_command(
         force,
         dry_run,
     };
-    let report = backup::import::import(&cwd.join(file), &opts)?;
+    let file = match file {
+        Some(file) => cwd.join(file),
+        None => backup::full_backup_file().ok_or_else(|| {
+            anyhow::anyhow!("no backup path configured; pass the backup file: bork import <file>")
+        })?,
+    };
+    let report = backup::import::import(&file, &opts)?;
     println!("{}", report.render());
     if !dry_run && report.any_restored() {
         // Like `bork init`, a fresh machine needs the agent hooks. Project
@@ -1322,6 +1331,20 @@ fn run_import_command(
     Ok(())
 }
 
+/// Skipped nested repos aren't backed up; flag the ones with no remote,
+/// since their content exists nowhere else.
+fn warn_local_only_repos(repos: &[PathBuf]) {
+    if repos.is_empty() {
+        return;
+    }
+    eprintln!(
+        "warning: these git repos are skipped and have no remote, so nothing else holds them:"
+    );
+    for repo in repos {
+        eprintln!("  {}", repo.display());
+    }
+}
+
 fn run_backup_status() -> anyhow::Result<()> {
     let settings = backup::config::load_settings();
     match &settings.path {
@@ -1331,6 +1354,7 @@ fn run_backup_status() -> anyhow::Result<()> {
         ),
         None => println!("path: not set (set `path` under [backup] in ~/.config/bork/config.toml)"),
     }
+    println!("this machine: {}", backup::backup_file_name());
 
     println!("projects:");
     for entry in global_config::list_projects() {
@@ -1365,6 +1389,12 @@ fn run_backup_status() -> anyhow::Result<()> {
             String::new()
         };
         println!("  {}: {result}{size}", file.display());
+        if !s.local_only_repos.is_empty() {
+            println!("    skipped repos with no remote (not backed up anywhere):");
+            for repo in &s.local_only_repos {
+                println!("      {}", repo.display());
+            }
+        }
     }
     Ok(())
 }

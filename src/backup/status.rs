@@ -30,6 +30,10 @@ pub struct ArchiveStatus {
     /// checked against the archive's own manifest).
     #[serde(default)]
     pub paths: Vec<PathBuf>,
+    /// Skipped git checkouts with no remote at the last successful run
+    /// (absolute paths): not in the backup and not on any remote.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_only_repos: Vec<PathBuf>,
     /// Content fingerprint of the last archive written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,

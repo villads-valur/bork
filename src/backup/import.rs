@@ -151,6 +151,8 @@ pub enum GlobalConfigOutcome {
 #[derive(Debug, Clone)]
 pub struct Report {
     pub dry_run: bool,
+    /// Host that wrote the backup (empty for older archives).
+    pub host: String,
     pub projects: Vec<ProjectReport>,
     pub global_config: GlobalConfigOutcome,
 }
@@ -210,6 +212,7 @@ pub fn import(file: &Path, opts: &Options) -> anyhow::Result<Report> {
 
     Ok(Report {
         dry_run: opts.dry_run,
+        host: manifest.host.clone(),
         projects,
         global_config,
     })
@@ -1087,7 +1090,13 @@ impl Report {
         };
         let mut out = String::new();
         if self.dry_run {
-            out.push_str("Dry run, nothing was changed.\n\n");
+            out.push_str("Dry run, nothing was changed.\n");
+        }
+        if !self.host.is_empty() {
+            let _ = writeln!(out, "Backup from {}.", self.host);
+        }
+        if self.dry_run || !self.host.is_empty() {
+            out.push('\n');
         }
         for p in &self.projects {
             let label = p
@@ -1633,6 +1642,10 @@ mod tests {
             assert!(p.files.contains(&"AGENTS.md".to_string()));
             let text = report.render();
             assert!(text.contains("Dry run"), "{text}");
+            assert!(
+                text.contains(&format!("Backup from {}.", super::super::host_name())),
+                "{text}"
+            );
             assert!(text.contains("would restore 2 issues"), "{text}");
             assert!(text.contains("AGENTS.md"), "{text}");
         });
