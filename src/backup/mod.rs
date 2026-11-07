@@ -176,6 +176,7 @@ pub fn plan(selection: &Selection) -> anyhow::Result<Option<Plan>> {
                     path,
                     source,
                     follow: true,
+                    captured: None,
                 });
             }
         }
@@ -202,9 +203,14 @@ pub fn run(selection: &Selection) -> anyhow::Result<Option<Outcome>> {
         Ok(Some(plan)) => plan,
         Ok(None) => return Ok(None),
         Err(err) => {
-            // Record against the file this run would have written, if known.
-            if let Some(file) = target_file(selection) {
-                record_failure(&file, &err);
+            // Record against the full backup's file so the daily status shows
+            // it. A refused `--project` run is reported by the caller only:
+            // its target file may belong to another project, whose healthy
+            // record must not turn into a failure.
+            if *selection == Selection::All {
+                if let Some(file) = full_backup_file() {
+                    record_failure(&file, &err);
+                }
             }
             return Err(err);
         }
@@ -242,9 +248,7 @@ pub fn run(selection: &Selection) -> anyhow::Result<Option<Outcome>> {
 /// [`BACKUP_MAX_AGE_SECS`] old. Explicit `bork backup` calls run regardless.
 #[cfg_attr(not(test), allow(dead_code))] // Used by the TUI worker in a follow-up
 pub fn is_due(now: u64) -> bool {
-    let file = config::load_settings()
-        .path
-        .map(|dir| resolve_through_existing(&dir).join(BACKUP_FILE));
+    let file = full_backup_file();
     is_due_at(&status::read(&status::status_path()), file.as_deref(), now)
 }
 
@@ -289,6 +293,25 @@ pub fn save_issue_plan(
     Ok(true)
 }
 
+/// Read the board (symlinks followed) as bytes and mode. `None` when the
+/// project has no board yet; other read errors fail.
+fn read_board(path: &Path) -> anyhow::Result<Option<(Vec<u8>, u32)>> {
+    use std::os::unix::fs::PermissionsExt;
+    let context = || format!("reading {}", path.display());
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(context),
+    };
+    let meta = file.metadata().with_context(context)?;
+    if !meta.is_file() {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes).with_context(context)?;
+    Ok(Some((bytes, meta.permissions().mode() & 0o777)))
+}
+
 /// ASCII-only directory name for a project in the archive: characters
 /// outside `[A-Za-z0-9._-]` become `_`.
 fn archive_dir_name(name: &str) -> String {
@@ -331,12 +354,15 @@ fn project_part(
     // A corrupt board fails the run (keeping the previous backup) instead of
     // reading as empty, which would drop every issue and plan from the new
     // file. A project without a board yet backs up everything else.
-    let state_file = root.join(".bork/state.json");
-    let board = if select::is_existing_file(&state_file)? {
-        crate::config::try_load_state(root)
-            .with_context(|| format!("{} can't be read or parsed", state_file.display()))?
-    } else {
-        AppState::default()
+    // The board is read once: the same bytes pick the plans, build the
+    // manifest and go into the archive, so a board saved mid-run can't leave
+    // them out of step.
+    let board_rel = ".bork/state.json";
+    let board_bytes = read_board(&root.join(board_rel))?;
+    let board: AppState = match &board_bytes {
+        Some((bytes, _)) => serde_json::from_slice(bytes)
+            .with_context(|| format!("{} can't be parsed", root.join(board_rel).display()))?,
+        None => AppState::default(),
     };
     let facts = manifest::RepoFacts::gather(root);
     let worktrees = select::worktree_dirs(root, &facts.worktree_paths(), &board);
@@ -347,12 +373,26 @@ fn project_part(
         let Some(rel_str) = rel.to_str().map(String::from) else {
             continue;
         };
+        if rel_str == board_rel {
+            continue;
+        }
         entries.push(ArchiveEntry {
             path: format!("{prefix}/{rel_str}"),
             follow: select::BORK_FILES.contains(&rel_str.as_str()),
             source: root.join(&rel),
+            captured: None,
         });
         files.push(rel_str);
+    }
+
+    if let Some(captured) = board_bytes {
+        entries.push(ArchiveEntry {
+            path: format!("{prefix}/{board_rel}"),
+            source: root.join(board_rel),
+            follow: true,
+            captured: Some(captured),
+        });
+        files.push(board_rel.to_string());
     }
 
     let mut plans = HashMap::new();
@@ -364,6 +404,7 @@ fn project_part(
             path,
             source,
             follow: true,
+            captured: None,
         });
         files.push(rel);
     }
@@ -440,7 +481,7 @@ fn check_single_project_owner(file: &Path, root: &Path) -> anyhow::Result<()> {
     if owners != [root] {
         let owners: Vec<String> = owners.iter().map(|p| p.display().to_string()).collect();
         bail!(
-            "{} holds the backup of {}; give {} a different project_name",
+            "{} holds the backup of {}; give {} a different project_name, or move the old file away if this is the same project in a new place",
             file.display(),
             owners.join(", "),
             root.display()
@@ -449,16 +490,10 @@ fn check_single_project_owner(file: &Path, root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The file a selection writes to, when the backup path is configured.
-fn target_file(selection: &Selection) -> Option<PathBuf> {
-    let dir = resolve_through_existing(&config::load_settings().path?);
-    match selection {
-        Selection::All => Some(dir.join(BACKUP_FILE)),
-        Selection::Project(root) => {
-            let name = crate::config::load_config_from(root).project_name;
-            Some(dir.join(format!("bork-backup-{name}.tar.gz")))
-        }
-    }
+/// The full backup's file, when the backup path is configured.
+fn full_backup_file() -> Option<PathBuf> {
+    let dir = config::load_settings().path?;
+    Some(resolve_through_existing(&dir).join(BACKUP_FILE))
 }
 
 fn record_failure(file: &Path, err: &anyhow::Error) {
@@ -918,6 +953,8 @@ mod tests {
                 format!("{err:#}").contains("holds the backup of"),
                 "{err:#}"
             );
+            // The refusal doesn't mark the owner's healthy backup as failed.
+            assert!(status::read(&status::status_path()).archives[&outcome.file].ok);
             let manifest = read_manifest(&outcome.file);
             assert_eq!(
                 manifest.projects[0].path,
@@ -1136,6 +1173,40 @@ mod tests {
             );
             assert_eq!(fs::metadata(&first.file).unwrap().len(), first.size);
             assert!(!status::read(&status::status_path()).archives[&first.file].ok);
+        });
+    }
+
+    #[test]
+    fn board_is_archived_from_the_bytes_that_were_parsed() {
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            set_global_path(dest.path());
+            let demo = project("demo", true);
+            let root = demo.path();
+            save_board(root, &[("demo-1", None)]);
+            let plan = plan(&Selection::All).unwrap().unwrap();
+            let board = plan
+                .entries
+                .iter()
+                .find(|e| e.path == "projects/demo/.bork/state.json")
+                .unwrap();
+            let (bytes, _) = board.captured.as_ref().unwrap();
+            assert_eq!(bytes, &fs::read(root.join(".bork/state.json")).unwrap());
+            assert_eq!(plan.manifest.projects[0].issues.len(), 1);
+
+            // A board saved after planning doesn't reach this archive.
+            save_board(root, &[("demo-1", None), ("demo-2", None)]);
+            let contents = archive::load(&plan.entries).unwrap();
+            let file = dest.path().join("snapshot.tar.gz");
+            archive::write(&file, b"{}", &contents).unwrap();
+            let out = std::process::Command::new("tar")
+                .arg("-xzOf")
+                .arg(&file)
+                .arg("projects/demo/.bork/state.json")
+                .output()
+                .unwrap();
+            assert_eq!(&out.stdout, bytes);
         });
     }
 
