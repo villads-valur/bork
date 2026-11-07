@@ -377,6 +377,12 @@ pub fn delete_issue(project_root: &Path, issue_id: &str) -> anyhow::Result<Issue
     let removed = state.issues.remove(idx);
     remove_link_references(&mut state.issues, &removed.id);
     config::save_state(&state, project_root)?;
+    crate::issue_plan::remove_saved_plans(project_root, &removed.id).map_err(|e| {
+        e.context(format!(
+            "Deleted {} but couldn't remove its saved plans",
+            removed.id
+        ))
+    })?;
 
     Ok(removed)
 }
@@ -743,6 +749,8 @@ pub struct ArchiveReport {
     pub session_name: String,
     pub session_killed: bool,
     pub worktree_removed: Option<String>,
+    /// Exit code of a teardown script that failed but `--force` went past.
+    pub teardown_failed: Option<i32>,
 }
 
 /// Archive an issue: kill its agent session, run the teardown script, remove
@@ -765,6 +773,7 @@ pub fn archive_issue(
     let session_name = issue.session_name(&app_config.project_name);
     let session_killed = agent::terminate_session(project_root, &session_name)?;
 
+    let mut teardown_failed = None;
     let worktree_removed = match issue.worktree.as_deref() {
         Some(dir) => {
             let removal = if force {
@@ -772,7 +781,8 @@ pub fn archive_issue(
             } else {
                 worktree::Removal::Safe
             };
-            worktree::remove_worktree_in(&app_config, dir, removal)?;
+            teardown_failed =
+                worktree::remove_worktree_in(&app_config, &issue.id, dir, removal)?.teardown_failed;
             Some(dir.to_string())
         }
         None => None,
@@ -793,6 +803,7 @@ pub fn archive_issue(
         session_name,
         session_killed,
         worktree_removed,
+        teardown_failed,
     })
 }
 
@@ -1547,6 +1558,38 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output, "No issues found.");
+    }
+
+    #[test]
+    fn delete_removes_the_saved_plans_and_archive_keeps_them() {
+        let dir = setup_project();
+        let root = dir.path();
+        crate::issue_plan::test_support::enable_backups(root);
+        for title in ["Delete me", "Archive me"] {
+            create_issue(
+                root,
+                CreateOptions {
+                    title: title.into(),
+                    column: None,
+                    agent_kind: None,
+                    agent_mode: None,
+                    prompt: None,
+                    model: None,
+                    kind: None,
+                },
+            )
+            .unwrap();
+        }
+        for id in ["test-1", "test-2"] {
+            fs::create_dir_all(root.join("plans").join(id)).unwrap();
+            fs::write(root.join("plans").join(id).join("planning.md"), id).unwrap();
+        }
+
+        delete_issue(root, "test-1").unwrap();
+        archive_issue(root, "test-2", false).unwrap();
+
+        assert!(!root.join("plans/test-1").exists());
+        assert!(root.join("plans/test-2/planning.md").exists());
     }
 
     #[test]
