@@ -420,14 +420,6 @@ fn spawn_backup_worker(
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || {
-        // Keyed by the resolved path, like `backup::run` records it.
-        let record_for = |file: &Path| {
-            backup::status::read(&backup::status::status_path())
-                .archives
-                .get(file)
-                .cloned()
-        };
-
         // An unreadable registry or project config is an error, not "off".
         let enabled = || {
             global_config::try_list_projects()
@@ -439,8 +431,8 @@ fn spawn_backup_worker(
                 })
         };
 
-        if let Some(file) = backup::full_backup_file() {
-            let record = record_for(&file);
+        if backup::full_backup_file().is_some() {
+            let record = backup::full_backup_record();
             let report =
                 schedule::startup_report(schedule::blocked(true, enabled()), record.as_ref());
             if tx.send(report).is_err() {
@@ -461,12 +453,12 @@ fn spawn_backup_worker(
             wait = schedule::CHECK_INTERVAL;
             wait_while_suspended(&suspended);
 
-            let file = backup::full_backup_file();
+            let mut status_warning = None;
             let check = schedule::decide(
-                schedule::blocked(file.is_some(), enabled()),
+                schedule::blocked(backup::full_backup_file().is_some(), enabled()),
                 manual,
                 || {
-                    let last = file.as_deref().and_then(record_for);
+                    let last = backup::full_backup_record();
                     schedule::retry_or_due(
                         last.as_ref(),
                         backup::is_due(app::unix_now()),
@@ -475,14 +467,22 @@ fn spawn_backup_worker(
                 },
                 || {
                     backup::run(&backup::Selection::All)
-                        .map(|outcome| outcome.map(|o| o.written))
+                        .map(|outcome| {
+                            outcome.map(|o| {
+                                status_warning = o.status_warning;
+                                o.written
+                            })
+                        })
                         .map_err(|err| format!("{err:#}"))
                 },
             );
             last_attempt_failed = matches!(check, schedule::Check::Ran(Err(_)));
-            let record = file.as_deref().and_then(record_for);
+            let record = backup::full_backup_record();
             let indicator = schedule::indicator(&check, record.as_ref());
-            let report = Report::new(indicator, manual.then_some(check), false, record.as_ref());
+            let report = Report {
+                status_warning,
+                ..Report::new(indicator, manual.then_some(check), record.as_ref())
+            };
             if tx.send(report).is_err() {
                 break;
             }
@@ -1397,6 +1397,9 @@ fn run_backup_command(project: Option<&str>, dry_run: bool) -> anyhow::Result<()
         outcome.projects.join(", ")
     );
     warn_local_only_repos(&outcome.local_only_repos);
+    if let Some(warning) = &outcome.status_warning {
+        eprintln!("warning: {warning}");
+    }
     Ok(())
 }
 
@@ -2628,6 +2631,41 @@ fn spawn_activity_poller(
     rx
 }
 
+/// Quitting while the Backup Worker writes a backup file: wait up to
+/// `schedule::QUIT_WAIT` with "Finishing backup…" and the spinner, then
+/// stop `tar` and remove its temp file and staging dir. Otherwise `tar`
+/// would outlive bork and leave both behind (the backup folder is often a
+/// synced one, like iCloud Drive).
+fn finish_backup_before_quit(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) {
+    use backup::schedule::{quit_step, QuitStep, FINISHING_BACKUP};
+
+    backup::stop_new_writes();
+    let started = std::time::Instant::now();
+    let mut shown = false;
+    loop {
+        match quit_step(backup::in_flight(), started.elapsed()) {
+            QuitStep::Exit => return,
+            QuitStep::Abort => {
+                backup::abort_in_flight();
+                return;
+            }
+            QuitStep::Wait => {}
+        }
+        if !shown {
+            shown = true;
+            app.busy_count += 1;
+            app.set_message(FINISHING_BACKUP);
+        }
+        app.spinner_tick = app.spinner_tick.wrapping_add(1);
+        // The terminal may already be gone (SIGHUP); keep waiting anyway.
+        let _ = terminal.draw(|frame| ui::render(frame, app));
+        // Doubles as the tick; input is ignored while finishing.
+        if matches!(event::poll(TICK_RATE), Ok(true)) {
+            let _ = event::read();
+        }
+    }
+}
+
 fn run_tui() -> anyhow::Result<()> {
     // --- Determine which project to focus ---
     global_config::prune_stale_projects();
@@ -2806,14 +2844,7 @@ fn run_tui() -> anyhow::Result<()> {
         .ok();
     // The full backup's record as last seen by that poll, so writes for
     // other archives (`bork backup --project`) are ignored.
-    let full_backup_record = || {
-        backup::full_backup_file().and_then(|file| {
-            backup::status::read(&backup::status::status_path())
-                .archives
-                .remove(&file)
-        })
-    };
-    let mut last_full_backup_record = full_backup_record();
+    let mut last_full_backup_record = backup::full_backup_record();
 
     // --- Main event loop ---
     loop {
@@ -3406,7 +3437,7 @@ fn run_tui() -> anyhow::Result<()> {
                 .ok();
             if status_mtime != last_backup_status_mtime {
                 last_backup_status_mtime = status_mtime;
-                let record = full_backup_record();
+                let record = backup::full_backup_record();
                 if let Some(indicator) = backup::schedule::on_status_change(
                     &app.backup,
                     last_full_backup_record.as_ref(),
@@ -3415,7 +3446,6 @@ fn run_tui() -> anyhow::Result<()> {
                     needs_redraw |= app.apply_backup_report(backup::schedule::Report::new(
                         indicator,
                         None,
-                        false,
                         record.as_ref(),
                     ));
                 }
@@ -3482,6 +3512,7 @@ fn run_tui() -> anyhow::Result<()> {
     }
 
     shared.shutdown.store(true, Ordering::Relaxed);
+    finish_backup_before_quit(&mut terminal, &mut app);
 
     for project in &mut app.projects {
         if project.state_dirty {

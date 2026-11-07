@@ -2445,18 +2445,15 @@ impl App {
             schedule::failure_to_report(&self.backup, &report.indicator)
         };
         if let Some(error) = failure {
-            let line = format!("backup failed: {error}");
-            for project in &self.projects {
-                let root = &project.config.project_root;
-                // An unreadable config may be the failure itself, so only
-                // projects that are definitely off are skipped.
-                if !matches!(crate::backup::config::project_enabled(root), Ok(false)) {
-                    crate::config::append_error_log(root, std::slice::from_ref(&line));
-                }
-            }
+            self.log_backup_error(format!("backup failed: {error}"));
             if report.manual.is_none() {
                 self.set_error(format!("Backup failed: {error}"));
             }
+            redraw = true;
+        }
+        if let Some(warning) = &report.status_warning {
+            self.log_backup_error(format!("backup: {warning}"));
+            self.set_warning(format!("Backup done, but {warning}"));
             redraw = true;
         }
         if self.backup != report.indicator {
@@ -2465,6 +2462,18 @@ impl App {
         }
         redraw |= self.refresh_backup_warning(unix_now());
         redraw
+    }
+
+    /// Append a backup problem to `.bork/errors.log` of each loaded project
+    /// that isn't opted out. An unreadable config may be the failure
+    /// itself, so only projects that are definitely off are skipped.
+    fn log_backup_error(&self, line: String) {
+        for project in &self.projects {
+            let root = &project.config.project_root;
+            if !matches!(crate::backup::config::project_enabled(root), Ok(false)) {
+                crate::config::append_error_log(root, std::slice::from_ref(&line));
+            }
+        }
     }
 
     /// Recompute the header's backup warning for `now` (the 48h warning
@@ -3672,6 +3681,37 @@ mod tests {
 
         app.apply_backup_report(backup_report(backup_failure("b"), None, false));
         assert_eq!(error_log(dir.path()).matches("backup failed: b").count(), 1);
+    }
+
+    #[test]
+    fn unrecorded_status_is_a_warning_and_a_log_line() {
+        use crate::backup::schedule::{BackupIndicator, Check, Report};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = backup_app(dir.path());
+
+        assert!(app.apply_backup_report(Report {
+            indicator: BackupIndicator::Ok {
+                last_success_at: Some(1),
+            },
+            manual: Some(Check::Ran(Ok(Some(true)))),
+            status_warning: Some("could not record backup status: disk full".into()),
+            ..Default::default()
+        }));
+
+        assert_eq!(
+            app.message,
+            Some((
+                "Backup done, but could not record backup status: disk full".into(),
+                MessageKind::Warning
+            ))
+        );
+        assert_eq!(
+            error_log(dir.path())
+                .matches("backup: could not record backup status: disk full")
+                .count(),
+            1
+        );
     }
 
     #[test]
