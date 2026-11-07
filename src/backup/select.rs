@@ -168,9 +168,15 @@ fn walk(root: &Path, rel: &Path, out: &mut BTreeSet<PathBuf>) -> anyhow::Result<
     if !file_type.is_dir() {
         return Ok(());
     }
+    // A nested checkout (anything with its own `.git`) is code, not
+    // container docs: skip it whole, like top-level worktrees.
+    match fs::symlink_metadata(path.join(".git")) {
+        Ok(_) => return Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+    }
     for name in list_dir(&path)? {
-        // A nested repo's object store is not ours to copy.
-        if name == ".git" || is_ephemeral(&name) {
+        if is_ephemeral(&name) {
             continue;
         }
         walk(root, &rel.join(&name), out)?;
@@ -250,9 +256,12 @@ mod tests {
         // Worktree known only from its `.git` file.
         touch(root, "bork-4-orphan/.git");
         touch(root, "bork-4-orphan/file.rs");
-        // A nested repo below the top level is kept, minus its object store.
+        // A nested checkout below the top level is skipped whole, `.git`
+        // file or dir alike.
         touch(root, "plans/tool/.git/HEAD");
         touch(root, "plans/tool/readme.md");
+        touch(root, "refs/other/.git");
+        touch(root, "refs/other/node_modules/pkg/index.js");
 
         let mut state = AppState::default();
         let mut issue = Issue::new("bork-3", "t", Column::InProgress, AgentKind::Claude);
@@ -280,7 +289,6 @@ mod tests {
                 "AGENTS.md",
                 "opencode.jsonc",
                 "plans/bork-7/planning.md",
-                "plans/tool/readme.md",
             ])
         );
         assert!(!worktrees.contains("x"));
