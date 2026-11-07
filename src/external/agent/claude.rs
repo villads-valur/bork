@@ -133,6 +133,21 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_project_subdir_is_unknown() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::TempDir::new().unwrap();
+        let project = root.path().join("-Users-x-code-bork");
+        fs::create_dir(&project).unwrap();
+        fs::set_permissions(&project, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = transcript_exists(root.path(), SID);
+        fs::set_permissions(&project, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(result, None);
+    }
+
+    #[test]
     fn unreadable_projects_dir_is_unknown() {
         let root = tempfile::TempDir::new().unwrap();
 

@@ -2484,7 +2484,7 @@ impl App {
             .filter(|(agent, sid)| {
                 !crate::external::agent::provider(**agent).has_session(&p.config.project_root, sid)
             })
-            .map(|(agent, _)| *agent)
+            .map(|(agent, sid)| (*agent, sid.clone()))
             .collect();
         self.dialog = Some(dialog);
         self.input_mode = InputMode::Dialog;

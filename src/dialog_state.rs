@@ -1,7 +1,7 @@
 //! New/edit issue dialog state: field ordering, focus, and the plain-text
 //! editing primitives used by the title field.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ratatui::style::{Modifier, Style};
 use ratatui_textarea::{CursorMove, TextArea, WrapMode};
@@ -55,9 +55,10 @@ pub struct DialogState {
     pub github_stack: Option<u32>,
     pub github_pr_cleared: bool,
     pub github_available: bool,
-    /// Agents whose stored session can't be resumed anymore, so the picker
-    /// hides their resume marker. Detected once at open.
-    pub lost_sessions: BTreeSet<AgentKind>,
+    /// Stored session ids that can't be resumed anymore, so the picker hides
+    /// their resume marker. Detected once at open; keyed by id so a new
+    /// session landing while the dialog is up shows again.
+    pub lost_sessions: BTreeMap<AgentKind, String>,
     /// Agents whose stored session the user dropped; submit forgets them so
     /// the next launch starts fresh.
     pub forgotten_sessions: BTreeSet<AgentKind>,
@@ -115,7 +116,7 @@ impl DialogState {
             github_stack: None,
             github_pr_cleared: false,
             github_available,
-            lost_sessions: BTreeSet::new(),
+            lost_sessions: BTreeMap::new(),
             forgotten_sessions: BTreeSet::new(),
         }
     }
@@ -181,7 +182,7 @@ impl DialogState {
             github_stack: issue.github_stack,
             github_pr_cleared: false,
             github_available,
-            lost_sessions: BTreeSet::new(),
+            lost_sessions: BTreeMap::new(),
             forgotten_sessions: BTreeSet::new(),
         }
     }
@@ -325,9 +326,10 @@ impl DialogState {
 
     /// Whether the resume marker should show for `agent`, given the live
     /// issue's stored sessions.
-    pub fn shows_session(&self, agent: AgentKind, session_agents: &[AgentKind]) -> bool {
-        session_agents.contains(&agent)
-            && !self.lost_sessions.contains(&agent)
+    pub fn shows_session(&self, agent: AgentKind, sessions: &BTreeMap<AgentKind, String>) -> bool {
+        sessions
+            .get(&agent)
+            .is_some_and(|sid| self.lost_sessions.get(&agent) != Some(sid))
             && !self.forgotten_sessions.contains(&agent)
     }
 

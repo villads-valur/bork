@@ -4313,13 +4313,11 @@ mod tests {
         let agent = app.project().issues[0].agent_kind;
 
         handle_action(&mut app, Action::DialogBackspace, &ctx, &test_channels());
-        let session_agents: Vec<AgentKind> =
-            app.project().issues[0].sessions.keys().copied().collect();
         assert!(!app
             .dialog
             .as_ref()
             .unwrap()
-            .shows_session(agent, &session_agents));
+            .shows_session(agent, &app.project().issues[0].sessions));
         // Nothing is dropped until the dialog is saved.
         assert_eq!(
             app.project().issues[0].current_session_id(),
@@ -4330,6 +4328,34 @@ mod tests {
         let issue = &app.project().issues[0];
         assert_eq!(issue.current_session_id(), None);
         assert_eq!(issue.sessions.len(), 1);
+    }
+
+    #[test]
+    fn new_session_after_lost_one_shows_resume_marker() {
+        let mut app = test_app();
+        app.project_mut().issues.push(issue_with_two_sessions());
+        open_dialog_on_agent_field(&mut app);
+        let agent = app.project().issues[0].agent_kind;
+        app.dialog
+            .as_mut()
+            .unwrap()
+            .lost_sessions
+            .insert(agent, "ses_old".to_string());
+        assert!(!app
+            .dialog
+            .as_ref()
+            .unwrap()
+            .shows_session(agent, &app.project().issues[0].sessions));
+
+        // A background launch replaced the lost session while the dialog was up.
+        app.project_mut().issues[0]
+            .sessions
+            .insert(agent, "ses_new".to_string());
+        assert!(app
+            .dialog
+            .as_ref()
+            .unwrap()
+            .shows_session(agent, &app.project().issues[0].sessions));
     }
 
     #[test]

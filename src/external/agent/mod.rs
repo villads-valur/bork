@@ -122,14 +122,22 @@ pub struct DetectContext<'a> {
 
 /// Whether any direct subdir of `root` contains `name`. For harnesses that
 /// group sessions by a workspace key bork doesn't derive itself. `None` when
-/// `root` can't be read, so callers keep the session.
+/// any part of the search can't be read and `name` wasn't found, so callers
+/// keep the session.
 fn exists_in_any_subdir(root: &Path, name: &str) -> Option<bool> {
-    let entries = fs::read_dir(root).ok()?;
-    Some(
-        entries
-            .flatten()
-            .any(|entry| entry.path().join(name).exists()),
-    )
+    let mut unreadable = false;
+    for entry in fs::read_dir(root).ok()? {
+        let Ok(entry) = entry else {
+            unreadable = true;
+            continue;
+        };
+        match entry.path().join(name).try_exists() {
+            Ok(true) => return Some(true),
+            Ok(false) => {}
+            Err(_) => unreadable = true,
+        }
+    }
+    (!unreadable).then_some(false)
 }
 
 /// Map an `AgentKind` to its provider. The one dispatch point — a match here is
