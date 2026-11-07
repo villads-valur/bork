@@ -39,7 +39,7 @@ pub fn log_dropped_plan(project_root: &Path, worktree_dir: &str, error: &str) {
 /// pruned issues keep theirs. Only touches projects with backups on, and
 /// only that one directory.
 pub fn remove_saved_plans(project_root: &Path, issue_id: &str) -> anyhow::Result<()> {
-    if !crate::backup::config::project_enabled(project_root) {
+    if !crate::backup::config::project_enabled(project_root)? {
         return Ok(());
     }
     if !crate::backup::select::is_plain_component(issue_id) {
