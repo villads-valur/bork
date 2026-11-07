@@ -663,6 +663,29 @@ enum Command {
         dry_run: bool,
     },
 
+    /// Restore projects, boards and plans from a `bork backup` file
+    Import {
+        /// Backup file, e.g. bork-backup.tar.gz
+        file: PathBuf,
+
+        /// Only restore this project (name or label in the backup)
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Restore each project to <root>/<name> instead of its recorded path
+        #[arg(long)]
+        root: Option<PathBuf>,
+
+        /// Restore over existing directories and the global config. Never
+        /// deletes main/ or worktrees, only overwrites the restored files.
+        #[arg(long)]
+        force: bool,
+
+        /// Print what would be cloned, written and registered without changing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Prune stale worktrees from the project on disk.
     Prune {
         /// Print what would be removed without touching anything
@@ -1093,6 +1116,13 @@ fn main() -> anyhow::Result<()> {
             project,
             dry_run,
         }) => run_backup_command(project.as_deref(), dry_run),
+        Some(Command::Import {
+            file,
+            project,
+            root,
+            force,
+            dry_run,
+        }) => run_import_command(&file, project, root, force, dry_run),
         Some(Command::Prune {
             dry_run,
             yes,
@@ -1259,6 +1289,32 @@ fn run_backup_command(project: Option<&str>, dry_run: bool) -> anyhow::Result<()
         format_size(outcome.size),
         outcome.projects.join(", ")
     );
+    Ok(())
+}
+
+fn run_import_command(
+    file: &Path,
+    project: Option<String>,
+    root: Option<PathBuf>,
+    force: bool,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir()?;
+    let opts = backup::import::Options {
+        project,
+        root: root.map(|r| cwd.join(r)),
+        force,
+        dry_run,
+    };
+    let report = backup::import::import(&cwd.join(file), &opts)?;
+    println!("{}", report.render());
+    if !dry_run {
+        // Same as `bork init`: a fresh machine needs the agent hooks too.
+        if let Err(err) = external::hooks::install() {
+            eprintln!("Warning: hook installation failed: {err}");
+            eprintln!("You can run 'bork install' later to set up hooks.");
+        }
+    }
     Ok(())
 }
 

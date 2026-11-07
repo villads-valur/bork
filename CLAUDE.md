@@ -69,6 +69,7 @@ src/
 ├── backup/           # Backups (library; `bork backup` CLI in main.rs is a thin layer)
 │   ├── mod.rs        # Selection, plan/run (one tar.gz, skip when unchanged), save_issue_plan
 │   ├── config.rs     # `[backup]`: enabled (project file), path + interval_minutes (global file)
+│   ├── import.rs     # `bork import`: extract, version check, clone main/, restore board/files/plans, register
 │   ├── manifest.rs   # Public manifest.json types (archive contract for `bork import`) + repo facts
 │   ├── archive.rs    # Staging copy + system `tar -czf`, atomic rename, content fingerprint
 │   ├── select.rs     # Container file selection, worktree detection, ephemeral excludes, issue plans
@@ -161,6 +162,7 @@ Legacy: `~/.config/bork/agents.toml` is no longer read (bork-119). A one-line st
 - Unchanged content (fingerprint over manifest without `created_at` + every file) skips the write. Read errors other than NotFound fail the run and keep the previous file. The path may not be inside a registered project.
 - `backup::save_issue_plan(root, issue_id, worktree_dir)` copies a worktree's plan into the container's `plans/<issue-id>/planning.md` before removal (no-op when backups are off); the archive/delete/prune paths call it (follow-up).
 - Runs are serialized with a required flock on `~/.config/bork/backup.lock`.
+- `bork import <file>` (`backup::import`): extracts with system `tar -xzf` into a private temp dir, checks `manifest.version` before parsing the rest (newer/unknown versions are refused). Target is the recorded `path` or `--root/<name>`; all targets are checked before any write (existing target needs `--force`, duplicates refused). Per project: clone into `main/` via `init::clone_repo` (shared with `bork init`) + checkout of `default_branch`, skipped when `main/` exists, failures reported but the rest still restored; container files copied from `manifest.files` (symlinks recreated, nothing under a symlinked archive dir); board via `try_load_state`/`save_state` with `rewrite_state` (worktree not at the target -> cleared like a prune: `pruned_at`, `setup_ran = false`, sessions dropped; another path than recorded -> all sessions dropped); `_issues/<id>/planning.md` -> `plans/<id>/planning.md`, never overwriting; register + label. `_global/config.toml` only when missing or `--force` (and not with `--project`); `_global/projects.json` is not copied. `--dry-run` runs the same code with writes off.
 
 ## Build & Run
 

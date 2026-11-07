@@ -129,6 +129,7 @@ bork --help
 |---------|-------------|
 | `bork` | Launch the TUI kanban board |
 | `bork init <repo>` | Set up a new bork project from a git repo |
+| `bork import <file>` | Restore projects, boards and plans from a backup file |
 | `bork install` | Install agent status hooks |
 | `bork worktree <id> [slug]` | Create a git worktree for an issue |
 | `bork uninstall` | Remove agent status hooks |
@@ -502,7 +503,19 @@ The file is replaced atomically and left untouched when nothing changed since th
 
 #### Restoring
 
-`bork import <file>` (coming) restores from the backup file: it clones each project's repo, puts the board and container files back, and registers the projects. To look inside a backup by hand:
+After a wipe, install bork, grab the file from your synced folder and run `bork import`:
+
+```bash
+bork import bork-backup.tar.gz                    # every project, back to its recorded path
+bork import bork-backup.tar.gz --root ~/code      # restore to ~/code/<name> instead
+bork import bork-backup.tar.gz --project bork     # just one project
+bork import bork-backup.tar.gz --dry-run          # print what would be cloned, written and registered
+bork import bork-backup.tar.gz --force            # restore over existing directories
+```
+
+For each project it clones the repo into `main/` (on the default branch), restores the board and container files, moves each worktree plan to `plans/<issue-id>/planning.md` and registers the project (with its sidebar label). Worktrees aren't recreated: issues that had one keep their prompt, column and links but lose the worktree and agent sessions, and the summary lists their branches so you can reopen them from the pushed branch. Without a clone URL, or when the clone fails, the board and docs are still restored and the summary says so. Your global `config.toml` is restored only when you don't have one yet; `--project` leaves it alone. Agent hooks are installed like `bork init` does.
+
+Import refuses to touch an existing project directory unless you pass `--force`. Even then it never deletes `main/` or worktrees, only overwrites the restored files, and never replaces a plan that already exists in `plans/`, so re-running it is safe. To look inside a backup by hand:
 
 ```bash
 tar -tzf bork-backup.tar.gz                       # list the contents

@@ -8,11 +8,14 @@
 //! layout and manifest are documented in [`manifest`]. A run whose content
 //! matches the last archive leaves the file untouched.
 //!
+//! `bork import <file>` ([`import`]) restores an archive.
+//!
 //! The CLI is a thin layer over [`plan`] and [`run`]; the TUI worker and the
 //! worktree removal paths ([`save_issue_plan`]) call the same functions.
 
 pub mod archive;
 pub mod config;
+pub mod import;
 pub mod manifest;
 pub mod select;
 pub mod status;

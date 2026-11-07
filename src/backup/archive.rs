@@ -160,11 +160,12 @@ fn stage_file(staging: &Path, path: &str, bytes: &[u8], mode: u32) -> anyhow::Re
     Ok(())
 }
 
-/// Private temp directory, removed on drop.
-struct Staging(PathBuf);
+/// Private temp directory, removed on drop. Also holds an extracted archive
+/// during `bork import`.
+pub(super) struct Staging(pub(super) PathBuf);
 
 impl Staging {
-    fn new() -> anyhow::Result<Self> {
+    pub(super) fn new() -> anyhow::Result<Self> {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
