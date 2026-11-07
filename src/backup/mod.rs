@@ -488,13 +488,17 @@ fn check_single_project_owner(file: &Path, root: &Path) -> anyhow::Result<()> {
 }
 
 /// Where a failed planning step is recorded: the full backup's file, or the
-/// project's own `--project` file. Nothing is recorded when that file
+/// project's own `--project` file. Nothing is recorded for a project that
+/// isn't opted in (it has no backup file to report on), or when the file
 /// belongs to another project, so its healthy record stays intact.
 fn failure_file(selection: &Selection) -> Option<PathBuf> {
     match selection {
         Selection::All => full_backup_file(),
         Selection::Project(root) => {
             let root = crate::global_config::normalize_path(root);
+            if !config::project_enabled(&root).unwrap_or(false) {
+                return None;
+            }
             let dir = resolve_through_existing(&config::load_settings().path?);
             let name = crate::config::load_config_from(&root).project_name;
             let file = dir.join(format!("bork-backup-{name}.tar.gz"));
@@ -750,6 +754,10 @@ mod tests {
 
             let off = project("off", false);
             assert!(run(&Selection::Project(off.path().to_path_buf())).is_err());
+            let off_file = resolve_through_existing(&dest.path().join("bork-backup-off.tar.gz"));
+            assert!(!status::read(&status::status_path())
+                .archives
+                .contains_key(&off_file));
         });
     }
 
