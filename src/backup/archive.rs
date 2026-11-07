@@ -104,6 +104,25 @@ pub fn write(dest: &Path, manifest: &[u8], entries: &[ArchiveEntry]) -> anyhow::
     result
 }
 
+/// Read `manifest.json` from an existing backup archive.
+pub fn read_manifest(file: &Path) -> anyhow::Result<super::manifest::Manifest> {
+    let output = Command::new("tar")
+        .arg("-xzOf")
+        .arg(file)
+        .arg(super::manifest::MANIFEST_FILE)
+        .output()
+        .context("running tar")?;
+    if !output.status.success() {
+        bail!(
+            "can't read the manifest of {}: {}",
+            file.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("parsing the manifest of {}", file.display()))
+}
+
 enum Source {
     Missing,
     Link(PathBuf),
