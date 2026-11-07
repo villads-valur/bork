@@ -461,7 +461,10 @@ fn spawn_backup_worker(
             let check = schedule::decide(
                 schedule::blocked(file.is_some(), enabled()),
                 manual,
-                || backup::is_due(app::unix_now()),
+                || {
+                    let last = file.as_deref().and_then(record_for);
+                    schedule::retry_or_due(last.as_ref(), backup::is_due(app::unix_now()))
+                },
                 || {
                     backup::run(&backup::Selection::All)
                         .map(|outcome| outcome.map(|o| o.written))

@@ -90,6 +90,13 @@ pub fn decide(
     }
 }
 
+/// Whether a scheduled check should run: due by [`super::is_due`], or the
+/// last run failed (e.g. a CLI `bork backup` hours after a good one), so a
+/// failure is retried hourly instead of waiting out the 24h.
+pub fn retry_or_due(record: Option<&ArchiveStatus>, due: bool) -> bool {
+    due || record.is_some_and(|r| !r.ok)
+}
+
 /// Error shown when the worker thread is gone and `B` can't reach it.
 pub const WORKER_STOPPED: &str = "Automatic backups stopped (worker crashed); restart bork";
 
@@ -177,22 +184,38 @@ pub fn failure_to_report<'a>(prev: &BackupIndicator, next: &'a BackupIndicator) 
     }
 }
 
-/// Error messages compared with digit runs masked: temp and staging names
-/// carry a pid or timestamp (`.bork-backup.tar.gz.tmp.<pid>`), which would
-/// otherwise make the same failure look new after a restart or every run.
+/// Error messages compared with the generated parts of temp and staging
+/// names masked (`.<backup file>.tmp.<pid>`, staging dir `bork-backup-<pid>-<nanos>`
+/// in `archive.rs`), which would otherwise make the same failure look new
+/// after a restart or every run. Other numbers, like `project-2` in a path,
+/// still count.
 fn same_error(a: &str, b: &str) -> bool {
     fn mask(s: &str) -> String {
+        let chars: Vec<char> = s.chars().collect();
+        let digits_from = |start: usize| {
+            chars[start..]
+                .iter()
+                .take_while(|c| c.is_ascii_digit())
+                .count()
+        };
         let mut out = String::with_capacity(s.len());
-        let mut in_digits = false;
-        for c in s.chars() {
-            if c.is_ascii_digit() {
-                if !in_digits {
-                    out.push('#');
-                }
-                in_digits = true;
+        let mut i = 0;
+        while i < chars.len() {
+            let run = digits_from(i);
+            // `.tmp.<pid>`, and the staging dir's `bork-backup-<pid>-<nanos>`
+            // (both runs), but not a backup file named after a host that
+            // starts with a digit.
+            let staging_pid = out.ends_with("bork-backup-")
+                && chars.get(i + run) == Some(&'-')
+                && digits_from(i + run + 1) > 0;
+            let generated =
+                out.ends_with(".tmp.") || out.ends_with("bork-backup-#-") || staging_pid;
+            if run > 0 && generated {
+                out.push('#');
+                i += run;
             } else {
-                out.push(c);
-                in_digits = false;
+                out.push(chars[i]);
+                i += 1;
             }
         }
         out
@@ -447,6 +470,17 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_last_run_is_retried_before_the_24h_mark() {
+        assert!(retry_or_due(
+            Some(&failed(Some(NOW - HOUR), "no dir")),
+            false
+        ));
+        assert!(!retry_or_due(Some(&ok_at(NOW - HOUR)), false));
+        assert!(!retry_or_due(None, false));
+        assert!(retry_or_due(Some(&ok_at(NOW - 25 * HOUR)), true));
+    }
+
+    #[test]
     fn decide_checks_blocked_then_manual_then_due() {
         let ran = || Ok(Some(true));
         let never_due = || false;
@@ -480,16 +514,27 @@ mod tests {
 
     #[test]
     fn errors_differing_only_in_pids_are_the_same_failure() {
-        let a = failure(
-            "tar: /b/.bork-backup.tar.gz.tmp.4123: Permission denied",
-            None,
-        );
-        let b = failure(
-            "tar: /b/.bork-backup.tar.gz.tmp.98: Permission denied",
-            None,
-        );
+        let a = failure("tar: /b/.backup.tar.gz.tmp.4123: Permission denied", None);
+        let b = failure("tar: /b/.backup.tar.gz.tmp.98: Permission denied", None);
         assert_eq!(failure_to_report(&a, &b), None);
-        let other = failure("tar: /b/.bork-backup.tar.gz.tmp.98: No space left", None);
+        let other = failure("tar: /b/.backup.tar.gz.tmp.98: No space left", None);
         assert!(failure_to_report(&a, &other).is_some());
+        let staging_a = failure("staging /tmp/bork-backup-41-1700000001/x: denied", None);
+        let staging_b = failure("staging /tmp/bork-backup-7-1700009999/x: denied", None);
+        assert_eq!(failure_to_report(&staging_a, &staging_b), None);
+        // A backup file named after a host keeps its digits.
+        let host_a = failure("writing /b/bork-backup-2024mac.tar.gz: denied", None);
+        let host_b = failure("writing /b/bork-backup-2025mac.tar.gz: denied", None);
+        assert!(failure_to_report(&host_a, &host_b).is_some());
+    }
+
+    #[test]
+    fn numbers_in_project_paths_still_make_a_new_failure() {
+        let one = failure("reading /work/project-1/.bork/config.toml: denied", None);
+        let two = failure("reading /work/project-2/.bork/config.toml: denied", None);
+        assert_eq!(
+            failure_to_report(&one, &two),
+            Some("reading /work/project-2/.bork/config.toml: denied")
+        );
     }
 }

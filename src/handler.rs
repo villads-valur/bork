@@ -4423,6 +4423,25 @@ mod tests {
     }
 
     #[test]
+    fn backup_now_wakes_the_worker_once_while_pending() {
+        let (wake_tx, wake_rx) = mpsc::channel();
+        let ch = ActionChannels {
+            backup_wake_tx: Box::leak(Box::new(wake_tx)),
+            ..test_channels()
+        };
+        let mut app = app_with_issues();
+
+        for _ in 0..2 {
+            let ctx = app.action_context();
+            handle_action(&mut app, Action::BackupNow, &ctx, &ch);
+        }
+
+        assert!(app.backup_manual_pending);
+        assert_eq!(app.busy_count, 1);
+        assert_eq!(wake_rx.try_iter().count(), 1);
+    }
+
+    #[test]
     fn backup_now_without_a_worker_says_so() {
         // `test_channels` drops the receivers, like a crashed worker.
         let mut app = app_with_issues();
