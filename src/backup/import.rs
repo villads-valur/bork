@@ -291,8 +291,9 @@ pub fn resolve_target(project: &ProjectManifest, root: Option<&Path>) -> anyhow:
 fn check_targets(targets: &[PathBuf], force: bool) -> anyhow::Result<()> {
     let mut seen = HashSet::new();
     for target in targets {
-        // Case-insensitive, since macOS file systems usually are.
-        if !seen.insert(target.to_string_lossy().to_lowercase()) {
+        // Exact paths only; names a file system treats as one directory
+        // (case, Unicode normalization) are caught by `claim_target`.
+        if !seen.insert(target) {
             bail!(
                 "two projects would be restored to {}; use --project to pick one",
                 target.display()
@@ -361,6 +362,20 @@ fn claim_target(
     restored_dirs: &mut HashMap<(u64, u64), PathBuf>,
 ) -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt;
+    // Every check below the target starts at the target; a link here would
+    // send the whole restore somewhere else.
+    if fs::symlink_metadata(target).is_ok_and(|m| m.file_type().is_symlink()) {
+        bail!(
+            "{} is a symlink; restore to a real directory",
+            target.display()
+        );
+    }
+    if fs::symlink_metadata(target.join(".git")).is_ok() {
+        bail!(
+            "{} is a git checkout, not a bork project container",
+            target.display()
+        );
+    }
     if !dry_run {
         fs::create_dir_all(target).with_context(|| {
             format!(
@@ -454,9 +469,15 @@ fn restore_files(
             continue;
         };
         let top = rel.split('/').next().unwrap_or_default();
-        if checkouts.contains(top) {
+        let checkout = if checkouts.contains(top) {
+            Some(PathBuf::from(top))
+        } else {
+            checkout_ancestor(target, &rel_path)
+        };
+        if let Some(dir) = checkout {
             report.warnings.push(format!(
-                "skipped {rel}: {top}/ is a git checkout at the target"
+                "skipped {rel}: {}/ is a git checkout at the target",
+                dir.display()
             ));
             continue;
         }
@@ -535,18 +556,47 @@ fn restore_board(
             .filter(|old| !state.issues.iter().any(|i| i.id == old.id))
             .map(|old| old.id.clone())
             .collect();
-        // A mistaken --force over a live project stays recoverable.
-        let previous = target.join(".bork/state.json.pre-import");
-        if !dry_run {
-            fs::copy(target.join(state_rel), &previous)
-                .with_context(|| format!("saving the old board to {}", previous.display()))?;
+        // A mistaken --force over a live project stays recoverable. Each
+        // replaced board gets its own file, and a re-run that changes nothing
+        // saves nothing, so a retry can't bury the first copy.
+        let unchanged = serde_json::to_value(local)? == serde_json::to_value(&state)?;
+        if !unchanged {
+            let previous = unused_path(&target.join(format!(".bork/state.json.pre-import-{now}")));
+            if !dry_run {
+                fs::copy(target.join(state_rel), &previous)
+                    .with_context(|| format!("saving the old board to {}", previous.display()))?;
+            }
+            report.previous_board = Some(previous);
         }
-        report.previous_board = Some(previous);
     }
     if !dry_run {
         crate::config::save_state(&state, target)?;
     }
     Ok(())
+}
+
+/// The closest directory between `target` and `target/rel` that holds a
+/// `.git` entry (a repo or worktree), relative to `target`.
+fn checkout_ancestor(target: &Path, rel: &Path) -> Option<PathBuf> {
+    let mut dir = PathBuf::new();
+    for part in rel.parent()?.components() {
+        dir.push(part);
+        if fs::symlink_metadata(target.join(&dir).join(".git")).is_ok() {
+            return Some(dir);
+        }
+    }
+    None
+}
+
+/// `path`, or `path-2`, `path-3`, ... for the first one that doesn't exist.
+fn unused_path(path: &Path) -> PathBuf {
+    let mut candidate = path.to_path_buf();
+    let mut n = 2;
+    while fs::symlink_metadata(&candidate).is_ok() {
+        candidate = PathBuf::from(format!("{}-{n}", path.display()));
+        n += 1;
+    }
+    candidate
 }
 
 /// The board at `target`, when it has a readable one.
@@ -732,19 +782,20 @@ pub fn rewrite_state(
 ) -> Vec<String> {
     let mut cleared = Vec::new();
     for issue in &mut state.issues {
+        let local_issue = local.and_then(|board| board.issues.iter().find(|i| i.id == issue.id));
         let gone = issue
             .worktree
             .as_deref()
             .is_some_and(|w| !is_plain_component(w) || !target.join(w).is_dir());
         if gone {
             issue.worktree = None;
-            issue.pruned_at = Some(now);
+            // A re-run keeps the first import's timestamp.
+            issue.pruned_at = local_issue.and_then(|i| i.pruned_at).or(Some(now));
             issue.setup_ran = false;
             issue.sessions.clear();
             cleared.push(issue.id.clone());
             continue;
         }
-        let local_issue = local.and_then(|board| board.issues.iter().find(|i| i.id == issue.id));
         issue
             .sessions
             .retain(|agent, id| local_issue.is_some_and(|i| i.sessions.get(agent) == Some(&*id)));
@@ -1404,16 +1455,21 @@ mod tests {
                 force: true,
                 ..opts(&dest_root)
             };
+            let mut first_saved = None;
             for run in 0..2 {
                 let report = import(&file, &force).unwrap();
                 let p = &report.projects[0];
-                let previous = target.join(".bork/state.json.pre-import");
-                assert_eq!(p.previous_board.as_ref(), Some(&previous));
                 if run == 0 {
                     assert_eq!(p.dropped_issues, vec!["demo-7".to_string()]);
-                    assert!(read(&previous).contains("demo-7"));
+                    let saved = p.previous_board.clone().unwrap();
+                    assert!(saved.starts_with(target.join(".bork")));
+                    assert!(read(&saved).contains("demo-7"));
+                    first_saved = Some(saved);
                 } else {
+                    // Nothing changed, so nothing is saved over the first copy.
                     assert!(p.dropped_issues.is_empty());
+                    assert_eq!(p.previous_board, None);
+                    assert!(read(first_saved.as_ref().unwrap()).contains("demo-7"));
                 }
                 assert_eq!(p.repo, Some(RepoOutcome::KeptExisting));
                 assert!(p.cleared_worktrees.is_empty());
@@ -1590,15 +1646,15 @@ mod tests {
         let file = crafted_archive(
             dir.path(),
             serde_json::json!([
-                project_json("Demo", "Demo", &[]),
-                project_json("demo", "demo-2", &[]),
+                project_json("demo", "a", &[]),
+                // Recorded at the same path as the first one.
+                project_json("demo", "b", &[]),
             ]),
             &[],
         );
         let home = tempfile::tempdir().unwrap();
-        let dest = tempfile::tempdir().unwrap();
         crate::global_config::with_test_config_home(home.path(), || {
-            let err = import(&file, &opts(dest.path())).unwrap_err();
+            let err = import(&file, &Options::default()).unwrap_err();
             assert!(
                 format!("{err:#}").contains("two projects would be restored"),
                 "{err:#}"
@@ -1726,6 +1782,67 @@ mod tests {
                 "{:?}",
                 p.warnings
             );
+        });
+    }
+
+    #[test]
+    fn never_writes_into_a_nested_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("notes.md");
+        write(&notes, "backup text");
+        let file = crafted_archive(
+            dir.path(),
+            serde_json::json!([project_json("demo", "demo", &["docs/tool/README.md"])]),
+            &[("projects/demo/docs/tool/README.md", &notes)],
+        );
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let tool = dest.path().join("demo/docs/tool");
+        fs::create_dir_all(tool.join(".git")).unwrap();
+        write(&tool.join("README.md"), "uncommitted local work");
+        crate::global_config::with_test_config_home(home.path(), || {
+            let force = Options {
+                force: true,
+                ..opts(dest.path())
+            };
+            let report = import(&file, &force).unwrap();
+            assert_eq!(read(&tool.join("README.md")), "uncommitted local work");
+            let p = &report.projects[0];
+            assert!(
+                p.warnings
+                    .iter()
+                    .any(|w| w.contains("docs/tool/ is a git checkout")),
+                "{:?}",
+                p.warnings
+            );
+        });
+    }
+
+    #[test]
+    fn refuses_a_symlinked_or_checkout_target() {
+        let out = tempfile::tempdir().unwrap();
+        let file = demo_archive(out.path());
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        write(&elsewhere.path().join("AGENTS.md"), "someone else's");
+        std::os::unix::fs::symlink(elsewhere.path(), dest.path().join("demo")).unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            let force = Options {
+                force: true,
+                ..opts(dest.path())
+            };
+            let report = import(&file, &force).unwrap();
+            let error = report.projects[0].error.clone().unwrap_or_default();
+            assert!(error.contains("symlink"), "{error}");
+            assert_eq!(read(&elsewhere.path().join("AGENTS.md")), "someone else's");
+
+            fs::remove_file(dest.path().join("demo")).unwrap();
+            fs::create_dir_all(dest.path().join("demo/.git")).unwrap();
+            let report = import(&file, &force).unwrap();
+            let error = report.projects[0].error.clone().unwrap_or_default();
+            assert!(error.contains("git checkout"), "{error}");
+            assert!(!dest.path().join("demo/AGENTS.md").exists());
         });
     }
 
