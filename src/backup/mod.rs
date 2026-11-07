@@ -288,6 +288,26 @@ pub fn save_issue_plan(
     Ok(true)
 }
 
+/// ASCII-only directory name for a project in the archive: characters
+/// outside `[A-Za-z0-9._-]` become `_`.
+fn archive_dir_name(name: &str) -> String {
+    let safe: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if safe.is_empty() || safe.chars().all(|c| c == '.') {
+        "project".to_string()
+    } else {
+        safe
+    }
+}
+
 /// Archive files and manifest entry for one project. `used_dirs` keeps
 /// archive directories unique when registered projects share a name.
 fn project_part(
@@ -296,12 +316,9 @@ fn project_part(
     used_dirs: &mut HashSet<String>,
 ) -> anyhow::Result<(ProjectManifest, Vec<ArchiveEntry>)> {
     let name = crate::config::load_config_from(root).project_name;
-    let base = if select::is_plain_component(&name) {
-        name.clone()
-    } else {
-        "project".to_string()
-    };
-    // Compared case-insensitively: staging may be on a case-insensitive disk.
+    let base = archive_dir_name(&name);
+    // ASCII and compared case-insensitively, so names stay distinct on any
+    // disk (case- or Unicode-normalization-insensitive ones included).
     let mut archive_dir = base.clone();
     let mut n = 2;
     while !used_dirs.insert(archive_dir.to_lowercase()) {
@@ -1033,6 +1050,60 @@ mod tests {
                 .collect();
             assert_eq!(agents.len(), 2, "{agents:?}");
         });
+    }
+
+    #[test]
+    fn archive_dirs_are_ascii_and_distinct() {
+        assert_eq!(archive_dir_name("bork"), "bork");
+        assert_eq!(archive_dir_name("Caf\u{e9}"), "Caf_");
+        assert_eq!(archive_dir_name("Cafe\u{301}"), "Cafe_");
+        assert_eq!(archive_dir_name(".."), "project");
+        assert_eq!(archive_dir_name("a/b c"), "a_b_c");
+
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            set_global_path(dest.path());
+            let a = project("Caf\u{e9}", true);
+            let b = project("Cafe\u{301}", true);
+            write(&a.path().join("AGENTS.md"), "first");
+            write(&b.path().join("AGENTS.md"), "second");
+            let outcome = run(&Selection::All).unwrap().unwrap();
+            let agents = list(&outcome.file)
+                .into_iter()
+                .filter(|p| p.ends_with("/AGENTS.md"))
+                .count();
+            assert_eq!(agents, 2);
+        });
+    }
+
+    #[test]
+    fn container_entry_aliasing_issues_dir_never_writes_outside() {
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        crate::global_config::with_test_config_home(home.path(), || {
+            set_global_path(dest.path());
+            let demo = project("demo", true);
+            let root = demo.path();
+            save_board(root, &[("demo-1", Some("demo-1-task"))]);
+            write(&root.join("demo-1-task/.git"), "gitdir: x");
+            write(&root.join("demo-1-task/.claude/planning.md"), "live plan");
+            write(&outside.path().join("demo-1/planning.md"), "outside");
+            std::os::unix::fs::symlink(outside.path(), root.join("_ISSUES")).unwrap();
+
+            // On a case-insensitive disk this collides and fails; on a
+            // case-sensitive one both entries are archived. Either way the
+            // outside file is untouched.
+            if let Ok(Some(outcome)) = run(&Selection::All) {
+                assert!(list(&outcome.file)
+                    .contains(&"projects/demo/_issues/demo-1/planning.md".to_string()));
+            }
+        });
+        assert_eq!(
+            fs::read_to_string(outside.path().join("demo-1/planning.md")).unwrap(),
+            "outside"
+        );
     }
 
     #[test]
