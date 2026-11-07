@@ -36,23 +36,37 @@ pub fn is_plain_component(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\0')
 }
 
+/// Whether `path` is a regular file (symlinks followed). Only "not found"
+/// means no; other errors (permissions, symlink loops) are returned so a
+/// backup never mistakes an unreadable file for a missing one.
+pub fn is_existing_file(path: &Path) -> anyhow::Result<bool> {
+    match fs::metadata(path) {
+        Ok(meta) => Ok(meta.is_file()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
 /// `(issue_id, plan path)` for every issue whose worktree currently has a plan.
-pub fn issue_plans(project_root: &Path, state: &AppState) -> Vec<(String, PathBuf)> {
-    let mut plans: Vec<(String, PathBuf)> = state
-        .issues
-        .iter()
-        .filter(|issue| is_plain_component(&issue.id))
-        .filter_map(|issue| {
-            let worktree = issue
-                .worktree
-                .as_deref()
-                .filter(|w| is_plain_component(w))?;
-            let plan = project_root.join(worktree).join(PLAN_FILE);
-            plan.is_file().then(|| (issue.id.clone(), plan))
-        })
-        .collect();
+pub fn issue_plans(
+    project_root: &Path,
+    state: &AppState,
+) -> anyhow::Result<Vec<(String, PathBuf)>> {
+    let mut plans = Vec::new();
+    for issue in &state.issues {
+        if !is_plain_component(&issue.id) {
+            continue;
+        }
+        let Some(worktree) = issue.worktree.as_deref().filter(|w| is_plain_component(w)) else {
+            continue;
+        };
+        let plan = project_root.join(worktree).join(PLAN_FILE);
+        if is_existing_file(&plan)? {
+            plans.push((issue.id.clone(), plan));
+        }
+    }
     plans.sort();
-    plans
+    Ok(plans)
 }
 
 /// Top-level directory names of every worktree in the container, from three
@@ -121,7 +135,7 @@ pub fn select_files(
     let mut out: BTreeSet<PathBuf> = BTreeSet::new();
 
     for rel in BORK_FILES {
-        if fs::metadata(project_root.join(rel)).is_ok_and(|m| m.is_file()) {
+        if is_existing_file(&project_root.join(rel))? {
             out.insert(PathBuf::from(rel));
         }
     }
@@ -293,7 +307,7 @@ mod tests {
         }
 
         assert_eq!(
-            issue_plans(root, &state),
+            issue_plans(root, &state).unwrap(),
             vec![("p-1".to_string(), root.join("p-1-a/.claude/planning.md"))]
         );
         // `_issues` in the container is never picked up as a container entry.

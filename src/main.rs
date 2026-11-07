@@ -1322,21 +1322,19 @@ fn run_backup_status() -> anyhow::Result<()> {
     let settings = backup::config::load_settings();
     match &settings.path {
         Some(path) => println!(
-            "path: {} (every {} min once the TUI worker lands)",
-            path.display(),
-            settings.interval_minutes
+            "path: {} (backed up daily, and on `bork backup`)",
+            path.display()
         ),
         None => println!("path: not set (set `path` under [backup] in ~/.config/bork/config.toml)"),
     }
 
     println!("projects:");
     for entry in global_config::list_projects() {
-        let state = if backup::config::project_enabled(&entry.path) {
-            "on"
-        } else {
-            "off"
-        };
-        println!("  {}: {state}", entry.name);
+        match backup::config::project_enabled(&entry.path) {
+            Ok(true) => println!("  {}: on", entry.name),
+            Ok(false) => println!("  {}: off", entry.name),
+            Err(err) => println!("  {}: unknown ({err:#})", entry.name),
+        }
     }
 
     let records = backup::status::read(&backup::status::status_path()).archives;
