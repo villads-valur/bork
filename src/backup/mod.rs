@@ -36,7 +36,7 @@ use crate::config::AppState;
 /// with anything outside `[a-z0-9-]` turned into `-`. Never contains `--`,
 /// never empty.
 ///
-/// On macOS this is the LocalHostName (`scutil --get LocalHostName`), which
+/// On macOS this is the LocalHostName (`/usr/sbin/scutil --get LocalHostName`), which
 /// the user controls and which doesn't change between networks; the kernel
 /// host name can follow DHCP or reverse DNS when no HostName is set.
 /// Elsewhere, or if that fails, `gethostname`'s first label. Read once per
@@ -54,7 +54,9 @@ pub fn host_name() -> String {
 
 #[cfg(target_os = "macos")]
 fn local_host_name() -> Option<String> {
-    let out = std::process::Command::new("scutil")
+    // Absolute path: a trimmed PATH (launchd, cron, agents) often lacks
+    // /usr/sbin, and silently falling back would change the file name.
+    let out = std::process::Command::new("/usr/sbin/scutil")
         .args(["--get", "LocalHostName"])
         .stdin(std::process::Stdio::null())
         .output()
