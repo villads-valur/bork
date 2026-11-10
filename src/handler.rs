@@ -4,9 +4,10 @@ use std::thread;
 
 use crate::app::{
     ActionContext, App, ConfirmAction, ImportSource, InputMode, LinearPickerContext, MessageKind,
-    Project, ProjectId,
+    Project, ProjectId, ProjectRename,
 };
 use crate::config::AppConfig;
+use crate::external::linear::LinearProject;
 use crate::external::{agent, browser, github, tmux, tuicr};
 use crate::global_config::ReloadResult;
 use crate::input::Action;
@@ -14,11 +15,13 @@ use crate::types::{
     AgentKind, Column, Issue, IssueDraft, IssueKind, LinkedGithubPr, LinkedLinear, PrImportSource,
 };
 use crate::undo::{self, Change, ColumnSnapshot, UndoEntry, UNDO_WINDOW};
+use crate::worktree::{ForceRequired, Removal};
 
 pub struct ActionChannels<'a> {
     pub action_tx: &'a mpsc::Sender<ActionResult>,
     pub pr_wake_tx: &'a mpsc::Sender<crate::github_poll::Wake>,
     pub linear_wake_tx: &'a mpsc::Sender<()>,
+    pub backup_wake_tx: &'a mpsc::Sender<()>,
     pub git_wake_tx: &'a mpsc::Sender<()>,
     pub reload_tx: &'a mpsc::Sender<ReloadResult>,
 }
@@ -40,6 +43,9 @@ pub struct ActionResult {
     pub session_to_open: Option<String>,
     pub popup_title: Option<String>,
     pub launched_session: Option<LaunchedSession>,
+    /// Set when a launch replaced a lost session but captured no new id, so
+    /// the dead id is dropped instead of being retried on every launch.
+    pub forget_lost_session: Option<AgentKind>,
     /// True when this launch's command included the one-time worktree setup
     /// prefix, so the issue's `setup_ran` flag must be persisted even if
     /// session-id detection failed.
@@ -56,6 +62,9 @@ pub struct ActionResult {
     /// asynchronous teardown (session kill + teardown script + worktree
     /// removal) succeeds.
     pub issues_to_archive: Vec<(ProjectId, String)>,
+    /// Archives that stopped short of removing the worktree but would go
+    /// through with `--force`. The main loop asks before forcing them.
+    pub force_archive_offers: Vec<(ProjectId, String, ForceRequired)>,
 }
 
 pub enum PostAction {
@@ -113,6 +122,10 @@ pub fn handle_action(
         }
         InputMode::Normal => handle_normal(app, action, ctx, ch),
         InputMode::Sidebar => handle_sidebar(app, action),
+        InputMode::SidebarRename => {
+            handle_sidebar_rename(app, action);
+            PostAction::None
+        }
         InputMode::PruneDialog => {
             handle_prune_dialog(app, action, ctx, ch.action_tx);
             PostAction::None
@@ -367,16 +380,26 @@ fn combine_results(results: Vec<ActionResult>, summary: String) -> ActionResult 
     let total = results.len();
     let mut combined = ActionResult::default();
     let mut failures = Vec::new();
+    let mut warnings = Vec::new();
     for result in results {
-        if result.message_kind == MessageKind::Error {
-            failures.push(result.message);
+        match result.message_kind {
+            MessageKind::Error => failures.push(result.message),
+            MessageKind::Warning => warnings.push(result.message),
+            MessageKind::Info => {}
         }
         combined.issues_to_delete.extend(result.issues_to_delete);
         combined.issues_to_archive.extend(result.issues_to_archive);
+        combined
+            .force_archive_offers
+            .extend(result.force_archive_offers);
     }
-    match failures.first() {
-        None => combined.message = summary,
-        Some(first) => {
+    match (failures.first(), warnings.first()) {
+        (None, None) => combined.message = summary,
+        (None, Some(first)) => {
+            combined.message = format!("{summary}; {first}");
+            combined.message_kind = MessageKind::Warning;
+        }
+        (Some(first), _) => {
             combined.message = format!("{} of {} failed; {}", failures.len(), total, first);
             combined.message_kind = MessageKind::Error;
         }
@@ -396,7 +419,7 @@ fn run_confirmed(
     issue_ids: &[String],
     done: &'static str,
     noun: &'static str,
-    per_issue: fn(&AppConfig, &ProjectId, &Issue) -> ActionResult,
+    per_issue: impl Fn(&AppConfig, &ProjectId, &Issue) -> ActionResult + Send + 'static,
 ) {
     let Some(project) = app.find_project_mut(&project_id) else {
         app.set_warning("Project no longer available");
@@ -494,7 +517,11 @@ fn handle_normal(
     let q = app.search_query.clone();
     if action == Action::OpenReviewPR {
         if let Some(issue) = app.context_project(ctx).selected_issue(&q).cloned() {
-            if issue.github_stack.is_some() {
+            let several_prs = app
+                .context_project(ctx)
+                .detail_open_numbers(&issue)
+                .is_ok_and(|numbers| numbers.len() > 1);
+            if issue.github_stack.is_some() || several_prs {
                 return open_pr_group(app, action, ctx, &issue, ch);
             }
         }
@@ -721,6 +748,8 @@ fn handle_normal(
                 ConfirmAction::ArchiveIssue {
                     issue_ids,
                     project_id: ctx.project_id.clone(),
+                    force: false,
+                    teardown_due: Vec::new(),
                 },
             );
             PostAction::None
@@ -907,26 +936,33 @@ fn handle_normal(
             };
             let session_name = issue.session_name(&app.context_project(ctx).config.project_name);
             let session_alive = app.context_project(ctx).is_session_alive(&session_name);
-            let pr_mode = action == Action::OpenReviewPR;
+            let pr = if action == Action::OpenReviewPR {
+                match app.context_project(ctx).detail_open_numbers(issue) {
+                    Ok(numbers) => numbers.first().copied(),
+                    Err(message) => {
+                        app.set_warning(message);
+                        return PostAction::None;
+                    }
+                }
+            } else {
+                None
+            };
             let popup_title = issue.popup_title();
             let worktree_path = app.context_project(ctx).config.project_root.join(&wt);
             let tx = ch.action_tx.clone();
             app.begin_busy();
-            app.set_message(if session_alive {
-                if pr_mode {
-                    "Opening tuicr --pr..."
-                } else {
-                    "Opening tuicr..."
-                }
-            } else {
-                "Starting tuicr session..."
+            app.set_message(match (session_alive, pr) {
+                (true, Some(number)) => format!("Opening tuicr on PR #{number}..."),
+                (true, None) => "Opening tuicr...".to_string(),
+                (false, Some(number)) => format!("Starting tuicr session on PR #{number}..."),
+                (false, None) => "Starting tuicr session...".to_string(),
             });
 
             thread::spawn(move || {
                 let outcome = if session_alive {
-                    tuicr::open_in_session(&session_name, &worktree_path, pr_mode)
+                    tuicr::open_in_session(&session_name, &worktree_path, pr)
                 } else {
-                    tuicr::launch_review_session(&session_name, &worktree_path, pr_mode)
+                    tuicr::launch_review_session(&session_name, &worktree_path, pr)
                 };
                 let result = match outcome {
                     Ok(()) => ActionResult {
@@ -950,6 +986,18 @@ fn handle_normal(
         Action::SyncPRs => {
             let _ = ch.pr_wake_tx.send(crate::github_poll::Wake::Refresh);
             app.set_message("Syncing PRs...");
+            PostAction::None
+        }
+
+        Action::BackupNow => {
+            if !app.backup_manual_pending {
+                if ch.backup_wake_tx.send(()).is_ok() {
+                    app.backup_manual_pending = true;
+                    app.begin_busy();
+                } else {
+                    app.set_error(crate::backup::schedule::WORKER_STOPPED);
+                }
+            }
             PostAction::None
         }
 
@@ -1117,7 +1165,18 @@ fn handle_debug_inspector(app: &mut App, action: Action) {
 
 fn handle_dialog(app: &mut App, action: Action, ctx: &ActionContext) -> PostAction {
     let on_linear = app.dialog.as_ref().is_some_and(|d| d.is_on_linear_field());
+    let on_linear_project = app
+        .dialog
+        .as_ref()
+        .is_some_and(|d| d.is_on_linear_project_field());
     let on_github = app.dialog.as_ref().is_some_and(|d| d.is_on_github_field());
+
+    if matches!(action, Action::DialogBackspace | Action::DialogDelete) {
+        if let Some(dialog) = app.dialog.as_mut().filter(|d| d.is_on_agent_field()) {
+            dialog.forgotten_sessions.insert(dialog.agent_kind);
+            return PostAction::None;
+        }
+    }
 
     if on_linear {
         match action {
@@ -1136,6 +1195,31 @@ fn handle_dialog(app: &mut App, action: Action, ctx: &ActionContext) -> PostActi
                             dialog.linear_detached = true;
                         }
                     }
+                }
+                return PostAction::None;
+            }
+            Action::DialogChar(_) => return PostAction::None,
+            _ => {}
+        }
+    }
+
+    if on_linear_project {
+        match action {
+            Action::DialogChar(' ') => {
+                // Without loaded projects the picker would fall back to
+                // another tab, and Enter would attach the wrong kind of link.
+                if app.context_project(ctx).live.linear_projects.is_empty() {
+                    app.set_warning("No Linear projects loaded yet");
+                    return PostAction::None;
+                }
+                app.picker_tab = ImportSource::LinearProject;
+                app.open_import_picker_with_context(LinearPickerContext::Attach, ctx);
+                return PostAction::None;
+            }
+            Action::DialogBackspace | Action::DialogDelete => {
+                if let Some(dialog) = app.dialog.as_mut() {
+                    dialog.linear_projects.pop();
+                    dialog.linear_projects_edited = true;
                 }
                 return PostAction::None;
             }
@@ -1275,8 +1359,16 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
             let switches_agent = picker_moved && dialog.agent_kind != issue.agent_kind;
             let crosses_boundary =
                 (issue.kind == IssueKind::Orchestrator) != (dialog.kind == IssueKind::Orchestrator);
-            if (switches_agent || crosses_boundary) && app.launches_in_flight.contains(&issue.id) {
-                app.set_warning("Launch in progress; wait for it before switching agent or kind");
+            let forgets_live_session = dialog
+                .forgotten_sessions
+                .iter()
+                .any(|agent| issue.forgetting_kills_session(*agent));
+            if (switches_agent || crosses_boundary || forgets_live_session)
+                && app.launches_in_flight.contains(&issue.id)
+            {
+                app.set_warning(
+                    "Launch in progress; wait for it before switching agent or kind, or starting a new session",
+                );
                 return;
             }
         }
@@ -1291,8 +1383,21 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
             let crossed_orchestrator_boundary =
                 p.issues[idx].kind_change_resets_session(dialog.kind);
             let agent_changed = picker_moved && dialog.agent_kind != p.issues[idx].agent_kind;
+            // Only forget sessions that are still stored, so the message
+            // doesn't claim a reset a background change already made.
+            let forgotten: Vec<AgentKind> = dialog
+                .forgotten_sessions
+                .iter()
+                .copied()
+                .filter(|agent| p.issues[idx].sessions.contains_key(agent))
+                .collect();
+            // An agent switch already kills; otherwise only forgetting the
+            // current agent's session does.
+            let current_session_forgotten = forgotten
+                .iter()
+                .any(|agent| p.issues[idx].forgetting_kills_session(*agent));
 
-            if crossed_orchestrator_boundary || agent_changed {
+            if crossed_orchestrator_boundary || agent_changed || current_session_forgotten {
                 // A live session would otherwise be re-attached with the old
                 // kind's prompt and cwd, or the old agent's process. Kill it
                 // before committing the edit so a failed cleanup can't leave
@@ -1314,7 +1419,11 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
             let _ = p.issues[idx].set_kind(dialog.kind);
 
             apply_linear_fields(&mut p.issues[idx], &dialog);
+            apply_linear_project_fields(&mut p.issues[idx], &dialog);
             apply_pr_fields(&mut p.issues[idx], &dialog);
+            for agent in &forgotten {
+                p.issues[idx].forget_session(*agent);
+            }
 
             let updated_id = p.issues[idx].id.clone();
             p.mark_dirty();
@@ -1327,10 +1436,20 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
                     )),
                     None => app.set_message(format!("Updated {} (session reset)", updated_id)),
                 }
+            } else if agent_changed && forgotten.contains(&dialog.agent_kind) {
+                app.set_message(format!(
+                    "Updated {} (switched to {}, starts a new session)",
+                    updated_id, dialog.agent_kind
+                ));
             } else if agent_changed {
                 app.set_message(format!(
                     "Updated {} (switched to {}, other sessions kept)",
                     updated_id, dialog.agent_kind
+                ));
+            } else if !forgotten.is_empty() {
+                app.set_message(format!(
+                    "Updated {} (next launch starts a new session)",
+                    updated_id
                 ));
             } else {
                 app.set_message(format!("Updated {}", updated_id));
@@ -1359,11 +1478,13 @@ fn submit_dialog(app: &mut App, ctx: &ActionContext) {
             kind: dialog.kind,
             agent_mode: dialog.agent_mode,
             prompt,
+            model: None,
         },
         crate::app::unix_now(),
     );
 
     apply_linear_fields(&mut issue, &dialog);
+    apply_linear_project_fields(&mut issue, &dialog);
     apply_pr_fields(&mut issue, &dialog);
 
     let Some(p) = app.find_project_mut(&proj_id) else {
@@ -1395,6 +1516,15 @@ fn apply_linear_fields(issue: &mut Issue, dialog: &crate::app::DialogState) {
                 imported: false,
             })
             .collect();
+    }
+}
+
+fn apply_linear_project_fields(issue: &mut Issue, dialog: &crate::app::DialogState) {
+    // Untouched, the dialog's copy may be stale (a CLI attach while it was
+    // open). `set_kind` already dropped projects if the issue left the
+    // orchestrator kind.
+    if dialog.kind.links_linear_projects() && dialog.linear_projects_edited {
+        issue.linear_projects = dialog.linear_projects.clone();
     }
 }
 
@@ -1431,13 +1561,10 @@ fn handle_linear_picker(
             app.close_linear_picker();
         }
         Action::PickerSwitchTab => {
-            let has_linear = !app.context_project(ctx).live.linear_issues.is_empty();
-            let has_github = app.context_project(ctx).can_browse_github();
-            if has_linear && has_github {
-                app.picker_tab = match app.picker_tab {
-                    ImportSource::Linear => ImportSource::GitHub,
-                    ImportSource::GitHub => ImportSource::Linear,
-                };
+            let tabs = app.picker_tabs();
+            if tabs.len() > 1 {
+                let current = tabs.iter().position(|t| *t == app.picker_tab).unwrap_or(0);
+                app.picker_tab = tabs[(current + 1) % tabs.len()];
                 if let Some(ref mut picker) = app.linear_picker {
                     picker.selected = 0;
                 }
@@ -1446,6 +1573,7 @@ fn handle_linear_picker(
         Action::LinearPickerDown => {
             let count = match app.picker_tab {
                 ImportSource::Linear => app.filtered_linear_issues().len(),
+                ImportSource::LinearProject => app.filtered_linear_projects().len(),
                 ImportSource::GitHub => app.filtered_github_prs().len(),
             };
             if let Some(ref mut picker) = app.linear_picker {
@@ -1478,16 +1606,20 @@ fn handle_linear_picker(
             (LinearPickerContext::Attach, ImportSource::Linear) => {
                 attach_linear_to_dialog(app, ctx)
             }
+            (LinearPickerContext::Attach, ImportSource::LinearProject) => {
+                attach_linear_project_to_dialog(app)
+            }
             (LinearPickerContext::Attach, ImportSource::GitHub) => {
                 attach_github_to_dialog(app, ctx)
             }
             (_, ImportSource::Linear) => import_linear_issue(app, ctx),
+            (_, ImportSource::LinearProject) => import_linear_project(app, ctx),
             (_, ImportSource::GitHub) => import_github_pr(app, ctx),
         },
         Action::LinearPickerRefresh => match app.picker_tab {
-            ImportSource::Linear => {
+            ImportSource::Linear | ImportSource::LinearProject => {
                 let _ = linear_wake_tx.send(());
-                app.set_message("Refreshing Linear issues...");
+                app.set_message("Refreshing Linear...");
             }
             ImportSource::GitHub => {
                 let _ = pr_wake_tx.send(crate::github_poll::Wake::Refresh);
@@ -1613,7 +1745,17 @@ fn import_linear_issue(app: &mut App, ctx: &ActionContext) {
         )
     };
 
-    let Some(p) = app.find_project_mut(&proj_id) else {
+    push_imported_todo(
+        app,
+        &proj_id,
+        issue,
+        format!("Imported {}", linear_issue.identifier),
+    );
+}
+
+/// Add an imported issue to Todo, select it, and close the picker.
+fn push_imported_todo(app: &mut App, proj_id: &ProjectId, issue: Issue, message: String) {
+    let Some(p) = app.find_project_mut(proj_id) else {
         return;
     };
     p.issues.push(issue);
@@ -1624,8 +1766,76 @@ fn import_linear_issue(app: &mut App, ctx: &ActionContext) {
     }
     p.mark_dirty();
 
-    app.set_message(format!("Imported {}", linear_issue.identifier));
+    app.set_message(message);
     app.close_linear_picker();
+}
+
+fn attach_linear_project_to_dialog(app: &mut App) {
+    let Some(project) = selected_linear_project(app) else {
+        return;
+    };
+
+    if let Some(ref mut dialog) = app.dialog {
+        if let Some(pos) = dialog
+            .linear_projects
+            .iter()
+            .position(|p| p.id == project.id)
+        {
+            dialog.linear_projects.remove(pos);
+        } else {
+            dialog.linear_projects.push(project.to_link(false));
+        }
+        dialog.linear_projects_edited = true;
+    }
+}
+
+/// Import a Linear project as a new orchestrator issue in Todo.
+fn import_linear_project(app: &mut App, ctx: &ActionContext) {
+    let Some(linear_project) = selected_linear_project(app) else {
+        return;
+    };
+
+    let proj_id = ctx.project_id.clone();
+    let Some(project) = app.find_project(&proj_id) else {
+        app.set_warning("Project no longer available");
+        app.close_linear_picker();
+        return;
+    };
+
+    if project
+        .issues
+        .iter()
+        .any(|i| i.linear_projects.iter().any(|p| p.id == linear_project.id))
+    {
+        app.set_message(format!("{} is already on the board", linear_project.name));
+        app.close_linear_picker();
+        return;
+    }
+
+    let issue = Issue {
+        kind: IssueKind::Orchestrator,
+        linear_projects: vec![linear_project.to_link(true)],
+        ..Issue::new(
+            project.next_issue_id(),
+            linear_project.name.clone(),
+            Column::Todo,
+            project.config.agent_kind,
+        )
+    };
+
+    push_imported_todo(
+        app,
+        &proj_id,
+        issue,
+        format!("Imported {} as an orchestrator", linear_project.name),
+    );
+}
+
+fn selected_linear_project(app: &App) -> Option<LinearProject> {
+    let selected_idx = app.linear_picker.as_ref().map(|p| p.selected).unwrap_or(0);
+    app.filtered_linear_projects()
+        .get(selected_idx)
+        .map(|p| (*p).clone())
 }
 
 fn import_github_pr(app: &mut App, ctx: &ActionContext) {
@@ -1938,19 +2148,32 @@ fn submit_prune_dialog(app: &mut App, action_tx: &mpsc::Sender<ActionResult>) {
     }
 
     let project_id = dialog.project_id.clone();
+    app.close_prune_dialog();
+    spawn_prune(app, action_tx, project_id, to_remove, dirty, false);
+}
+
+/// Run a prune off the main thread and send its outcome back.
+fn spawn_prune(
+    app: &mut App,
+    action_tx: &mpsc::Sender<ActionResult>,
+    project_id: ProjectId,
+    to_remove: Vec<crate::prune::PruneTarget>,
+    dirty: Vec<String>,
+    force_plans: bool,
+) {
     let Some(project) = app.find_project(&project_id) else {
-        app.close_prune_dialog();
+        app.set_warning("Project no longer available");
         return;
     };
     let project_root = project.config.project_root.clone();
 
-    app.close_prune_dialog();
     app.begin_busy();
     app.set_message(format!("Pruning {} worktree(s)...", to_remove.len()));
 
     let tx = action_tx.clone();
     thread::spawn(move || {
-        let outcome = crate::prune::execute_removals(&project_root, &to_remove, &dirty);
+        let outcome =
+            crate::prune::execute_removals(&project_root, &to_remove, &dirty, force_plans);
         let (message, message_kind) = format_prune_result(&outcome);
         let _ = tx.send(ActionResult {
             message,
@@ -1959,6 +2182,63 @@ fn submit_prune_dialog(app: &mut App, action_tx: &mpsc::Sender<ActionResult>) {
             ..Default::default()
         });
     });
+}
+
+/// Hold worktrees a prune kept because their plan couldn't be saved until
+/// `show_queued_force_prune` can offer removing them anyway.
+pub fn queue_force_prune(
+    app: &mut App,
+    project_id: ProjectId,
+    targets: Vec<crate::prune::PruneTarget>,
+) {
+    if targets.is_empty() {
+        return;
+    }
+    app.queued_force_prunes
+        .retain(|(queued_project, _)| *queued_project != project_id);
+    app.queued_force_prunes.push((project_id, targets));
+}
+
+/// Ask whether to remove one project's queued worktrees anyway. Waits for
+/// Normal mode like `show_queued_force_archive`. Returns whether a prompt
+/// opened.
+pub fn show_queued_force_prune(app: &mut App) -> bool {
+    if app.input_mode != InputMode::Normal
+        || app.pending_confirm.is_some()
+        || app.queued_force_prunes.is_empty()
+    {
+        return false;
+    }
+    let (project_id, targets) = app.queued_force_prunes.remove(0);
+    let message = match targets.as_slice() {
+        [target] => format!(
+            "Kept {}: its plan couldn't be saved. Remove it anyway and lose the plan? (y/n)",
+            target.worktree
+        ),
+        _ => {
+            let mut named: Vec<String> = targets
+                .iter()
+                .take(FORCE_PROMPT_NAMED)
+                .map(|target| target.worktree.clone())
+                .collect();
+            if targets.len() > FORCE_PROMPT_NAMED {
+                named.push(format!("{} more", targets.len() - FORCE_PROMPT_NAMED));
+            }
+            format!(
+                "Kept {} worktrees whose plan couldn't be saved ({}). Remove them anyway and lose the plans? (y/n)",
+                targets.len(),
+                named.join(", ")
+            )
+        }
+    };
+    app.start_confirm(
+        message,
+        ConfirmAction::ForcePrune {
+            project_id,
+            targets,
+        },
+    );
+    true
 }
 
 fn format_prune_result(outcome: &crate::prune::PruneOutcome) -> (String, MessageKind) {
@@ -1972,7 +2252,10 @@ fn format_prune_result(outcome: &crate::prune::PruneOutcome) -> (String, Message
         .iter()
         .filter_map(|r| match &r.outcome {
             crate::prune::RemoveOutcome::Failed(msg) => Some(format!("{}: {}", r.worktree, msg)),
-            _ => None,
+            crate::prune::RemoveOutcome::PlanNotSaved { error, .. } => {
+                Some(format!("{}: plan not saved, {}", r.worktree, error))
+            }
+            crate::prune::RemoveOutcome::Removed => None,
         })
         .collect();
     (
@@ -2056,6 +2339,40 @@ fn handle_sidebar(app: &mut App, action: Action) -> PostAction {
             }
             PostAction::None
         }
+        Action::SidebarMoveUp | Action::SidebarMoveDown => {
+            let up = action == Action::SidebarMoveUp;
+            if let Some(order) = app.move_sidebar_project(up) {
+                if let Err(e) = crate::global_config::set_project_order(&order) {
+                    app.set_error(format!("Failed to save project order: {e}"));
+                }
+            }
+            PostAction::None
+        }
+        Action::SidebarRename => {
+            if let Some(project_id) = app.sidebar_selected_id() {
+                let buffer = app.project_display_name(&project_id);
+                if let Some(sidebar) = app.sidebar.as_mut() {
+                    sidebar.rename = Some(ProjectRename { project_id, buffer });
+                    app.input_mode = InputMode::SidebarRename;
+                }
+            }
+            PostAction::None
+        }
+        Action::SidebarRemove => {
+            let Some(project_id) = app.sidebar_selected_id() else {
+                return PostAction::None;
+            };
+            if project_id == app.focused_project {
+                app.set_warning("Can't remove the open project, switch to another one first");
+                return PostAction::None;
+            }
+            let name = app.project_display_name(&project_id);
+            app.start_confirm(
+                format!("Remove '{name}' from the project list? Files stay on disk (y/n)"),
+                ConfirmAction::RemoveProject { project_id },
+            );
+            PostAction::None
+        }
         Action::ShowHelp => {
             app.open_help();
             PostAction::None
@@ -2065,6 +2382,65 @@ fn handle_sidebar(app: &mut App, action: Action) -> PostAction {
             PostAction::None
         }
         _ => PostAction::None,
+    }
+}
+
+fn handle_sidebar_rename(app: &mut App, action: Action) {
+    let Some(rename) = app.sidebar.as_mut().and_then(|s| s.rename.as_mut()) else {
+        app.input_mode = InputMode::Sidebar;
+        return;
+    };
+    match action {
+        Action::SearchChar(c) => rename.buffer.push(c),
+        Action::SearchBackspace => {
+            rename.buffer.pop();
+        }
+        Action::SearchCancel => end_sidebar_rename(app),
+        Action::SearchConfirm => {
+            let name = rename.buffer.trim().to_string();
+            let project_id = rename.project_id.clone();
+            if name.is_empty() {
+                app.set_warning("Project name can't be empty");
+                return;
+            }
+            let Some(project) = app.find_project(&project_id) else {
+                end_sidebar_rename(app);
+                return;
+            };
+            // Renaming back to the config name clears the label, so later
+            // config.toml edits show up again.
+            let label = Some(name.as_str()).filter(|name| *name != project.config.project_name);
+            // Errors keep the field open so the name can be fixed.
+            match crate::global_config::set_project_label(&project_id, label) {
+                Ok(entries) => {
+                    app.sync_with_registry(&entries);
+                    end_sidebar_rename(app);
+                }
+                Err(e) => app.set_error(format!("Rename failed: {e}")),
+            }
+        }
+        _ => {}
+    }
+}
+
+fn end_sidebar_rename(app: &mut App) {
+    if let Some(sidebar) = app.sidebar.as_mut() {
+        sidebar.rename = None;
+    }
+    app.input_mode = InputMode::Sidebar;
+}
+
+fn unregister_sidebar_project(app: &mut App, project_id: ProjectId) {
+    let name = app.project_display_name(&project_id);
+    match crate::global_config::unregister_project(&project_id) {
+        Ok(_) => {
+            app.remove_projects(&[project_id]);
+            app.show_message(
+                format!("Removed '{name}' from the project list"),
+                MessageKind::Info,
+            );
+        }
+        Err(e) => app.set_error(format!("Failed to remove '{name}': {e}")),
     }
 }
 
@@ -2119,13 +2495,32 @@ fn handle_confirm(
                                 result
                                     .issues_to_delete
                                     .push((project_id.clone(), issue.id.clone()));
+                                if let Err(e) = crate::issue_plan::remove_saved_plans(
+                                    &config.project_root,
+                                    &issue.id,
+                                ) {
+                                    result.message = format!(
+                                        "Deleted {} but couldn't remove its saved plans: {e}",
+                                        issue.id
+                                    );
+                                    result.message_kind = MessageKind::Warning;
+                                }
                             }
                             result
                         },
                     ),
+                    ConfirmAction::RemoveProject { project_id } => {
+                        unregister_sidebar_project(app, project_id)
+                    }
+                    ConfirmAction::ForcePrune {
+                        project_id,
+                        targets,
+                    } => spawn_prune(app, action_tx, project_id, targets, Vec::new(), true),
                     ConfirmAction::ArchiveIssue {
                         issue_ids,
                         project_id,
+                        force,
+                        teardown_due,
                     } => run_confirmed(
                         app,
                         action_tx,
@@ -2133,14 +2528,9 @@ fn handle_confirm(
                         &issue_ids,
                         "Archived",
                         "issue",
-                        |config, project_id, issue| {
-                            archive_to_result(
-                                config,
-                                project_id.clone(),
-                                issue.id.clone(),
-                                &issue.session_name(&config.project_name),
-                                issue.worktree.as_deref(),
-                            )
+                        move |config, project_id, issue| {
+                            let removal = archive_removal(force, &teardown_due, &issue.id);
+                            archive_issue_off_thread(config, project_id, issue, removal)
                         },
                     ),
                 }
@@ -2153,18 +2543,50 @@ fn handle_confirm(
     }
 }
 
-/// Run the off-thread half of a TUI archive: kill the agent session, run the
-/// teardown script, and remove the worktree (never forced, matching the CLI's
-/// default — a failing teardown or dirty worktree aborts and reports an
-/// error). On success it sets `issues_to_archive` so the main thread applies
-/// the move-to-Done and worktree drop against the live in-memory board,
-/// instead of writing state.json directly and racing concurrent merges.
+/// How a confirmed archive removes `issue_id`'s worktree. A forced archive
+/// follows an attempt that stopped short: the teardown already ran, unless
+/// the attempt stopped at an unsaved plan (`teardown_due`).
+fn archive_removal(force: bool, teardown_due: &[String], issue_id: &str) -> Removal {
+    if !force {
+        Removal::Safe
+    } else if teardown_due.iter().any(|id| id == issue_id) {
+        Removal::Force
+    } else {
+        Removal::ForceSkipTeardown
+    }
+}
+
+/// Run the off-thread half of a TUI archive: kill the agent session, save the
+/// plan, run the teardown script, and remove the worktree. A safe `removal`
+/// stops at an unsaved plan, a failing teardown or a dirty worktree and
+/// comes back as a force offer for the main loop to confirm; a forced one
+/// goes past them and discards uncommitted changes. On success it sets `issues_to_archive`
+/// so the main thread applies the move-to-Done and worktree drop against the
+/// live in-memory board, instead of writing state.json directly and racing
+/// concurrent merges.
+fn archive_issue_off_thread(
+    config: &AppConfig,
+    project_id: &ProjectId,
+    issue: &Issue,
+    removal: Removal,
+) -> ActionResult {
+    archive_to_result(
+        config,
+        project_id.clone(),
+        issue.id.clone(),
+        &issue.session_name(&config.project_name),
+        issue.worktree.as_deref(),
+        removal,
+    )
+}
+
 fn archive_to_result(
     config: &AppConfig,
     project_id: ProjectId,
     issue_id: String,
     session_name: &str,
     worktree: Option<&str>,
+    removal: Removal,
 ) -> ActionResult {
     let session_killed = match agent::terminate_session(&config.project_root, session_name) {
         Ok(killed) => killed,
@@ -2177,26 +2599,160 @@ fn archive_to_result(
         }
     };
 
+    let mut teardown_failed = None;
     if let Some(dir) = worktree {
-        if let Err(e) = crate::worktree::remove_worktree_in(config, dir, false) {
-            return ActionResult {
-                message: format!("Failed to archive {issue_id}: {e}"),
-                message_kind: MessageKind::Error,
-                ..Default::default()
-            };
+        match crate::worktree::remove_worktree_in(config, &issue_id, dir, removal) {
+            Ok(removed) => teardown_failed = removed.teardown_failed,
+            Err(e) => {
+                let force_archive_offers = e
+                    .downcast_ref::<ForceRequired>()
+                    .map(|reason| vec![(project_id, issue_id.clone(), reason.clone())])
+                    .unwrap_or_default();
+                return ActionResult {
+                    message: format!("Failed to archive {issue_id}: {e}"),
+                    message_kind: MessageKind::Error,
+                    force_archive_offers,
+                    ..Default::default()
+                };
+            }
         }
     }
 
-    let message = match (worktree.is_some(), session_killed) {
+    let mut message = match (worktree.is_some(), session_killed) {
         (true, true) => format!("Archived {issue_id} (session killed, worktree removed)"),
         (true, false) => format!("Archived {issue_id} (worktree removed)"),
         (false, true) => format!("Archived {issue_id} (session killed)"),
         (false, false) => format!("Archived {issue_id}"),
     };
+    let mut message_kind = MessageKind::Info;
+    if let Some(code) = teardown_failed {
+        message.push_str(&format!(", but its teardown script failed (exit {code})"));
+        message_kind = MessageKind::Warning;
+    }
     ActionResult {
         message,
+        message_kind,
         issues_to_archive: vec![(project_id, issue_id)],
         ..Default::default()
+    }
+}
+
+/// Hold archives that stopped short until `show_queued_force_archive` can
+/// offer them. A later offer for the same card replaces the earlier one.
+pub fn queue_force_archive(app: &mut App, offers: Vec<(ProjectId, String, ForceRequired)>) {
+    for offer in offers {
+        app.queued_force_archives
+            .retain(|(project_id, issue_id, _)| (project_id, issue_id) != (&offer.0, &offer.1));
+        app.queued_force_archives.push(offer);
+    }
+}
+
+/// Ask whether to force one project's queued archives. Waits while the user
+/// is in a dialog, search or another prompt, so a `y` meant for something
+/// else never forces an archive. Returns whether a prompt opened.
+pub fn show_queued_force_archive(app: &mut App) -> bool {
+    if app.input_mode != InputMode::Normal || app.pending_confirm.is_some() {
+        return false;
+    }
+    let Some((project_id, _, _)) = app.queued_force_archives.first() else {
+        return false;
+    };
+    let project_id = project_id.clone();
+
+    let (offers, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut app.queued_force_archives)
+        .into_iter()
+        .partition(|(offer_project, _, _)| *offer_project == project_id);
+    app.queued_force_archives = rest;
+
+    let offers: Vec<(String, ForceRequired)> = offers
+        .into_iter()
+        .map(|(_, issue_id, reason)| (issue_id, reason))
+        .collect();
+    let message = force_archive_prompt(&offers);
+    // An unsaved plan stops the archive before its teardown runs.
+    let teardown_due = offers
+        .iter()
+        .filter(|(_, reason)| matches!(reason, ForceRequired::PlanNotSaved { .. }))
+        .map(|(issue_id, _)| issue_id.clone())
+        .collect();
+    app.start_confirm(
+        message,
+        ConfirmAction::ArchiveIssue {
+            issue_ids: offers.into_iter().map(|(issue_id, _)| issue_id).collect(),
+            project_id,
+            force: true,
+            teardown_due,
+        },
+    );
+    true
+}
+
+/// How many cards a combined force prompt names before summarising the rest.
+const FORCE_PROMPT_NAMED: usize = 3;
+
+fn force_archive_prompt(offers: &[(String, ForceRequired)]) -> String {
+    match offers {
+        [(issue_id, ForceRequired::Uncommitted(_))] => format!(
+            "{issue_id}'s worktree has uncommitted changes. Archive anyway and discard them? (y/n)"
+        ),
+        [(issue_id, ForceRequired::TeardownFailed { code, dirty: false })] => format!(
+            "{issue_id}'s teardown script failed (exit {code}). Archive anyway? (y/n)"
+        ),
+        [(issue_id, ForceRequired::TeardownFailed { code, dirty: true })] => format!(
+            "{issue_id}'s teardown script failed (exit {code}) and its worktree has uncommitted changes. Archive anyway and discard them? (y/n)"
+        ),
+        [(issue_id, ForceRequired::PlanNotSaved { error, dirty: false })] => format!(
+            "{issue_id}'s plan couldn't be saved ({error}). Archive anyway and lose the plan? (y/n)"
+        ),
+        [(issue_id, ForceRequired::PlanNotSaved { error, dirty: true })] => format!(
+            "{issue_id}'s plan couldn't be saved ({error}) and its worktree has uncommitted changes. Archive anyway, losing the plan and the changes? (y/n)"
+        ),
+        _ => {
+            let mut named: Vec<String> = offers
+                .iter()
+                .take(FORCE_PROMPT_NAMED)
+                .map(|(issue_id, reason)| format!("{issue_id}: {}", force_reason(reason)))
+                .collect();
+            if offers.len() > FORCE_PROMPT_NAMED {
+                named.push(format!("{} more", offers.len() - FORCE_PROMPT_NAMED));
+            }
+            let any_dirty = offers.iter().any(|(_, reason)| {
+                matches!(
+                    reason,
+                    ForceRequired::Uncommitted(_)
+                        | ForceRequired::TeardownFailed { dirty: true, .. }
+                        | ForceRequired::PlanNotSaved { dirty: true, .. }
+                )
+            });
+            let any_plan = offers
+                .iter()
+                .any(|(_, reason)| matches!(reason, ForceRequired::PlanNotSaved { .. }));
+            let question = match (any_dirty, any_plan) {
+                (true, true) => "Archive anyway, losing unsaved plans and uncommitted changes?",
+                (true, false) => "Archive anyway and discard their uncommitted changes?",
+                (false, true) => "Archive anyway and lose the unsaved plans?",
+                (false, false) => "Archive anyway?",
+            };
+            format!(
+                "{} stopped short ({}). {question} (y/n)",
+                count_of(offers.len(), "issue"),
+                named.join(", ")
+            )
+        }
+    }
+}
+
+fn force_reason(reason: &ForceRequired) -> String {
+    match reason {
+        ForceRequired::Uncommitted(_) => "uncommitted changes".to_string(),
+        ForceRequired::TeardownFailed { code, dirty: false } => format!("teardown exit {code}"),
+        ForceRequired::TeardownFailed { code, dirty: true } => {
+            format!("teardown exit {code}, uncommitted changes")
+        }
+        ForceRequired::PlanNotSaved { dirty: false, .. } => "plan not saved".to_string(),
+        ForceRequired::PlanNotSaved { dirty: true, .. } => {
+            "plan not saved, uncommitted changes".to_string()
+        }
     }
 }
 
@@ -2252,24 +2808,56 @@ pub fn delete_issue_from_app(app: &mut App, project_id: &ProjectId, issue_id: &s
 
 fn launch_and_report(issue: Issue, config: AppConfig) -> ActionResult {
     match agent::launch_session(&issue, &config) {
-        Ok((session_name, agent_sid, setup_ran)) => ActionResult {
-            launched_setup_ran: setup_ran,
-            message: format!("Session '{}' started", session_name),
-            session_to_open: Some(session_name),
-            launched_session: agent_sid.map(|sid| LaunchedSession {
-                agent: issue.agent_kind,
-                kind: issue.kind,
-                session_id: sid,
-            }),
-            launched_issue_id: Some(issue.id),
-            ..Default::default()
-        },
+        Ok(outcome) => launch_result(issue, outcome),
         Err(e) => ActionResult {
             message: format!("Failed to launch: {e}"),
             message_kind: MessageKind::Error,
             launched_issue_id: Some(issue.id),
             ..Default::default()
         },
+    }
+}
+
+fn launch_result(issue: Issue, outcome: agent::LaunchOutcome) -> ActionResult {
+    let lost = outcome.replaced_lost_session;
+    let (message, message_kind) = if lost {
+        (
+            format!(
+                "Previous {} session for {} was gone, started a new one",
+                issue.agent_kind, issue.id
+            ),
+            MessageKind::Warning,
+        )
+    } else {
+        (
+            format!("Session '{}' started", outcome.session_name),
+            MessageKind::Info,
+        )
+    };
+    // The status bar is hidden behind the popup that opens right away, so the
+    // popup title repeats the news.
+    let popup_title = lost.then(|| {
+        format!(
+            "{} (new session, the previous one was gone)",
+            issue.popup_title()
+        )
+    });
+    let forget_lost_session =
+        (lost && outcome.agent_session_id.is_none()).then_some(issue.agent_kind);
+    ActionResult {
+        launched_setup_ran: outcome.setup_ran,
+        message,
+        message_kind,
+        popup_title,
+        forget_lost_session,
+        session_to_open: Some(outcome.session_name),
+        launched_session: outcome.agent_session_id.map(|sid| LaunchedSession {
+            agent: issue.agent_kind,
+            kind: issue.kind,
+            session_id: sid,
+        }),
+        launched_issue_id: Some(issue.id),
+        ..Default::default()
     }
 }
 
@@ -2372,7 +2960,7 @@ mod tests {
                 head_branch: format!("branch-{number}"),
                 is_cross_repository: false,
                 merge_blocker: None,
-                in_merge_queue: false,
+                merge_queue: None,
                 unresolved_threads: 0,
             };
             members.push(GithubStackPullRequest {
@@ -3431,6 +4019,29 @@ mod tests {
     }
 
     #[test]
+    fn pr_review_without_an_open_pr_warns_instead_of_opening_the_local_review() {
+        let mut app = test_app();
+        app.project_mut().tuicr_available = true;
+        app.project_mut().issues.push(crate::types::Issue {
+            worktree: Some("main".to_string()),
+            ..test_issue_titled("bork-1", "Work", Column::Todo)
+        });
+
+        let ctx = app.action_context();
+        let post = handle_action(&mut app, Action::OpenReviewPR, &ctx, &test_channels());
+
+        assert!(matches!(post, PostAction::None));
+        assert_eq!(app.busy_count, 0);
+        assert_eq!(
+            app.message,
+            Some((
+                "No open PRs linked to this issue".to_string(),
+                MessageKind::Warning
+            ))
+        );
+    }
+
+    #[test]
     fn open_session_on_non_agentic_opens_edit_dialog() {
         let mut app = test_app();
         app.project_mut().issues.push(crate::types::Issue {
@@ -3735,6 +4346,215 @@ mod tests {
         );
     }
 
+    fn open_dialog_on_agent_field(app: &mut App) -> ActionContext {
+        let ctx = app.action_context();
+        let issue = app.project().issues[0].clone();
+        app.open_edit_dialog(&issue, 0, &ctx);
+        let dialog = app.dialog.as_mut().unwrap();
+        dialog.focused_field = dialog
+            .ordered_fields()
+            .iter()
+            .position(|field| *field == crate::dialog_state::DialogField::Agent)
+            .unwrap();
+        ctx
+    }
+
+    fn issue_with_two_sessions() -> Issue {
+        let mut issue = test_issue_titled("bork-1", "Test issue", Column::Todo);
+        issue
+            .sessions
+            .insert(issue.agent_kind, "ses_old".to_string());
+        // The second agent's has_session reads its real session dir, so these
+        // tests never assert on its resume marker.
+        issue
+            .sessions
+            .insert(AgentKind::Codex, "ses_other".to_string());
+        issue
+    }
+
+    fn focus_agent(app: &mut App, agent: AgentKind) {
+        app.dialog.as_mut().unwrap().agent_kind = agent;
+    }
+
+    #[test]
+    fn forgetting_current_session_kills_live_session() {
+        let mut app = test_app();
+        app.project_mut().issues.push(issue_with_two_sessions());
+        let session_name = app.project().issues[0].session_name("bork");
+        app.project_mut()
+            .live
+            .active_sessions
+            .insert(session_name.clone());
+        let ctx = open_dialog_on_agent_field(&mut app);
+
+        handle_action(&mut app, Action::DialogBackspace, &ctx, &test_channels());
+        handle_action(&mut app, Action::DialogSubmit, &ctx, &test_channels());
+
+        assert!(!app.project().live.active_sessions.contains(&session_name));
+    }
+
+    #[test]
+    fn forgetting_other_agent_session_keeps_live_session() {
+        let mut app = test_app();
+        app.project_mut().issues.push(issue_with_two_sessions());
+        let session_name = app.project().issues[0].session_name("bork");
+        app.project_mut()
+            .live
+            .active_sessions
+            .insert(session_name.clone());
+        let ctx = open_dialog_on_agent_field(&mut app);
+
+        // Move the picker to Codex, forget its session, then move back.
+        focus_agent(&mut app, AgentKind::Codex);
+        handle_action(&mut app, Action::DialogBackspace, &ctx, &test_channels());
+        focus_agent(&mut app, AgentKind::OpenCode);
+        handle_action(&mut app, Action::DialogSubmit, &ctx, &test_channels());
+
+        let issue = &app.project().issues[0];
+        assert!(!issue.sessions.contains_key(&AgentKind::Codex));
+        assert_eq!(issue.current_session_id(), Some("ses_old"));
+        assert!(app.project().live.active_sessions.contains(&session_name));
+    }
+
+    #[test]
+    fn forgetting_live_session_waits_for_in_flight_launch() {
+        let mut app = test_app();
+        app.project_mut().issues.push(issue_with_two_sessions());
+        app.launches_in_flight.insert("bork-1".to_string());
+        let ctx = open_dialog_on_agent_field(&mut app);
+
+        handle_action(&mut app, Action::DialogBackspace, &ctx, &test_channels());
+        handle_action(&mut app, Action::DialogSubmit, &ctx, &test_channels());
+
+        assert_eq!(app.message.as_ref().unwrap().1, MessageKind::Warning);
+        assert_eq!(app.project().issues[0].sessions.len(), 2);
+    }
+
+    #[test]
+    fn forgetting_agent_without_session_saves_during_launch() {
+        let mut app = test_app();
+        app.project_mut().issues.push(issue_with_two_sessions());
+        app.launches_in_flight.insert("bork-1".to_string());
+        let ctx = open_dialog_on_agent_field(&mut app);
+
+        focus_agent(&mut app, AgentKind::Pi);
+        handle_action(&mut app, Action::DialogBackspace, &ctx, &test_channels());
+        focus_agent(&mut app, AgentKind::OpenCode);
+        handle_action(&mut app, Action::DialogSubmit, &ctx, &test_channels());
+
+        assert_eq!(app.message.as_ref().unwrap().1, MessageKind::Info);
+        assert_eq!(app.project().issues[0].sessions.len(), 2);
+    }
+
+    fn launch_outcome(agent_session_id: Option<&str>, lost: bool) -> agent::LaunchOutcome {
+        agent::LaunchOutcome {
+            session_name: "bork-bork-1".to_string(),
+            agent_session_id: agent_session_id.map(str::to_string),
+            setup_ran: false,
+            replaced_lost_session: lost,
+        }
+    }
+
+    #[test]
+    fn launch_result_reports_replaced_lost_session() {
+        let issue = test_issue("bork-1", Column::InProgress);
+        let result = launch_result(issue, launch_outcome(Some("new-id"), true));
+
+        assert_eq!(result.message_kind, MessageKind::Warning);
+        assert!(result.message.contains("was gone"));
+        assert!(result
+            .popup_title
+            .as_deref()
+            .is_some_and(|title| title.contains("previous one was gone")));
+        assert_eq!(result.forget_lost_session, None);
+        assert_eq!(result.launched_session.unwrap().session_id, "new-id");
+    }
+
+    #[test]
+    fn launch_result_forgets_lost_session_without_new_id() {
+        let issue = test_issue("bork-1", Column::InProgress);
+        let result = launch_result(issue, launch_outcome(None, true));
+
+        assert_eq!(result.forget_lost_session, Some(AgentKind::OpenCode));
+    }
+
+    #[test]
+    fn launch_result_normal_launch_is_quiet() {
+        let issue = test_issue("bork-1", Column::InProgress);
+        let result = launch_result(issue, launch_outcome(Some("id"), false));
+
+        assert_eq!(result.message_kind, MessageKind::Info);
+        assert_eq!(result.popup_title, None);
+        assert_eq!(result.forget_lost_session, None);
+    }
+
+    #[test]
+    fn backspace_on_agent_field_forgets_current_session_on_save() {
+        let mut app = test_app();
+        app.project_mut().issues.push(issue_with_two_sessions());
+        let ctx = open_dialog_on_agent_field(&mut app);
+        let agent = app.project().issues[0].agent_kind;
+
+        handle_action(&mut app, Action::DialogBackspace, &ctx, &test_channels());
+        assert!(!app
+            .dialog
+            .as_ref()
+            .unwrap()
+            .shows_session(agent, &app.project().issues[0].sessions));
+        // Nothing is dropped until the dialog is saved.
+        assert_eq!(
+            app.project().issues[0].current_session_id(),
+            Some("ses_old")
+        );
+
+        handle_action(&mut app, Action::DialogSubmit, &ctx, &test_channels());
+        let issue = &app.project().issues[0];
+        assert_eq!(issue.current_session_id(), None);
+        assert_eq!(issue.sessions.len(), 1);
+    }
+
+    #[test]
+    fn new_session_after_lost_one_shows_resume_marker() {
+        let mut app = test_app();
+        app.project_mut().issues.push(issue_with_two_sessions());
+        open_dialog_on_agent_field(&mut app);
+        let agent = app.project().issues[0].agent_kind;
+        app.dialog
+            .as_mut()
+            .unwrap()
+            .lost_sessions
+            .insert(agent, "ses_old".to_string());
+        assert!(!app
+            .dialog
+            .as_ref()
+            .unwrap()
+            .shows_session(agent, &app.project().issues[0].sessions));
+
+        // A background launch replaced the lost session while the dialog was up.
+        app.project_mut().issues[0]
+            .sessions
+            .insert(agent, "ses_new".to_string());
+        assert!(app
+            .dialog
+            .as_ref()
+            .unwrap()
+            .shows_session(agent, &app.project().issues[0].sessions));
+    }
+
+    #[test]
+    fn cancel_after_backspace_keeps_session() {
+        let mut app = test_app();
+        app.project_mut().issues.push(issue_with_two_sessions());
+        let ctx = open_dialog_on_agent_field(&mut app);
+
+        handle_action(&mut app, Action::DialogBackspace, &ctx, &test_channels());
+        handle_action(&mut app, Action::DialogCancel, &ctx, &test_channels());
+        assert_eq!(
+            app.project().issues[0].current_session_id(),
+            Some("ses_old")
+        );
+    }
+
     // ================================================================
     // Normal mode: navigation
     // ================================================================
@@ -3760,6 +4580,7 @@ mod tests {
             action_tx: Box::leak(Box::new(mpsc::channel().0)),
             pr_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
             linear_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
+            backup_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
             git_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
             reload_tx: Box::leak(Box::new(mpsc::channel().0)),
         }
@@ -3769,6 +4590,41 @@ mod tests {
         let ctx = app.action_context();
         let ch = test_channels();
         handle_action(app, action, &ctx, &ch)
+    }
+
+    #[test]
+    fn backup_now_wakes_the_worker_once_while_pending() {
+        let (wake_tx, wake_rx) = mpsc::channel();
+        let ch = ActionChannels {
+            backup_wake_tx: Box::leak(Box::new(wake_tx)),
+            ..test_channels()
+        };
+        let mut app = app_with_issues();
+
+        for _ in 0..2 {
+            let ctx = app.action_context();
+            handle_action(&mut app, Action::BackupNow, &ctx, &ch);
+        }
+
+        assert!(app.backup_manual_pending);
+        assert_eq!(app.busy_count, 1);
+        assert_eq!(wake_rx.try_iter().count(), 1);
+    }
+
+    #[test]
+    fn backup_now_without_a_worker_says_so() {
+        // `test_channels` drops the receivers, like a crashed worker.
+        let mut app = app_with_issues();
+        act(&mut app, Action::BackupNow);
+        assert!(!app.backup_manual_pending);
+        assert_eq!(app.busy_count, 0);
+        assert_eq!(
+            app.message,
+            Some((
+                crate::backup::schedule::WORKER_STOPPED.to_string(),
+                MessageKind::Error
+            ))
+        );
     }
 
     #[test]
@@ -4040,6 +4896,474 @@ mod tests {
         assert!(issue.done_at.is_some());
         assert!(issue.worktree.is_none());
         assert!(app.project().state_dirty);
+    }
+
+    /// A project root with a real `main/` checkout and one worktree,
+    /// `bork-1-slug`, holding an uncommitted file.
+    fn project_with_dirty_worktree() -> (tempfile::TempDir, AppConfig) {
+        let root = tempfile::tempdir().unwrap();
+        let main = root.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
+                .args(args)
+                .current_dir(&main)
+                .output()
+                .unwrap();
+            assert!(status.status.success(), "git {args:?}: {status:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            "../bork-1-slug",
+            "-b",
+            "bork-1/slug",
+        ]);
+        std::fs::write(root.path().join("bork-1-slug/dirty.txt"), "uncommitted").unwrap();
+
+        let mut config = test_config();
+        config.project_root = root.path().to_path_buf();
+        (root, config)
+    }
+
+    fn unique_session() -> String {
+        format!("bork-force-archive-test-{}", std::process::id())
+    }
+
+    #[test]
+    fn archiving_a_dirty_worktree_offers_to_force_it() {
+        let (root, config) = project_with_dirty_worktree();
+        let project_id = root.path().to_path_buf();
+
+        let result = archive_to_result(
+            &config,
+            project_id.clone(),
+            "bork-1".into(),
+            &unique_session(),
+            Some("bork-1-slug"),
+            Removal::Safe,
+        );
+
+        assert!(result.issues_to_archive.is_empty());
+        assert_eq!(result.force_archive_offers.len(), 1);
+        let (offer_project, offer_issue, reason) = &result.force_archive_offers[0];
+        assert_eq!(offer_project, &project_id);
+        assert_eq!(offer_issue, "bork-1");
+        assert!(matches!(reason, ForceRequired::Uncommitted(_)));
+        assert!(root.path().join("bork-1-slug").exists());
+    }
+
+    #[test]
+    fn a_forced_archive_discards_the_uncommitted_changes() {
+        let (root, config) = project_with_dirty_worktree();
+        let project_id = root.path().to_path_buf();
+
+        let result = archive_to_result(
+            &config,
+            project_id.clone(),
+            "bork-1".into(),
+            &unique_session(),
+            Some("bork-1-slug"),
+            Removal::ForceSkipTeardown,
+        );
+
+        assert_eq!(
+            result.issues_to_archive,
+            vec![(project_id, "bork-1".to_string())]
+        );
+        assert!(result.force_archive_offers.is_empty());
+        assert!(!root.path().join("bork-1-slug").exists());
+    }
+
+    #[test]
+    fn a_forced_archive_warns_about_a_teardown_it_went_past() {
+        let (root, mut config) = project_with_dirty_worktree();
+        config.teardown_script = Some("exit 3".into());
+        let project_id = root.path().to_path_buf();
+
+        let result = archive_to_result(
+            &config,
+            project_id.clone(),
+            "bork-1".into(),
+            &unique_session(),
+            Some("bork-1-slug"),
+            Removal::Force,
+        );
+
+        assert_eq!(result.message_kind, MessageKind::Warning);
+        assert!(
+            result
+                .message
+                .ends_with(", but its teardown script failed (exit 3)"),
+            "{}",
+            result.message
+        );
+        assert_eq!(
+            result.issues_to_archive,
+            vec![(project_id, "bork-1".to_string())]
+        );
+        assert!(!root.path().join("bork-1-slug").exists());
+    }
+
+    fn offer(app: &mut App, offers: Vec<(ProjectId, String, ForceRequired)>) -> bool {
+        queue_force_archive(app, offers);
+        show_queued_force_archive(app)
+    }
+
+    fn dirty(project_id: &ProjectId, issue_id: &str) -> (ProjectId, String, ForceRequired) {
+        (
+            project_id.clone(),
+            issue_id.into(),
+            ForceRequired::Uncommitted("fatal: dirty".into()),
+        )
+    }
+
+    fn teardown_failed(
+        project_id: &ProjectId,
+        issue_id: &str,
+        dirty: bool,
+    ) -> (ProjectId, String, ForceRequired) {
+        (
+            project_id.clone(),
+            issue_id.into(),
+            ForceRequired::TeardownFailed { code: 2, dirty },
+        )
+    }
+
+    fn plan_not_saved(
+        project_id: &ProjectId,
+        issue_id: &str,
+        dirty: bool,
+    ) -> (ProjectId, String, ForceRequired) {
+        (
+            project_id.clone(),
+            issue_id.into(),
+            ForceRequired::PlanNotSaved {
+                error: "disk full".into(),
+                dirty,
+            },
+        )
+    }
+
+    #[test]
+    fn an_unsaved_plan_asks_before_archiving_and_runs_the_teardown_when_forced() {
+        let mut app = app_with_issues();
+        let project_id = app.project().id();
+
+        assert!(offer(
+            &mut app,
+            vec![plan_not_saved(&project_id, "bork-1", false)]
+        ));
+
+        assert_eq!(
+            app.confirm_message.as_deref(),
+            Some("bork-1's plan couldn't be saved (disk full). Archive anyway and lose the plan? (y/n)")
+        );
+        match &app.pending_confirm {
+            Some(ConfirmAction::ArchiveIssue {
+                force: true,
+                teardown_due,
+                ..
+            }) => assert_eq!(teardown_due, &["bork-1"]),
+            other => panic!("expected a forced ArchiveIssue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unsaved_plan_names_every_other_problem() {
+        let mut app = app_with_issues();
+        let project_id = app.project().id();
+
+        assert!(offer(
+            &mut app,
+            vec![plan_not_saved(&project_id, "bork-1", true)]
+        ));
+        assert_eq!(
+            app.confirm_message.as_deref(),
+            Some("bork-1's plan couldn't be saved (disk full) and its worktree has uncommitted changes. Archive anyway, losing the plan and the changes? (y/n)")
+        );
+        app.cancel_confirm();
+
+        assert!(offer(
+            &mut app,
+            vec![
+                plan_not_saved(&project_id, "bork-1", false),
+                teardown_failed(&project_id, "bork-2", false),
+            ]
+        ));
+        assert_eq!(
+            app.confirm_message.as_deref(),
+            Some("2 issues stopped short (bork-1: plan not saved, bork-2: teardown exit 2). Archive anyway and lose the unsaved plans? (y/n)")
+        );
+        match &app.pending_confirm {
+            Some(ConfirmAction::ArchiveIssue { teardown_due, .. }) => {
+                assert_eq!(teardown_due, &["bork-1"])
+            }
+            other => panic!("expected a forced ArchiveIssue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_forced_archive_runs_the_teardown_only_where_it_is_due() {
+        let due = vec!["bork-1".to_string()];
+        assert_eq!(archive_removal(false, &due, "bork-1"), Removal::Safe);
+        assert_eq!(archive_removal(true, &due, "bork-1"), Removal::Force);
+        assert_eq!(
+            archive_removal(true, &due, "bork-2"),
+            Removal::ForceSkipTeardown
+        );
+    }
+
+    #[test]
+    fn combined_results_keep_warnings() {
+        let warning = |message: &str| ActionResult {
+            message: message.into(),
+            message_kind: MessageKind::Warning,
+            ..Default::default()
+        };
+        let combined = combine_results(
+            vec![
+                warning("Deleted bork-1 but couldn't remove its saved plans: denied"),
+                ActionResult::default(),
+            ],
+            "Deleted 2 issues".into(),
+        );
+        assert_eq!(combined.message_kind, MessageKind::Warning);
+        assert_eq!(
+            combined.message,
+            "Deleted 2 issues; Deleted bork-1 but couldn't remove its saved plans: denied"
+        );
+    }
+
+    #[test]
+    fn a_prune_that_kept_unsaved_plans_asks_to_remove_them() {
+        use crate::prune::PruneTarget;
+        let mut app = app_with_issues();
+        let project_id = app.project().id();
+        let target = |worktree: &str, issue_id: &str| PruneTarget {
+            worktree: worktree.into(),
+            issue_id: Some(issue_id.into()),
+        };
+
+        queue_force_prune(&mut app, project_id.clone(), Vec::new());
+        assert!(!show_queued_force_prune(&mut app));
+
+        queue_force_prune(
+            &mut app,
+            project_id.clone(),
+            vec![target("bork-1-a", "bork-1")],
+        );
+        assert!(show_queued_force_prune(&mut app));
+        assert_eq!(
+            app.confirm_message.as_deref(),
+            Some("Kept bork-1-a: its plan couldn't be saved. Remove it anyway and lose the plan? (y/n)")
+        );
+        match &app.pending_confirm {
+            Some(ConfirmAction::ForcePrune { targets, .. }) => {
+                assert_eq!(targets, &vec![target("bork-1-a", "bork-1")])
+            }
+            other => panic!("expected ForcePrune, got {other:?}"),
+        }
+        app.cancel_confirm();
+
+        queue_force_prune(
+            &mut app,
+            project_id,
+            vec![target("bork-1-a", "bork-1"), target("bork-2-b", "bork-2")],
+        );
+        assert!(show_queued_force_prune(&mut app));
+        assert_eq!(
+            app.confirm_message.as_deref(),
+            Some("Kept 2 worktrees whose plan couldn't be saved (bork-1-a, bork-2-b). Remove them anyway and lose the plans? (y/n)")
+        );
+    }
+
+    #[test]
+    fn a_force_offer_asks_before_discarding_anything() {
+        let mut app = app_with_issues();
+        let project_id = app.project().id();
+
+        assert!(offer(&mut app, vec![dirty(&project_id, "bork-1")]));
+
+        assert_eq!(app.input_mode, InputMode::Confirm);
+        assert_eq!(
+            app.confirm_message.as_deref(),
+            Some(
+                "bork-1's worktree has uncommitted changes. Archive anyway and discard them? (y/n)"
+            )
+        );
+        match &app.pending_confirm {
+            Some(ConfirmAction::ArchiveIssue {
+                issue_ids,
+                project_id: confirmed_project,
+                force: true,
+                teardown_due,
+            }) => {
+                assert_eq!(issue_ids, &["bork-1"]);
+                assert_eq!(confirmed_project, &project_id);
+                assert!(teardown_due.is_empty());
+            }
+            _ => panic!("expected a forced ArchiveIssue"),
+        }
+        assert!(app.queued_force_archives.is_empty());
+    }
+
+    #[test]
+    fn a_force_offer_names_a_failing_teardown() {
+        let mut app = app_with_issues();
+        let project_id = app.project().id();
+
+        offer(
+            &mut app,
+            vec![teardown_failed(&project_id, "bork-1", false)],
+        );
+
+        assert_eq!(
+            app.confirm_message.as_deref(),
+            Some("bork-1's teardown script failed (exit 2). Archive anyway? (y/n)")
+        );
+    }
+
+    #[test]
+    fn a_failing_teardown_on_a_dirty_worktree_warns_about_the_changes() {
+        let mut app = app_with_issues();
+        let project_id = app.project().id();
+
+        offer(&mut app, vec![teardown_failed(&project_id, "bork-1", true)]);
+
+        assert_eq!(
+            app.confirm_message.as_deref(),
+            Some("bork-1's teardown script failed (exit 2) and its worktree has uncommitted changes. Archive anyway and discard them? (y/n)")
+        );
+    }
+
+    #[test]
+    fn several_force_offers_become_one_prompt_naming_each_card() {
+        let mut app = app_with_issues();
+        let project_id = app.project().id();
+
+        offer(
+            &mut app,
+            vec![
+                dirty(&project_id, "bork-1"),
+                teardown_failed(&project_id, "bork-2", false),
+            ],
+        );
+
+        assert_eq!(
+            app.confirm_message.as_deref(),
+            Some("2 issues stopped short (bork-1: uncommitted changes, bork-2: teardown exit 2). Archive anyway and discard their uncommitted changes? (y/n)")
+        );
+        match &app.pending_confirm {
+            Some(ConfirmAction::ArchiveIssue {
+                issue_ids,
+                force: true,
+                ..
+            }) => assert_eq!(issue_ids, &["bork-1", "bork-2"]),
+            _ => panic!("expected a forced ArchiveIssue"),
+        }
+    }
+
+    #[test]
+    fn a_combined_prompt_without_dirty_worktrees_does_not_mention_discarding() {
+        let mut app = app_with_issues();
+        let project_id = app.project().id();
+
+        offer(
+            &mut app,
+            ["bork-1", "bork-2", "bork-3", "bork-4", "bork-5"]
+                .into_iter()
+                .map(|id| teardown_failed(&project_id, id, false))
+                .collect(),
+        );
+
+        assert_eq!(
+            app.confirm_message.as_deref(),
+            Some("5 issues stopped short (bork-1: teardown exit 2, bork-2: teardown exit 2, bork-3: teardown exit 2, 2 more). Archive anyway? (y/n)")
+        );
+    }
+
+    #[test]
+    fn a_force_offer_waits_until_the_board_is_back_in_normal_mode() {
+        let mut app = app_with_issues();
+        let project_id = app.project().id();
+        app.start_search();
+
+        assert!(!offer(&mut app, vec![dirty(&project_id, "bork-1")]));
+        assert_eq!(app.input_mode, InputMode::Search);
+        assert!(app.pending_confirm.is_none());
+
+        app.input_mode = InputMode::Normal;
+        assert!(show_queued_force_archive(&mut app));
+        assert!(matches!(
+            &app.pending_confirm,
+            Some(ConfirmAction::ArchiveIssue { force: true, .. })
+        ));
+    }
+
+    #[test]
+    fn a_force_offer_leaves_an_open_prompt_alone_and_queues_behind_it() {
+        let mut app = app_with_issues();
+        let project_id = app.project().id();
+        offer(&mut app, vec![dirty(&project_id, "bork-1")]);
+
+        assert!(!offer(&mut app, vec![dirty(&project_id, "bork-2")]));
+        match &app.pending_confirm {
+            Some(ConfirmAction::ArchiveIssue { issue_ids, .. }) => {
+                assert_eq!(issue_ids, &["bork-1"])
+            }
+            _ => panic!("expected the first offer to stay open"),
+        }
+
+        app.cancel_confirm();
+        assert!(show_queued_force_archive(&mut app));
+        match &app.pending_confirm {
+            Some(ConfirmAction::ArchiveIssue { issue_ids, .. }) => {
+                assert_eq!(issue_ids, &["bork-2"])
+            }
+            _ => panic!("expected the queued offer"),
+        }
+    }
+
+    #[test]
+    fn a_repeated_offer_for_a_card_replaces_the_queued_one() {
+        let mut app = app_with_issues();
+        let project_id = app.project().id();
+        app.start_search();
+
+        queue_force_archive(&mut app, vec![dirty(&project_id, "bork-1")]);
+        queue_force_archive(
+            &mut app,
+            vec![teardown_failed(&project_id, "bork-1", false)],
+        );
+
+        assert_eq!(
+            app.queued_force_archives,
+            vec![teardown_failed(&project_id, "bork-1", false)]
+        );
+    }
+
+    #[test]
+    fn combined_results_keep_every_force_offer() {
+        let project_id = PathBuf::from("/tmp/test-bork");
+        let offer = |id: &str| ActionResult {
+            message: format!("{id} is dirty"),
+            message_kind: MessageKind::Error,
+            force_archive_offers: vec![(
+                project_id.clone(),
+                id.to_string(),
+                ForceRequired::Uncommitted("fatal: dirty".into()),
+            )],
+            ..Default::default()
+        };
+
+        let combined = combine_results(vec![offer("bork-1"), offer("bork-2")], "done".into());
+
+        assert_eq!(combined.force_archive_offers.len(), 2);
     }
 
     #[test]
@@ -4357,6 +5681,7 @@ mod tests {
                 action_tx: Box::leak(Box::new(mpsc::channel().0)),
                 pr_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
                 linear_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
+                backup_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
                 git_wake_tx: Box::leak(Box::new(mpsc::channel().0)),
                 reload_tx: &reload_tx,
             };
@@ -4417,6 +5742,229 @@ mod tests {
 
         let post = handle_sidebar(&mut app, Action::SidebarSelect);
         assert!(matches!(post, PostAction::None));
+    }
+
+    fn register_test_projects(app: &App) {
+        for project in &app.projects {
+            crate::global_config::register_project(
+                &project.config.project_name,
+                &project.config.project_root,
+            )
+            .unwrap();
+        }
+    }
+
+    fn open_sidebar(app: &mut App, selected: usize) {
+        let sidebar = app.sidebar.as_mut().unwrap();
+        sidebar.visible = true;
+        sidebar.focused = true;
+        sidebar.selected = selected;
+        app.input_mode = InputMode::Sidebar;
+    }
+
+    #[test]
+    fn sidebar_move_persists_order() {
+        crate::global_config::tests::with_temp_config("sidebar-move", || {
+            let mut app = test_multi_app();
+            register_test_projects(&app);
+            open_sidebar(&mut app, 2);
+
+            handle_sidebar(&mut app, Action::SidebarMoveUp);
+
+            let names: Vec<String> = crate::global_config::list_projects()
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect();
+            assert_eq!(names, ["alpha", "gamma", "beta"]);
+            assert_eq!(app.sidebar.as_ref().unwrap().selected, 1);
+        });
+    }
+
+    #[test]
+    fn sidebar_move_at_edge_saves_nothing() {
+        crate::global_config::tests::with_temp_config("sidebar-move-edge", || {
+            let mut app = test_multi_app();
+            open_sidebar(&mut app, 0);
+
+            handle_sidebar(&mut app, Action::SidebarMoveUp);
+
+            assert!(crate::global_config::list_projects().is_empty());
+            assert_eq!(app.sidebar.as_ref().unwrap().selected, 0);
+            assert!(app.message.is_none());
+        });
+    }
+
+    fn rename_buffer(app: &mut App) -> &mut String {
+        &mut app
+            .sidebar
+            .as_mut()
+            .unwrap()
+            .rename
+            .as_mut()
+            .unwrap()
+            .buffer
+    }
+
+    #[test]
+    fn sidebar_rename_saves_label() {
+        crate::global_config::tests::with_temp_config("sidebar-rename", || {
+            let mut app = test_multi_app();
+            register_test_projects(&app);
+            open_sidebar(&mut app, 1);
+
+            handle_sidebar(&mut app, Action::SidebarRename);
+            assert_eq!(app.input_mode, InputMode::SidebarRename);
+            assert_eq!(rename_buffer(&mut app), "beta");
+
+            handle_sidebar_rename(&mut app, Action::SearchBackspace);
+            assert_eq!(rename_buffer(&mut app), "bet");
+            rename_buffer(&mut app).clear();
+            for c in "  Bee ".chars() {
+                handle_sidebar_rename(&mut app, Action::SearchChar(c));
+            }
+            handle_sidebar_rename(&mut app, Action::SearchConfirm);
+
+            assert_eq!(app.input_mode, InputMode::Sidebar);
+            assert!(app.sidebar.as_ref().unwrap().rename.is_none());
+            assert_eq!(app.projects[1].display_name(), "Bee");
+            assert_eq!(app.projects[1].config.project_name, "beta");
+            let entry = &crate::global_config::list_projects()[1];
+            assert_eq!(entry.name, "beta");
+            assert_eq!(entry.label.as_deref(), Some("Bee"));
+        });
+    }
+
+    #[test]
+    fn sidebar_rename_to_config_name_clears_label() {
+        crate::global_config::tests::with_temp_config("sidebar-rename-clear", || {
+            let mut app = test_multi_app();
+            register_test_projects(&app);
+            crate::global_config::set_project_label(&app.projects[1].id(), Some("Bee")).unwrap();
+            app.sync_with_registry(&crate::global_config::list_projects());
+            open_sidebar(&mut app, 1);
+
+            handle_sidebar(&mut app, Action::SidebarRename);
+            *rename_buffer(&mut app) = "beta".into();
+            handle_sidebar_rename(&mut app, Action::SearchConfirm);
+
+            assert_eq!(app.projects[1].label, None);
+            assert_eq!(crate::global_config::list_projects()[1].label, None);
+        });
+    }
+
+    #[test]
+    fn sidebar_rename_keeps_target_when_list_shifts() {
+        crate::global_config::tests::with_temp_config("sidebar-rename-shift", || {
+            let mut app = test_multi_app();
+            register_test_projects(&app);
+            open_sidebar(&mut app, 1);
+            let beta_id = app.projects[1].id();
+
+            handle_sidebar(&mut app, Action::SidebarRename);
+            // A reload moves the cursor off beta while the field is open.
+            app.sidebar.as_mut().unwrap().selected = 2;
+            *rename_buffer(&mut app) = "Bee".into();
+            handle_sidebar_rename(&mut app, Action::SearchConfirm);
+
+            assert_eq!(app.find_project(&beta_id).unwrap().display_name(), "Bee");
+            assert_eq!(app.projects[2].display_name(), "gamma");
+        });
+    }
+
+    #[test]
+    fn sidebar_rename_rejects_empty_and_duplicate_names() {
+        crate::global_config::tests::with_temp_config("sidebar-rename-bad", || {
+            let mut app = test_multi_app();
+            register_test_projects(&app);
+            open_sidebar(&mut app, 1);
+
+            handle_sidebar(&mut app, Action::SidebarRename);
+            *rename_buffer(&mut app) = "   ".into();
+            handle_sidebar_rename(&mut app, Action::SearchConfirm);
+            assert_eq!(app.input_mode, InputMode::SidebarRename);
+
+            *rename_buffer(&mut app) = "gamma".into();
+            handle_sidebar_rename(&mut app, Action::SearchConfirm);
+            assert_eq!(app.input_mode, InputMode::SidebarRename);
+            assert_eq!(app.projects[1].display_name(), "beta");
+
+            handle_sidebar_rename(&mut app, Action::SearchCancel);
+            assert_eq!(app.input_mode, InputMode::Sidebar);
+            assert!(app.sidebar.as_ref().unwrap().rename.is_none());
+        });
+    }
+
+    #[test]
+    fn sidebar_remove_blocks_focused_project() {
+        let mut app = test_multi_app();
+        open_sidebar(&mut app, 0);
+
+        handle_sidebar(&mut app, Action::SidebarRemove);
+
+        assert_eq!(app.input_mode, InputMode::Sidebar);
+        assert!(app.pending_confirm.is_none());
+    }
+
+    #[test]
+    fn sidebar_remove_unregisters_after_confirm() {
+        crate::global_config::tests::with_temp_config("sidebar-remove", || {
+            let mut app = test_multi_app();
+            register_test_projects(&app);
+            open_sidebar(&mut app, 1);
+            let beta_id = app.projects[1].id();
+            let (tx, _rx) = mpsc::channel();
+            let ctx = app.action_context();
+
+            handle_sidebar(&mut app, Action::SidebarRemove);
+            assert_eq!(app.input_mode, InputMode::Confirm);
+            handle_confirm(&mut app, Action::ConfirmYes, &ctx, &tx);
+
+            assert_eq!(app.input_mode, InputMode::Sidebar);
+            assert!(app.find_project(&beta_id).is_none());
+            assert_eq!(crate::global_config::list_projects().len(), 2);
+        });
+    }
+
+    #[test]
+    fn sidebar_remove_visible_swimlane_drops_its_lane() {
+        crate::global_config::tests::with_temp_config("sidebar-remove-lane", || {
+            let mut app = test_multi_app();
+            register_test_projects(&app);
+            let alpha_id = app.projects[0].id();
+            let beta_id = app.projects[1].id();
+            let gamma_id = app.projects[2].id();
+            app.sidebar.as_mut().unwrap().swimlanes =
+                vec![alpha_id.clone(), beta_id.clone(), gamma_id.clone()];
+            app.focused_swimlane = 2;
+            open_sidebar(&mut app, 1);
+            let (tx, _rx) = mpsc::channel();
+            let ctx = app.action_context();
+
+            handle_sidebar(&mut app, Action::SidebarRemove);
+            handle_confirm(&mut app, Action::ConfirmYes, &ctx, &tx);
+
+            assert_eq!(
+                app.sidebar.as_ref().unwrap().swimlanes,
+                vec![alpha_id, gamma_id.clone()]
+            );
+            // The focused lane follows gamma to its new position.
+            assert_eq!(app.focused_swimlane, 1);
+            assert_eq!(app.active_project_id(), gamma_id);
+        });
+    }
+
+    #[test]
+    fn sidebar_remove_cancel_returns_to_sidebar() {
+        let mut app = test_multi_app();
+        open_sidebar(&mut app, 1);
+        let (tx, _rx) = mpsc::channel();
+        let ctx = app.action_context();
+
+        handle_sidebar(&mut app, Action::SidebarRemove);
+        handle_confirm(&mut app, Action::ConfirmNo, &ctx, &tx);
+
+        assert_eq!(app.input_mode, InputMode::Sidebar);
+        assert_eq!(app.projects.len(), 3);
     }
 
     #[test]
@@ -4639,7 +6187,7 @@ mod tests {
             head_branch: "feature".to_string(),
             is_cross_repository: false,
             merge_blocker: None,
-            in_merge_queue: false,
+            merge_queue: None,
             unresolved_threads: 0,
         };
         app.projects[0]

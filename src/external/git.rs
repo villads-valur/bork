@@ -283,6 +283,31 @@ fn list_worktree_branches(project_root: &Path) -> HashMap<String, String> {
     parse_worktree_list(&stdout)
 }
 
+/// Every issue directory's branch, resolved the same way as `GitPoller::poll`
+/// (batched worktree list, `rev-parse` for independent clones) but without
+/// statuses. Used for hidden projects, which don't run a full git poller.
+pub fn list_project_branches(project_root: &Path) -> HashMap<String, String> {
+    let mut batched = list_worktree_branches(project_root);
+    let mut branches = HashMap::new();
+    let Ok(entries) = std::fs::read_dir(project_root) else {
+        return branches;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(dir_name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if dir_name.starts_with('.') || !path.is_dir() || !path.join(".git").exists() {
+            continue;
+        }
+        let branch = batched.remove(&dir_name).or_else(|| get_branch_name(&path));
+        if let Some(branch) = branch {
+            branches.insert(dir_name, branch);
+        }
+    }
+    branches
+}
+
 /// Parse `git worktree list --porcelain` into dir-name -> branch-name.
 /// Detached or bare entries (no `branch` line) are skipped.
 pub(crate) fn parse_worktree_list(output: &str) -> HashMap<String, String> {
@@ -493,6 +518,70 @@ detached
         let output = "worktree /tmp/x\nbranch feature/foo\n";
         let map = parse_worktree_list(output);
         assert_eq!(map["x"], "feature/foo");
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+
+    fn init_repo(dir: &Path, branch: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "-q", "-b", branch]);
+        git(
+            dir,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        );
+    }
+
+    #[test]
+    fn list_project_branches_covers_worktrees_and_independent_clones() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        init_repo(&root.join("main"), "main");
+        git(
+            &root.join("main"),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "bork-1/task",
+                "../bork-1-task",
+            ],
+        );
+        init_repo(&root.join("bork-2-clone"), "bork-2/clone");
+        std::fs::create_dir_all(root.join(".bork")).unwrap();
+        std::fs::create_dir_all(root.join("plans")).unwrap();
+
+        let branches = list_project_branches(root);
+
+        assert_eq!(branches.get("main").map(String::as_str), Some("main"));
+        assert_eq!(
+            branches.get("bork-1-task").map(String::as_str),
+            Some("bork-1/task")
+        );
+        assert_eq!(
+            branches.get("bork-2-clone").map(String::as_str),
+            Some("bork-2/clone")
+        );
+        assert_eq!(branches.len(), 3);
     }
 
     #[test]

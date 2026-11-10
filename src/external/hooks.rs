@@ -133,11 +133,18 @@ const CODEX_HOOKS: &str = r#"{
 /// Iterates `AgentKind::ALL` through the provider registry so a new harness
 /// with hooks is picked up without editing a hand-written call list here.
 pub fn install() -> anyhow::Result<()> {
+    install_agent_hooks()?;
+    install_skills();
+    println!("bork hooks installed successfully");
+    Ok(())
+}
+
+/// Only the global agent hooks, without touching any project's skills.
+/// For `bork import`, which restores each project's skills from the backup.
+pub fn install_agent_hooks() -> anyhow::Result<()> {
     for kind in crate::types::AgentKind::ALL {
         crate::external::agent::provider(kind).install_hooks()?;
     }
-    install_skills();
-    println!("bork hooks installed successfully");
     Ok(())
 }
 
@@ -263,9 +270,19 @@ pub(crate) fn uninstall_pi_extension() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Claude's config dir: `CLAUDE_CONFIG_DIR` when set, else `~/.claude`.
+pub(crate) fn claude_config_dir() -> PathBuf {
+    match std::env::var("CLAUDE_CONFIG_DIR") {
+        Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            PathBuf::from(home).join(".claude")
+        }
+    }
+}
+
 fn claude_settings_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".claude").join("settings.json")
+    claude_config_dir().join("settings.json")
 }
 
 fn codex_hooks_path() -> PathBuf {

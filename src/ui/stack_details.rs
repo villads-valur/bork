@@ -120,7 +120,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         details.selected,
         inner,
         &summary,
-        &stack.pull_requests,
+        &project.detail_members(issue),
     );
 }
 

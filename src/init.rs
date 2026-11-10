@@ -68,6 +68,22 @@ pub fn extract_repo_name(repo: &str) -> anyhow::Result<String> {
     Ok(name.to_string())
 }
 
+/// Clone `url` into `main_dir` (a container's `main/`) with live progress
+/// output. Shared by `bork init` and `bork import`.
+pub fn clone_repo(url: &str, main_dir: &Path) -> anyhow::Result<()> {
+    let status = crate::external::git_command()
+        .args(["clone", "--progress", "--", url])
+        .arg(main_dir)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .context("Failed to run git clone")?;
+    if !status.success() {
+        bail!("git clone failed (exit code: {})", status);
+    }
+    Ok(())
+}
+
 /// Initialize a new bork project by cloning a git repo and scaffolding the
 /// `.bork/` directory structure.
 ///
@@ -98,23 +114,8 @@ pub fn run_init(
     let clone_url = normalize_repo_url(repo);
     let main_dir = container.join("main");
 
-    // Clone the repository into <container>/main with live progress output
     println!("Cloning {} into {}/main ...", clone_url, dir_name);
-    let status = crate::external::git_command()
-        .args([
-            "clone",
-            "--progress",
-            &clone_url,
-            main_dir.to_str().unwrap_or("main"),
-        ])
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .context("Failed to run git clone")?;
-
-    if !status.success() {
-        bail!("git clone failed (exit code: {})", status);
-    }
+    clone_repo(&clone_url, &main_dir)?;
 
     // Create .bork/ directory structure
     let bork_dir = container.join(".bork");
