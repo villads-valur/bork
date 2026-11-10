@@ -57,6 +57,10 @@ pub fn orchestrator_badge_style() -> Style {
     Style::default().fg(Color::Magenta)
 }
 
+pub fn cloud_badge_style() -> Style {
+    Style::default().fg(Color::Blue)
+}
+
 pub fn card_title_style(selected: bool) -> Style {
     if selected {
         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
