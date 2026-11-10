@@ -22,6 +22,15 @@ pub fn resolve_agent_selection(config: &config::AppConfig) -> AgentSelection {
     resolve_with_installed(prefs, &installed)
 }
 
+/// Agent for a new issue when none was picked: the configured agent if it is
+/// installed, else the first installed one. Falls back to the configured agent
+/// when nothing is installed, so the launch reports the missing binary.
+pub fn default_agent_for(config: &config::AppConfig) -> AgentKind {
+    resolve_agent_selection(config)
+        .default_agent
+        .unwrap_or(config.agent_kind)
+}
+
 #[derive(Debug, Clone, Default)]
 struct AgentPreferences {
     enabled: Option<Vec<AgentKind>>,
@@ -157,5 +166,15 @@ mod tests {
         };
         let selection = resolve_with_installed(prefs, &[AgentKind::OpenCode]);
         assert_eq!(selection.default_agent, Some(AgentKind::OpenCode));
+    }
+
+    #[test]
+    fn default_agent_for_keeps_configured_agent_when_none_is_available() {
+        let config = config::AppConfig {
+            agent_kind: AgentKind::Pi,
+            agents_allowlist: Some(Vec::new()),
+            ..Default::default()
+        };
+        assert_eq!(default_agent_for(&config), AgentKind::Pi);
     }
 }
