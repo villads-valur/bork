@@ -3300,6 +3300,9 @@ fn run_tui() -> anyhow::Result<()> {
                 // A failed poll carries no issues. Overwriting with that empties
                 // the picker and blanks every imported card's title on a blip,
                 // so the last good list stands until a poll succeeds.
+                for project in &mut app.projects {
+                    project.live.linear_error = result.error.clone();
+                }
                 if let Some(ref error) = result.error {
                     if last_linear_error.as_deref() != Some(error.as_str()) {
                         app.set_warning(format!("Linear: {error}"));
