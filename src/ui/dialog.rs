@@ -1,14 +1,14 @@
 use std::collections::BTreeMap;
 
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
 use ratatui::Frame;
 
-use crate::app::{App, DialogField, DialogState};
+use crate::app::{App, DialogField, DialogState, MessageKind};
 use crate::types::{AgentKind, AgentMode, IssueKind, LinkedGithubPr};
 use crate::ui::styles;
 
@@ -211,49 +211,61 @@ pub fn render_dialog(frame: &mut Frame, app: &App) {
     render_prompt_field(frame, dialog, prompt_area, is_prompt_focused);
 
     let footer_y = inner.y + inner.height - 2;
-    let on_external_field = dialog.is_on_linear_field() || dialog.is_on_github_field();
+    let on_external_field = dialog.is_on_linear_field()
+        || dialog.is_on_linear_project_field()
+        || dialog.is_on_github_field();
     let submit_hint = if dialog.editing_index.is_some() || dialog.kind == IssueKind::NonAgentic {
         ":save  "
     } else {
         ":start  "
     };
 
-    let footer = if on_external_field {
-        Line::from(vec![
-            Span::styled("Space", styles::statusbar_key_style()),
-            Span::styled(":attach  ", styles::statusbar_desc_style()),
-            Span::styled("Bksp", styles::statusbar_key_style()),
-            Span::styled(":detach  ", styles::statusbar_desc_style()),
-            Span::styled("Ctrl+S", styles::statusbar_key_style()),
-            Span::styled(submit_hint, styles::statusbar_desc_style()),
-            Span::styled("Esc", styles::statusbar_key_style()),
-            Span::styled(":cancel", styles::statusbar_desc_style()),
-        ])
-    } else {
-        let next_key = if is_prompt_focused { "Tab" } else { "Enter" };
-        let mut spans = vec![
-            Span::styled(next_key, styles::statusbar_key_style()),
-            Span::styled(":next  ", styles::statusbar_desc_style()),
-        ];
-        if is_prompt_focused {
-            spans.push(Span::styled("Ctrl+e", styles::statusbar_key_style()));
-            spans.push(Span::styled(":editor  ", styles::statusbar_desc_style()));
-        }
-        if dialog.is_on_agent_field() && dialog.shows_session(dialog.agent_kind, sessions) {
-            spans.push(Span::styled("Bksp", styles::statusbar_key_style()));
-            spans.push(Span::styled(
-                ":new session  ",
-                styles::statusbar_desc_style(),
-            ));
-        }
-        spans.extend([
-            Span::styled("Ctrl+S", styles::statusbar_key_style()),
-            Span::styled(submit_hint, styles::statusbar_desc_style()),
-            Span::styled("Esc", styles::statusbar_key_style()),
-            Span::styled(":cancel", styles::statusbar_desc_style()),
-        ]);
-        Line::from(spans)
-    };
+    // The app footer is hidden behind the dialog, so warnings raised from
+    // here (e.g. nothing to attach) take the hint row until they expire.
+    let footer =
+        if let Some((message, kind @ (MessageKind::Warning | MessageKind::Error))) = &app.message {
+            let color = if *kind == MessageKind::Error {
+                Color::Red
+            } else {
+                Color::Yellow
+            };
+            Line::from(Span::styled(message.as_str(), Style::default().fg(color)))
+        } else if on_external_field {
+            Line::from(vec![
+                Span::styled("Space", styles::statusbar_key_style()),
+                Span::styled(":attach  ", styles::statusbar_desc_style()),
+                Span::styled("Bksp", styles::statusbar_key_style()),
+                Span::styled(":detach  ", styles::statusbar_desc_style()),
+                Span::styled("Ctrl+S", styles::statusbar_key_style()),
+                Span::styled(submit_hint, styles::statusbar_desc_style()),
+                Span::styled("Esc", styles::statusbar_key_style()),
+                Span::styled(":cancel", styles::statusbar_desc_style()),
+            ])
+        } else {
+            let next_key = if is_prompt_focused { "Tab" } else { "Enter" };
+            let mut spans = vec![
+                Span::styled(next_key, styles::statusbar_key_style()),
+                Span::styled(":next  ", styles::statusbar_desc_style()),
+            ];
+            if is_prompt_focused {
+                spans.push(Span::styled("Ctrl+e", styles::statusbar_key_style()));
+                spans.push(Span::styled(":editor  ", styles::statusbar_desc_style()));
+            }
+            if dialog.is_on_agent_field() && dialog.shows_session(dialog.agent_kind, sessions) {
+                spans.push(Span::styled("Bksp", styles::statusbar_key_style()));
+                spans.push(Span::styled(
+                    ":new session  ",
+                    styles::statusbar_desc_style(),
+                ));
+            }
+            spans.extend([
+                Span::styled("Ctrl+S", styles::statusbar_key_style()),
+                Span::styled(submit_hint, styles::statusbar_desc_style()),
+                Span::styled("Esc", styles::statusbar_key_style()),
+                Span::styled(":cancel", styles::statusbar_desc_style()),
+            ]);
+            Line::from(spans)
+        };
     let footer_area = Rect::new(inner.x + 1, footer_y, inner.width - 2, 1);
     frame.render_widget(Paragraph::new(footer), footer_area);
 }

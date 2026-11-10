@@ -88,6 +88,10 @@ pub struct LiveState {
     pub background_branches: Option<HashMap<String, String>>,
     pub linear_issues: Vec<LinearIssue>,
     pub linear_projects: Vec<LinearProject>,
+    /// Error from the latest Linear poll, cleared by the next success. The
+    /// lists above keep the last good data, so this explains why they're
+    /// empty or stale.
+    pub linear_error: Option<String>,
     pub user_prs: Vec<PrStatus>,
     pub review_requested_prs: Vec<PrStatus>,
     pub review_stacks: Option<HashMap<u32, Option<u32>>>,
