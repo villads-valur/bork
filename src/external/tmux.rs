@@ -594,6 +594,20 @@ pub(super) fn window_names(session: &str) -> Vec<String> {
     }
 }
 
+/// The last `lines` lines of `target`'s pane, scrollback included, with
+/// wrapped lines joined and the blank rows below the cursor dropped. Empty
+/// when the pane can't be read.
+pub fn capture_pane_history(target: &str, lines: usize) -> String {
+    let start = format!("-{lines}");
+    let output = tmux()
+        .args(["capture-pane", "-p", "-J", "-S", &start, "-t", target])
+        .output();
+    match output {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim_end().to_string(),
+        _ => String::new(),
+    }
+}
+
 #[cfg(test)]
 pub(super) fn capture_pane(target: &str) -> String {
     tmux()
@@ -624,6 +638,41 @@ mod tests {
                 "should be harmless: {stderr}"
             );
         }
+    }
+
+    #[test]
+    fn pane_history_includes_scrollback_and_drops_trailing_blank_rows() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux is not installed");
+            return;
+        }
+        let session = format!("bork-history-{}", std::process::id());
+        let cwd = std::env::temp_dir();
+        create_session(&session, &cwd).unwrap();
+        // More lines than the pane is tall, so the first ones are in scrollback.
+        send_keys(
+            &session,
+            "for i in $(seq 1 120); do echo line-$i; done; echo all-done",
+        )
+        .unwrap();
+        let mut history = String::new();
+        for _ in 0..50 {
+            history = capture_pane_history(&session, 200);
+            if history.lines().any(|line| line == "all-done") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let _ = kill_session(&session);
+
+        assert!(history.lines().any(|line| line == "line-1"), "{history}");
+        assert!(history.lines().any(|line| line == "line-120"), "{history}");
+        assert!(!history.ends_with('\n'), "{history:?}");
+    }
+
+    #[test]
+    fn pane_history_of_a_missing_session_is_empty() {
+        assert_eq!(capture_pane_history("bork-no-such-session", 200), "");
     }
 
     #[test]
