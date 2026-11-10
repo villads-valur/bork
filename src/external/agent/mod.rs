@@ -262,10 +262,6 @@ pub fn launch_session(issue: &Issue, config: &AppConfig) -> Result<LaunchOutcome
             } => (session_id, setup_ran, replaced_lost_session),
             handoff::Report::Failed { error } => return Err(AppError::Launch(error)),
         };
-    // Remove the staged request now, so a `bork issue launch` re-run in the
-    // pane during the session-id detection below can't claim it and then
-    // lose its dir mid-write.
-    drop(handoff);
 
     // For OpenCode/Codex/Pi, detect session IDs after launch.
     let agent_session_id = session_id.or_else(|| {
@@ -422,8 +418,8 @@ fn ensure_agent_installed(
         return Ok(());
     }
     Err(AppError::Launch(format!(
-        "{binary} is not installed (not found on PATH). Pick another agent for {}, e.g. `bork issue update {} --agent claude`",
-        issue.id, issue.id
+        "{binary} is not installed (not found on PATH). Pick another agent with `bork issue update {} --agent <name>`",
+        issue.id
     )))
 }
 
@@ -961,7 +957,7 @@ mod tests {
             .to_string();
         assert_eq!(
             err,
-            "opencode is not installed (not found on PATH). Pick another agent for bork-1, e.g. `bork issue update bork-1 --agent claude`"
+            "opencode is not installed (not found on PATH). Pick another agent with `bork issue update bork-1 --agent <name>`"
         );
     }
 
