@@ -288,7 +288,7 @@ impl Project {
         }
     }
 
-    pub fn dialog_default_agent(&self) -> AgentKind {
+    pub fn default_agent(&self) -> AgentKind {
         if self.available_agents.contains(&self.config.agent_kind) {
             return self.config.agent_kind;
         }
@@ -1413,11 +1413,12 @@ impl Project {
                 ))
             }
         };
+        let agent_kind = self.default_agent();
         Issue {
             pr_import_baseline: Some(PrImportBaseline {
                 title: pr.title.clone(),
                 prompt: prompt.clone(),
-                agent_kind: self.config.agent_kind,
+                agent_kind,
                 number: pr.number,
                 source,
             }),
@@ -1427,12 +1428,7 @@ impl Project {
                 imported: true,
                 import_source: Some(source),
             }],
-            ..Issue::new(
-                id,
-                pr.title.clone(),
-                Column::CodeReview,
-                self.config.agent_kind,
-            )
+            ..Issue::new(id, pr.title.clone(), Column::CodeReview, agent_kind)
         }
     }
 
@@ -2630,7 +2626,7 @@ impl App {
         let p = self.context_project(ctx);
         let github_available = p.can_browse_github();
         let mut state = DialogState::new(
-            p.dialog_default_agent(),
+            p.default_agent(),
             p.config.agent_mode,
             p.available_agents.clone(),
             p.linear_available,

@@ -1704,7 +1704,7 @@ fn import_linear_issue(app: &mut App, ctx: &ActionContext) {
             id,
             linear_issue.title.clone(),
             Column::Todo,
-            project.config.agent_kind,
+            project.default_agent(),
         )
     };
 
@@ -1782,7 +1782,7 @@ fn import_linear_project(app: &mut App, ctx: &ActionContext) {
             project.next_issue_id(),
             linear_project.name.clone(),
             Column::Todo,
-            project.config.agent_kind,
+            project.default_agent(),
         )
     };
 
@@ -1839,7 +1839,7 @@ fn import_github_pr(app: &mut App, ctx: &ActionContext) {
             project.next_issue_id(),
             pr.title.clone(),
             Column::CodeReview,
-            project.config.agent_kind,
+            project.default_agent(),
         )
     };
 
@@ -2026,7 +2026,7 @@ fn attach_selected_stack(app: &mut App, ctx: &ActionContext) {
             project.next_issue_id(),
             pr.title().to_string(),
             Column::CodeReview,
-            project.config.agent_kind,
+            project.default_agent(),
         )
     };
     let project = app.context_project_mut(ctx);
