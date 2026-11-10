@@ -16,6 +16,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::agent_config;
 use crate::config;
 use crate::external::agent;
 use crate::types::{AgentKind, AgentMode, Column, Issue, IssueDraft, IssueKind};
@@ -199,7 +200,9 @@ pub fn create_issue(project_root: &Path, opts: CreateOptions) -> anyhow::Result<
     let id = next_issue_id(&state.issues, &config.project_name);
     let column = opts.column.unwrap_or(Column::Todo);
     let kind = opts.kind.unwrap_or(IssueKind::Agentic);
-    let agent_kind = opts.agent_kind.unwrap_or(config.agent_kind);
+    let agent_kind = opts
+        .agent_kind
+        .unwrap_or_else(|| agent_config::default_agent_for(&config));
     let agent_mode = opts.agent_mode.unwrap_or(config.agent_mode);
     if let Some(model) = opts.model.as_deref() {
         validate_model(model, agent_kind)?;
@@ -1140,12 +1143,14 @@ mod tests {
 
     #[test]
     fn create_rejects_model_for_unsupported_agent() {
-        // The project default agent is opencode, which has no --model flag.
+        // opencode has no --model flag. An explicit --agent is kept even when
+        // that agent isn't installed.
         let dir = setup_project();
         let err = create_issue(
             dir.path(),
             CreateOptions {
                 title: "Nope".into(),
+                agent_kind: Some(AgentKind::OpenCode),
                 model: Some("sonnet".into()),
                 ..Default::default()
             },
