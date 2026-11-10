@@ -232,7 +232,7 @@ impl Project {
                     requested_prs: requested,
                     generated_prompt: prompt,
                 }),
-                ..Issue::new(id, title, Column::CodeReview, self.config.agent_kind)
+                ..Issue::new(id, title, Column::CodeReview, self.default_agent())
             });
             changed = true;
         }
@@ -609,5 +609,45 @@ mod tests {
         let saved = serde_json::to_string(&project.to_state()).unwrap();
         let state: AppState = serde_json::from_str(&saved).unwrap();
         assert_eq!(state.issues, project.issues);
+    }
+
+    #[test]
+    fn imported_review_cards_use_an_installed_agent_when_the_configured_one_is_missing() {
+        let mut project = project();
+        assert_eq!(project.config.agent_kind, AgentKind::OpenCode);
+        project.available_agents = vec![AgentKind::Claude, AgentKind::Codex];
+
+        sync(&mut project);
+
+        let stack = project
+            .issues
+            .iter()
+            .find(|issue| issue.github_stack == Some(10))
+            .unwrap();
+        let standalone = project
+            .issues
+            .iter()
+            .find(|issue| issue.has_pr_number(5))
+            .unwrap();
+        assert_eq!(stack.agent_kind, AgentKind::Claude);
+        assert_eq!(standalone.agent_kind, AgentKind::Claude);
+        assert_eq!(
+            standalone.pr_import_baseline.as_ref().unwrap().agent_kind,
+            AgentKind::Claude
+        );
+    }
+
+    #[test]
+    fn imported_review_cards_keep_the_configured_agent_when_it_is_installed() {
+        let mut project = project();
+        project.config.agent_kind = AgentKind::Codex;
+        project.available_agents = vec![AgentKind::Claude, AgentKind::Codex];
+
+        sync(&mut project);
+
+        assert!(project
+            .issues
+            .iter()
+            .all(|issue| issue.agent_kind == AgentKind::Codex));
     }
 }

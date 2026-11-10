@@ -3,6 +3,7 @@ use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context};
 
+use crate::agent_config;
 use crate::config;
 use crate::types::{Column, Issue, IssueKind};
 
@@ -186,7 +187,12 @@ pub fn create_worktree_in(
     } else if let Some(title) = title {
         let issue = Issue {
             worktree: Some(worktree_dir.to_string()),
-            ..Issue::new(issue_id, title, Column::Todo, config.agent_kind)
+            ..Issue::new(
+                issue_id,
+                title,
+                Column::Todo,
+                agent_config::default_agent_for(config),
+            )
         };
         state.issues.push(issue);
     } else {

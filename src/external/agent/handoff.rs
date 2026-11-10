@@ -120,10 +120,13 @@ impl Handoff {
 
 impl Claim {
     /// Claim a staged launch. `None` when the command was run by hand, with
-    /// nobody waiting on a report.
+    /// nobody waiting on a report. The rename makes the claim one-shot, so a
+    /// re-run in the pane can't take a request the caller is about to remove.
     pub(super) fn take(status_dir: &Path, issue_id: &str) -> Option<(Self, Issue)> {
         let dir = Handoff::dir(status_dir, issue_id);
-        let request = fs::read_to_string(dir.join("request.json")).ok()?;
+        let claimed = dir.join("request.claimed");
+        fs::rename(dir.join("request.json"), &claimed).ok()?;
+        let request = fs::read_to_string(claimed).ok()?;
         let issue: Issue = serde_json::from_str(&request).ok()?;
         // Without the pid the caller times out, so a failed write fails the
         // launch either way.
@@ -178,6 +181,15 @@ mod tests {
 
         let (_command, claimed) = Claim::take(status.path(), "bork-7").unwrap();
         assert_eq!(claimed, issue());
+    }
+
+    #[test]
+    fn a_staged_launch_can_only_be_claimed_once() {
+        let status = tempfile::TempDir::new().unwrap();
+        let _caller = Handoff::prepare(status.path(), &issue()).unwrap();
+
+        let _first = Claim::take(status.path(), "bork-7").unwrap();
+        assert!(Claim::take(status.path(), "bork-7").is_none());
     }
 
     #[test]

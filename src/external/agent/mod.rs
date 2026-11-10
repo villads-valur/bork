@@ -320,7 +320,11 @@ pub fn exec_launch(project_root: &Path, issue_id: &str) -> anyhow::Result<()> {
         }
     };
 
-    let prepared = match prepare_launch(&issue, &config, &status_dir) {
+    // The agent runs through `/bin/sh -c`, so a missing binary would only
+    // surface as the shell's "command not found" after reporting success.
+    let prepared = match ensure_agent_installed(&issue, crate::agent_config::command_exists)
+        .and_then(|()| prepare_launch(&issue, &config, &status_dir))
+    {
         Ok(prepared) => prepared,
         Err(e) => {
             if let Some(claim) = &claim {
@@ -403,6 +407,20 @@ fn prepare_launch(
         setup_ran: setup.is_some(),
         replaced_lost_session,
     })
+}
+
+fn ensure_agent_installed(
+    issue: &Issue,
+    command_exists: impl Fn(&str) -> bool,
+) -> Result<(), AppError> {
+    let binary = binary(issue.agent_kind);
+    if command_exists(binary) {
+        return Ok(());
+    }
+    Err(AppError::Launch(format!(
+        "{binary} is not installed (not found on PATH). Pick another agent with `bork issue update {} --agent <name>`",
+        issue.id
+    )))
 }
 
 /// Run the setup script in the user's shell with the pane's stdio, so its
@@ -926,6 +944,29 @@ mod tests {
     /// PR URL resolver that always returns a stable test URL.
     fn test_pr_url(number: u32) -> Option<String> {
         Some(format!("https://github.com/test/repo/pull/{}", number))
+    }
+
+    // --- ensure_agent_installed ---
+
+    #[test]
+    fn launch_fails_when_the_agent_binary_is_missing() {
+        let issue = test_issue(AgentKind::OpenCode, AgentMode::Plan);
+
+        let err = ensure_agent_installed(&issue, |_| false)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "opencode is not installed (not found on PATH). Pick another agent with `bork issue update bork-1 --agent <name>`"
+        );
+    }
+
+    #[test]
+    fn launch_checks_the_provider_binary_not_the_display_name() {
+        let issue = test_issue(AgentKind::Cursor, AgentMode::Plan);
+
+        assert!(ensure_agent_installed(&issue, |cmd| cmd == "cursor-agent").is_ok());
+        assert!(ensure_agent_installed(&issue, |cmd| cmd == "cursor").is_err());
     }
 
     // --- append_section ---
