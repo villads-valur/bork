@@ -248,20 +248,20 @@ pub fn launch_session(issue: &Issue, config: &AppConfig) -> Result<LaunchOutcome
     let before = provider.snapshot_session_ids(&config.project_root);
 
     tmux::create_session(&session_name, cwd)?;
-    tmux::send_keys(&session_name, &launch_cmd)?;
-
-    // Second window: bare terminal for ad-hoc commands
-    tmux::create_window(&session_name, "terminal", cwd)?;
-
-    let (session_id, setup_ran, replaced_lost_session) =
-        match handoff.wait(|| tmux::is_pane_alive(&session_name))? {
-            handoff::Report::Started {
-                session_id,
-                setup_ran,
-                replaced_lost_session,
-            } => (session_id, setup_ran, replaced_lost_session),
-            handoff::Report::Failed { error } => return Err(AppError::Launch(error)),
-        };
+    let started = start_in_session(&session_name, cwd, &launch_cmd, &handoff);
+    let (session_id, setup_ran, replaced_lost_session) = match started {
+        Ok(started) => started,
+        Err(err) => {
+            let pane_output = tmux::capture_pane_history(&session_name, FAILED_PANE_LINES);
+            return Err(abandon_launch(
+                &config.project_root,
+                &issue.id,
+                &session_name,
+                err,
+                &pane_output,
+            ));
+        }
+    };
 
     // For OpenCode/Codex/Pi, detect session IDs after launch.
     let agent_session_id = session_id.or_else(|| {
@@ -277,6 +277,68 @@ pub fn launch_session(issue: &Issue, config: &AppConfig) -> Result<LaunchOutcome
         setup_ran,
         replaced_lost_session,
     })
+}
+
+/// How much of a failed launch's pane goes into `.bork/errors.log`.
+const FAILED_PANE_LINES: usize = 200;
+
+/// Type the launch command into the new session, add the terminal window and
+/// wait for the command's report. Returns `(session_id, setup_ran,
+/// replaced_lost_session)` once the agent is about to start.
+fn start_in_session(
+    session_name: &str,
+    cwd: &Path,
+    launch_cmd: &str,
+    handoff: &handoff::Handoff,
+) -> Result<(Option<String>, bool, bool), AppError> {
+    tmux::send_keys(session_name, launch_cmd)?;
+
+    // Second window: bare terminal for ad-hoc commands
+    tmux::create_window(session_name, "terminal", cwd)?;
+
+    match handoff.wait(|| tmux::is_pane_alive(session_name))? {
+        handoff::Report::Started {
+            session_id,
+            setup_ran,
+            replaced_lost_session,
+        } => Ok((session_id, setup_ran, replaced_lost_session)),
+        handoff::Report::Failed { error } => Err(AppError::Launch(error)),
+    }
+}
+
+/// Clean up after a launch that failed once its tmux session existed. The
+/// pane is left at a plain shell, and `launch_session` would only attach to
+/// it next time, so kill the session to let the next launch start clean.
+/// What the pane showed (e.g. setup script errors) goes to `.bork/errors.log`
+/// first, since killing the session throws it away.
+fn abandon_launch(
+    project_root: &Path,
+    issue_id: &str,
+    session_name: &str,
+    err: AppError,
+    pane_output: &str,
+) -> AppError {
+    config::append_error_log(
+        project_root,
+        &failed_launch_log(issue_id, &err, pane_output),
+    );
+    match terminate_session(project_root, session_name) {
+        Ok(_) => AppError::Launch(format!("{err} (pane output in .bork/errors.log)")),
+        Err(kill_err) => AppError::Launch(format!(
+            "{err} (and its tmux session '{session_name}' could not be closed: {kill_err}, close it before relaunching)"
+        )),
+    }
+}
+
+fn failed_launch_log(issue_id: &str, err: &AppError, pane_output: &str) -> Vec<String> {
+    let mut lines = vec![format!("Failed to launch {issue_id}: {err}")];
+    if pane_output.trim().is_empty() {
+        lines.push("  (agent pane was empty)".to_string());
+        return lines;
+    }
+    lines.push("  agent pane output:".to_string());
+    lines.extend(pane_output.lines().map(|line| format!("  | {line}")));
+    lines
 }
 
 /// The line typed into the agent pane. Uses this binary's own path so PATH
@@ -2268,6 +2330,74 @@ mod tests {
         assert!(root.path().join("bork-1/setup-done").exists());
         assert!(prepared.agent_cmd.contains("claude --name"));
         assert!(prompt_file_path(&status, "bork-bork-1").exists());
+    }
+
+    fn error_log(root: &Path) -> String {
+        fs::read_to_string(config::error_log_path(root)).unwrap_or_default()
+    }
+
+    #[test]
+    fn abandoned_launch_keeps_the_pane_output_in_the_error_log() {
+        let root = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join(".bork")).unwrap();
+        let pane = "$ bork issue launch bork-1\nnpm ERR! missing script: setup\n";
+
+        let err = abandon_launch(
+            root.path(),
+            "bork-1",
+            "bork-bork-1",
+            AppError::Launch("setup error: script exited with status 1".to_string()),
+            pane,
+        );
+
+        assert_eq!(
+            err.to_string(),
+            "setup error: script exited with status 1 (pane output in .bork/errors.log)"
+        );
+        let log = error_log(root.path());
+        assert!(
+            log.contains("Failed to launch bork-1: setup error: script exited with status 1"),
+            "{log}"
+        );
+        assert!(log.contains("  | npm ERR! missing script: setup"), "{log}");
+    }
+
+    #[test]
+    fn abandoned_launch_with_an_empty_pane_says_so_in_the_log() {
+        let root = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join(".bork")).unwrap();
+
+        abandon_launch(
+            root.path(),
+            "bork-1",
+            "bork-bork-1",
+            AppError::Launch("launch command did not start in the agent pane".to_string()),
+            "",
+        );
+
+        let log = error_log(root.path());
+        assert!(log.contains("did not start in the agent pane"), "{log}");
+        assert!(log.contains("(agent pane was empty)"), "{log}");
+        assert!(!log.contains("agent pane output:"), "{log}");
+    }
+
+    #[test]
+    fn abandoned_launch_removes_the_session_status_files() {
+        let root = tempfile::TempDir::new().unwrap();
+        let status_dir = config::agent_status_dir(root.path());
+        fs::create_dir_all(&status_dir).unwrap();
+        let status_file = status_dir.join("bork-bork-1.json");
+        fs::write(&status_file, "{}").unwrap();
+
+        abandon_launch(
+            root.path(),
+            "bork-1",
+            "bork-bork-1",
+            AppError::Launch("claude is not installed".to_string()),
+            "",
+        );
+
+        assert!(!status_file.exists());
     }
 
     #[test]
