@@ -1208,8 +1208,13 @@ fn handle_dialog(app: &mut App, action: Action, ctx: &ActionContext) -> PostActi
             Action::DialogChar(' ') => {
                 // Without loaded projects the picker would fall back to
                 // another tab, and Enter would attach the wrong kind of link.
-                if app.context_project(ctx).live.linear_projects.is_empty() {
-                    app.set_warning("No Linear projects loaded yet");
+                let live = &app.context_project(ctx).live;
+                if live.linear_projects.is_empty() {
+                    let warning = match &live.linear_error {
+                        Some(error) => format!("Linear projects unavailable: {error}"),
+                        None => "No Linear projects loaded yet".to_string(),
+                    };
+                    app.set_warning(warning);
                     return PostAction::None;
                 }
                 app.picker_tab = ImportSource::LinearProject;
@@ -4290,6 +4295,90 @@ mod tests {
         // Tab on Prompt (last field) wraps to Kind(0)
         handle_action(&mut app, Action::DialogNextField, &ctx, &test_channels());
         assert_eq!(app.dialog.as_ref().unwrap().focused_field, 0);
+    }
+
+    fn render_dialog_text(app: &App) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::dialog::render_dialog(frame, app))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn projects_field_shows_why_nothing_can_be_attached() {
+        let mut app = test_app();
+        app.project_mut().linear_available = true;
+        app.project_mut().live.linear_error = Some("linear api failed: no API key".into());
+        let mut issue = test_issue_titled("bork-1", "Orchestrate", Column::Todo);
+        let _ = issue.set_kind(IssueKind::Orchestrator);
+        app.project_mut().issues.push(issue);
+
+        let ctx = app.action_context();
+        let issue = app.project().issues[0].clone();
+        app.open_edit_dialog(&issue, 0, &ctx);
+        let dialog = app.dialog.as_mut().unwrap();
+        dialog.focused_field = dialog
+            .ordered_fields()
+            .iter()
+            .position(|f| *f == crate::app::DialogField::LinearProject)
+            .unwrap();
+
+        handle_action(&mut app, Action::DialogChar(' '), &ctx, &test_channels());
+
+        assert_eq!(app.input_mode, crate::app::InputMode::Dialog);
+        assert!(render_dialog_text(&app)
+            .contains("Linear projects unavailable: linear api failed: no API key"));
+    }
+
+    #[test]
+    fn projects_field_opens_picker_on_projects_tab() {
+        let mut app = test_app();
+        app.project_mut().linear_available = true;
+        app.project_mut().live.linear_issues = vec![test_linear_issue("uuid-1", "TEST-1", "First")];
+        app.project_mut().live.linear_projects = vec![LinearProject {
+            id: "proj-1".into(),
+            slug: "abc123".into(),
+            name: "Roadmap".into(),
+            url: "https://linear.app/x/project/roadmap-abc123".into(),
+            status_name: "Started".into(),
+        }];
+        let mut issue = test_issue_titled("bork-1", "Orchestrate", Column::Todo);
+        let _ = issue.set_kind(IssueKind::Orchestrator);
+        app.project_mut().issues.push(issue);
+
+        let ctx = app.action_context();
+        let issue = app.project().issues[0].clone();
+        app.open_edit_dialog(&issue, 0, &ctx);
+        let dialog = app.dialog.as_mut().unwrap();
+        dialog.focused_field = dialog
+            .ordered_fields()
+            .iter()
+            .position(|f| *f == crate::app::DialogField::LinearProject)
+            .unwrap();
+        assert!(render_dialog_text(&app).contains("Space:attach"));
+
+        handle_action(&mut app, Action::DialogChar(' '), &ctx, &test_channels());
+        assert_eq!(app.input_mode, crate::app::InputMode::LinearPicker);
+        assert_eq!(app.picker_tab, ImportSource::LinearProject);
+
+        handle_action(&mut app, Action::LinearPickerSelect, &ctx, &test_channels());
+        handle_action(&mut app, Action::LinearPickerClose, &ctx, &test_channels());
+        handle_action(&mut app, Action::DialogSubmit, &ctx, &test_channels());
+
+        let names: Vec<&str> = app.project().issues[0]
+            .linear_projects
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["Roadmap"]);
     }
 
     #[test]
