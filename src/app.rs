@@ -20,7 +20,7 @@ const MAX_CLEANUP_ATTEMPTS: u32 = 5;
 use crate::attention::Attention;
 use crate::config::{AppConfig, AppState, DEFAULT_REVIEW_PROMPT};
 use crate::external::git::PollClass;
-use crate::external::linear::LinearIssue;
+use crate::external::linear::{LinearIssue, LinearProject};
 use crate::prune::{PruneAction, PruneCandidate};
 use crate::types::{
     AgentKind, AgentStatus, AgentStatusInfo, ChecksStatus, Column, GithubStack, Issue, IssueKind,
@@ -28,6 +28,7 @@ use crate::types::{
     ReviewDecision, WorktreeStatus,
 };
 use crate::undo::UndoEntry;
+use crate::worktree::ForceRequired;
 
 pub type ProjectId = PathBuf;
 
@@ -63,6 +64,7 @@ pub enum InputMode {
     Help,
     DebugInspector,
     Sidebar,
+    SidebarRename,
     PruneDialog,
 }
 
@@ -79,7 +81,13 @@ pub struct LiveState {
     pub stacks_available: bool,
     pub frozen_worktree_statuses: HashMap<String, WorktreeStatus>,
     pub frozen_worktree_branches: HashMap<String, String>,
+    /// Branches from a hidden project's background poll. While set they
+    /// replace `worktree_branches` for attention (`resolved_worktree`,
+    /// `branch_for`), but never drive worktree assignment or stale cleanup.
+    /// Reset to `None` once the project's full workers take over.
+    pub background_branches: Option<HashMap<String, String>>,
     pub linear_issues: Vec<LinearIssue>,
+    pub linear_projects: Vec<LinearProject>,
     pub user_prs: Vec<PrStatus>,
     pub review_requested_prs: Vec<PrStatus>,
     pub review_stacks: Option<HashMap<u32, Option<u32>>>,
@@ -150,6 +158,8 @@ pub struct Project {
     /// Canonicalized project root, computed once at construction. `id()` is
     /// called in per-frame render paths, so it must not hit the filesystem.
     id: ProjectId,
+    /// Sidebar label from the global registry. See `display_name`.
+    pub label: Option<String>,
     pub issues: Vec<Issue>,
     pub config: AppConfig,
     pub available_agents: Vec<AgentKind>,
@@ -217,6 +227,7 @@ impl Project {
         let last_config_mtime = crate::config::config_mtime(&config.project_root);
         let mut project = Project {
             id,
+            label: None,
             issues,
             config,
             available_agents: Vec::new(),
@@ -250,6 +261,12 @@ impl Project {
 
     pub fn id(&self) -> ProjectId {
         self.id.clone()
+    }
+
+    /// Shown in the sidebar, header and lane titles. Issue IDs and tmux
+    /// sessions always use `config.project_name`.
+    pub fn display_name(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.config.project_name)
     }
 
     fn refresh_available_agents(&mut self) {
@@ -825,28 +842,12 @@ impl Project {
     /// Finds a worktree directory by dash-bounded substring match of the issue ID.
     /// Shortest match wins (e.g. `bork-1` preferred over `bork-1-extended`).
     pub(crate) fn detect_worktree(&self, issue: &Issue) -> Option<String> {
-        let issue_id_lower = issue.id.to_lowercase();
         let live = &self.live;
-
-        let mut best: Option<&str> = None;
         let all_keys = live
             .worktree_branches
             .keys()
             .chain(live.frozen_worktree_branches.keys());
-
-        for dir_name in all_keys {
-            let dir_lower = dir_name.to_lowercase();
-            let Some(pos) = dir_lower.find(&issue_id_lower) else {
-                continue;
-            };
-            let before_ok = pos == 0 || dir_lower.as_bytes()[pos - 1] == b'-';
-            let end = pos + issue_id_lower.len();
-            let after_ok = end == dir_lower.len() || dir_lower.as_bytes()[end] == b'-';
-            if before_ok && after_ok && best.is_none_or(|b| dir_name.len() < b.len()) {
-                best = Some(dir_name.as_str());
-            }
-        }
-        best.map(|s| s.to_string())
+        match_worktree(&issue.id, all_keys).map(|s| s.to_string())
     }
 
     pub fn auto_assign_worktrees(&mut self) -> bool {
@@ -910,15 +911,33 @@ impl Project {
         live.worktree_statuses.get(wt)
     }
 
+    /// The issue's worktree, or for a hidden project a matching directory
+    /// from its background poll: a read-only stand-in for
+    /// `auto_assign_worktrees`, which only runs once the project is shown.
+    fn resolved_worktree<'a>(&'a self, issue: &'a Issue) -> Option<&'a str> {
+        if let Some(wt) = self.worktree_for(issue) {
+            return Some(wt);
+        }
+        if issue.kind == IssueKind::Orchestrator {
+            return None;
+        }
+        let branches = self.live.background_branches.as_ref()?;
+        match_worktree(&issue.id, branches.keys())
+    }
+
     pub fn branch_for(&self, issue: &Issue) -> Option<&str> {
         let live = &self.live;
-        if let Some(wt) = self.worktree_for(issue) {
+        if let Some(wt) = self.resolved_worktree(issue) {
             if issue.column == Column::Done {
                 if let Some(frozen) = live.frozen_worktree_branches.get(wt) {
                     return Some(frozen.as_str());
                 }
             }
-            if let Some(branch) = live.worktree_branches.get(wt) {
+            let branches = live
+                .background_branches
+                .as_ref()
+                .unwrap_or(&live.worktree_branches);
+            if let Some(branch) = branches.get(wt) {
                 return Some(branch.as_str());
             }
         }
@@ -999,9 +1018,10 @@ impl Project {
         }
 
         // While the queue holds the PR, its checks and merge-state describe
-        // the queue's work, not the owner's.
-        if pr.in_merge_queue {
-            return Some(Attention::Queued);
+        // the queue's work, not the owner's. Trunk's own check is part of the
+        // rollup, so a failed queue run would otherwise read as failing CI.
+        if let Some(state) = pr.merge_queue {
+            return Some(Attention::Queue(state));
         }
 
         let changes_requested = pr.review == Some(ReviewDecision::ChangesRequested);
@@ -1011,6 +1031,12 @@ impl Project {
             (true, false) => return Some(Attention::ChecksFailing),
             (false, true) => return Some(Attention::ChangesRequested),
             (false, false) => {}
+        }
+
+        // Actions does not run pull_request workflows on a conflicting PR, so
+        // its checks can stay pending until the rebase.
+        if pr.merge_blocker == Some(MergeBlocker::Conflicts) {
+            return Some(Attention::NeedsRebase);
         }
 
         // A null review decision means the repo requires no review.
@@ -1024,6 +1050,8 @@ impl Project {
         match pr.merge_blocker {
             Some(MergeBlocker::Conflicts) => Some(Attention::NeedsRebase),
             Some(MergeBlocker::Blocked) => Some(Attention::Blocked),
+            Some(MergeBlocker::Behind) => Some(Attention::NeedsUpdate),
+            Some(MergeBlocker::Computing) => None,
             None => Some(Attention::ReadyToMerge),
         }
     }
@@ -1048,7 +1076,7 @@ impl Project {
         }
         let drafts = &self.live.tuicr_drafts;
         let mut total = self
-            .worktree_for(issue)
+            .resolved_worktree(issue)
             .and_then(|wt| drafts.by_worktree.get(&self.id.join(wt)))
             .copied()
             .unwrap_or(0);
@@ -1567,6 +1595,18 @@ impl Project {
             .collect()
     }
 
+    pub fn filtered_linear_projects<'a>(
+        &'a self,
+        picker: &LinearPickerState,
+    ) -> Vec<&'a LinearProject> {
+        let query = picker.search.to_lowercase();
+        self.live
+            .linear_projects
+            .iter()
+            .filter(|p| query.is_empty() || p.name.to_lowercase().contains(&query))
+            .collect()
+    }
+
     pub fn filtered_github_prs<'a>(
         &'a self,
         picker: &LinearPickerState,
@@ -1612,6 +1652,30 @@ impl Project {
         crate::ops::next_issue_id_after(&self.issues, &self.config.project_name, offset)
     }
 
+    /// Apply a background refresh without moving the cursor off its card.
+    /// With the needs-you filter on, cards drop in and out on every poll, so
+    /// the selected card is found again by id; the filter turns itself off
+    /// once nothing needs you, rather than leave an empty board.
+    pub fn keep_selection<T>(&mut self, query: &str, refresh: impl FnOnce(&mut Self) -> T) -> T {
+        let selected = self.selected_issue(query).map(|issue| issue.id.clone());
+        let result = refresh(self);
+
+        if self.attention_filter && self.attention_count() == 0 {
+            self.attention_filter = false;
+        }
+
+        let row = Column::from_index(self.selected_column).and_then(|column| {
+            self.issues_in_column(column, query)
+                .iter()
+                .position(|(_, issue)| Some(&issue.id) == selected.as_ref())
+        });
+        if let Some(row) = row {
+            self.selected_row[self.selected_column] = row;
+        }
+        self.clamp_all_rows(query);
+        result
+    }
+
     pub fn clamp_all_rows(&mut self, query: &str) {
         for col in 0..4 {
             let count = self.column_count(col, query);
@@ -1647,12 +1711,42 @@ impl Project {
     }
 }
 
+/// Finds a worktree directory by dash-bounded substring match of the issue ID.
+/// Shortest match wins (e.g. `bork-1` preferred over `bork-1-extended`).
+fn match_worktree<'a>(
+    issue_id: &str,
+    dir_names: impl Iterator<Item = &'a String>,
+) -> Option<&'a str> {
+    let issue_id_lower = issue_id.to_lowercase();
+    let mut best: Option<&str> = None;
+    for dir_name in dir_names {
+        let dir_lower = dir_name.to_lowercase();
+        let Some(pos) = dir_lower.find(&issue_id_lower) else {
+            continue;
+        };
+        let before_ok = pos == 0 || dir_lower.as_bytes()[pos - 1] == b'-';
+        let end = pos + issue_id_lower.len();
+        let after_ok = end == dir_lower.len() || dir_lower.as_bytes()[end] == b'-';
+        if before_ok && after_ok && best.is_none_or(|b| dir_name.len() < b.len()) {
+            best = Some(dir_name.as_str());
+        }
+    }
+    best
+}
+
 pub struct SidebarState {
     pub visible: bool,
     pub focused: bool,
     pub selected: usize,
-    pub activity: HashMap<ProjectId, bool>,
     pub swimlanes: Vec<ProjectId>,
+    pub rename: Option<ProjectRename>,
+}
+
+/// Rename in progress. Holds the project id so a reload that shifts the
+/// list can't move the rename onto another row.
+pub struct ProjectRename {
+    pub project_id: ProjectId,
+    pub buffer: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1792,7 +1886,22 @@ pub enum ConfirmAction {
     ArchiveIssue {
         issue_ids: Vec<String>,
         project_id: ProjectId,
+        /// Go past what stopped the first attempt and discard uncommitted
+        /// changes. The teardown is skipped, since it already ran, except
+        /// for `teardown_due`.
+        force: bool,
+        /// Forced issues whose first attempt stopped before the teardown (an
+        /// unsaved plan), so the forced archive still runs it.
+        teardown_due: Vec<String>,
     },
+    /// Remove worktrees a prune kept because their issue plan couldn't be
+    /// saved, losing the plans.
+    ForcePrune {
+        project_id: ProjectId,
+        targets: Vec<crate::prune::PruneTarget>,
+    },
+    /// Unregister the project. Its files stay on disk.
+    RemoveProject { project_id: ProjectId },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1804,7 +1913,18 @@ pub enum LinearPickerContext {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportSource {
     Linear,
+    LinearProject,
     GitHub,
+}
+
+impl ImportSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Linear => "Linear",
+            Self::LinearProject => "Projects",
+            Self::GitHub => "GitHub",
+        }
+    }
 }
 
 pub use crate::dialog_state::{DialogField, DialogState};
@@ -1831,11 +1951,13 @@ fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
         agent_kind: _,
         agent_mode: _,
         prompt: _,
+        model: _,
         worktree: _,
         done_at: _,
         pruned_at: _,
         setup_ran: _,
         linear_links: _,
+        linear_projects: _,
         github_pr_links: _,
         github_stack: _,
         pr_import_baseline: _,
@@ -1871,11 +1993,17 @@ fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
     merge_field!(agent_kind);
     merge_field!(agent_mode);
     merge_field!(prompt);
+    // A file-side model was picked for the file's agent; don't pair it with
+    // an agent switch made in memory.
+    if memory.agent_kind == base.agent_kind {
+        merge_field!(model);
+    }
     merge_field!(worktree);
     merge_field!(done_at);
     merge_field!(pruned_at);
     merge_field!(setup_ran);
     merge_field!(linear_links);
+    merge_field!(linear_projects);
     merge_field!(github_pr_links);
     merge_field!(github_stack);
     merge_field!(pr_import_baseline);
@@ -1914,6 +2042,13 @@ fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
     if file_crossed_boundary && !memory_crossed_boundary && memory.kind == file.kind {
         memory.sessions = file.sessions.clone();
     }
+
+    // Kind and projects merge separately, so a kind change on one side and a
+    // project attach on the other could combine into projects on an issue
+    // that can't carry them.
+    if !memory.kind.links_linear_projects() {
+        memory.linear_projects.clear();
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1933,6 +2068,14 @@ pub struct App {
     pub search_query: String,
     pub confirm_message: Option<String>,
     pub pending_confirm: Option<ConfirmAction>,
+    /// Archives that stopped short and wait to be offered as a force archive
+    /// once the board is back in Normal mode.
+    pub queued_force_archives: Vec<(ProjectId, String, ForceRequired)>,
+    /// Worktrees a prune kept because their plan couldn't be saved, waiting
+    /// to be offered for removal anyway, like `queued_force_archives`.
+    pub queued_force_prunes: Vec<(ProjectId, Vec<crate::prune::PruneTarget>)>,
+    /// Mode to go back to when the confirm prompt closes.
+    confirm_return_mode: InputMode,
     pub dialog: Option<DialogState>,
     pub prune_dialog: Option<PruneDialogState>,
     pub should_quit: bool,
@@ -1962,6 +2105,19 @@ pub struct App {
     pub debug_inspector_json: Option<String>,
     pub debug_inspector_scroll: usize,
     pub update_available: bool,
+    /// Latest backup worker status; only warnings render.
+    pub backup: crate::backup::schedule::BackupIndicator,
+    /// A "back up now" is in flight (owns one `busy_count`).
+    pub backup_manual_pending: bool,
+    /// Skipped no-remote repos from the last successful report, so the
+    /// warning about them shows once per change (and once per TUI session,
+    /// since this starts empty).
+    pub backup_local_only: Vec<std::path::PathBuf>,
+    /// Last `backup.json` write failure logged, so an hourly repeat isn't.
+    pub backup_status_warning: Option<String>,
+    /// Header warning derived from `backup` and the clock; refreshed by
+    /// `refresh_backup_warning` so rendering stays pure.
+    pub backup_warning: Option<String>,
 }
 
 impl App {
@@ -1977,6 +2133,9 @@ impl App {
             search_query: String::new(),
             confirm_message: None,
             pending_confirm: None,
+            queued_force_archives: Vec::new(),
+            queued_force_prunes: Vec::new(),
+            confirm_return_mode: InputMode::Normal,
             dialog: None,
             prune_dialog: None,
             should_quit: false,
@@ -1997,6 +2156,11 @@ impl App {
             debug_inspector_json: None,
             debug_inspector_scroll: 0,
             update_available: false,
+            backup: Default::default(),
+            backup_manual_pending: false,
+            backup_warning: None,
+            backup_local_only: Vec::new(),
+            backup_status_warning: None,
         }
     }
 
@@ -2010,8 +2174,8 @@ impl App {
                 visible: false,
                 focused: false,
                 selected: 0,
-                activity: HashMap::new(),
                 swimlanes: vec![self.focused_project.clone()],
+                rename: None,
             });
         }
     }
@@ -2020,19 +2184,86 @@ impl App {
         self.projects.iter().map(|p| p.id()).collect()
     }
 
-    pub fn apply_reload_result(&mut self, result: crate::global_config::ReloadResult) {
+    /// `registry` should be read on the main thread: the reload thread's
+    /// snapshot can predate a rename or move made while it ran.
+    pub fn apply_reload_result(
+        &mut self,
+        result: crate::global_config::ReloadResult,
+        registry: &[crate::global_config::ProjectEntry],
+    ) {
         self.remove_projects(&result.removed_projects);
         for (config, state) in result.new_projects {
             self.add_background_project(config, state);
         }
+        self.sync_with_registry(registry);
         if self.projects.len() > 1 && self.sidebar.is_none() {
             self.enable_sidebar();
         }
     }
 
+    /// Applies registry labels and order. Projects missing from the registry
+    /// lose their label and go last.
+    pub fn sync_with_registry(&mut self, entries: &[crate::global_config::ProjectEntry]) {
+        let paths: Vec<ProjectId> = entries
+            .iter()
+            .map(|entry| crate::global_config::normalize_path(&entry.path))
+            .collect();
+        let selected_id = self.sidebar_selected_id();
+
+        let mut ranked: Vec<(usize, Project)> = std::mem::take(&mut self.projects)
+            .into_iter()
+            .map(|mut project| {
+                let position = paths.iter().position(|path| *path == project.id);
+                project.label = position.and_then(|i| entries[i].label.clone());
+                (position.unwrap_or(usize::MAX), project)
+            })
+            .collect();
+        ranked.sort_by_key(|(position, _)| *position);
+        self.projects = ranked.into_iter().map(|(_, project)| project).collect();
+
+        if let Some(id) = selected_id {
+            self.select_sidebar_project(&id);
+        }
+    }
+
+    pub fn project_display_name(&self, id: &ProjectId) -> String {
+        self.find_project(id)
+            .map(|p| p.display_name().to_string())
+            .unwrap_or_default()
+    }
+
+    pub fn sidebar_selected_id(&self) -> Option<ProjectId> {
+        let sidebar = self.sidebar.as_ref()?;
+        self.projects.get(sidebar.selected).map(|p| p.id())
+    }
+
+    fn select_sidebar_project(&mut self, id: &ProjectId) {
+        let index = self.project_index(id);
+        if let (Some(sidebar), Some(index)) = (self.sidebar.as_mut(), index) {
+            sidebar.selected = index;
+        }
+    }
+
+    /// Swaps the selected sidebar project with its neighbour and returns the
+    /// new order, or `None` at the edge of the list.
+    pub fn move_sidebar_project(&mut self, up: bool) -> Option<Vec<ProjectId>> {
+        let selected = self.sidebar.as_ref()?.selected;
+        let target = if up {
+            selected.checked_sub(1)?
+        } else {
+            selected + 1
+        };
+        if target >= self.projects.len() {
+            return None;
+        }
+        self.projects.swap(selected, target);
+        self.sidebar.as_mut()?.selected = target;
+        Some(self.projects.iter().map(|p| p.id()).collect())
+    }
+
     /// Drops projects that left the registry. The focused project is kept so
     /// the board always has something to show.
-    fn remove_projects(&mut self, ids: &[ProjectId]) {
+    pub(crate) fn remove_projects(&mut self, ids: &[ProjectId]) {
         let to_remove: HashSet<&ProjectId> = ids
             .iter()
             .filter(|id| **id != self.focused_project)
@@ -2040,17 +2271,15 @@ impl App {
         // Selection and focused lane are indices, so remember what they point
         // at and re-find it after the lists shrink.
         let active_id = self.active_project_id();
-        let selected_id = self
-            .sidebar
-            .as_ref()
-            .and_then(|sidebar| self.projects.get(sidebar.selected))
-            .map(|p| p.id());
+        let old_selected = self.sidebar.as_ref().map_or(0, |sidebar| sidebar.selected);
+        let selected_id = self.sidebar_selected_id();
 
         self.projects.retain(|p| !to_remove.contains(&p.id()));
 
+        // A removed selection stays on the same row rather than jumping to the top.
         let selected = selected_id
             .and_then(|id| self.projects.iter().position(|p| p.id() == id))
-            .unwrap_or(0);
+            .unwrap_or_else(|| old_selected.min(self.projects.len().saturating_sub(1)));
         if let Some(ref mut sidebar) = self.sidebar {
             sidebar.swimlanes.retain(|id| !to_remove.contains(id));
             if sidebar.swimlanes.is_empty() {
@@ -2073,7 +2302,6 @@ impl App {
         self.projects.iter_mut().find(|p| p.id() == *id)
     }
 
-    #[allow(dead_code)] // Future sidebar/swimlane reordering
     pub(crate) fn project_index(&self, id: &ProjectId) -> Option<usize> {
         self.projects.iter().position(|p| p.id() == *id)
     }
@@ -2178,6 +2406,120 @@ impl App {
         self.message = Some((msg.into(), kind));
         self.message_set_at = Some(Instant::now());
         self.message_ttl = ttl;
+    }
+
+    /// Fold a backup worker report in. A new failure from a real check goes
+    /// to the status bar (unless the manual result already says so) and to
+    /// `.bork/errors.log` of every loaded project not opted out; the
+    /// startup baseline and routine successes stay silent. A changed list of
+    /// skipped no-remote repos is warned about once (and always in a manual
+    /// result). Returns whether to redraw.
+    pub fn apply_backup_report(&mut self, report: crate::backup::schedule::Report) -> bool {
+        use crate::backup::schedule;
+
+        let mut redraw = false;
+        // Only a working backup says what it skipped; a failure or Off
+        // period keeps the last list, so the next success doesn't re-warn.
+        let mut skipped_warning = None;
+        if matches!(report.indicator, schedule::BackupIndicator::Ok { .. }) {
+            skipped_warning =
+                schedule::local_only_warning(&self.backup_local_only, &report.local_only_repos);
+            self.backup_local_only = report.local_only_repos.clone();
+        }
+        // An unwritable backup.json stays unwritable and keeps the run due,
+        // so only a changed warning is logged (and flashed by a scheduled run).
+        let new_status_warning = report
+            .status_warning
+            .as_ref()
+            .filter(|w| self.backup_status_warning.as_ref() != Some(*w))
+            .cloned();
+        if let Some(warning) = &new_status_warning {
+            self.log_backup_error(format!("backup: {warning}"));
+            self.backup_status_warning = Some(warning.clone());
+        }
+        if let Some(check) = &report.manual {
+            self.finish_manual_backup();
+            let (message, is_error) = schedule::manual_message(check);
+            let mut notes = Vec::new();
+            if !report.local_only_repos.is_empty() {
+                notes.push(schedule::local_only_summary(&report.local_only_repos));
+            }
+            if let Some(warning) = &report.status_warning {
+                let mut chars = warning.chars();
+                let first = chars.next().map(|c| c.to_uppercase().to_string());
+                notes.push(format!("{}{}", first.unwrap_or_default(), chars.as_str()));
+            }
+            if is_error {
+                self.set_error(message);
+            } else if notes.is_empty() {
+                self.set_message(message);
+            } else {
+                self.set_warning(format!("{message}. {}", notes.join(". ")));
+            }
+            redraw = true;
+        } else if let Some(warning) = new_status_warning {
+            self.set_warning(format!("Backup done, but {warning}"));
+            redraw = true;
+        } else if let Some(warning) = skipped_warning {
+            self.set_warning(warning);
+            redraw = true;
+        }
+        let failure = if report.baseline {
+            None
+        } else {
+            schedule::failure_to_report(&self.backup, &report.indicator)
+        };
+        if let Some(error) = failure {
+            self.log_backup_error(format!("backup failed: {error}"));
+            if report.manual.is_none() {
+                self.set_error(format!("Backup failed: {error}"));
+            }
+            redraw = true;
+        }
+        if self.backup != report.indicator {
+            self.backup = report.indicator;
+            redraw = true;
+        }
+        redraw |= self.refresh_backup_warning(unix_now());
+        redraw
+    }
+
+    /// Append a backup problem to `.bork/errors.log` of each loaded project
+    /// that isn't opted out. An unreadable config may be the failure
+    /// itself, so only projects that are definitely off are skipped.
+    fn log_backup_error(&self, line: String) {
+        for project in &self.projects {
+            let root = &project.config.project_root;
+            if !matches!(crate::backup::config::project_enabled(root), Ok(false)) {
+                crate::config::append_error_log(root, std::slice::from_ref(&line));
+            }
+        }
+    }
+
+    /// Recompute the header's backup warning for `now` (the 48h warning
+    /// depends on the clock). Returns whether it changed.
+    pub fn refresh_backup_warning(&mut self, now: u64) -> bool {
+        let warning = crate::backup::schedule::warning_text(&self.backup, now);
+        if warning == self.backup_warning {
+            return false;
+        }
+        self.backup_warning = warning;
+        true
+    }
+
+    /// Release a pending "back up now" and its spinner, if any.
+    fn finish_manual_backup(&mut self) {
+        if self.backup_manual_pending {
+            self.backup_manual_pending = false;
+            self.busy_count = self.busy_count.saturating_sub(1);
+        }
+    }
+
+    /// The backup worker thread is gone (it panicked): release a pending
+    /// "back up now" and say so, since no more reports will come.
+    pub fn backup_worker_stopped(&mut self) {
+        self.finish_manual_backup();
+        self.set_error(crate::backup::schedule::WORKER_STOPPED);
     }
 
     pub fn set_message(&mut self, msg: impl Into<String>) {
@@ -2303,14 +2645,23 @@ impl App {
         let p = self.context_project(ctx);
         let github_available = p.can_browse_github() || issue.has_pr();
         let live = &p.live;
-        self.dialog = Some(DialogState::from_issue(
+        let mut dialog = DialogState::from_issue(
             issue,
             index,
             p.available_agents.clone(),
             p.linear_available,
             github_available,
             live,
-        ));
+        );
+        dialog.lost_sessions = issue
+            .sessions
+            .iter()
+            .filter(|(agent, sid)| {
+                !crate::external::agent::provider(**agent).has_session(&p.config.project_root, sid)
+            })
+            .map(|(agent, sid)| (*agent, sid.clone()))
+            .collect();
+        self.dialog = Some(dialog);
         self.input_mode = InputMode::Dialog;
     }
 
@@ -2343,23 +2694,18 @@ impl App {
         context: LinearPickerContext,
         ctx: &ActionContext,
     ) {
-        let p = self.context_project(ctx);
-        let has_linear = !p.live.linear_issues.is_empty();
-        let has_github = p.can_browse_github();
-
-        if !has_linear && !has_github {
-            if p.linear_available {
+        let tabs = self.picker_tabs_for(self.context_project(ctx), context);
+        let Some(&first_tab) = tabs.first() else {
+            if self.context_project(ctx).linear_available {
                 self.set_warning("No issues loaded yet");
             } else {
                 self.set_warning("No import sources available");
             }
             return;
-        }
+        };
 
-        if self.picker_tab == ImportSource::Linear && !has_linear {
-            self.picker_tab = ImportSource::GitHub;
-        } else if self.picker_tab == ImportSource::GitHub && !has_github {
-            self.picker_tab = ImportSource::Linear;
+        if !tabs.contains(&self.picker_tab) {
+            self.picker_tab = first_tab;
         }
 
         self.message = None;
@@ -2399,6 +2745,45 @@ impl App {
             return Vec::new();
         };
         self.active_project().filtered_linear_issues(picker)
+    }
+
+    pub fn filtered_linear_projects(&self) -> Vec<&LinearProject> {
+        let Some(picker) = &self.linear_picker else {
+            return Vec::new();
+        };
+        self.active_project().filtered_linear_projects(picker)
+    }
+
+    /// Tabs the open picker can show, in display order.
+    pub fn picker_tabs(&self) -> Vec<ImportSource> {
+        self.picker_tabs_for(self.active_project(), self.linear_picker_context)
+    }
+
+    /// Sources with something to pick. Projects can only be attached from an
+    /// orchestrator's dialog, since only orchestrators carry project links.
+    fn picker_tabs_for(
+        &self,
+        project: &Project,
+        context: LinearPickerContext,
+    ) -> Vec<ImportSource> {
+        let projects_allowed = match context {
+            LinearPickerContext::Import => true,
+            LinearPickerContext::Attach => self
+                .dialog
+                .as_ref()
+                .is_some_and(|d| d.kind.links_linear_projects()),
+        };
+        let mut tabs = Vec::new();
+        if !project.live.linear_issues.is_empty() {
+            tabs.push(ImportSource::Linear);
+        }
+        if projects_allowed && !project.live.linear_projects.is_empty() {
+            tabs.push(ImportSource::LinearProject);
+        }
+        if project.can_browse_github() {
+            tabs.push(ImportSource::GitHub);
+        }
+        tabs
     }
 
     pub fn filtered_github_prs(&self) -> Vec<GithubPickerEntry<'_>> {
@@ -2465,19 +2850,20 @@ impl App {
     }
 
     pub fn start_confirm(&mut self, message: String, action: ConfirmAction) {
+        self.confirm_return_mode = self.input_mode;
         self.input_mode = InputMode::Confirm;
         self.confirm_message = Some(message);
         self.pending_confirm = Some(action);
     }
 
     pub fn cancel_confirm(&mut self) {
-        self.input_mode = InputMode::Normal;
+        self.input_mode = self.confirm_return_mode;
         self.confirm_message = None;
         self.pending_confirm = None;
     }
 
     pub fn take_confirm_action(&mut self) -> Option<ConfirmAction> {
-        self.input_mode = InputMode::Normal;
+        self.input_mode = self.confirm_return_mode;
         self.confirm_message = None;
         self.pending_confirm.take()
     }
@@ -2696,7 +3082,7 @@ mod tests {
 
     use super::*;
     use crate::config::DEFAULT_DONE_SESSION_TTL;
-    use crate::types::{AgentKind, IssueKind, PrState, PrStatus};
+    use crate::types::{AgentKind, IssueKind, MergeQueueState, PrState, PrStatus};
 
     fn test_config() -> AppConfig {
         AppConfig {
@@ -2821,7 +3207,7 @@ mod tests {
             head_branch: branch.into(),
             is_cross_repository: false,
             merge_blocker: None,
-            in_merge_queue: false,
+            merge_queue: None,
             unresolved_threads: 0,
         }
     }
@@ -2848,17 +3234,103 @@ mod tests {
         assert_eq!(attention_of(&app), Some(Attention::ReadyToMerge));
     }
 
-    #[test]
-    fn queued_pr_shows_queued_but_needs_nothing() {
-        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+    fn own_pr_in_queue(state: MergeQueueState) -> PrStatus {
         let mut pr = test_pr(7, "feature");
-        pr.in_merge_queue = true;
-        // Queue-side state must not surface as owner work while queued.
-        pr.merge_blocker = Some(MergeBlocker::Blocked);
-        app.project_mut().live.user_prs = vec![pr];
+        pr.merge_queue = Some(state);
+        pr
+    }
 
-        assert_eq!(attention_of(&app), Some(Attention::Queued));
+    #[test]
+    fn queue_state_shows_on_the_card_and_only_failures_need_you() {
+        for (state, count) in [
+            (MergeQueueState::Queued, 0),
+            (MergeQueueState::Testing, 0),
+            (MergeQueueState::Failed, 1),
+            (MergeQueueState::Cancelled, 1),
+        ] {
+            let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+            app.project_mut().live.user_prs = vec![own_pr_in_queue(state)];
+
+            assert_eq!(
+                attention_of(&app),
+                Some(Attention::Queue(state)),
+                "{state:?}"
+            );
+            assert_eq!(app.project().attention_count(), count, "{state:?}");
+        }
+    }
+
+    #[test]
+    fn queue_state_outranks_ci_review_and_merge_state() {
+        // Trunk's own check is in the rollup: pending while testing, red once
+        // the run fails. Neither is owner work while the queue holds the PR.
+        for state in [MergeQueueState::Testing, MergeQueueState::Failed] {
+            let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+            let mut pr = own_pr_in_queue(state);
+            pr.checks = Some(ChecksStatus::Failure);
+            pr.review = Some(ReviewDecision::ChangesRequested);
+            pr.merge_blocker = Some(MergeBlocker::Conflicts);
+            app.project_mut().live.user_prs = vec![pr];
+
+            assert_eq!(
+                attention_of(&app),
+                Some(Attention::Queue(state)),
+                "{state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_queue_run_passes_the_attention_filter() {
+        let mut app = test_app(vec![
+            issue_linked_to_pr("bork-1", 7, None),
+            test_issue("bork-2", Column::CodeReview),
+        ]);
+        app.project_mut().live.user_prs = vec![own_pr_in_queue(MergeQueueState::Failed)];
+        app.project_mut().attention_filter = true;
+
+        let visible = app.project().issues_in_column(Column::CodeReview, "");
+
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].1.id, "bork-1");
+    }
+
+    #[test]
+    fn queue_state_is_ignored_on_drafts_closed_and_merged_prs() {
+        for (is_draft, state) in [
+            (true, PrState::Open),
+            (false, PrState::Closed),
+            (false, PrState::Merged),
+        ] {
+            let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+            let mut pr = own_pr_in_queue(MergeQueueState::Failed);
+            pr.is_draft = is_draft;
+            pr.state = state;
+            app.project_mut().live.user_prs = vec![pr];
+
+            assert_eq!(attention_of(&app), None, "{state:?} draft={is_draft}");
+        }
+    }
+
+    #[test]
+    fn someone_elses_failed_queue_run_does_not_nag() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        app.project_mut()
+            .live
+            .pr_statuses_by_number
+            .insert(7, own_pr_in_queue(MergeQueueState::Failed));
+
+        assert_eq!(attention_of(&app), None);
         assert_eq!(app.project().attention_count(), 0);
+    }
+
+    #[test]
+    fn a_blocked_agent_outranks_a_failed_queue_run() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        app.project_mut().live.user_prs = vec![own_pr_in_queue(MergeQueueState::Failed)];
+        set_agent_status(&mut app, "bork-bork-1", AgentStatus::WaitingPermission);
+
+        assert_eq!(attention_of(&app), Some(Attention::AgentBlocked));
     }
 
     #[test]
@@ -2985,6 +3457,51 @@ mod tests {
     }
 
     #[test]
+    fn a_conflict_surfaces_before_review_or_checks_settle() {
+        // Actions does not run pull_request workflows while a PR conflicts,
+        // so its checks can sit pending until the rebase.
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let mut pr = test_pr(7, "feature");
+        pr.review = Some(ReviewDecision::ReviewRequired);
+        pr.checks = Some(ChecksStatus::Pending);
+        pr.merge_blocker = Some(MergeBlocker::Conflicts);
+        app.project_mut().live.user_prs = vec![pr];
+
+        assert_eq!(attention_of(&app), Some(Attention::NeedsRebase));
+    }
+
+    #[test]
+    fn red_checks_outrank_a_conflict() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let mut pr = test_pr(7, "feature");
+        pr.checks = Some(ChecksStatus::Failure);
+        pr.merge_blocker = Some(MergeBlocker::Conflicts);
+        app.project_mut().live.user_prs = vec![pr];
+
+        assert_eq!(attention_of(&app), Some(Attention::ChecksFailing));
+    }
+
+    #[test]
+    fn a_branch_behind_its_base_without_a_merge_queue_needs_an_update() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let mut pr = test_pr(7, "feature");
+        pr.merge_blocker = Some(MergeBlocker::Behind);
+        app.project_mut().live.user_prs = vec![pr];
+
+        assert_eq!(attention_of(&app), Some(Attention::NeedsUpdate));
+    }
+
+    #[test]
+    fn a_merge_state_github_is_still_computing_stays_quiet() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let mut pr = test_pr(7, "feature");
+        pr.merge_blocker = Some(MergeBlocker::Computing);
+        app.project_mut().live.user_prs = vec![pr];
+
+        assert_eq!(attention_of(&app), None);
+    }
+
+    #[test]
     fn attention_filter_hides_quiet_cards() {
         let mut app = test_app(vec![
             issue_linked_to_pr("bork-1", 7, None),
@@ -3071,6 +3588,421 @@ mod tests {
         assert!(!app.find_project(&ids[1]).unwrap().attention_filter);
     }
 
+    fn header_text(app: &App) -> String {
+        header_text_at(app, 100)
+    }
+
+    fn header_text_at(app: &App, width: u16) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 1)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::status_bar::render_header(frame, app, frame.area()))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn header_shows_backup_warnings_only() {
+        use crate::backup::schedule::{BackupIndicator, OffReason};
+
+        let mut app = test_app(Vec::new());
+        for quiet in [
+            BackupIndicator::Unknown,
+            BackupIndicator::Off(OffReason::NoPath),
+            BackupIndicator::Ok {
+                last_success_at: Some(unix_now()),
+            },
+            BackupIndicator::Ok {
+                last_success_at: None,
+            },
+        ] {
+            app.backup = quiet;
+            app.refresh_backup_warning(unix_now());
+            assert!(!header_text(&app).contains("backup"));
+        }
+
+        app.backup = BackupIndicator::Ok {
+            last_success_at: Some(unix_now() - 3 * 24 * 60 * 60),
+        };
+        app.refresh_backup_warning(unix_now());
+        assert!(header_text(&app).contains("no backup in 3d (B to back up)"));
+
+        app.backup = BackupIndicator::Failed {
+            error: "tar failed".into(),
+            last_success_at: Some(unix_now()),
+        };
+        app.refresh_backup_warning(unix_now());
+        assert!(header_text(&app).contains("backup failed (B to retry)"));
+
+        app.backup = BackupIndicator::Failed {
+            error: "tar failed".into(),
+            last_success_at: Some(unix_now() - 3 * 24 * 60 * 60),
+        };
+        app.refresh_backup_warning(unix_now());
+        assert!(header_text(&app).contains("backup failed, none in 3d (B to retry)"));
+    }
+
+    fn backup_report(
+        indicator: crate::backup::schedule::BackupIndicator,
+        manual: Option<crate::backup::schedule::Check>,
+        baseline: bool,
+    ) -> crate::backup::schedule::Report {
+        crate::backup::schedule::Report {
+            indicator,
+            manual,
+            baseline,
+            ..Default::default()
+        }
+    }
+
+    fn backup_failure(error: &str) -> crate::backup::schedule::BackupIndicator {
+        crate::backup::schedule::BackupIndicator::Failed {
+            error: error.into(),
+            last_success_at: Some(1),
+        }
+    }
+
+    /// An app whose only project lives in a temp dir with backups enabled,
+    /// so failures land in its errors.log.
+    fn backup_app(dir: &std::path::Path) -> App {
+        std::fs::create_dir_all(dir.join(".bork")).unwrap();
+        std::fs::write(dir.join(".bork/config.toml"), "[backup]\nenabled = true\n").unwrap();
+        let mut config = test_config();
+        config.project_root = dir.to_path_buf();
+        App::new(config, AppState::default())
+    }
+
+    fn error_log(dir: &std::path::Path) -> String {
+        std::fs::read_to_string(crate::config::error_log_path(dir)).unwrap_or_default()
+    }
+
+    #[test]
+    fn backup_failure_reports_once_until_it_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = backup_app(dir.path());
+
+        assert!(app.apply_backup_report(backup_report(backup_failure("a"), None, false)));
+        assert_eq!(
+            app.message,
+            Some(("Backup failed: a".into(), MessageKind::Error))
+        );
+        app.message = None;
+
+        // The hourly check failing the same way stays quiet.
+        assert!(!app.apply_backup_report(backup_report(backup_failure("a"), None, false)));
+        assert_eq!(app.message, None);
+        assert_eq!(error_log(dir.path()).matches("backup failed: a").count(), 1);
+
+        app.apply_backup_report(backup_report(backup_failure("b"), None, false));
+        assert_eq!(error_log(dir.path()).matches("backup failed: b").count(), 1);
+    }
+
+    #[test]
+    fn unrecorded_status_is_a_warning_and_a_log_line() {
+        use crate::backup::schedule::{BackupIndicator, Check, Report};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = backup_app(dir.path());
+
+        assert!(app.apply_backup_report(Report {
+            indicator: BackupIndicator::Ok {
+                last_success_at: Some(1),
+            },
+            manual: Some(Check::Ran(Ok(Some(true)))),
+            status_warning: Some("could not record backup status: disk full".into()),
+            ..Default::default()
+        }));
+
+        assert_eq!(
+            app.message,
+            Some((
+                "Backup written. Could not record backup status: disk full".into(),
+                MessageKind::Warning
+            ))
+        );
+        let logged = |dir: &std::path::Path| {
+            error_log(dir)
+                .matches("backup: could not record backup status: disk full")
+                .count()
+        };
+        assert_eq!(logged(dir.path()), 1);
+
+        // The hourly run hitting the same problem stays quiet.
+        app.message = None;
+        let scheduled = Report {
+            indicator: BackupIndicator::Ok {
+                last_success_at: Some(1),
+            },
+            status_warning: Some("could not record backup status: disk full".into()),
+            ..Default::default()
+        };
+        app.apply_backup_report(scheduled.clone());
+        assert_eq!(app.message, None);
+        assert_eq!(logged(dir.path()), 1);
+
+        // A changed problem from a scheduled run flashes and logs once.
+        app.apply_backup_report(Report {
+            status_warning: Some("could not record backup status: read-only".into()),
+            ..scheduled
+        });
+        assert_eq!(
+            app.message,
+            Some((
+                "Backup done, but could not record backup status: read-only".into(),
+                MessageKind::Warning
+            ))
+        );
+    }
+
+    #[test]
+    fn an_unreadable_project_config_still_gets_the_log_line() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".bork/config.toml")).unwrap();
+        let mut config = test_config();
+        config.project_root = dir.path().to_path_buf();
+        let mut app = App::new(config, AppState::default());
+
+        app.apply_backup_report(backup_report(backup_failure("reading config"), None, false));
+
+        assert_eq!(
+            error_log(dir.path())
+                .matches("backup failed: reading config")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn startup_baseline_does_not_re_report_an_old_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = backup_app(dir.path());
+
+        assert!(app.apply_backup_report(backup_report(backup_failure("old"), None, true)));
+        assert_eq!(app.backup, backup_failure("old"));
+        assert_eq!(app.message, None);
+        assert_eq!(error_log(dir.path()), "");
+
+        // The first real check failing the same way is not new either.
+        app.apply_backup_report(backup_report(backup_failure("old"), None, false));
+        assert_eq!(app.message, None);
+        assert_eq!(error_log(dir.path()), "");
+    }
+
+    #[test]
+    fn skipped_repos_warn_once_per_change_and_in_manual_results() {
+        use crate::backup::schedule::{BackupIndicator, Check, Report};
+
+        let ok = BackupIndicator::Ok {
+            last_success_at: Some(1),
+        };
+        let skipped = vec![std::path::PathBuf::from("/p/plans/scratch")];
+        let mut app = test_app(Vec::new());
+
+        app.apply_backup_report(Report {
+            indicator: ok.clone(),
+            local_only_repos: skipped.clone(),
+            ..Default::default()
+        });
+        assert_eq!(
+            app.message,
+            Some((
+                "Backup skips 1 git repo with no remote: /p/plans/scratch".into(),
+                MessageKind::Warning
+            ))
+        );
+
+        // The hourly check with the same list stays quiet.
+        app.message = None;
+        app.apply_backup_report(Report {
+            indicator: ok.clone(),
+            local_only_repos: skipped.clone(),
+            ..Default::default()
+        });
+        assert_eq!(app.message, None);
+
+        // A failure in between doesn't make the next success warn again.
+        app.apply_backup_report(Report {
+            indicator: BackupIndicator::Failed {
+                error: "tar failed".into(),
+                last_success_at: Some(1),
+            },
+            ..Default::default()
+        });
+        app.message = None;
+        app.apply_backup_report(Report {
+            indicator: ok.clone(),
+            local_only_repos: skipped.clone(),
+            ..Default::default()
+        });
+        assert_eq!(app.message, None);
+
+        // `B` always says it.
+        app.apply_backup_report(Report {
+            indicator: ok,
+            manual: Some(Check::Ran(Ok(Some(true)))),
+            local_only_repos: skipped,
+            ..Default::default()
+        });
+        assert_eq!(
+            app.message,
+            Some((
+                "Backup written. Backup skips 1 git repo with no remote: /p/plans/scratch".into(),
+                MessageKind::Warning
+            ))
+        );
+    }
+
+    #[test]
+    fn a_stopped_backup_worker_releases_the_spinner() {
+        let mut app = test_app(Vec::new());
+        app.backup_manual_pending = true;
+        app.begin_busy();
+
+        app.backup_worker_stopped();
+
+        assert!(!app.backup_manual_pending);
+        assert_eq!(app.busy_count, 0);
+        assert!(matches!(app.message, Some((_, MessageKind::Error))));
+    }
+
+    #[test]
+    fn manual_backup_releases_the_spinner_and_shows_the_result() {
+        use crate::backup::schedule::{BackupIndicator, Check};
+
+        let mut app = test_app(Vec::new());
+        app.backup_manual_pending = true;
+        app.begin_busy();
+
+        app.apply_backup_report(backup_report(
+            BackupIndicator::Ok {
+                last_success_at: Some(1),
+            },
+            Some(Check::Ran(Ok(Some(true)))),
+            false,
+        ));
+        assert!(!app.backup_manual_pending);
+        assert_eq!(app.busy_count, 0);
+        assert_eq!(
+            app.message,
+            Some(("Backup written".into(), MessageKind::Info))
+        );
+
+        // A manual failure shows the manual message, not a second flash.
+        app.apply_backup_report(backup_report(
+            backup_failure("tar failed"),
+            Some(Check::Ran(Err("tar failed".into()))),
+            false,
+        ));
+        assert_eq!(app.busy_count, 0);
+        assert_eq!(
+            app.message,
+            Some(("Backup failed: tar failed".into(), MessageKind::Error))
+        );
+    }
+
+    #[test]
+    fn narrow_header_drops_the_backup_hint_before_the_title() {
+        let mut app = test_app(Vec::new());
+        app.backup = crate::backup::schedule::BackupIndicator::Failed {
+            error: "x".into(),
+            last_success_at: Some(unix_now()),
+        };
+        app.refresh_backup_warning(unix_now());
+        let title = format!(" BORK - {} ", app.active_project().display_name());
+        let full = " \u{26a0} backup failed (B to retry) ";
+        let compact = " \u{26a0} backup failed ";
+
+        let width = (title.chars().count() + compact.chars().count()) as u16;
+        let text = header_text_at(&app, width);
+        assert!(text.starts_with(&title), "{text:?}");
+        assert!(text.ends_with(compact), "{text:?}");
+        assert!(!text.contains("B to retry"));
+
+        let wide = header_text_at(&app, (title.chars().count() + full.chars().count()) as u16);
+        assert!(wide.starts_with(&title) && wide.ends_with(full), "{wide:?}");
+    }
+
+    fn footer_text(app: &App) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 1)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::status_bar::render_footer(frame, app, frame.area()))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn esc_peels_the_link_filter_before_the_attention_filter() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        app.project_mut().live.user_prs = vec![test_pr(7, "feature")];
+        app.project_mut().link_filter = Some("bork-1".into());
+        app.project_mut().attention_filter = true;
+        app.input_mode = InputMode::Normal;
+        let ctx = app.action_context();
+        assert!(footer_text(&app).contains("linked: bork-1"));
+
+        app.clear_search(&ctx);
+
+        assert_eq!(app.project().link_filter, None);
+        assert!(app.project().attention_filter);
+        assert!(footer_text(&app).contains("needs you"));
+
+        app.clear_search(&ctx);
+
+        assert!(!app.project().attention_filter);
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_cursor_on_its_card_when_another_drops_out() {
+        let mut app = test_app(vec![
+            issue_linked_to_pr("bork-1", 7, None),
+            issue_linked_to_pr("bork-2", 8, None),
+            issue_linked_to_pr("bork-3", 9, None),
+        ]);
+        app.project_mut().live.user_prs = vec![
+            test_pr(7, "first"),
+            test_pr(8, "second"),
+            test_pr(9, "third"),
+        ];
+        app.project_mut().attention_filter = true;
+        app.project_mut().selected_column = Column::CodeReview.index();
+        app.project_mut().selected_row[Column::CodeReview.index()] = 1;
+        assert_eq!(app.project().selected_issue("").unwrap().id, "bork-2");
+
+        app.project_mut().keep_selection("", |project| {
+            project.live.user_prs[0].checks = Some(ChecksStatus::Pending);
+        });
+
+        assert_eq!(app.project().selected_issue("").unwrap().id, "bork-2");
+    }
+
+    #[test]
+    fn a_refresh_that_leaves_nothing_needing_you_turns_the_filter_off() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        app.project_mut().live.user_prs = vec![test_pr(7, "feature")];
+        app.project_mut().attention_filter = true;
+        app.project_mut().selected_column = Column::CodeReview.index();
+
+        app.project_mut().keep_selection("", |project| {
+            project.live.user_prs[0].checks = Some(ChecksStatus::Pending);
+        });
+
+        assert!(!app.project().attention_filter);
+        assert_eq!(app.project().selected_issue("").unwrap().id, "bork-1");
+    }
+
     #[test]
     fn attention_count_sums_only_actionable_cards() {
         let mut app = test_app(vec![
@@ -3082,6 +4014,86 @@ mod tests {
         app.project_mut().live.user_prs = vec![test_pr(7, "feature"), pending];
 
         assert_eq!(app.project().attention_count(), 1);
+    }
+
+    #[test]
+    fn hidden_project_counts_the_pr_of_an_unassigned_matching_worktree() {
+        let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
+        let pr = test_pr(7, "bork-1/task");
+        let live = &mut app.project_mut().live;
+        live.background_branches = Some(HashMap::from([(
+            "bork-1-task".to_string(),
+            "bork-1/task".to_string(),
+        )]));
+        live.pr_statuses.insert("bork-1/task".into(), pr.clone());
+        live.user_prs = vec![pr];
+
+        let project = app.project();
+        assert_eq!(project.branch_for(&project.issues[0]), Some("bork-1/task"));
+        assert_eq!(
+            crate::github_poll::Targets::for_project(project).branches,
+            vec![("bork-1/task".to_string(), 1)]
+        );
+        assert_eq!(project.attention_count(), 1);
+        assert_eq!(project.issues[0].worktree, None);
+    }
+
+    #[test]
+    fn hidden_project_follows_a_branch_switched_while_hidden() {
+        let mut issue = test_issue("bork-1", Column::InProgress);
+        issue.worktree = Some("bork-1-task".into());
+        let mut app = test_app(vec![issue]);
+        let pr = test_pr(7, "bork-1/new");
+        let live = &mut app.project_mut().live;
+        // Left over from the last full poll before the project was hidden.
+        live.worktree_branches
+            .insert("bork-1-task".into(), "bork-1/old".into());
+        live.background_branches = Some(HashMap::from([(
+            "bork-1-task".to_string(),
+            "bork-1/new".to_string(),
+        )]));
+        live.pr_statuses.insert("bork-1/new".into(), pr.clone());
+        live.user_prs = vec![pr];
+
+        let project = app.project();
+        assert_eq!(project.branch_for(&project.issues[0]), Some("bork-1/new"));
+        assert_eq!(project.attention_count(), 1);
+    }
+
+    #[test]
+    fn hidden_project_counts_drafts_on_an_unassigned_matching_worktree() {
+        let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
+        let worktree = app.project().id().join("bork-1-task");
+        let live = &mut app.project_mut().live;
+        live.background_branches = Some(HashMap::from([(
+            "bork-1-task".to_string(),
+            "bork-1/task".to_string(),
+        )]));
+        live.tuicr_drafts.by_worktree.insert(worktree, 1);
+
+        assert_eq!(app.project().attention_count(), 1);
+        assert_eq!(app.project().issues[0].worktree, None);
+    }
+
+    #[test]
+    fn background_branches_never_assign_or_clear_worktrees() {
+        let mut assigned = test_issue("bork-1", Column::InProgress);
+        assigned.worktree = Some("bork-1-clone".into());
+        let mut app = test_app(vec![assigned, test_issue("bork-2", Column::InProgress)]);
+        let live = &mut app.project_mut().live;
+        // Left over from the last full poll before the project was hidden.
+        live.worktree_branches
+            .insert("bork-1-clone".into(), "bork-1/clone".into());
+        live.background_branches = Some(HashMap::from([(
+            "bork-2-task".to_string(),
+            "bork-2/task".to_string(),
+        )]));
+
+        assert!(!app.project_mut().auto_assign_worktrees());
+        assert!(!app.project_mut().clear_stale_worktrees());
+        let issues = &app.project().issues;
+        assert_eq!(issues[0].worktree.as_deref(), Some("bork-1-clone"));
+        assert_eq!(issues[1].worktree, None);
     }
 
     fn comments_of(app: &App) -> u32 {
@@ -4640,6 +5652,7 @@ mod tests {
             vec![
                 DialogField::Kind,
                 DialogField::Linear,
+                DialogField::LinearProject,
                 DialogField::Agent,
                 DialogField::Mode,
                 DialogField::Title,
@@ -6091,7 +7104,7 @@ mod tests {
             head_branch: "bork-1/task".into(),
             is_cross_repository: false,
             merge_blocker: None,
-            in_merge_queue: false,
+            merge_queue: None,
             unresolved_threads: 0,
         };
         app.project_mut()
@@ -6803,6 +7816,58 @@ mod tests {
 
     // --- apply_reload_result tests ---
 
+    fn registry_entry(label: &str, project: &str) -> crate::global_config::ProjectEntry {
+        crate::global_config::ProjectEntry {
+            name: project.into(),
+            path: PathBuf::from(format!("/tmp/test-{}", project)),
+            label: Some(label.into()),
+        }
+    }
+
+    #[test]
+    fn sync_with_registry_applies_names_and_order() {
+        let mut app = test_multi_app();
+        let beta_id = app.projects[1].id();
+        app.sidebar.as_mut().unwrap().selected = 1;
+
+        app.sync_with_registry(&[
+            registry_entry("Gamma!", "gamma"),
+            registry_entry("Beta!", "beta"),
+        ]);
+
+        let names: Vec<&str> = app.projects.iter().map(|p| p.display_name()).collect();
+        // alpha is missing from the registry, so it shows its config name and goes last.
+        assert_eq!(names, ["Gamma!", "Beta!", "alpha"]);
+        assert_eq!(app.sidebar_selected_id(), Some(beta_id));
+    }
+
+    #[test]
+    fn move_sidebar_project_swaps_and_stops_at_edges() {
+        let mut app = test_multi_app();
+        let alpha_id = app.projects[0].id();
+
+        assert!(app.move_sidebar_project(true).is_none());
+        let order = app.move_sidebar_project(false).unwrap();
+        assert_eq!(order[1], alpha_id);
+        assert_eq!(app.sidebar_selected_id(), Some(alpha_id.clone()));
+
+        app.move_sidebar_project(false).unwrap();
+        assert!(app.move_sidebar_project(false).is_none());
+        assert_eq!(app.projects[2].id(), alpha_id);
+    }
+
+    #[test]
+    fn removing_selected_project_keeps_cursor_row() {
+        let mut app = test_multi_app();
+        let beta_id = app.projects[1].id();
+        app.sidebar.as_mut().unwrap().selected = 1;
+
+        app.remove_projects(&[beta_id]);
+
+        assert_eq!(app.projects.len(), 2);
+        assert_eq!(app.sidebar.as_ref().unwrap().selected, 1);
+    }
+
     #[test]
     fn apply_reload_adds_new_projects() {
         let mut app = test_app(vec![]);
@@ -6813,7 +7878,7 @@ mod tests {
             new_projects: vec![(test_config_named("beta"), AppState::default())],
             ..Default::default()
         };
-        app.apply_reload_result(result);
+        app.apply_reload_result(result, &[]);
 
         assert_eq!(app.projects.len(), 2);
         assert_eq!(app.projects[1].config.project_name, "beta");
@@ -6824,7 +7889,7 @@ mod tests {
     fn apply_reload_empty_is_noop() {
         let mut app = test_app(vec![]);
         let result = crate::global_config::ReloadResult::default();
-        app.apply_reload_result(result);
+        app.apply_reload_result(result, &[]);
 
         assert_eq!(app.projects.len(), 1);
         assert!(app.sidebar.is_none());
@@ -6838,7 +7903,7 @@ mod tests {
         app.sidebar.as_mut().unwrap().selected = 1;
 
         let result = crate::global_config::ReloadResult::default();
-        app.apply_reload_result(result);
+        app.apply_reload_result(result, &[]);
 
         let sidebar = app.sidebar.as_ref().unwrap();
         assert_eq!(sidebar.swimlanes.len(), 2);
@@ -6858,7 +7923,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        app.apply_reload_result(result);
+        app.apply_reload_result(result, &[]);
 
         assert_eq!(app.projects.len(), 3);
         assert!(app.sidebar.is_some());
@@ -6872,14 +7937,14 @@ mod tests {
             new_projects: vec![(test_config_named("beta"), AppState::default())],
             ..Default::default()
         };
-        app.apply_reload_result(result1);
+        app.apply_reload_result(result1, &[]);
         assert_eq!(app.projects.len(), 2);
 
         let result2 = crate::global_config::ReloadResult {
             new_projects: vec![(test_config_named("gamma"), AppState::default())],
             ..Default::default()
         };
-        app.apply_reload_result(result2);
+        app.apply_reload_result(result2, &[]);
         assert_eq!(app.projects.len(), 3);
         assert_eq!(app.projects[2].config.project_name, "gamma");
     }
@@ -6898,7 +7963,7 @@ mod tests {
             new_projects: vec![],
             removed_projects: vec![beta_id.clone()],
         };
-        app.apply_reload_result(result);
+        app.apply_reload_result(result, &[]);
 
         assert_eq!(app.projects.len(), 2);
         assert!(app.find_project(&beta_id).is_none());
@@ -6924,7 +7989,7 @@ mod tests {
             removed_projects: vec![alpha_id],
             ..Default::default()
         };
-        app.apply_reload_result(result);
+        app.apply_reload_result(result, &[]);
 
         assert_eq!(app.sidebar.as_ref().unwrap().selected, 0);
         assert_eq!(app.focused_swimlane, 0);
@@ -6940,7 +8005,7 @@ mod tests {
             new_projects: vec![],
             removed_projects: vec![alpha_id.clone()],
         };
-        app.apply_reload_result(result);
+        app.apply_reload_result(result, &[]);
 
         assert_eq!(app.projects.len(), 3);
         assert!(app.find_project(&alpha_id).is_some());
@@ -6982,6 +8047,30 @@ mod tests {
 
         merge_issue_fields(&mut memory, &base, &file);
         assert_eq!(memory.title, "Local edit");
+    }
+
+    #[test]
+    fn merge_model_from_file() {
+        let base = test_issue_titled("a", "T", Column::Todo);
+        let mut memory = base.clone();
+        let mut file = base.clone();
+        file.model = Some("sonnet".to_string());
+
+        merge_issue_fields(&mut memory, &base, &file);
+        assert_eq!(memory.model.as_deref(), Some("sonnet"));
+    }
+
+    #[test]
+    fn merge_skips_file_model_after_memory_agent_switch() {
+        let base = test_issue_titled("a", "T", Column::Todo);
+        let mut memory = base.clone();
+        let _ = memory.set_agent_kind(AgentKind::Codex);
+        let mut file = base.clone();
+        file.model = Some("sonnet".to_string());
+
+        merge_issue_fields(&mut memory, &base, &file);
+        assert_eq!(memory.agent_kind, AgentKind::Codex);
+        assert_eq!(memory.model, None);
     }
 
     #[test]
@@ -7141,6 +8230,15 @@ mod tests {
             requested_prs: vec![42],
             generated_prompt: "review stack".into(),
         });
+        issue
+            .linear_projects
+            .push(crate::types::LinkedLinearProject {
+                id: "p".into(),
+                slug: "abc123".into(),
+                name: "Project".into(),
+                url: String::new(),
+                imported: false,
+            });
         let value = serde_json::to_value(&issue).expect("issue serializes");
         let object = value.as_object().expect("issue is a JSON object");
         let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
@@ -7160,6 +8258,7 @@ mod tests {
             "pruned_at",
             "setup_ran",
             "linear_links",
+            "linear_projects",
             "github_pr_links",
             "pr_import_baseline",
             "stack_review_import",

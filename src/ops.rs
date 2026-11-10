@@ -170,7 +170,26 @@ pub struct CreateOptions {
     pub agent_kind: Option<AgentKind>,
     pub agent_mode: Option<AgentMode>,
     pub prompt: Option<String>,
+    pub model: Option<String>,
     pub kind: Option<IssueKind>,
+}
+
+/// Reject a `--model` value the agent can't take: blank, flag-like, or an
+/// agent with no model flag.
+fn validate_model(model: &str, agent_kind: AgentKind) -> anyhow::Result<()> {
+    if model.trim().is_empty() {
+        anyhow::bail!("--model can't be empty");
+    }
+    if model.starts_with('-') {
+        anyhow::bail!("--model value '{}' looks like a flag", model);
+    }
+    if !agent::supports_model(agent_kind) {
+        anyhow::bail!(
+            "{} doesn't support --model; set the model in its own config or use another agent",
+            agent_kind
+        );
+    }
+    Ok(())
 }
 
 pub fn create_issue(project_root: &Path, opts: CreateOptions) -> anyhow::Result<Issue> {
@@ -182,6 +201,9 @@ pub fn create_issue(project_root: &Path, opts: CreateOptions) -> anyhow::Result<
     let kind = opts.kind.unwrap_or(IssueKind::Agentic);
     let agent_kind = opts.agent_kind.unwrap_or(config.agent_kind);
     let agent_mode = opts.agent_mode.unwrap_or(config.agent_mode);
+    if let Some(model) = opts.model.as_deref() {
+        validate_model(model, agent_kind)?;
+    }
 
     let issue = Issue::build(
         IssueDraft {
@@ -192,6 +214,7 @@ pub fn create_issue(project_root: &Path, opts: CreateOptions) -> anyhow::Result<
             kind,
             agent_mode,
             prompt: opts.prompt,
+            model: opts.model,
         },
         now_epoch(),
     );
@@ -209,6 +232,8 @@ pub struct UpdateOptions {
     pub agent_kind: Option<AgentKind>,
     pub agent_mode: Option<AgentMode>,
     pub prompt: Option<String>,
+    /// New model; an empty string clears it.
+    pub model: Option<String>,
     pub kind: Option<IssueKind>,
 }
 
@@ -237,6 +262,16 @@ pub fn update_issue(
     if let Some(agent_mode) = opts.agent_mode {
         issue.agent_mode = agent_mode;
     }
+    // After the agent change, which clears the model, so `--agent X --model Y`
+    // validates Y against X and keeps it.
+    if let Some(model) = opts.model {
+        if model.is_empty() {
+            issue.model = None;
+        } else {
+            validate_model(&model, issue.agent_kind)?;
+            issue.model = Some(model);
+        }
+    }
     if let Some(prompt) = opts.prompt {
         if prompt.is_empty() {
             issue.prompt = None;
@@ -263,6 +298,72 @@ pub fn update_issue(
     Ok(updated)
 }
 
+/// Store a launch's result for `bork issue launch` run by hand, when no TUI
+/// or `bork issue start` is waiting to do it. A lost session with no new id
+/// to replace it is dropped, so the next launch doesn't retry the dead one.
+pub fn record_launch(
+    project_root: &Path,
+    launched: &Issue,
+    session_id: Option<String>,
+    setup_ran: bool,
+    replaced_lost_session: bool,
+) -> anyhow::Result<()> {
+    let mut state = config::load_state(project_root);
+    let idx = find_issue_index(&state.issues, &launched.id)
+        .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", launched.id))?;
+    let issue = &mut state.issues[idx];
+    // Only drop the id this launch found dead, not one a later launch stored.
+    let forget_lost = replaced_lost_session
+        && session_id.is_none()
+        && issue.accepts_launch_result(launched.kind, launched.agent_kind)
+        && issue.current_session_id() == launched.current_session_id();
+    issue.record_launch(launched.kind, launched.agent_kind, session_id, setup_ran);
+    if forget_lost {
+        issue.forget_session(launched.agent_kind);
+    }
+    config::save_state(&state, project_root)
+}
+
+pub struct SessionReset {
+    pub issue_id: String,
+    pub agent: AgentKind,
+    pub removed: bool,
+}
+
+/// Forget the stored session for `agent` (default: the issue's agent) so the
+/// next launch starts fresh. Kills the live session when it runs that agent,
+/// since re-attaching it would keep the old conversation going.
+pub fn reset_session(
+    project_root: &Path,
+    issue_id: &str,
+    agent: Option<AgentKind>,
+) -> anyhow::Result<SessionReset> {
+    let mut state = config::load_state(project_root);
+
+    let idx = find_issue_index(&state.issues, issue_id)
+        .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", issue_id))?;
+
+    let issue = &mut state.issues[idx];
+    let agent = agent.unwrap_or(issue.agent_kind);
+    let removed = issue.sessions.contains_key(&agent);
+
+    if removed {
+        // Kill first so a failed cleanup aborts before the state is saved.
+        if issue.forgetting_kills_session(agent) {
+            let config = config::load_config_from(project_root);
+            agent::terminate_session(project_root, &issue.session_name(&config.project_name))?;
+        }
+        issue.forget_session(agent);
+        config::save_state(&state, project_root)?;
+    }
+
+    Ok(SessionReset {
+        issue_id: state.issues[idx].id.clone(),
+        agent,
+        removed,
+    })
+}
+
 pub fn delete_issue(project_root: &Path, issue_id: &str) -> anyhow::Result<Issue> {
     let mut state = config::load_state(project_root);
 
@@ -276,6 +377,12 @@ pub fn delete_issue(project_root: &Path, issue_id: &str) -> anyhow::Result<Issue
     let removed = state.issues.remove(idx);
     remove_link_references(&mut state.issues, &removed.id);
     config::save_state(&state, project_root)?;
+    crate::issue_plan::remove_saved_plans(project_root, &removed.id).map_err(|e| {
+        e.context(format!(
+            "Deleted {} but couldn't remove its saved plans",
+            removed.id
+        ))
+    })?;
 
     Ok(removed)
 }
@@ -360,6 +467,9 @@ pub fn show_issue(project_root: &Path, issue_id: &str, json: bool) -> anyhow::Re
     let _ = writeln!(out, "Column:   {}", issue.column);
     let _ = writeln!(out, "Agent:    {}", issue.agent_kind);
     let _ = writeln!(out, "Mode:     {}", issue.agent_mode);
+    if let Some(ref model) = issue.model {
+        let _ = writeln!(out, "Model:    {}", model);
+    }
     if let Some(ref prompt) = issue.prompt {
         let _ = writeln!(out, "Prompt:   {}", prompt);
     }
@@ -369,6 +479,14 @@ pub fn show_issue(project_root: &Path, issue_id: &str, json: bool) -> anyhow::Re
     if !issue.linear_links.is_empty() {
         let ids: Vec<&str> = issue.linear_identifiers();
         let _ = writeln!(out, "Linear:   {}", ids.join(", "));
+    }
+    if !issue.linear_projects.is_empty() {
+        let names: Vec<&str> = issue
+            .linear_projects
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        let _ = writeln!(out, "Projects: {}", names.join(", "));
     }
     if !issue.github_pr_links.is_empty() {
         let nums: Vec<String> = issue
@@ -466,6 +584,59 @@ pub fn detach_linear(
     issue.linear_links.retain(|l| l.identifier != identifier);
     if issue.linear_links.len() == before {
         anyhow::bail!("Issue '{}' has no Linear link '{}'", issue.id, identifier);
+    }
+
+    let updated = issue.clone();
+    config::save_state(&state, project_root)?;
+
+    Ok(updated)
+}
+
+pub fn attach_linear_project(
+    project_root: &Path,
+    issue_id: &str,
+    project: crate::types::LinkedLinearProject,
+) -> anyhow::Result<Issue> {
+    let mut state = config::load_state(project_root);
+
+    let idx = find_issue_index(&state.issues, issue_id)
+        .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", issue_id))?;
+
+    let issue = &mut state.issues[idx];
+
+    if !issue.kind.links_linear_projects() {
+        anyhow::bail!(
+            "Cannot attach a Linear project to '{}': only orchestrator issues have project links",
+            issue.id
+        );
+    }
+
+    if !issue.linear_projects.iter().any(|p| p.id == project.id) {
+        issue.linear_projects.push(project);
+    }
+
+    let updated = issue.clone();
+    config::save_state(&state, project_root)?;
+
+    Ok(updated)
+}
+
+pub fn detach_linear_project(
+    project_root: &Path,
+    issue_id: &str,
+    slug: &str,
+) -> anyhow::Result<Issue> {
+    let mut state = config::load_state(project_root);
+
+    let idx = find_issue_index(&state.issues, issue_id)
+        .ok_or_else(|| anyhow::anyhow!("Issue '{}' not found", issue_id))?;
+
+    let issue = &mut state.issues[idx];
+
+    let before = issue.linear_projects.len();
+    issue.linear_projects.retain(|p| p.slug != slug);
+    if issue.linear_projects.len() == before {
+        anyhow::bail!("Issue '{}' has no Linear project '{}'", issue.id, slug);
     }
 
     let updated = issue.clone();
@@ -578,6 +749,8 @@ pub struct ArchiveReport {
     pub session_name: String,
     pub session_killed: bool,
     pub worktree_removed: Option<String>,
+    /// Exit code of a teardown script that failed but `--force` went past.
+    pub teardown_failed: Option<i32>,
 }
 
 /// Archive an issue: kill its agent session, run the teardown script, remove
@@ -600,9 +773,16 @@ pub fn archive_issue(
     let session_name = issue.session_name(&app_config.project_name);
     let session_killed = agent::terminate_session(project_root, &session_name)?;
 
+    let mut teardown_failed = None;
     let worktree_removed = match issue.worktree.as_deref() {
         Some(dir) => {
-            worktree::remove_worktree_in(&app_config, dir, force)?;
+            let removal = if force {
+                worktree::Removal::Force
+            } else {
+                worktree::Removal::Safe
+            };
+            teardown_failed =
+                worktree::remove_worktree_in(&app_config, &issue.id, dir, removal)?.teardown_failed;
             Some(dir.to_string())
         }
         None => None,
@@ -623,6 +803,7 @@ pub fn archive_issue(
         session_name,
         session_killed,
         worktree_removed,
+        teardown_failed,
     })
 }
 
@@ -693,6 +874,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -723,6 +905,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: Some("Do the thing".into()),
+                model: None,
                 kind: None,
             },
         )
@@ -758,6 +941,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -779,6 +963,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -793,6 +978,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -815,6 +1001,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -829,6 +1016,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -850,6 +1038,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -864,6 +1053,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -885,6 +1075,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -913,6 +1104,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: Some(IssueKind::Orchestrator),
             },
         )
@@ -922,6 +1114,337 @@ mod tests {
         assert!(updated.worktree.is_none());
         assert!(updated.sessions.is_empty());
         assert!(updated.github_pr_links.is_empty());
+    }
+
+    fn create_claude_with_model(root: &Path) -> Issue {
+        create_issue(
+            root,
+            CreateOptions {
+                title: "Review".into(),
+                agent_kind: Some(AgentKind::Claude),
+                model: Some("sonnet".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn create_stores_model() {
+        let dir = setup_project();
+        let issue = create_claude_with_model(dir.path());
+        assert_eq!(issue.model.as_deref(), Some("sonnet"));
+        let state = config::load_state(dir.path());
+        assert_eq!(state.issues[0].model.as_deref(), Some("sonnet"));
+    }
+
+    #[test]
+    fn create_rejects_model_for_unsupported_agent() {
+        // The project default agent is opencode, which has no --model flag.
+        let dir = setup_project();
+        let err = create_issue(
+            dir.path(),
+            CreateOptions {
+                title: "Nope".into(),
+                model: Some("sonnet".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("opencode doesn't support --model"));
+        assert!(config::load_state(dir.path()).issues.is_empty());
+    }
+
+    #[test]
+    fn create_rejects_blank_or_flag_like_model() {
+        let dir = setup_project();
+        for model in ["", "  ", "--dangerously-skip-permissions"] {
+            let result = create_issue(
+                dir.path(),
+                CreateOptions {
+                    title: "Nope".into(),
+                    agent_kind: Some(AgentKind::Claude),
+                    model: Some(model.into()),
+                    ..Default::default()
+                },
+            );
+            assert!(result.is_err(), "{model:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn update_sets_and_clears_model() {
+        let dir = setup_project();
+        let root = dir.path();
+        create_claude_with_model(root);
+
+        let set = |model: &str| {
+            update_issue(
+                root,
+                "test-1",
+                UpdateOptions {
+                    model: Some(model.into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+        assert_eq!(set("opus").model.as_deref(), Some("opus"));
+        assert_eq!(set("").model, None);
+    }
+
+    #[test]
+    fn update_agent_clears_model_unless_given() {
+        let dir = setup_project();
+        let root = dir.path();
+        create_claude_with_model(root);
+
+        let switched = update_issue(
+            root,
+            "test-1",
+            UpdateOptions {
+                agent_kind: Some(AgentKind::Codex),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(switched.model, None);
+
+        let both = update_issue(
+            root,
+            "test-1",
+            UpdateOptions {
+                agent_kind: Some(AgentKind::Claude),
+                model: Some("haiku".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(both.agent_kind, AgentKind::Claude);
+        assert_eq!(both.model.as_deref(), Some("haiku"));
+    }
+
+    #[test]
+    fn update_rejects_model_for_unsupported_agent() {
+        let dir = setup_project();
+        let root = dir.path();
+        create_claude_with_model(root);
+
+        let result = update_issue(
+            root,
+            "test-1",
+            UpdateOptions {
+                agent_kind: Some(AgentKind::OpenCode),
+                model: Some("sonnet".into()),
+                ..Default::default()
+            },
+        );
+        assert!(result.is_err());
+        // Nothing was saved: still claude on sonnet.
+        let issue = &config::load_state(root).issues[0];
+        assert_eq!(issue.agent_kind, AgentKind::Claude);
+        assert_eq!(issue.model.as_deref(), Some("sonnet"));
+    }
+
+    fn issue_without_session(root: &Path, agent: AgentKind) -> Issue {
+        create_issue(
+            root,
+            CreateOptions {
+                title: "Launch by hand".into(),
+                agent_kind: Some(agent),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        config::load_state(root).issues.remove(0)
+    }
+
+    fn issue_with_session(root: &Path, agent: AgentKind, sid: &str) -> Issue {
+        issue_without_session(root, agent);
+        edit_stored_issue(root, |issue| {
+            issue.sessions.insert(agent, sid.into());
+        });
+        config::load_state(root).issues.remove(0)
+    }
+
+    /// Change the stored issue after the launch took its snapshot.
+    fn edit_stored_issue(root: &Path, edit: impl FnOnce(&mut Issue)) {
+        let mut state = config::load_state(root);
+        edit(&mut state.issues[0]);
+        config::save_state(&state, root).unwrap();
+    }
+
+    #[test]
+    fn record_launch_drops_a_lost_session_with_no_new_id() {
+        let dir = setup_project();
+        let root = dir.path();
+        let launched = issue_with_session(root, AgentKind::OpenCode, "ses_dead");
+
+        record_launch(root, &launched, None, false, true).unwrap();
+        assert_eq!(
+            config::load_state(root).issues[0].current_session_id(),
+            None
+        );
+    }
+
+    #[test]
+    fn record_launch_keeps_a_session_stored_after_the_launch_began() {
+        let dir = setup_project();
+        let root = dir.path();
+        let launched = issue_with_session(root, AgentKind::OpenCode, "ses_dead");
+
+        edit_stored_issue(root, |issue| {
+            issue
+                .sessions
+                .insert(AgentKind::OpenCode, "ses_newer".into());
+        });
+
+        record_launch(root, &launched, None, false, true).unwrap();
+        assert_eq!(
+            config::load_state(root).issues[0].current_session_id(),
+            Some("ses_newer")
+        );
+    }
+
+    #[test]
+    fn record_launch_keeps_a_live_session_with_no_new_id() {
+        let dir = setup_project();
+        let root = dir.path();
+        let launched = issue_with_session(root, AgentKind::OpenCode, "ses_live");
+
+        record_launch(root, &launched, None, false, false).unwrap();
+        assert_eq!(
+            config::load_state(root).issues[0].current_session_id(),
+            Some("ses_live")
+        );
+    }
+
+    #[test]
+    fn record_launch_replaces_a_lost_session_with_the_new_id() {
+        let dir = setup_project();
+        let root = dir.path();
+        let launched = issue_with_session(root, AgentKind::Claude, "dead-uuid");
+
+        record_launch(root, &launched, Some("new-uuid".into()), false, true).unwrap();
+        assert_eq!(
+            config::load_state(root).issues[0].current_session_id(),
+            Some("new-uuid")
+        );
+    }
+
+    #[test]
+    fn record_launch_keeps_other_agents_sessions() {
+        let dir = setup_project();
+        let root = dir.path();
+        let launched = issue_with_session(root, AgentKind::OpenCode, "ses_dead");
+        edit_stored_issue(root, |issue| {
+            issue.sessions.insert(AgentKind::Claude, "uuid-1".into());
+        });
+
+        record_launch(root, &launched, None, false, true).unwrap();
+        let sessions = &config::load_state(root).issues[0].sessions;
+        assert!(!sessions.contains_key(&AgentKind::OpenCode));
+        assert_eq!(
+            sessions.get(&AgentKind::Claude).map(String::as_str),
+            Some("uuid-1")
+        );
+    }
+
+    // Issues with a stored session load with `setup_ran` already set (legacy
+    // migration), so the `setup_ran` tests start from an issue without one.
+
+    #[test]
+    fn record_launch_marks_setup_ran_without_a_session_id() {
+        let dir = setup_project();
+        let root = dir.path();
+        let launched = issue_without_session(root, AgentKind::OpenCode);
+        assert!(!launched.setup_ran);
+
+        record_launch(root, &launched, None, true, false).unwrap();
+        let issue = &config::load_state(root).issues[0];
+        assert!(issue.setup_ran);
+        assert!(issue.sessions.is_empty());
+    }
+
+    #[test]
+    fn record_launch_ignores_a_launch_from_before_a_kind_change() {
+        let dir = setup_project();
+        let root = dir.path();
+        let launched = issue_without_session(root, AgentKind::OpenCode);
+        edit_stored_issue(root, |issue| issue.kind = IssueKind::NonAgentic);
+
+        record_launch(root, &launched, Some("ses_new".into()), true, false).unwrap();
+        let issue = &config::load_state(root).issues[0];
+        assert!(!issue.setup_ran);
+        assert!(issue.sessions.is_empty());
+    }
+
+    #[test]
+    fn record_launch_after_an_agent_change_keeps_setup_ran_only() {
+        let dir = setup_project();
+        let root = dir.path();
+        let launched = issue_without_session(root, AgentKind::OpenCode);
+        edit_stored_issue(root, |issue| issue.agent_kind = AgentKind::Claude);
+
+        record_launch(root, &launched, Some("ses_new".into()), true, false).unwrap();
+        let issue = &config::load_state(root).issues[0];
+        assert!(issue.setup_ran);
+        assert!(issue.sessions.is_empty());
+    }
+
+    #[test]
+    fn record_launch_after_an_agent_change_keeps_the_lost_session() {
+        let dir = setup_project();
+        let root = dir.path();
+        let launched = issue_with_session(root, AgentKind::OpenCode, "ses_dead");
+        edit_stored_issue(root, |issue| issue.agent_kind = AgentKind::Claude);
+
+        record_launch(root, &launched, None, false, true).unwrap();
+        assert_eq!(
+            config::load_state(root).issues[0]
+                .sessions
+                .get(&AgentKind::OpenCode)
+                .map(String::as_str),
+            Some("ses_dead")
+        );
+    }
+
+    #[test]
+    fn reset_session_forgets_only_the_chosen_agent() {
+        let dir = setup_project();
+        let root = dir.path();
+        create_issue(
+            root,
+            CreateOptions {
+                title: "Lost session".into(),
+                agent_kind: Some(AgentKind::OpenCode),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mut state = config::load_state(root);
+        state.issues[0]
+            .sessions
+            .insert(AgentKind::OpenCode, "ses_abc".into());
+        state.issues[0]
+            .sessions
+            .insert(AgentKind::Claude, "uuid-1".into());
+        config::save_state(&state, root).unwrap();
+
+        let reset = reset_session(root, "test-1", None).unwrap();
+        assert_eq!(reset.agent, AgentKind::OpenCode);
+        assert!(reset.removed);
+
+        let sessions = &config::load_state(root).issues[0].sessions;
+        assert!(!sessions.contains_key(&AgentKind::OpenCode));
+        assert_eq!(
+            sessions.get(&AgentKind::Claude).map(String::as_str),
+            Some("uuid-1")
+        );
+
+        let again = reset_session(root, "test-1", Some(AgentKind::Codex)).unwrap();
+        assert!(!again.removed);
     }
 
     #[test]
@@ -980,6 +1503,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: Some(IssueKind::Orchestrator),
             },
         )
@@ -1006,6 +1530,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -1036,6 +1561,38 @@ mod tests {
     }
 
     #[test]
+    fn delete_removes_the_saved_plans_and_archive_keeps_them() {
+        let dir = setup_project();
+        let root = dir.path();
+        crate::issue_plan::test_support::enable_backups(root);
+        for title in ["Delete me", "Archive me"] {
+            create_issue(
+                root,
+                CreateOptions {
+                    title: title.into(),
+                    column: None,
+                    agent_kind: None,
+                    agent_mode: None,
+                    prompt: None,
+                    model: None,
+                    kind: None,
+                },
+            )
+            .unwrap();
+        }
+        for id in ["test-1", "test-2"] {
+            fs::create_dir_all(root.join("plans").join(id)).unwrap();
+            fs::write(root.join("plans").join(id).join("planning.md"), id).unwrap();
+        }
+
+        delete_issue(root, "test-1").unwrap();
+        archive_issue(root, "test-2", false).unwrap();
+
+        assert!(!root.join("plans/test-1").exists());
+        assert!(root.join("plans/test-2/planning.md").exists());
+    }
+
+    #[test]
     fn delete_nonexistent_fails() {
         let dir = setup_project();
         assert!(delete_issue(dir.path(), "nope-99").is_err());
@@ -1054,6 +1611,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: Some("A prompt".into()),
+                model: None,
                 kind: None,
             },
         )
@@ -1078,6 +1636,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -1102,6 +1661,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -1114,6 +1674,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -1145,6 +1706,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -1177,6 +1739,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -1200,6 +1763,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -1222,6 +1786,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         );
@@ -1241,6 +1806,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -1262,6 +1828,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -1292,6 +1859,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: Some(IssueKind::Orchestrator),
             },
         )
@@ -1325,6 +1893,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )
@@ -1346,6 +1915,7 @@ mod tests {
                 agent_kind: None,
                 agent_mode: None,
                 prompt: None,
+                model: None,
                 kind: None,
             },
         )

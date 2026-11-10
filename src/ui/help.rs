@@ -30,6 +30,9 @@ const PROJECTS_SECTION: Section = Section {
     bindings: &[
         ("Ctrl+P", "Toggle project sidebar"),
         ("Space", "Toggle swimlane (sidebar)"),
+        ("Shift+J / K", "Move project (sidebar)"),
+        ("Shift+R", "Rename project (sidebar)"),
+        ("Shift+D", "Remove from list (sidebar)"),
         ("Tab / S-Tab", "Switch swimlane focus"),
     ],
 };
@@ -85,6 +88,7 @@ const SECTIONS: &[Section] = &[
             ("/", "Search"),
             ("!", "Only cards that need you"),
             ("P", "Sync PRs"),
+            ("Shift+B", "Back up now"),
             ("W", "Prune worktrees"),
             ("o", "Open PR / stack"),
             ("s", "Expand stack or PRs"),

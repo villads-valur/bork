@@ -9,8 +9,12 @@ use crate::config::{AppConfig, AppState};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectEntry {
+    /// Follows `project_name` in the project's config.toml.
     pub name: String,
     pub path: PathBuf,
+    /// Name set from the sidebar. Shown instead of `name` when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -116,7 +120,7 @@ fn lock_config_file() -> Option<File> {
     Some(file)
 }
 
-fn normalize_path(path: &Path) -> PathBuf {
+pub(crate) fn normalize_path(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
@@ -136,6 +140,7 @@ pub fn register_project(name: &str, path: &Path) -> anyhow::Result<()> {
         config.projects.push(ProjectEntry {
             name: name.to_string(),
             path: canonical,
+            label: None,
         });
     }
 
@@ -157,6 +162,7 @@ pub fn register_if_absent(name: &str, path: &Path) -> anyhow::Result<()> {
         config.projects.push(ProjectEntry {
             name: name.to_string(),
             path: canonical,
+            label: None,
         });
         save_global_config(&config)?;
     }
@@ -180,6 +186,52 @@ pub fn unregister_project(path: &Path) -> anyhow::Result<bool> {
     Ok(removed)
 }
 
+/// Sets or clears the sidebar label for `path` and returns the saved
+/// registry. A label can't match another project's name or label, since
+/// `--project` resolves by both.
+pub fn set_project_label(path: &Path, label: Option<&str>) -> anyhow::Result<Vec<ProjectEntry>> {
+    let _lock = lock_config_file();
+    let canonical = normalize_path(path);
+    let mut config = load_global_config();
+
+    if let Some(label) = label {
+        let taken = config.projects.iter().any(|entry| {
+            normalize_path(&entry.path) != canonical
+                && (entry.name == label || entry.label.as_deref() == Some(label))
+        });
+        if taken {
+            anyhow::bail!("A project named '{}' already exists", label);
+        }
+    }
+    let entry = config
+        .projects
+        .iter_mut()
+        .find(|e| normalize_path(&e.path) == canonical)
+        .ok_or_else(|| anyhow::anyhow!("Project is not registered"))?;
+    entry.label = label.map(str::to_string);
+
+    save_global_config(&config)?;
+    Ok(config.projects)
+}
+
+/// Sorts the registry to follow `order` and returns the saved registry.
+/// Entries missing from `order` keep their relative order at the end.
+pub fn set_project_order(order: &[PathBuf]) -> anyhow::Result<Vec<ProjectEntry>> {
+    let _lock = lock_config_file();
+    let mut config = load_global_config();
+
+    config.projects.sort_by_key(|entry| {
+        let canonical = normalize_path(&entry.path);
+        order
+            .iter()
+            .position(|path| *path == canonical)
+            .unwrap_or(usize::MAX)
+    });
+
+    save_global_config(&config)?;
+    Ok(config.projects)
+}
+
 pub fn prune_stale_projects() {
     let _lock = lock_config_file();
     let mut config = load_global_config();
@@ -194,6 +246,23 @@ pub fn prune_stale_projects() {
 
 pub fn list_projects() -> Vec<ProjectEntry> {
     load_global_config().projects
+}
+
+/// Like [`list_projects`], but an unreadable or corrupt `projects.json` is an
+/// error instead of an empty list (a missing file is still empty). For
+/// callers where "no projects" must not be mistaken for a read failure.
+pub fn try_list_projects() -> anyhow::Result<Vec<ProjectEntry>> {
+    let path = global_config_path();
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(anyhow::Error::new(err).context(format!("reading {}", path.display())))
+        }
+    };
+    let config: GlobalConfig = serde_json::from_str(&contents)
+        .map_err(|err| anyhow::anyhow!("parsing {}: {err}", path.display()))?;
+    Ok(config.projects)
 }
 
 #[derive(Default)]
@@ -357,6 +426,74 @@ pub(crate) mod tests {
             assert_eq!(projects[0].name, "proj-v2");
 
             let _ = fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn label_sets_clears_and_rejects_duplicates() {
+        with_temp_config("label", || {
+            let dir1 = make_temp_dir("label1");
+            let dir2 = make_temp_dir("label2");
+            register_project("alpha", &dir1).unwrap();
+            register_project("beta", &dir2).unwrap();
+
+            let saved = set_project_label(&dir1, Some("Alpha (main)")).unwrap();
+            assert_eq!(saved[0].label.as_deref(), Some("Alpha (main)"));
+            assert_eq!(list_projects()[0].label.as_deref(), Some("Alpha (main)"));
+            // Its own name and label are not duplicates.
+            set_project_label(&dir1, Some("Alpha (main)")).unwrap();
+            set_project_label(&dir1, Some("alpha")).unwrap();
+
+            assert!(set_project_label(&dir2, Some("alpha")).is_err());
+            set_project_label(&dir1, Some("Alpha (main)")).unwrap();
+            assert!(set_project_label(&dir2, Some("Alpha (main)")).is_err());
+            assert_eq!(list_projects()[1].label, None);
+            assert!(set_project_label(Path::new("/not/registered"), Some("x")).is_err());
+
+            set_project_label(&dir1, None).unwrap();
+            assert_eq!(list_projects()[0].label, None);
+
+            let _ = fs::remove_dir_all(&dir1);
+            let _ = fs::remove_dir_all(&dir2);
+        });
+    }
+
+    #[test]
+    fn register_keeps_label_and_refreshes_name() {
+        with_temp_config("register-label", || {
+            let dir = make_temp_dir("register-label");
+            register_project("old", &dir).unwrap();
+            set_project_label(&dir, Some("Custom")).unwrap();
+
+            register_project("new", &dir).unwrap();
+
+            let entry = &list_projects()[0];
+            assert_eq!(entry.name, "new");
+            assert_eq!(entry.label.as_deref(), Some("Custom"));
+            let _ = fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn set_order_sorts_known_and_keeps_unknown_last() {
+        with_temp_config("order", || {
+            let dirs: Vec<PathBuf> = ["order-a", "order-b", "order-c"]
+                .iter()
+                .map(|name| make_temp_dir(name))
+                .collect();
+            for (dir, name) in dirs.iter().zip(["a", "b", "c"]) {
+                register_project(name, dir).unwrap();
+            }
+
+            let order = vec![normalize_path(&dirs[1]), normalize_path(&dirs[0])];
+            let saved = set_project_order(&order).unwrap();
+            let names: Vec<&str> = saved.iter().map(|e| e.name.as_str()).collect();
+            assert_eq!(names, ["b", "a", "c"]);
+            assert_eq!(list_projects()[0].name, "b");
+
+            for dir in &dirs {
+                let _ = fs::remove_dir_all(dir);
+            }
         });
     }
 

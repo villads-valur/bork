@@ -274,6 +274,19 @@ fn format_bottom_line(ctx: &CardContext, max_width: usize) -> Line<'static> {
         ));
         left.push(Span::raw(" "));
     }
+    let used = left.iter().map(Span::width).sum::<usize>() + comments_width;
+    if !issue.linear_projects.is_empty() && left_budget > used + 2 {
+        let names: Vec<&str> = issue
+            .linear_projects
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        left.push(Span::styled(
+            styles::truncate(&format!("▤ {}", names.join(", ")), left_budget - used),
+            Style::default().fg(Color::Blue),
+        ));
+        left.push(Span::raw(" "));
+    }
     if let Some(badge) = comments {
         left.push(badge);
     }
@@ -377,8 +390,9 @@ fn format_pr_rows(ctx: &CardContext, width: usize, compact: bool) -> Vec<Line<'s
         };
         let count = stack.pull_requests.len();
         if !compact && count <= 2 && count > 0 && ctx.project.live.stacks_available {
-            return stack
-                .pull_requests
+            return ctx
+                .project
+                .detail_members(ctx.issue)
                 .iter()
                 .enumerate()
                 .map(|(index, member)| {
@@ -470,7 +484,12 @@ fn format_pr_rows(ctx: &CardContext, width: usize, compact: bool) -> Vec<Line<'s
         return vec![Line::from(header)];
     }
 
-    let mut numbers = ctx.issue.pr_numbers();
+    let mut numbers: Vec<_> = ctx
+        .project
+        .linked_pr_members(ctx.issue)
+        .into_iter()
+        .map(|member| member.number)
+        .collect();
     if numbers.is_empty() {
         if let Some(pr) = ctx.pr {
             numbers.push(pr.number);

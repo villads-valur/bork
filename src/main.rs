@@ -1,6 +1,7 @@
 mod agent_config;
 mod app;
 mod attention;
+mod backup;
 mod cloud;
 mod config;
 mod dialog_state;
@@ -11,6 +12,7 @@ mod global_config;
 mod handler;
 mod init;
 mod input;
+mod issue_plan;
 mod lock;
 mod ops;
 mod prune;
@@ -109,6 +111,10 @@ const PORT_POLL_INTERVAL: Duration = Duration::from_secs(10);
 const LINEAR_POLL_INTERVAL: Duration = Duration::from_secs(45);
 const TUICR_POLL_INTERVAL: Duration = Duration::from_secs(10);
 const PR_POLL_INTERVAL: Duration = Duration::from_secs(60);
+/// PR polling for projects that are neither focused nor a swimlane. Only
+/// feeds the sidebar's needs-you dot, so it can run slower.
+const BACKGROUND_PR_POLL_INTERVAL: Duration = Duration::from_secs(180);
+const BACKGROUND_BRANCH_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const STATE_POLL_TICKS: usize = 40; // 40 * 50ms = 2s
 /// Minimum interval between auto-prune checks (and thus toasts) for the same
 /// project. Keeps the tick loop from counting worktrees constantly and the
@@ -378,13 +384,15 @@ fn spawn_linear_worker(
 
     thread::spawn(move || loop {
         wait_while_suspended(&suspended);
-        let result = match external::linear::fetch_assigned_issues() {
-            Ok(issues) => LinearPollResult {
+        let result = match external::linear::fetch_poll() {
+            Ok((issues, projects)) => LinearPollResult {
                 issues,
+                projects,
                 error: None,
             },
             Err(e) => LinearPollResult {
                 issues: Vec::new(),
+                projects: Vec::new(),
                 error: Some(e.to_string()),
             },
         };
@@ -399,11 +407,98 @@ fn spawn_linear_worker(
     rx
 }
 
+/// Daily backup of every opted-in project. Sends the recorded status right
+/// away, checks `STARTUP_DELAY` after startup and then hourly whether a
+/// backup is due, and runs one when it is (or when woken by "back up now").
+/// `backup::run` holds the backup flock, so a concurrent `bork backup`
+/// serializes with it.
+fn spawn_backup_worker(
+    suspended: Arc<AtomicBool>,
+    wake_rx: mpsc::Receiver<()>,
+) -> mpsc::Receiver<backup::schedule::Report> {
+    use backup::schedule::{self, Report};
+
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        // An unreadable registry or project config is an error, not "off".
+        let enabled = || {
+            global_config::try_list_projects()
+                .map_err(|err| format!("{err:#}"))
+                .and_then(|projects| {
+                    schedule::any_enabled(projects.iter().map(|entry| {
+                        backup::config::project_enabled(&global_config::normalize_path(&entry.path))
+                    }))
+                })
+        };
+
+        if backup::full_backup_file().is_some() {
+            let record = backup::full_backup_record();
+            let report =
+                schedule::startup_report(schedule::blocked(true, enabled()), record.as_ref());
+            if tx.send(report).is_err() {
+                return;
+            }
+        }
+
+        // A failed attempt `backup::run` couldn't record (e.g. an unusable
+        // backup.lock) still needs the hourly retry.
+        let mut last_attempt_failed = false;
+        let mut wait = schedule::STARTUP_DELAY;
+        loop {
+            let manual = match sleep_until_wake(&wake_rx, wait) {
+                WakeReason::Disconnected => break,
+                WakeReason::Woken => true,
+                WakeReason::Timeout => false,
+            };
+            wait = schedule::CHECK_INTERVAL;
+            wait_while_suspended(&suspended);
+
+            let mut status_warning = None;
+            let check = schedule::decide(
+                schedule::blocked(backup::full_backup_file().is_some(), enabled()),
+                manual,
+                || {
+                    let last = backup::full_backup_record();
+                    schedule::retry_or_due(
+                        last.as_ref(),
+                        backup::is_due(app::unix_now()),
+                        last_attempt_failed,
+                    )
+                },
+                || {
+                    backup::run(&backup::Selection::All)
+                        .map(|outcome| {
+                            outcome.map(|o| {
+                                status_warning = o.status_warning;
+                                o.written
+                            })
+                        })
+                        .map_err(|err| format!("{err:#}"))
+                },
+            );
+            last_attempt_failed = matches!(check, schedule::Check::Ran(Err(_)));
+            let record = backup::full_backup_record();
+            let indicator = schedule::indicator(&check, record.as_ref());
+            let report = Report {
+                status_warning,
+                ..Report::new(indicator, manual.then_some(check), record.as_ref())
+            };
+            if tx.send(report).is_err() {
+                break;
+            }
+        }
+    });
+
+    rx
+}
+
 fn spawn_pr_poll_worker(
     main_worktree: PathBuf,
     targets: Arc<Mutex<github_poll::Targets>>,
     suspended: Arc<AtomicBool>,
     wake_rx: mpsc::Receiver<github_poll::Wake>,
+    interval: Duration,
 ) -> mpsc::Receiver<PrPollResult> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
@@ -478,7 +573,7 @@ fn spawn_pr_poll_worker(
                 let _ = tx.send(cache.result.clone());
             }
             force = false;
-            let wait = PR_POLL_INTERVAL
+            let wait = interval
                 .saturating_sub(cycle_started.elapsed())
                 .max(Duration::from_secs(1));
             match wake_rx.recv_timeout(wait) {
@@ -514,6 +609,9 @@ Start here (for AI agents):
                                  (--base <branch> to pick its base branch)
   bork issue archive <id>        Kill session + teardown + remove worktree
                                  (--force to discard uncommitted changes)
+  bork integration attach-pr <pr>
+                                 Link a PR you opened to your issue (run it
+                                 right after creating the PR)
 
   Agentic issues each run one coding agent. Pick which and how with:
     --agent   {agents}     # must be on your PATH
@@ -644,6 +742,45 @@ enum Command {
         check: bool,
     },
 
+    /// Write boards, container docs and issue plans of opted-in projects to one backup file
+    #[command(args_conflicts_with_subcommands = true)]
+    Backup {
+        #[command(subcommand)]
+        command: Option<BackupCommand>,
+
+        /// Write a separate file with only this project (name, label or path)
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Print the backup file path and its contents without writing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Restore projects, boards and plans from a `bork backup` file
+    Import {
+        /// Path to a backup file written by `bork backup` (any name). Defaults
+        /// to this Mac's backup file in the configured backup path.
+        file: Option<PathBuf>,
+
+        /// Only restore this project (name or label in the backup)
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Restore each project to <root>/<name> instead of its recorded path
+        #[arg(long)]
+        root: Option<PathBuf>,
+
+        /// Restore over existing directories and the global config. Never
+        /// deletes main/ or worktrees, only overwrites the restored files.
+        #[arg(long)]
+        force: bool,
+
+        /// Print what would be cloned, written and registered without changing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Prune stale worktrees from the project on disk.
     Prune {
         /// Print what would be removed without touching anything
@@ -661,7 +798,18 @@ enum Command {
         /// Skip these worktree directory names
         #[arg(long)]
         exclude: Vec<String>,
+
+        /// Remove worktrees even when their issue plan can't be saved (dirty
+        /// worktrees are still skipped)
+        #[arg(long)]
+        force: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum BackupCommand {
+    /// Show backup settings, opted-in projects and the last result per file
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -754,6 +902,10 @@ enum IssueCommand {
         #[arg(long)]
         prompt: Option<String>,
 
+        /// Model passed to the agent's --model flag (e.g. sonnet). Not supported by opencode.
+        #[arg(long)]
+        model: Option<String>,
+
         /// Issue kind (agentic, todo, orchestrator)
         #[arg(long, value_parser = parse_issue_kind)]
         kind: Option<IssueKind>,
@@ -776,6 +928,10 @@ enum IssueCommand {
         #[arg(long, value_parser = parse_agent_mode)]
         mode: Option<AgentMode>,
 
+        /// Model passed to the agent's --model flag (e.g. sonnet). Not supported by opencode.
+        #[arg(long)]
+        model: Option<String>,
+
         /// Branch/worktree slug. Defaults to a slug generated from the title.
         #[arg(long)]
         slug: Option<String>,
@@ -796,6 +952,10 @@ enum IssueCommand {
         /// to the spawning issue when run from inside an agent session.
         #[arg(long)]
         link: Option<String>,
+
+        /// Linear ticket to link before the agent starts (e.g. VIL-123)
+        #[arg(long)]
+        linear: Option<String>,
     },
 
     /// Update an existing issue
@@ -823,6 +983,10 @@ enum IssueCommand {
         #[arg(long)]
         prompt: Option<String>,
 
+        /// Change the model for the next launch (empty string clears it)
+        #[arg(long)]
+        model: Option<String>,
+
         /// Change issue kind (agentic, todo, orchestrator)
         #[arg(long, value_parser = parse_issue_kind)]
         kind: Option<IssueKind>,
@@ -838,10 +1002,27 @@ enum IssueCommand {
         force: bool,
     },
 
+    /// Run an issue's agent in this terminal: setup script, then the agent
+    /// (bork types this into the issue's tmux pane)
+    Launch {
+        /// Issue ID (e.g. bork-1)
+        id: String,
+    },
+
     /// Delete an issue
     Delete {
         /// Issue ID (e.g. bork-1)
         id: String,
+    },
+
+    /// Forget an issue's stored agent session so the next launch starts fresh
+    ResetSession {
+        /// Issue ID (e.g. bork-1)
+        id: String,
+
+        /// Agent whose session to forget (defaults to the issue's agent)
+        #[arg(long, value_parser = parse_agent_kind)]
+        agent: Option<AgentKind>,
     },
 
     /// Show issue details
@@ -880,13 +1061,13 @@ enum IntegrationCommand {
         linear_identifier: String,
     },
 
-    /// Link a GitHub PR to an issue
+    /// Link a GitHub PR to an issue. The issue ID can be left out inside an
+    /// agent session, where it defaults to `BORK_ISSUE_ID`.
+    #[command(override_usage = "bork integration attach-pr [ISSUE_ID] <PR_NUMBER>")]
     AttachPr {
-        /// Issue ID (e.g. bork-1)
-        issue_id: String,
-
-        /// GitHub PR number
-        pr_number: u32,
+        /// Optional issue ID (e.g. bork-1), then the GitHub PR number
+        #[arg(num_args = 1..=2, value_names = ["ISSUE_ID", "PR_NUMBER"], required = true)]
+        args: Vec<String>,
     },
 
     /// Unlink a Linear ticket from an issue
@@ -905,6 +1086,24 @@ enum IntegrationCommand {
 
         /// GitHub PR number
         pr_number: u32,
+    },
+
+    /// Link a Linear project to an orchestrator issue
+    AttachLinearProject {
+        /// Issue ID (e.g. bork-1)
+        issue_id: String,
+
+        /// Linear project URL or slug (e.g. https://linear.app/acme/project/auth-1a2b3c4d5e6f)
+        project: String,
+    },
+
+    /// Unlink a Linear project from an issue
+    DetachLinearProject {
+        /// Issue ID (e.g. bork-1)
+        issue_id: String,
+
+        /// Linear project URL or slug
+        project: String,
     },
 
     /// Remove all Linear links from an issue
@@ -1021,12 +1220,29 @@ fn main() -> anyhow::Result<()> {
                 update::run_update()
             }
         }
+        Some(Command::Backup {
+            command: Some(BackupCommand::Status),
+            ..
+        }) => run_backup_status(),
+        Some(Command::Backup {
+            command: None,
+            project,
+            dry_run,
+        }) => run_backup_command(project.as_deref(), dry_run),
+        Some(Command::Import {
+            file,
+            project,
+            root,
+            force,
+            dry_run,
+        }) => run_import_command(file.as_deref(), project, root, force, dry_run),
         Some(Command::Prune {
             dry_run,
             yes,
             include,
             exclude,
-        }) => run_prune_command(dry_run, yes, &include, &exclude),
+            force,
+        }) => run_prune_command(dry_run, yes, &include, &exclude, force),
         None => run_tui(),
     }
 }
@@ -1036,6 +1252,7 @@ fn run_prune_command(
     yes: bool,
     include: &[String],
     exclude: &[String],
+    force: bool,
 ) -> anyhow::Result<()> {
     use crate::prune::{
         apply_outcome_to_issues, execute_removals, partition_selection, PruneAction,
@@ -1127,12 +1344,16 @@ fn run_prune_command(
         }
     }
 
-    let outcome = execute_removals(&config.project_root, &to_remove, &dirty_names);
+    let outcome = execute_removals(&config.project_root, &to_remove, &dirty_names, force);
 
     for result in &outcome.results {
         match &result.outcome {
             RemoveOutcome::Removed => println!("Removed: {}", result.worktree),
             RemoveOutcome::Failed(msg) => println!("Failed: {} ({})", result.worktree, msg),
+            RemoveOutcome::PlanNotSaved { error, .. } => println!(
+                "Kept: {} (couldn't save its plan: {error})",
+                result.worktree
+            ),
         }
     }
 
@@ -1142,6 +1363,13 @@ fn run_prune_command(
     config::save_state(&state, &config.project_root)?;
 
     println!("\nDone. Pruned {} worktree(s).", outcome.removed_count());
+    let plan_not_saved = outcome.plan_not_saved();
+    if !plan_not_saved.is_empty() {
+        anyhow::bail!(
+            "kept {} worktree(s) whose plan couldn't be saved; fix it or re-run with --force to remove them and lose the plans",
+            plan_not_saved.len()
+        );
+    }
     if outcome.failed_count() > 0 {
         anyhow::bail!(
             "{} worktree(s) failed, see .bork/errors.log",
@@ -1149,6 +1377,171 @@ fn run_prune_command(
         );
     }
     Ok(())
+}
+
+const NOTHING_TO_BACK_UP: &str = "Nothing to back up. Opt a project in with `enabled = true` under [backup] in its .bork/config.toml.";
+
+fn run_backup_command(project: Option<&str>, dry_run: bool) -> anyhow::Result<()> {
+    let selection = match project {
+        Some(name) => backup::Selection::Project(lookup_project_root(name)?),
+        None => backup::Selection::All,
+    };
+
+    if dry_run {
+        let Some(plan) = backup::plan(&selection)? else {
+            println!("{NOTHING_TO_BACK_UP}");
+            return Ok(());
+        };
+        println!("{}", plan.file.display());
+        println!("  {}", backup::manifest::MANIFEST_FILE);
+        for entry in &plan.entries {
+            println!("  {}", entry.path);
+        }
+        warn_local_only_repos(&plan.local_only_repos);
+        return Ok(());
+    }
+
+    let Some(outcome) = backup::run(&selection)? else {
+        println!("{NOTHING_TO_BACK_UP}");
+        return Ok(());
+    };
+    let what = if outcome.written {
+        "wrote"
+    } else {
+        "unchanged"
+    };
+    println!(
+        "{what} {} ({}, {})",
+        outcome.file.display(),
+        format_size(outcome.size),
+        outcome.projects.join(", ")
+    );
+    warn_local_only_repos(&outcome.local_only_repos);
+    if let Some(warning) = &outcome.status_warning {
+        eprintln!("warning: {warning}");
+    }
+    Ok(())
+}
+
+fn run_import_command(
+    file: Option<&Path>,
+    project: Option<String>,
+    root: Option<PathBuf>,
+    force: bool,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir()?;
+    let opts = backup::import::Options {
+        project,
+        root: root.map(|r| cwd.join(r)),
+        force,
+        dry_run,
+    };
+    let file = match file {
+        Some(file) => cwd.join(file),
+        None => backup::full_backup_file().ok_or_else(|| {
+            anyhow::anyhow!("no backup path configured; pass the backup file: bork import <file>")
+        })?,
+    };
+    let report = backup::import::import(&file, &opts)?;
+    println!("{}", report.render());
+    if !dry_run && report.any_restored() {
+        // Like `bork init`, a fresh machine needs the agent hooks. Project
+        // skills came back with the restored files, so they're left alone.
+        if let Err(err) = external::hooks::install_agent_hooks() {
+            eprintln!("Warning: hook installation failed: {err}");
+            eprintln!("You can run 'bork install' later to set up hooks.");
+        }
+    }
+    if report.failed() {
+        anyhow::bail!("some projects were not fully restored, see above");
+    }
+    Ok(())
+}
+
+/// Skipped nested repos aren't backed up; flag the ones with no remote,
+/// since their content exists nowhere else.
+fn warn_local_only_repos(repos: &[PathBuf]) {
+    if repos.is_empty() {
+        return;
+    }
+    eprintln!(
+        "warning: these git repos are skipped and have no remote, so nothing else holds them:"
+    );
+    for repo in repos {
+        eprintln!("  {}", repo.display());
+    }
+}
+
+fn run_backup_status() -> anyhow::Result<()> {
+    let settings = backup::config::load_settings();
+    match &settings.path {
+        Some(path) => println!(
+            "path: {} (backed up daily, and on `bork backup`)",
+            path.display()
+        ),
+        None => println!("path: not set (set `path` under [backup] in ~/.config/bork/config.toml)"),
+    }
+    println!("this machine: {}", backup::backup_file_name());
+
+    println!("projects:");
+    for entry in global_config::list_projects() {
+        match backup::config::project_enabled(&entry.path) {
+            Ok(true) => println!("  {}: on", entry.name),
+            Ok(false) => println!("  {}: off", entry.name),
+            Err(err) => println!("  {}: unknown ({err:#})", entry.name),
+        }
+    }
+
+    let records = backup::status::read(&backup::status::status_path()).archives;
+    if records.is_empty() {
+        println!("no backups yet");
+        return Ok(());
+    }
+    let now = app::unix_now();
+    println!("files:");
+    for (file, s) in records {
+        let ago = format_age(now.saturating_sub(s.last_run_at));
+        let result = if s.ok {
+            format!("ok {ago} ago")
+        } else {
+            let since = s
+                .last_success_at
+                .map(|t| format!(", last success {} ago", format_age(now.saturating_sub(t))))
+                .unwrap_or_default();
+            format!("FAILED {ago} ago: {}{since}", s.error.unwrap_or_default())
+        };
+        let size = if s.last_success_at.is_some() {
+            format!(", {} ({})", format_size(s.size), s.projects.join(", "))
+        } else {
+            String::new()
+        };
+        println!("  {}: {result}{size}", file.display());
+        if !s.local_only_repos.is_empty() {
+            println!("    skipped repos with no remote (not backed up anywhere):");
+            for repo in &s.local_only_repos {
+                println!("      {}", repo.display());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn format_age(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m", secs / 60),
+        3600..86_400 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86_400),
+    }
+}
+
+fn format_size(bytes: u64) -> String {
+    match bytes {
+        0..1024 => format!("{bytes} B"),
+        1024..1_048_576 => format!("{:.1} KB", bytes as f64 / 1024.0),
+        _ => format!("{:.1} MB", bytes as f64 / 1_048_576.0),
+    }
 }
 
 fn run_project_command(command: ProjectCommand) -> anyhow::Result<()> {
@@ -1161,7 +1554,12 @@ fn run_project_command(command: ProjectCommand) -> anyhow::Result<()> {
                 println!("Run 'bork init' or 'bork project add' to register a project.");
             } else {
                 for entry in &projects {
-                    println!("  {} ({})", entry.name, entry.path.display());
+                    match &entry.label {
+                        Some(label) => {
+                            println!("  {} [{}] ({})", label, entry.name, entry.path.display())
+                        }
+                        None => println!("  {} ({})", entry.name, entry.path.display()),
+                    }
                 }
             }
             Ok(())
@@ -1352,6 +1750,7 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
             agent,
             mode,
             prompt,
+            model,
             kind,
         } => {
             let issue = ops::create_issue(
@@ -1362,6 +1761,7 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
                     agent_kind: agent,
                     agent_mode: mode,
                     prompt,
+                    model,
                     kind,
                 },
             )?;
@@ -1373,11 +1773,13 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
             prompt,
             agent,
             mode,
+            model,
             slug,
             no_worktree,
             base,
             project,
             link,
+            linear,
         } => {
             let project_root = resolve_start_project_root(project.as_deref())?;
             let report = start_issue(
@@ -1387,10 +1789,12 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
                     prompt,
                     agent_kind: agent,
                     agent_mode: mode,
+                    model,
                     slug,
                     no_worktree,
                     base_branch: base,
                     link,
+                    linear,
                 },
             )?;
             println!("Started {}: \"{}\"", report.issue_id, report.title);
@@ -1411,6 +1815,7 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
             agent,
             mode,
             prompt,
+            model,
             kind,
         } => {
             let issue = ops::update_issue(
@@ -1422,6 +1827,7 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
                     agent_kind: agent,
                     agent_mode: mode,
                     prompt,
+                    model,
                     kind,
                 },
             )?;
@@ -1434,6 +1840,11 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
             if let Some(worktree_dir) = report.worktree_removed {
                 println!("Removed worktree: {}/", worktree_dir);
             }
+            if let Some(code) = report.teardown_failed {
+                eprintln!(
+                    "Warning: teardown_script failed (exit {code}); removed anyway (--force)"
+                );
+            }
             if report.session_killed {
                 println!("Killed session: {}", report.session_name);
             }
@@ -1442,6 +1853,19 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
         IssueCommand::Delete { id } => {
             let issue = ops::delete_issue(&project_root, &id)?;
             println!("Deleted {}: \"{}\"", issue.id, issue.title);
+            Ok(())
+        }
+        IssueCommand::Launch { id } => external::agent::exec_launch(&project_root, &id),
+        IssueCommand::ResetSession { id, agent } => {
+            let reset = ops::reset_session(&project_root, &id, agent)?;
+            if reset.removed {
+                println!(
+                    "Forgot {}'s {} session; the next launch starts a new one",
+                    reset.issue_id, reset.agent
+                );
+            } else {
+                println!("{} has no stored {} session", reset.issue_id, reset.agent);
+            }
             Ok(())
         }
         IssueCommand::Show { id, json } => {
@@ -1478,17 +1902,52 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
     }
 }
 
+/// The issue the current agent session works on, from `BORK_ISSUE_ID`.
+fn session_issue_id() -> Option<String> {
+    std::env::var(external::process::BORK_ISSUE_ID_VAR)
+        .ok()
+        .filter(|id| !id.is_empty())
+}
+
+/// Split `attach-pr` args into (issue id, PR number). A lone PR number uses
+/// the session's issue id.
+fn resolve_attach_pr_args(
+    args: &[impl AsRef<str>],
+    session_issue_id: Option<String>,
+) -> anyhow::Result<(String, u32)> {
+    let (issue_id, pr_number) = match args {
+        [pr] => {
+            let Some(id) = session_issue_id else {
+                anyhow::bail!(
+                    "no issue id given and BORK_ISSUE_ID is not set; use `bork integration attach-pr <issue-id> <pr-number>`"
+                );
+            };
+            (id, pr.as_ref())
+        }
+        [id, pr] => (id.as_ref().to_string(), pr.as_ref()),
+        _ => anyhow::bail!("expected `[issue-id] <pr-number>`"),
+    };
+    let pr_number = pr_number
+        .trim_start_matches('#')
+        .parse::<u32>()
+        .map_err(|_| anyhow::anyhow!("invalid PR number: {pr_number}"))?;
+    Ok((issue_id, pr_number))
+}
+
 struct StartIssueOptions {
     title: String,
     prompt: Option<String>,
     agent_kind: Option<AgentKind>,
     agent_mode: Option<AgentMode>,
+    model: Option<String>,
     slug: Option<String>,
     no_worktree: bool,
     base_branch: Option<String>,
     /// Explicit issue id to link the new issue to. Falls back to `BORK_ISSUE_ID`
     /// (the spawning agent's issue) when None.
     link: Option<String>,
+    /// Linear ticket identifier to link before launch.
+    linear: Option<String>,
 }
 
 struct StartIssueReport {
@@ -1504,6 +1963,12 @@ fn resolve_start_project_root(project: Option<&str>) -> anyhow::Result<PathBuf> 
         return Ok(config::find_project_root());
     };
 
+    global_config::prune_stale_projects();
+    lookup_project_root(project)
+}
+
+/// Resolve a project path, name or label without touching the registry.
+fn lookup_project_root(project: &str) -> anyhow::Result<PathBuf> {
     let project_path = Path::new(project);
     if project_path.exists() {
         if let Some(root) = find_project_root_from(project_path) {
@@ -1511,10 +1976,10 @@ fn resolve_start_project_root(project: Option<&str>) -> anyhow::Result<PathBuf> 
         }
     }
 
-    global_config::prune_stale_projects();
     global_config::list_projects()
         .into_iter()
-        .find(|entry| entry.name == project)
+        .filter(|entry| entry.path.exists())
+        .find(|entry| entry.name == project || entry.label.as_deref() == Some(project))
         .map(|entry| entry.path)
         .ok_or_else(|| anyhow::anyhow!("Project '{}' not found", project))
 }
@@ -1540,9 +2005,14 @@ fn start_issue(project_root: &Path, opts: StartIssueOptions) -> anyhow::Result<S
             agent_kind: opts.agent_kind,
             agent_mode: opts.agent_mode,
             prompt: opts.prompt,
+            model: opts.model,
             kind: Some(IssueKind::Agentic),
         },
     )?;
+    // Linked before launch so the ticket lands in the agent's prompt.
+    if let Some(identifier) = opts.linear.as_deref() {
+        issue = ops::attach_linear(project_root, &issue.id, identifier)?;
+    }
 
     let worktree_dir = if opts.no_worktree {
         None
@@ -1562,9 +2032,8 @@ fn start_issue(project_root: &Path, opts: StartIssueOptions) -> anyhow::Result<S
     };
 
     let launched_agent = issue.agent_kind;
-    let (session_name, agent_session_id, setup_ran) =
-        external::agent::launch_session(&issue, &config)
-            .map_err(|e| anyhow::anyhow!("Failed to launch agent: {e}"))?;
+    let outcome = external::agent::launch_session(&issue, &config)
+        .map_err(|e| anyhow::anyhow!("Failed to launch agent: {e}"))?;
 
     // Resolve the link target: explicit --link wins, else the spawning agent's
     // issue from BORK_ISSUE_ID. Only link when the target exists in this same
@@ -1572,7 +2041,7 @@ fn start_issue(project_root: &Path, opts: StartIssueOptions) -> anyhow::Result<S
     let explicit_link = opts.link.is_some();
     let link_target = opts
         .link
-        .or_else(|| std::env::var("BORK_ISSUE_ID").ok())
+        .or_else(session_issue_id)
         .filter(|id| !id.is_empty() && !id.eq_ignore_ascii_case(&issue.id));
 
     // Reload state so we don't clobber concurrent updates that happened during launch
@@ -1581,17 +2050,12 @@ fn start_issue(project_root: &Path, opts: StartIssueOptions) -> anyhow::Result<S
         if saved.column == Column::Todo {
             saved.column = Column::InProgress;
         }
-        // A kind change during the launch detached what it produced (see
-        // Issue::accepts_launch_result); setup_ran additionally ignores
-        // agent changes since the setup script is agent-independent.
-        if setup_ran && saved.kind == issue.kind {
-            saved.setup_ran = true;
-        }
-        if let Some(sid) =
-            agent_session_id.filter(|_| saved.accepts_launch_result(issue.kind, launched_agent))
-        {
-            saved.sessions.insert(launched_agent, sid);
-        }
+        saved.record_launch(
+            issue.kind,
+            launched_agent,
+            outcome.agent_session_id,
+            outcome.setup_ran,
+        );
     }
     config::save_state(&state, project_root)?;
 
@@ -1624,7 +2088,7 @@ fn start_issue(project_root: &Path, opts: StartIssueOptions) -> anyhow::Result<S
         issue_id: issue.id,
         title: issue.title,
         worktree_dir,
-        session_name,
+        session_name: outcome.session_name,
         linked_to,
     })
 }
@@ -1641,14 +2105,26 @@ fn run_integration_command(command: IntegrationCommand) -> anyhow::Result<()> {
             println!(
                 "Linked {} to Linear {}",
                 issue.id,
-                issue.linear_identifier.as_deref().unwrap_or("?")
+                linear_identifier.to_uppercase()
             );
             Ok(())
         }
-        IntegrationCommand::AttachPr {
-            issue_id,
-            pr_number,
-        } => {
+        IntegrationCommand::AttachLinearProject { issue_id, project } => {
+            let found = external::linear::fetch_project(&project)?;
+            let issue = ops::attach_linear_project(&project_root, &issue_id, found.to_link(false))?;
+            println!("Linked {} to Linear project {}", issue.id, found.name);
+            Ok(())
+        }
+        IntegrationCommand::DetachLinearProject { issue_id, project } => {
+            let slug = external::linear::project_slug(&project).ok_or_else(|| {
+                anyhow::anyhow!("'{project}' is not a Linear project URL or slug")
+            })?;
+            let issue = ops::detach_linear_project(&project_root, &issue_id, &slug)?;
+            println!("Unlinked Linear project {} from {}", slug, issue.id);
+            Ok(())
+        }
+        IntegrationCommand::AttachPr { args } => {
+            let (issue_id, pr_number) = resolve_attach_pr_args(&args, session_issue_id())?;
             let issue = ops::attach_pr(&project_root, &issue_id, pr_number)?;
             println!("Linked {} to PR #{}", issue.id, pr_number);
             Ok(())
@@ -1705,6 +2181,8 @@ struct SharedWorkers {
     linear_wake_tx: mpsc::Sender<()>,
     linear_wake_rx: Option<mpsc::Receiver<()>>,
     tuicr_rx: Option<mpsc::Receiver<external::tuicr::DraftComments>>,
+    backup_rx: mpsc::Receiver<backup::schedule::Report>,
+    backup_wake_tx: mpsc::Sender<()>,
     shutdown: Arc<AtomicBool>,
     /// While set, all pollers idle instead of spawning subprocesses. Used when
     /// the terminal is handed over to a tmux popup or external editor.
@@ -1738,6 +2216,9 @@ fn spawn_shared_workers() -> SharedWorkers {
 
     let (linear_wake_tx, linear_wake_rx) = mpsc::channel::<()>();
 
+    let (backup_wake_tx, backup_wake_rx) = mpsc::channel::<()>();
+    let backup_rx = spawn_backup_worker(poll_suspended.clone(), backup_wake_rx);
+
     SharedWorkers {
         tmux_rx,
         tmux_wake_tx,
@@ -1747,9 +2228,88 @@ fn spawn_shared_workers() -> SharedWorkers {
         linear_wake_tx,
         linear_wake_rx: Some(linear_wake_rx),
         tuicr_rx: None,
+        backup_rx,
+        backup_wake_tx,
         shutdown,
         poll_suspended,
     }
+}
+
+/// PR poller for a project that is neither focused nor a swimlane, so its
+/// sidebar dot reflects PR attention without full git or agent-status
+/// workers. Worktree branches come from one cheap `git worktree list`, so
+/// cards whose PR is only found by branch still count.
+struct BackgroundPrWorker {
+    pr_rx: mpsc::Receiver<PrPollResult>,
+    pr_wake_tx: mpsc::Sender<github_poll::Wake>,
+    targets: Arc<Mutex<github_poll::Targets>>,
+    branch_rx: mpsc::Receiver<HashMap<String, String>>,
+    /// Never sent on; dropping it stops the branch thread.
+    _branch_stop_tx: mpsc::Sender<()>,
+}
+
+fn spawn_background_pr_worker(
+    project: &app::Project,
+    suspended: &Arc<AtomicBool>,
+) -> BackgroundPrWorker {
+    let targets = Arc::new(Mutex::new(github_poll::Targets::for_project(project)));
+    let (pr_wake_tx, pr_wake_rx) = mpsc::channel();
+    let pr_rx = spawn_pr_poll_worker(
+        project.config.project_root.join("main"),
+        targets.clone(),
+        suspended.clone(),
+        pr_wake_rx,
+        BACKGROUND_PR_POLL_INTERVAL,
+    );
+    let (branch_tx, branch_rx) = mpsc::channel();
+    let (branch_stop_tx, branch_stop_rx) = mpsc::channel::<()>();
+    let project_root = project.config.project_root.clone();
+    let suspended = suspended.clone();
+    thread::spawn(move || loop {
+        wait_while_suspended(&suspended);
+        let branches = external::git::list_project_branches(&project_root);
+        if branch_tx.send(branches).is_err() {
+            break;
+        }
+        if !sleep_with_wake(&branch_stop_rx, BACKGROUND_BRANCH_POLL_INTERVAL) {
+            break;
+        }
+    });
+    BackgroundPrWorker {
+        pr_rx,
+        pr_wake_tx,
+        targets,
+        branch_rx,
+        _branch_stop_tx: branch_stop_tx,
+    }
+}
+
+/// Only stores the PR data: imports and title rewrites wait until the project
+/// is shown and gets its full workers.
+fn drain_background_pr_worker(project: &mut app::Project, worker: &BackgroundPrWorker) -> bool {
+    let mut needs_redraw = false;
+    while let Ok(branches) = worker.branch_rx.try_recv() {
+        if project.live.background_branches.as_ref() != Some(&branches) {
+            project.live.background_branches = Some(branches);
+            needs_redraw = true;
+        }
+    }
+
+    let requested = github_poll::Targets::for_project(project);
+    let mut targets = worker
+        .targets
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if *targets != requested {
+        *targets = requested;
+        let _ = worker.pr_wake_tx.send(github_poll::Wake::TargetsChanged);
+    }
+    drop(targets);
+
+    while let Ok(pr_result) = worker.pr_rx.try_recv() {
+        needs_redraw |= apply_pr_result(project, pr_result) != PrApplied::Unchanged;
+    }
+    needs_redraw
 }
 
 fn spawn_project_workers(
@@ -1781,6 +2341,7 @@ fn spawn_project_workers(
         linked_prs.clone(),
         suspended.clone(),
         pr_wake_rx,
+        PR_POLL_INTERVAL,
     );
 
     ProjectWorkers {
@@ -1793,6 +2354,79 @@ fn spawn_project_workers(
         pr_wake_tx,
         linked_prs,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrApplied {
+    Unchanged,
+    /// Only loading state or the GitHub user changed.
+    Redraw,
+    /// PR data changed, so imports and title rewrites should run.
+    DataChanged,
+}
+
+/// Store one PR poll result in the project's live state. Shared by the full
+/// project workers and the PR-only background poller.
+fn apply_pr_result(project: &mut app::Project, pr_result: PrPollResult) -> PrApplied {
+    project.github_available = !pr_result.gh_missing;
+    let live = &mut project.live;
+    if pr_result.started {
+        live.gh_missing = false;
+        live.pr_refreshing = true;
+        return PrApplied::Redraw;
+    }
+    let changed = !pr_result.refreshed_stacks.is_empty()
+        || live.gh_missing != pr_result.gh_missing
+        || live.stacks_unsupported != pr_result.stacks_unsupported
+        || live.pr_refreshing
+        || live.authored_prs_ready != Some(pr_result.authored_ready)
+        || live.review_prs_ready != Some(pr_result.reviews_ready)
+        || live.stack_errors != pr_result.stack_errors
+        || !live.pr_poll_done
+        || live.pr_loading_more != pr_result.loading_more
+        || live.github_error != pr_result.error
+        || live.stacks_available != pr_result.stacks.is_some()
+        || live.pr_statuses != pr_result.prs
+        || live.pr_statuses_by_number != pr_result.prs_by_number
+        || pr_result
+            .stacks
+            .as_ref()
+            .is_some_and(|stacks| live.github_stacks != *stacks)
+        || live.user_prs != pr_result.user_prs
+        || live.review_requested_prs != pr_result.review_requested_prs
+        || live.review_stacks != pr_result.review_stacks
+        || live.changes_requested_prs != pr_result.changes_requested_prs;
+    let mut user_changed = false;
+    if pr_result.github_user.is_some() && live.github_user != pr_result.github_user {
+        live.github_user = pr_result.github_user;
+        user_changed = true;
+    }
+    if !changed {
+        if user_changed {
+            return PrApplied::Redraw;
+        }
+        return PrApplied::Unchanged;
+    }
+    live.pr_refreshing = false;
+    live.authored_prs_ready = Some(pr_result.authored_ready);
+    live.review_prs_ready = Some(pr_result.reviews_ready);
+    live.stack_errors = pr_result.stack_errors;
+    live.gh_missing = pr_result.gh_missing;
+    live.stacks_unsupported = pr_result.stacks_unsupported;
+    live.github_error = pr_result.error;
+    live.pr_loading_more = pr_result.loading_more;
+    live.pr_statuses = pr_result.prs;
+    live.pr_statuses_by_number = pr_result.prs_by_number;
+    live.stacks_available = pr_result.stacks.is_some();
+    if let Some(stacks) = pr_result.stacks {
+        live.github_stacks = stacks;
+    }
+    live.user_prs = pr_result.user_prs;
+    live.review_requested_prs = pr_result.review_requested_prs;
+    live.review_stacks = pr_result.review_stacks;
+    live.changes_requested_prs = pr_result.changes_requested_prs;
+    live.pr_poll_done = true;
+    PrApplied::DataChanged
 }
 
 /// Outcome of draining one project's worker channels for a single tick.
@@ -1886,64 +2520,13 @@ fn drain_project_workers(
     let mut pr_data_changed = false;
     let mut refreshed_stacks = HashSet::new();
     while let Ok(pr_result) = workers.pr_rx.try_recv() {
-        project.github_available = !pr_result.gh_missing;
-        let live = &mut project.live;
-        if pr_result.started {
-            live.gh_missing = false;
-            live.pr_refreshing = true;
-            needs_redraw = true;
-            continue;
-        }
         refreshed_stacks.extend(&pr_result.refreshed_stacks);
-        let changed = !pr_result.refreshed_stacks.is_empty()
-            || live.gh_missing != pr_result.gh_missing
-            || live.stacks_unsupported != pr_result.stacks_unsupported
-            || live.pr_refreshing
-            || live.authored_prs_ready != Some(pr_result.authored_ready)
-            || live.review_prs_ready != Some(pr_result.reviews_ready)
-            || live.stack_errors != pr_result.stack_errors
-            || !live.pr_poll_done
-            || live.pr_loading_more != pr_result.loading_more
-            || live.github_error != pr_result.error
-            || live.stacks_available != pr_result.stacks.is_some()
-            || live.pr_statuses != pr_result.prs
-            || live.pr_statuses_by_number != pr_result.prs_by_number
-            || pr_result
-                .stacks
-                .as_ref()
-                .is_some_and(|stacks| live.github_stacks != *stacks)
-            || live.user_prs != pr_result.user_prs
-            || live.review_requested_prs != pr_result.review_requested_prs
-            || live.review_stacks != pr_result.review_stacks
-            || live.changes_requested_prs != pr_result.changes_requested_prs;
-        if pr_result.github_user.is_some() && live.github_user != pr_result.github_user {
-            live.github_user = pr_result.github_user;
-            needs_redraw = true;
-        }
-        if !changed {
+        let applied = apply_pr_result(project, pr_result);
+        needs_redraw |= applied != PrApplied::Unchanged;
+        if applied != PrApplied::DataChanged {
             continue;
         }
-        needs_redraw = true;
         pr_data_changed = true;
-        live.pr_refreshing = false;
-        live.authored_prs_ready = Some(pr_result.authored_ready);
-        live.review_prs_ready = Some(pr_result.reviews_ready);
-        live.stack_errors = pr_result.stack_errors;
-        live.gh_missing = pr_result.gh_missing;
-        live.stacks_unsupported = pr_result.stacks_unsupported;
-        live.github_error = pr_result.error;
-        live.pr_loading_more = pr_result.loading_more;
-        live.pr_statuses = pr_result.prs;
-        live.pr_statuses_by_number = pr_result.prs_by_number;
-        live.stacks_available = pr_result.stacks.is_some();
-        if let Some(stacks) = pr_result.stacks {
-            live.github_stacks = stacks;
-        }
-        live.user_prs = pr_result.user_prs;
-        live.review_requested_prs = pr_result.review_requested_prs;
-        live.review_stacks = pr_result.review_stacks;
-        live.changes_requested_prs = pr_result.changes_requested_prs;
-        live.pr_poll_done = true;
 
         // Rewrite imported issue titles from the fresh PR titles.
         let pr_titles: Vec<(u32, String)> = project
@@ -2038,11 +2621,13 @@ fn apply_drain_outcome(app: &mut app::App, outcome: DrainOutcome) -> bool {
 
 const ACTIVITY_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Reads every registered project's agent status files so the sidebar's
+/// needs-you dot stays current for projects without their own workers.
 fn spawn_activity_poller(
     projects: Vec<(ProjectId, PathBuf)>,
     suspended: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
-) -> mpsc::Receiver<HashMap<ProjectId, bool>> {
+) -> mpsc::Receiver<HashMap<ProjectId, HashMap<String, AgentStatusInfo>>> {
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || {
@@ -2052,23 +2637,11 @@ fn spawn_activity_poller(
                 break;
             }
             wait_while_suspended(&suspended);
-            let mut activity: HashMap<ProjectId, bool> = HashMap::new();
-            for (id, root) in &projects {
-                let status_dir = root.join(".bork").join("agent-status");
-                let statuses = cache.read(&status_dir);
-                let has_activity = statuses.values().any(|info| {
-                    matches!(
-                        info.status,
-                        types::AgentStatus::Busy
-                            | types::AgentStatus::WaitingInput
-                            | types::AgentStatus::WaitingPermission
-                            | types::AgentStatus::WaitingApproval
-                            | types::AgentStatus::Error
-                    )
-                });
-                activity.insert(id.clone(), has_activity);
-            }
-            if tx.send(activity).is_err() {
+            let statuses = projects
+                .iter()
+                .map(|(id, root)| (id.clone(), cache.read(&config::agent_status_dir(root))))
+                .collect();
+            if tx.send(statuses).is_err() {
                 break;
             }
             thread::sleep(ACTIVITY_POLL_INTERVAL);
@@ -2076,6 +2649,41 @@ fn spawn_activity_poller(
     });
 
     rx
+}
+
+/// Quitting while the Backup Worker runs a backup: wait up to
+/// `schedule::QUIT_WAIT` with "Finishing backup…" and the spinner, then
+/// stop `tar` and remove its temp file and staging dir. Otherwise `tar`
+/// would outlive bork and leave both behind (the backup folder is often a
+/// synced one, like iCloud Drive).
+fn finish_backup_before_quit(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) {
+    use backup::schedule::{quit_step, QuitStep, FINISHING_BACKUP};
+
+    backup::stop_new_runs();
+    let started = std::time::Instant::now();
+    let mut shown = false;
+    loop {
+        match quit_step(backup::in_flight(), started.elapsed()) {
+            QuitStep::Exit => return,
+            QuitStep::Abort => {
+                backup::abort_in_flight();
+                return;
+            }
+            QuitStep::Wait => {}
+        }
+        if !shown {
+            shown = true;
+            app.busy_count += 1;
+            app.set_message(FINISHING_BACKUP);
+        }
+        app.spinner_tick = app.spinner_tick.wrapping_add(1);
+        // The terminal may already be gone (SIGHUP); keep waiting anyway.
+        let _ = terminal.draw(|frame| ui::render(frame, app));
+        // A plain sleep, not `event::poll`: after a hangup (SIGHUP) crossterm
+        // can block in its tty read and never get back to the deadline.
+        // Input is ignored while finishing anyway.
+        thread::sleep(TICK_RATE);
+    }
 }
 
 fn run_tui() -> anyhow::Result<()> {
@@ -2153,7 +2761,8 @@ fn run_tui() -> anyhow::Result<()> {
     let _ = global_config::register_if_absent(&app.project().config.project_name, &current_root);
     let current_canonical =
         std::fs::canonicalize(&current_root).unwrap_or_else(|_| current_root.clone());
-    for entry in &global_config::load_global_config().projects {
+    let registry = global_config::list_projects();
+    for entry in &registry {
         let canonical = std::fs::canonicalize(&entry.path).unwrap_or_else(|_| entry.path.clone());
         if canonical == current_canonical || !entry.path.join(".bork").join("config.toml").exists()
         {
@@ -2163,7 +2772,12 @@ fn run_tui() -> anyhow::Result<()> {
         let proj_state = config::load_state(&entry.path);
         app.add_background_project(proj_config, proj_state);
     }
+    app.sync_with_registry(&registry);
     app.enable_sidebar();
+    let _ = execute!(
+        terminal.backend_mut(),
+        SetTitle(format!("bork: {}", app.project().display_name()))
+    );
 
     // Clean up tmp files left behind by writers that crashed mid-save.
     for project in &app.projects {
@@ -2179,8 +2793,9 @@ fn run_tui() -> anyhow::Result<()> {
     let git_pool = GitStatusPool::new(GIT_STATUS_CONCURRENCY);
     let mut workers = spawn_project_workers(app.project(), &shared.poll_suspended, &git_pool);
     let mut swimlane_workers: HashMap<ProjectId, ProjectWorkers> = HashMap::new();
+    let mut background_pr_workers: HashMap<ProjectId, BackgroundPrWorker> = HashMap::new();
 
-    // --- Activity poller for sidebar markers ---
+    // --- Agent status poller for the sidebar's needs-you dots ---
     let activity_rx = if app.sidebar.is_some() {
         let project_paths: Vec<(ProjectId, PathBuf)> = app
             .projects
@@ -2241,9 +2856,20 @@ fn run_tui() -> anyhow::Result<()> {
     // that stays wrong would otherwise re-raise the same warning forever.
     let mut last_linear_error: Option<String> = None;
     let mut state_poll_counter: usize = 0;
+    // Cleared if the backup worker thread dies (a panic), so a pending
+    // "back up now" doesn't spin forever.
+    let mut backup_worker_alive = true;
+    let mut last_backup_status_mtime = fs::metadata(backup::status::status_path())
+        .and_then(|meta| meta.modified())
+        .ok();
+    // The full backup's record as last seen by that poll, so writes for
+    // other archives (`bork backup --project`) are ignored.
+    let mut last_full_backup_record = backup::full_backup_record();
 
     // --- Main event loop ---
     loop {
+        needs_redraw |= handler::show_queued_force_archive(&mut app);
+        needs_redraw |= handler::show_queued_force_prune(&mut app);
         if needs_redraw {
             terminal.draw(|frame| {
                 ui::render(frame, &app);
@@ -2285,6 +2911,7 @@ fn run_tui() -> anyhow::Result<()> {
                             action_tx: &action_tx,
                             pr_wake_tx: &active_workers.pr_wake_tx,
                             linear_wake_tx: &shared.linear_wake_tx,
+                            backup_wake_tx: &shared.backup_wake_tx,
                             git_wake_tx: &active_workers.git_wake_tx,
                             reload_tx: &reload_tx,
                         };
@@ -2303,7 +2930,7 @@ fn run_tui() -> anyhow::Result<()> {
                                     &mut terminal,
                                     &session_name,
                                     &popup_title,
-                                    &app.project().config.project_name,
+                                    app.project().display_name(),
                                     &shared.poll_suspended,
                                 )?;
                                 app.message = None;
@@ -2323,7 +2950,7 @@ fn run_tui() -> anyhow::Result<()> {
                                 if let Some(edited) = open_external_editor(
                                     &mut terminal,
                                     &initial_content,
-                                    &app.project().config.project_name,
+                                    app.project().display_name(),
                                     &shared.poll_suspended,
                                 )? {
                                     if let Some(dialog) = app.dialog.as_mut() {
@@ -2371,14 +2998,11 @@ fn run_tui() -> anyhow::Result<()> {
                                     }
                                     let _ = execute!(
                                         terminal.backend_mut(),
-                                        SetTitle(format!(
-                                            "bork: {}",
-                                            app.project().config.project_name
-                                        ))
+                                        SetTitle(format!("bork: {}", app.project().display_name()))
                                     );
                                     app.set_message(format!(
                                         "Switched to {}",
-                                        app.project().config.project_name
+                                        app.project().display_name()
                                     ));
                                 }
                             }
@@ -2412,6 +3036,7 @@ fn run_tui() -> anyhow::Result<()> {
                     // Reset cooldown so we don't immediately re-prompt.
                     project.last_auto_prune_check = Some(std::time::Instant::now());
                 }
+                handler::queue_force_prune(&mut app, project_id, outcome.plan_not_saved());
             }
 
             for (project_id, issue_id) in result.issues_to_delete {
@@ -2421,6 +3046,7 @@ fn run_tui() -> anyhow::Result<()> {
             for (project_id, issue_id) in result.issues_to_archive {
                 handler::archive_issue_in_app(&mut app, &project_id, &issue_id);
             }
+            handler::queue_force_archive(&mut app, result.force_archive_offers);
 
             if let Some(launch_id) = result.launched_issue_id {
                 // A kill during the detection window (x kill, done-TTL)
@@ -2446,6 +3072,12 @@ fn run_tui() -> anyhow::Result<()> {
                             dirty = true;
                         }
                     }
+                    if let Some(agent) = result.forget_lost_session.filter(|_| !invalidated) {
+                        if issue.agent_kind == agent {
+                            issue.forget_session(agent);
+                            dirty = true;
+                        }
+                    }
                     if dirty {
                         project.mark_dirty();
                     }
@@ -2468,6 +3100,7 @@ fn run_tui() -> anyhow::Result<()> {
                             }
                         }
                         if open_popup {
+                            let popup_title = result.popup_title.unwrap_or(popup_title);
                             pending_popup_session = Some((session_name, popup_title));
                         }
                     }
@@ -2497,7 +3130,7 @@ fn run_tui() -> anyhow::Result<()> {
                 &mut terminal,
                 &session_name,
                 &popup_title,
-                &app.project().config.project_name,
+                app.project().display_name(),
                 &shared.poll_suspended,
             )?;
             app.message = None;
@@ -2525,6 +3158,41 @@ fn run_tui() -> anyhow::Result<()> {
             swimlane_workers.retain(|id, _| active_swimlanes.contains(id));
         } else {
             swimlane_workers.clear();
+        }
+
+        // --- Sync background PR workers (sidebar dots for hidden projects) ---
+        if app.sidebar.is_some() {
+            let hidden: HashSet<ProjectId> = app
+                .projects
+                .iter()
+                .map(|project| project.id())
+                .filter(|id| *id != app.focused_project && !swimlane_workers.contains_key(id))
+                .collect();
+            let shown: Vec<ProjectId> = background_pr_workers
+                .keys()
+                .filter(|id| !hidden.contains(*id))
+                .cloned()
+                .collect();
+            for id in shown {
+                background_pr_workers.remove(&id);
+                if let Some(project) = app.find_project_mut(&id) {
+                    project.live.background_branches = None;
+                }
+            }
+            for project in &app.projects {
+                let id = project.id();
+                if hidden.contains(&id) && !background_pr_workers.contains_key(&id) {
+                    background_pr_workers.insert(
+                        id,
+                        spawn_background_pr_worker(project, &shared.poll_suspended),
+                    );
+                }
+            }
+        } else if !background_pr_workers.is_empty() {
+            background_pr_workers.clear();
+            for project in &mut app.projects {
+                project.live.background_branches = None;
+            }
         }
 
         // Drain all queued poll results but only redraw when data changed:
@@ -2571,14 +3239,17 @@ fn run_tui() -> anyhow::Result<()> {
         {
             protected_imports.insert(id.clone());
         }
-        let outcome = drain_project_workers(
-            app.project_mut(),
-            &workers,
-            &action_tx,
-            now,
-            picker,
-            &protected_imports,
-        );
+        let query = app.search_query.clone();
+        let outcome = app.project_mut().keep_selection(&query, |project| {
+            drain_project_workers(
+                project,
+                &workers,
+                &action_tx,
+                now,
+                picker,
+                &protected_imports,
+            )
+        });
         needs_redraw |= apply_drain_outcome(&mut app, outcome);
 
         // --- Update check (periodic worker results) ---
@@ -2592,6 +3263,22 @@ fn run_tui() -> anyhow::Result<()> {
             if app.update_available != available {
                 app.update_available = available;
                 needs_redraw = true;
+            }
+        }
+
+        // --- Backup worker ---
+        if backup_worker_alive {
+            loop {
+                match shared.backup_rx.try_recv() {
+                    Ok(report) => needs_redraw |= app.apply_backup_report(report),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        backup_worker_alive = false;
+                        app.backup_worker_stopped();
+                        needs_redraw = true;
+                        break;
+                    }
+                }
             }
         }
 
@@ -2659,7 +3346,16 @@ fn run_tui() -> anyhow::Result<()> {
                                 }
                             }
                         }
+                        let imported_project = issue
+                            .linear_projects
+                            .iter()
+                            .find(|p| p.imported)
+                            .and_then(|link| result.projects.iter().find(|p| p.id == link.id));
+                        if let Some(linear_project) = imported_project {
+                            issue.title = linear_project.name.clone();
+                        }
                     }
+                    project.live.linear_projects = result.projects.clone();
                 }
             }
         }
@@ -2673,14 +3369,17 @@ fn run_tui() -> anyhow::Result<()> {
             let Some(proj_pos) = app.projects.iter().position(|p| p.id() == *proj_id) else {
                 continue;
             };
-            let outcome = drain_project_workers(
-                &mut app.projects[proj_pos],
-                sw,
-                &action_tx,
-                now,
-                picker_project.as_ref() == Some(proj_id),
-                &protected_imports,
-            );
+            let query = app.search_query.clone();
+            let outcome = app.projects[proj_pos].keep_selection(&query, |project| {
+                drain_project_workers(
+                    project,
+                    sw,
+                    &action_tx,
+                    now,
+                    picker_project.as_ref() == Some(proj_id),
+                    &protected_imports,
+                )
+            });
             needs_redraw |= apply_drain_outcome(&mut app, outcome);
         }
 
@@ -2697,11 +3396,26 @@ fn run_tui() -> anyhow::Result<()> {
             }
         }
 
+        for project in &mut app.projects {
+            if let Some(worker) = background_pr_workers.get(&project.id()) {
+                needs_redraw |= drain_background_pr_worker(project, worker);
+            }
+        }
+
         if let Some(ref rx) = activity_rx {
-            while let Ok(activity) = rx.try_recv() {
-                if let Some(ref mut sidebar) = app.sidebar {
-                    if sidebar.activity != activity {
-                        sidebar.activity = activity;
+            // Focused and swimlane projects get fresher statuses from their own
+            // workers, applied under `keep_selection`; only fill in the rest.
+            while let Ok(mut statuses) = rx.try_recv() {
+                for project in &mut app.projects {
+                    let id = project.id();
+                    if id == app.focused_project || swimlane_workers.contains_key(&id) {
+                        continue;
+                    }
+                    let Some(project_statuses) = statuses.remove(&id) else {
+                        continue;
+                    };
+                    if project.live.agent_statuses != project_statuses {
+                        project.live.agent_statuses = project_statuses;
                         needs_redraw = true;
                     }
                 }
@@ -2710,7 +3424,7 @@ fn run_tui() -> anyhow::Result<()> {
 
         while let Ok(result) = reload_rx.try_recv() {
             if !result.is_empty() {
-                app.apply_reload_result(result);
+                app.apply_reload_result(result, &global_config::list_projects());
                 needs_redraw = true;
             }
         }
@@ -2731,6 +3445,32 @@ fn run_tui() -> anyhow::Result<()> {
         state_poll_counter += 1;
         if state_poll_counter >= STATE_POLL_TICKS {
             state_poll_counter = 0;
+
+            // The 48h backup warning depends on the clock, not on a worker
+            // report (the worker may be blocked on the backup lock).
+            needs_redraw |= app.refresh_backup_warning(app::unix_now());
+
+            // Pick up `bork backup` runs from the CLI without waiting for
+            // the hourly check.
+            let status_mtime = fs::metadata(backup::status::status_path())
+                .and_then(|meta| meta.modified())
+                .ok();
+            if status_mtime != last_backup_status_mtime {
+                last_backup_status_mtime = status_mtime;
+                let record = backup::full_backup_record();
+                if let Some(indicator) = backup::schedule::on_status_change(
+                    &app.backup,
+                    last_full_backup_record.as_ref(),
+                    record.as_ref(),
+                ) {
+                    needs_redraw |= app.apply_backup_report(backup::schedule::Report::new(
+                        indicator,
+                        None,
+                        record.as_ref(),
+                    ));
+                }
+                last_full_backup_record = record;
+            }
 
             // Pick up `bork update --check` runs from other terminals.
             let mtime = update::cache_mtime_secs();
@@ -2792,6 +3532,7 @@ fn run_tui() -> anyhow::Result<()> {
     }
 
     shared.shutdown.store(true, Ordering::Relaxed);
+    finish_backup_before_quit(&mut terminal, &mut app);
 
     for project in &mut app.projects {
         if project.state_dirty {
@@ -2875,7 +3616,7 @@ fn open_tmux_popup(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     session_name: &str,
     title: &str,
-    project_name: &str,
+    display_name: &str,
     suspended: &AtomicBool,
 ) -> anyhow::Result<()> {
     let _guard = SuspendGuard::new(suspended);
@@ -2889,7 +3630,7 @@ fn open_tmux_popup(
     execute!(
         terminal.backend_mut(),
         EnterAlternateScreen,
-        SetTitle(format!("bork: {}", project_name))
+        SetTitle(format!("bork: {}", display_name))
     )?;
     push_kitty_flags(terminal.backend_mut());
     terminal.clear()?;
@@ -2900,7 +3641,7 @@ fn open_tmux_popup(
 fn open_external_editor(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     initial_content: &str,
-    project_name: &str,
+    display_name: &str,
     suspended: &AtomicBool,
 ) -> anyhow::Result<Option<String>> {
     let _guard = SuspendGuard::new(suspended);
@@ -2924,7 +3665,7 @@ fn open_external_editor(
     execute!(
         terminal.backend_mut(),
         EnterAlternateScreen,
-        SetTitle(format!("bork: {}", project_name))
+        SetTitle(format!("bork: {}", display_name))
     )?;
     push_kitty_flags(terminal.backend_mut());
     terminal.clear()?;
@@ -2978,6 +3719,7 @@ mod tests {
             })),
             Arc::new(AtomicBool::new(false)),
             wake_rx,
+            PR_POLL_INTERVAL,
         );
         let start = std::time::Instant::now();
         let mut updates = 0;
@@ -3004,6 +3746,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn project_flag_resolves_by_name_or_label() {
+        global_config::tests::with_temp_config("resolve-label", || {
+            let dir =
+                std::env::temp_dir().join(format!("bork-resolve-label-{}", std::process::id()));
+            std::fs::create_dir_all(dir.join(".bork")).unwrap();
+            std::fs::write(dir.join(".bork/config.toml"), "project_name = \"api\"\n").unwrap();
+            global_config::register_project("api", &dir).unwrap();
+            global_config::set_project_label(&dir, Some("Backend")).unwrap();
+            let root = std::fs::canonicalize(&dir).unwrap();
+
+            assert_eq!(resolve_start_project_root(Some("api")).unwrap(), root);
+            assert_eq!(resolve_start_project_root(Some("Backend")).unwrap(), root);
+            assert!(resolve_start_project_root(Some("nope")).is_err());
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
     fn toml_literal_escapes_control_chars_for_roundtrip() {
         let literal =
             toml_literal_for(ConfigKeyKind::Str, "line one\nline two\twith \"quotes\"").unwrap();
@@ -3027,6 +3788,44 @@ mod tests {
         assert_eq!(parse_issue_kind("planner"), Ok(IssueKind::Orchestrator));
         assert_eq!(parse_issue_kind("todo"), Ok(IssueKind::NonAgentic));
         assert!(parse_issue_kind("bogus").is_err());
+    }
+
+    #[test]
+    fn background_drain_keeps_branches_out_of_the_worktree_map() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = config::AppConfig {
+            project_name: "bork".to_string(),
+            project_root: dir.path().to_path_buf(),
+            ..config::AppConfig::default()
+        };
+        let mut project = Project::new(config, config::AppState::default());
+        project
+            .live
+            .worktree_branches
+            .insert("bork-1-clone".into(), "bork-1/clone".into());
+
+        let (pr_tx, pr_rx) = mpsc::channel();
+        let (pr_wake_tx, _pr_wake_rx) = mpsc::channel();
+        let (branch_tx, branch_rx) = mpsc::channel();
+        let (branch_stop_tx, _branch_stop_rx) = mpsc::channel();
+        let worker = BackgroundPrWorker {
+            pr_rx,
+            pr_wake_tx,
+            targets: Arc::new(Mutex::new(github_poll::Targets::for_project(&project))),
+            branch_rx,
+            _branch_stop_tx: branch_stop_tx,
+        };
+        let branches = HashMap::from([("bork-2-task".to_string(), "bork-2/task".to_string())]);
+        branch_tx.send(branches.clone()).unwrap();
+        pr_tx.send(PrPollResult::default()).unwrap();
+
+        assert!(drain_background_pr_worker(&mut project, &worker));
+        assert_eq!(project.live.background_branches, Some(branches));
+        assert_eq!(
+            project.live.worktree_branches,
+            HashMap::from([("bork-1-clone".to_string(), "bork-1/clone".to_string())])
+        );
+        assert!(project.live.pr_poll_done);
     }
 
     #[test]
@@ -3200,5 +3999,27 @@ mod tests {
         let (wake_tx, wake_rx) = mpsc::channel::<()>();
         drop(wake_tx);
         assert!(!sleep_with_wake(&wake_rx, Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn attach_pr_uses_explicit_issue_id() {
+        let (id, pr) = resolve_attach_pr_args(&["bork-1", "42"], Some("bork-9".into())).unwrap();
+        assert_eq!((id.as_str(), pr), ("bork-1", 42));
+    }
+
+    #[test]
+    fn attach_pr_falls_back_to_session_issue_id() {
+        let (id, pr) = resolve_attach_pr_args(&["#42"], Some("bork-9".into())).unwrap();
+        assert_eq!((id.as_str(), pr), ("bork-9", 42));
+    }
+
+    #[test]
+    fn attach_pr_without_issue_id_or_session_errors() {
+        assert!(resolve_attach_pr_args(&["42"], None).is_err());
+    }
+
+    #[test]
+    fn attach_pr_rejects_bad_pr_number() {
+        assert!(resolve_attach_pr_args(&["bork-1", "abc"], None).is_err());
     }
 }

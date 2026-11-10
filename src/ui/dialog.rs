@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -7,7 +9,6 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 use crate::app::{App, DialogField, DialogState};
-use crate::external::linear::LinearIssue;
 use crate::types::{AgentKind, AgentMode, IssueKind, LinkedGithubPr};
 use crate::ui::styles;
 
@@ -74,11 +75,36 @@ pub fn render_dialog(frame: &mut Frame, app: &App) {
 
     if dialog.linear_available {
         let linear_area = Rect::new(inner.x + 1, inner.y + next_row, inner.width - 2, 1);
-        render_linear_field(
+        let identifiers: Vec<&str> = dialog
+            .linear_issues
+            .iter()
+            .map(|li| li.identifier.as_str())
+            .collect();
+        render_tag_field(
             frame,
-            &dialog.linear_issues,
+            "Linear:",
+            &identifiers,
             linear_area,
             dialog.current_field() == DialogField::Linear,
+            label_width,
+        );
+        next_row += 2;
+    }
+
+    // Takes the PR row's place: orchestrators have projects instead of PRs.
+    if dialog.linear_available && dialog.kind.links_linear_projects() {
+        let project_area = Rect::new(inner.x + 1, inner.y + next_row, inner.width - 2, 1);
+        let names: Vec<&str> = dialog
+            .linear_projects
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        render_tag_field(
+            frame,
+            "Projects:",
+            &names,
+            project_area,
+            dialog.current_field() == DialogField::LinearProject,
             label_width,
         );
         next_row += 2;
@@ -97,28 +123,29 @@ pub fn render_dialog(frame: &mut Frame, app: &App) {
         next_row += 2;
     }
 
+    // Resume markers come from the live issue, not a dialog-open snapshot:
+    // background launch results and external merges can change the sessions
+    // map while the dialog is up.
+    let no_sessions = BTreeMap::new();
+    let sessions = dialog
+        .editing_issue_id
+        .as_deref()
+        .and_then(|id| {
+            let lower = id.to_lowercase();
+            app.active_project()
+                .issues
+                .iter()
+                .find(|issue| issue.id.to_lowercase() == lower)
+        })
+        .map_or(&no_sessions, |issue| &issue.sessions);
+
     if dialog.kind.is_agentic() {
         if !dialog.available_agents.is_empty() {
             let agent_area = Rect::new(inner.x + 1, inner.y + next_row, inner.width - 2, 1);
-            // Resume markers come from the live issue, not a dialog-open
-            // snapshot: background launch results and external merges can
-            // change the sessions map while the dialog is up.
-            let session_agents: Vec<AgentKind> = dialog
-                .editing_issue_id
-                .as_deref()
-                .and_then(|id| {
-                    let lower = id.to_lowercase();
-                    app.active_project()
-                        .issues
-                        .iter()
-                        .find(|issue| issue.id.to_lowercase() == lower)
-                })
-                .map(|issue| issue.sessions.keys().copied().collect())
-                .unwrap_or_default();
             render_agent_field(
                 frame,
                 dialog,
-                &session_agents,
+                sessions,
                 agent_area,
                 dialog.current_field() == DialogField::Agent,
                 label_width,
@@ -211,6 +238,13 @@ pub fn render_dialog(frame: &mut Frame, app: &App) {
         if is_prompt_focused {
             spans.push(Span::styled("Ctrl+e", styles::statusbar_key_style()));
             spans.push(Span::styled(":editor  ", styles::statusbar_desc_style()));
+        }
+        if dialog.is_on_agent_field() && dialog.shows_session(dialog.agent_kind, sessions) {
+            spans.push(Span::styled("Bksp", styles::statusbar_key_style()));
+            spans.push(Span::styled(
+                ":new session  ",
+                styles::statusbar_desc_style(),
+            ));
         }
         spans.extend([
             Span::styled("Ctrl+S", styles::statusbar_key_style()),
@@ -441,7 +475,7 @@ fn render_kind_field(
 fn render_agent_field(
     frame: &mut Frame,
     dialog: &DialogState,
-    session_agents: &[AgentKind],
+    sessions: &BTreeMap<AgentKind, String>,
     area: Rect,
     focused: bool,
     label_width: usize,
@@ -464,7 +498,7 @@ fn render_agent_field(
         }
         let selected = *kind == dialog.agent_kind;
         // ↺ = this agent has a session to resume.
-        let resume_marker = if session_agents.contains(kind) {
+        let resume_marker = if dialog.shows_session(*kind, sessions) {
             " \u{21ba}"
         } else {
             ""
@@ -482,9 +516,12 @@ fn render_agent_field(
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn render_linear_field(
+/// A labelled row of comma-separated tags that collapses the overflow into
+/// `+N`.
+fn render_tag_field(
     frame: &mut Frame,
-    linear_issues: &[LinearIssue],
+    label: &str,
+    tags: &[&str],
     area: Rect,
     focused: bool,
     label_width: usize,
@@ -495,20 +532,20 @@ fn render_linear_field(
         .add_modifier(Modifier::BOLD);
 
     let mut spans = vec![Span::styled(
-        format!("{:<width$}", "Linear:", width = label_width),
+        format!("{:<width$}", label, width = label_width),
         label_style,
     )];
 
-    if linear_issues.is_empty() {
+    if tags.is_empty() {
         spans.push(Span::styled("\u{2014}", styles::dim_style()));
     } else {
         let available = (area.width as usize).saturating_sub(label_width);
         let mut used = 0;
-        for (i, li) in linear_issues.iter().enumerate() {
+        for (i, tag) in tags.iter().enumerate() {
             let sep = if i > 0 { ", " } else { "" };
-            let text = format!("{}{}", sep, li.identifier);
+            let text = format!("{}{}", sep, tag);
             if used + text.len() > available && i > 0 {
-                let remaining_count = linear_issues.len() - i;
+                let remaining_count = tags.len() - i;
                 spans.push(Span::styled(
                     format!("+{}", remaining_count),
                     styles::dim_style(),
@@ -518,7 +555,7 @@ fn render_linear_field(
             if i > 0 {
                 spans.push(Span::styled(", ", styles::dim_style()));
             }
-            spans.push(Span::styled(li.identifier.clone(), accent_style));
+            spans.push(Span::styled(tag.to_string(), accent_style));
             used += text.len();
         }
     }

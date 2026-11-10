@@ -41,6 +41,11 @@ impl AgentProvider for OpenCode {
         false
     }
 
+    // The OpenCode TUI has no `--model` flag (only `opencode run` does).
+    fn supports_model(&self) -> bool {
+        false
+    }
+
     fn build_cmd(&self, ctx: &LaunchContext) -> (String, Option<String>, Option<String>) {
         if let Some(sid) = ctx.current_session {
             // Resume existing session — skip --prompt, history is preserved

@@ -13,7 +13,7 @@
 ---
 
 <p align="center">
-  <img src="assets/board-light.png" alt="bork kanban board" width="720">
+  <img src="assets/hero.png" alt="bork in a light and a dark terminal, showing the kanban board" width="720">
   <br>
   <sub>Adapts to your terminal theme (ANSI 16 colors)</sub>
 </p>
@@ -78,6 +78,12 @@ Press `n` to create an issue, `Enter` to launch an agent session. You're up and 
 - **Multi-project view** &mdash; Register multiple projects and view them in stacked swimlanes with a collapsible project sidebar
 - **Zero-dependency state** &mdash; JSON file persistence with atomic writes, no database
 
+## Screenshots
+
+| Dark | Light |
+|------|-------|
+| ![bork in a dark terminal](assets/board-dark.png) | ![bork in a light terminal](assets/board-light.png) |
+
 ## Requirements
 
 | Dependency | Purpose |
@@ -123,6 +129,7 @@ bork --help
 |---------|-------------|
 | `bork` | Launch the TUI kanban board |
 | `bork init <repo>` | Set up a new bork project from a git repo |
+| `bork import <file>` | Restore projects, boards and plans from a backup file |
 | `bork install` | Install agent status hooks |
 | `bork worktree <id> [slug]` | Create a git worktree for an issue |
 | `bork uninstall` | Remove agent status hooks |
@@ -138,7 +145,9 @@ bork --help
 | `bork issue archive <id>` | Kill session, run teardown, remove worktree, move to Done |
 | `bork issue delete <id>` | Delete an issue |
 | `bork integration attach-linear <id> <identifier>` | Link a Linear ticket to an issue (can attach multiple) |
-| `bork integration attach-pr <id> <number>` | Link a GitHub PR to an issue (can attach multiple) |
+| `bork integration attach-linear-project <id> <url-or-slug>` | Link a Linear project to an orchestrator issue (can attach multiple) |
+| `bork integration detach-linear-project <id> <url-or-slug>` | Unlink a Linear project from an issue |
+| `bork integration attach-pr [id] <number>` | Link a GitHub PR to an issue (can attach multiple; `id` defaults to `BORK_ISSUE_ID` inside an agent session) |
 | `bork config list` | Show all resolved config values |
 | `bork config get <key>` | Print a resolved config value |
 | `bork config set <key> <value>` | Set a config value (`--global` for the global file) |
@@ -204,13 +213,18 @@ bork issue list --json                    # machine-readable output
 bork issue move bork-3 code-review
 bork issue update bork-3 --title "Fix OAuth flow"
 bork issue show bork-3
+bork issue reset-session bork-3           # next launch starts a new agent session
 bork issue archive bork-3                 # cleanup when work is merged
 bork issue delete bork-3
 ```
 
-**Create options:** `--column` (todo, in-progress, code-review, done), `--agent` (opencode, claude, codex, pi), `--mode` (plan, build, yolo), `--prompt`, `--kind` (agentic, todo, orchestrator).
+**Create options:** `--column` (todo, in-progress, code-review, done), `--agent` (opencode, claude, codex, pi), `--mode` (plan, build, yolo), `--prompt`, `--model`, `--kind` (agentic, todo, orchestrator).
 
-**Start options:** `--prompt`, `--agent` (opencode, claude, codex), `--mode` (plan, build, yolo), `--slug`, `--no-worktree`, `--project` (registered project name or path). `bork issue start` defaults to build mode and creates a worktree with a slug generated from the title. If a `setup_script` is configured, it runs inside the worktree before the agent starts.
+**Start options:** `--prompt`, `--agent` (opencode, claude, codex), `--mode` (plan, build, yolo), `--model`, `--slug`, `--no-worktree`, `--project` (registered project name or path). `bork issue start` defaults to build mode and creates a worktree with a slug generated from the title. If a `setup_script` is configured, it runs inside the worktree before the agent starts.
+
+**Model per issue:** `--model <name>` on `create`, `start` and `update` is saved on the issue and passed to the agent as `--model <name>` on every launch and resume, e.g. `bork issue start "Review PR 42" --agent claude --model sonnet`. It replaces any `--model`/`-m` in `[agent.<name>].args`. Model names are agent-specific, so changing an issue's agent clears it. OpenCode's TUI has no `--model` flag, so `--model` on an opencode issue is an error. `bork issue update <id> --model ""` clears it.
+
+**Lost sessions:** if an issue's conversation is gone (Claude cleans up old transcripts after `cleanupPeriodDays`; Codex, Pi and Cursor sessions go when you delete them), bork notices on launch, starts a new session with the issue's prompt, and says so in the popup title and status bar. To start fresh on purpose, run `bork issue reset-session <id> [--agent <kind>]`, or edit the issue, focus the Agent field, press Backspace and save. If that agent's session is running, it's killed. The old conversation isn't deleted. OpenCode keeps sessions in a database bork doesn't read, so its sessions are always resumed.
 
 **Archive options:** `bork issue archive <id> [--force]` kills the issue's tmux session, runs the configured `teardown_script` inside the worktree, removes the worktree, and moves the issue to Done. `--force` proceeds past a failing teardown and discards uncommitted changes.
 
@@ -221,6 +235,9 @@ bork integration attach-linear bork-3 VIL-123   # link a Linear ticket
 bork integration attach-linear bork-3 VIL-456   # link another Linear ticket to the same issue
 bork integration attach-pr bork-3 42             # link a GitHub PR
 bork integration attach-pr bork-3 43             # link another PR to the same issue
+bork integration attach-linear-project bork-5 https://linear.app/acme/project/auth-1a2b3c4d5e6f
+                                                 # link a Linear project to an orchestrator
+bork issue start "Fix login" --linear VIL-789    # start an issue with a ticket already linked
 ```
 
 All commands must be run from within a bork project directory (any directory containing or nested under `.bork/`). Issue IDs are case-insensitive.
@@ -255,6 +272,7 @@ bork update --check   # force a fresh check without pulling
 | `Enter` | Open session (resume or launch if none, attach if running) |
 | `Ctrl+P` | Toggle project sidebar |
 | `P` | Force-sync PR statuses from GitHub |
+| `Shift+B` | Back up now (see [Backups](#backups)) |
 | `o` | Open PR in browser (if issue has a matching PR, or all marked issues' PRs) |
 | `t` | Open project-root terminal in tmux |
 | `/` | Search / filter board |
@@ -270,7 +288,7 @@ bork update --check   # force a fresh check without pulling
 | `n` | Create new issue |
 | `e` | Edit selected issue |
 | `d` | Delete issue (with confirmation) |
-| `A` | Archive issue: kill session, run teardown, remove worktree, move to Done (with confirmation) |
+| `A` | Archive issue: kill session, run teardown, remove worktree, move to Done (with confirmation; offers to force it when the worktree is dirty or the teardown fails) |
 | `x` | Kill session (with confirmation) |
 | `a` | Add issue in current column |
 | `H` | Move issue to previous column |
@@ -294,6 +312,7 @@ With issues marked, `H`, `L`, `D`, `T`, `Shift+Enter`, `o`, `O`, `x`, `d` and `A
 | `Ctrl+e` | Open prompt in `$EDITOR` (on Prompt field) |
 | `Esc` / `Ctrl+c` | Cancel |
 | `Space` / `h` / `l` | Cycle agent (on Agent field); cycle mode (on Mode field); open Linear picker (on Linear field) |
+| `Backspace` | Start the selected agent's next launch in a new session, on save (on Agent field) |
 
 ### Sidebar Mode
 
@@ -303,6 +322,9 @@ With issues marked, `H`, `L`, `D`, `T`, `Shift+Enter`, `o`, `O`, `x`, `d` and `A
 | `k` / `Up` | Move selection up |
 | `Enter` | Focus selected project (single board view) |
 | `Space` | Toggle project as swimlane (add/remove from view) |
+| `Shift+J` / `Shift+K` | Move project down / up in the list |
+| `Shift+R` | Rename project in bork's UI (issue IDs and tmux sessions keep the config name). Renaming back to the config name clears it |
+| `Shift+D` | Remove project from the list (files stay on disk) |
 | `Esc` / `Ctrl+P` | Close sidebar |
 
 ### Confirm Mode
@@ -456,6 +478,58 @@ teardown_script = "docker compose down"
 
 Both keys accept a single shell command line and can live in either config layer. Scripts should be idempotent — setup may run again if a session is recreated for an existing worktree.
 
+### Backups
+
+`bork backup` writes one file per Mac, `<path>/bork-backup-<host>.tar.gz`, holding what git doesn't cover: each opted-in project's board (`.bork/state.json`, `.bork/config.toml`), everything else in the project folder (`AGENTS.md`, `plans/`, `.claude/`, `.agents/`, `opencode.jsonc`, ...) except `main/`, worktrees, nested git checkouts and temp files, and the `.claude/planning.md` of every live issue worktree, plus your global `projects.json` and `config.toml`. Point `path` at a synced folder such as iCloud Drive and a wiped machine can get its boards and plans back; several Macs can share the folder, since each writes its own file (`<host>` is the Mac's LocalHostName from Sharing settings, lowercased, see `bork backup status`). Code in worktrees and agent transcripts are not backed up. Nested git repos inside a project folder are skipped too; if one has no remote, `bork backup` and `bork backup status` list it, since nothing else holds its content.
+
+```toml
+# ~/.config/bork/config.toml
+[backup]
+path = "~/Library/Mobile Documents/com~apple~CloudDocs/bork"  # absolute or ~/
+
+# <project>/.bork/config.toml: nothing is backed up until a project opts in
+[backup]
+enabled = true
+```
+
+```bash
+bork backup                     # all opted-in projects -> <path>/bork-backup-<host>.tar.gz
+bork backup --project bork      # just one project -> <path>/bork-backup-<host>--bork.tar.gz
+bork backup --dry-run           # print the file path and its contents, write nothing
+bork backup status              # opted-in projects, last run, result and size per file
+```
+
+Archive and prune keep issue plans: before they remove a worktree, its `.claude/planning.md` is copied to `plans/<issue-id>/planning.md` in the project container, so it lands in the next backup. A worktree no issue claims (for example one whose issue was deleted) gets `plans/_orphans/<worktree>/planning.md` instead. If the copy fails, the worktree is kept: the TUI asks whether to remove it anyway, and `bork issue archive` / `bork prune` need `--force` (a plan lost that way is noted in `.bork/errors.log`). Deleting an issue also removes its `plans/<issue-id>/` folder.
+
+Backups run once a day automatically while the TUI is open and whenever you run `bork backup`. The file is replaced atomically and left untouched when nothing changed since the last backup. A file bork can't read (or a corrupt `.bork/state.json`) fails the run and keeps the previous backup. The last result per file is stored in `~/.config/bork/backup.json`.
+
+The TUI checks shortly after startup and then hourly, and runs a backup when none has succeeded in the last 24 hours. Press `Shift+B` to back up right away. The header stays quiet while backups work, and shows a warning when the last run failed (the error also goes to `.bork/errors.log` of each opted-in project) or when no backup has succeeded in over 48 hours. Like `bork backup`, it also warns when a backup skips a git repo that has no remote, since nothing else holds that repo.
+
+#### Restoring
+
+After a wipe, install bork and run `bork import` with the path of a backup file from your synced folder (any name works, so another Mac's file is fine too). Without a path it uses this Mac's `bork-backup-<host>.tar.gz` in the configured backup `path`:
+
+```bash
+bork import <backup-file>                    # every project, back to its recorded path
+bork import                                  # this Mac's backup file in the configured path
+bork import <backup-file> --root ~/code      # restore to ~/code/<name> instead
+bork import <backup-file> --project bork     # just one project
+bork import <backup-file> --dry-run          # print what would be cloned, written and registered
+bork import <backup-file> --force            # restore over existing directories
+```
+
+For each project it clones the repo into `main/` (on the default branch, with your other remotes added back), restores the board and container files, moves each worktree plan to `plans/<issue-id>/planning.md` (it wins over an older copy saved there) and registers the project (with its sidebar label). Worktrees aren't recreated: issues that had one keep their prompt, column and links but lose the worktree, and the summary lists their branches so you can reopen them from the pushed branch. Agent sessions are dropped, since transcripts aren't in the backup, except ones the board you're restoring over still has. Without a clone URL, or when the clone fails, the board and docs are still restored and the summary says so. If one project fails part-way, the others still run and the command exits with an error after the summary. Your global `config.toml` is restored only when you don't have one yet; `--project` leaves it alone. The global agent hooks are installed like `bork init` does (project skills come back from the backup).
+
+Import refuses to touch an existing project directory unless you pass `--force`, and refuses a project whose name is already registered at another path (both would share issue ids and tmux sessions). Even then it never deletes `main/` or worktrees and never replaces a plan that already exists in `plans/`, so re-running it is safe. It does overwrite the other restored files, so the board goes back to the backup's version: the old board is kept as `.bork/state.json.pre-import-<time>` (a re-run that changes nothing saves nothing) and the summary names any issues that weren't in the backup. A replaced project `.bork/config.toml` or global `config.toml` is kept the same way. Files are never restored into a git checkout (`main/`, worktrees, any nested repo), and a target that is a symlink, a repo itself, or an existing directory inside a repo is refused. A failed clone or project makes the command exit non-zero after the summary. To look inside a backup by hand:
+
+```bash
+tar -tzf bork-backup-<host>.tar.gz                       # list the contents
+tar -xzOf bork-backup-<host>.tar.gz manifest.json        # host, projects, repos, issues
+tar -xzf bork-backup-<host>.tar.gz -C /tmp/bork-restore  # extract everything
+```
+
+Inside, `manifest.json` describes each project (path, clone URL, default branch, issues), `projects/<name>/` holds its files with worktree plans under `_issues/<issue-id>/planning.md`, and `_global/` holds the global config.
+
 ### Agent Configuration Notes
 
 The new/edit issue dialog hides the Agent field when only one agent is available. Pi has a single mode and no built-in mode flags; its general launch args still apply, and mode overrides can supply additional flags.
@@ -524,6 +598,19 @@ Cards with unresolved comments also count as needing you. Review threads from bo
 
 The `gh` CLI must be installed and authenticated. If `gh` is not available or the repo is not on GitHub, PR polling is silently skipped.
 
+### Merge queues
+
+Your own PRs show where they are in a merge queue. Bork reads GitHub's native merge queue and [Trunk](https://trunk.io/merge-queue) (from the `Trunk Merge Queue` check Trunk posts on the PR, so no Trunk token is needed).
+
+| Badge | Meaning | Needs you |
+|-------|---------|-----------|
+| `⧖ queued` (dim) | Waiting its turn, or passed and about to merge | No |
+| `⧖ testing` (blue) | The queue is running checks on it | No |
+| `✗ queue failed` (red) | The queue removed it after a failed run | Yes |
+| `⧖ dequeued` (yellow) | Cancelled before it merged (Trunk only) | Yes |
+
+While a PR is in a queue, its queue badge takes the place of the status badge (`✗ CI`, `↩ review`, `✓ merge`). The PR line's CI and review icons stay, so a failed Trunk run also shows a red CI `✗`, since Trunk's check is part of the CI result. GitHub clears its queue entry once it removes a PR, so a PR dropped from GitHub's queue goes back to its normal badges. Trunk's check stays on the commit, so its failed and dequeued badges last until you push a new commit or re-queue. A PR Trunk hasn't admitted yet (not ready) has no check, so it shows its normal status.
+
 ### Attached PR stacks
 
 The GitHub picker marks PRs that belong to a stack. **Enter** still imports or
@@ -577,12 +664,13 @@ export LINEAR_API_KEY="lin_api_..."
 
 It belongs in your shell profile rather than `config.toml` — that file lives
 inside the project directory and is easy to commit by accident. bork only reads
-your assigned issues, so a read-scoped key is enough.
+your assigned issues and open projects, so a read-scoped key is enough.
 
-With a key set, bork polls your assigned issues every 45 seconds and enables:
+With a key set, bork polls your assigned issues and open projects every 45 seconds and enables:
 
 - **Import issues** &mdash; Press `I` to open a fuzzy-search picker of your assigned Linear issues. Imported issues use the Linear identifier as the bork issue ID (e.g. `BORK-14` becomes `bork-14`).
 - **Attach issues to a card** &mdash; In the issue dialog, the Linear field opens a multi-select picker; Enter toggles selection, Backspace removes the last item. `bork integration attach-linear <issue-id> <identifier>` does the same from the CLI, and one card can hold several Linear issues.
+- **Linear projects on orchestrators** &mdash; The picker's Projects tab imports a Linear project as an orchestrator issue named after it. On an orchestrator, the dialog's Projects field attaches more. The orchestrator's prompt lists its projects and tells it to read their description, documents, milestones and tickets for context, and to link a ticket with `bork issue start --linear <ticket>` when an issue it starts covers one. Only orchestrators carry projects; switching an issue to another kind drops them.
 - **Open in Linear** &mdash; Press `O` to open all linked Linear issues in your browser.
 - **State refresh** &mdash; Linear issue state is re-read on each poll cycle, and imported issues follow their Linear title. Nothing is written back to Linear.
 
