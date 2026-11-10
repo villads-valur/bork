@@ -1,4 +1,4 @@
-//! Cursor cloud agents (experimental). See `plans/bork-180/cloud-agents-design.md`.
+//! Cursor cloud agents (experimental). See `docs/design/cursor-cloud-agents.md`.
 //!
 //! This module only holds the API key and talks to `GET /v1/me` so far.
 
