@@ -101,6 +101,9 @@ pub struct LiveState {
     pub review_stack_fallback: HashSet<u32>,
     pub github_user: Option<String>,
     pub tuicr_drafts: crate::external::tuicr::DraftComments,
+    /// Main checkout's position behind `origin/<base_branch>`, from the git
+    /// poll. `None` until known (or when the remote branch does not exist).
+    pub base_sync: Option<crate::external::git::BaseSync>,
     pub git_poll_done: bool,
     pub pr_poll_done: bool,
     pub pr_loading_more: bool,
@@ -3168,6 +3171,8 @@ mod tests {
             orchestrator_prompt: None,
             setup_script: None,
             teardown_script: None,
+            base_branch: "main".to_string(),
+            base_fetch_interval_secs: 900,
             done_session_ttl: DEFAULT_DONE_SESSION_TTL,
             debug: false,
             auto_import_reviews: true,
@@ -7602,6 +7607,8 @@ mod tests {
             orchestrator_prompt: None,
             setup_script: None,
             teardown_script: None,
+            base_branch: "main".to_string(),
+            base_fetch_interval_secs: 900,
             done_session_ttl: DEFAULT_DONE_SESSION_TTL,
             debug: false,
             auto_import_reviews: true,

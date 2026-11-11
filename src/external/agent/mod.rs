@@ -1519,6 +1519,8 @@ mod tests {
             orchestrator_prompt: None,
             setup_script: None,
             teardown_script: None,
+            base_branch: "main".to_string(),
+            base_fetch_interval_secs: 900,
             done_session_ttl: 300,
             debug: false,
             auto_import_reviews: true,

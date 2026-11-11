@@ -30,6 +30,8 @@ pub enum Action {
     ScrollToBottom,
     SyncPRs,
     BackupNow,
+    /// Fast-forward the main checkout to its base branch's remote.
+    PullBase,
     OpenPR,
     OpenAllPRs,
     OpenLinear,

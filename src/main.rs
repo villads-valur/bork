@@ -314,11 +314,14 @@ fn spawn_git_status_worker(
     pool: GitStatusPool,
     suspended: Arc<AtomicBool>,
     wake_rx: mpsc::Receiver<()>,
+    base_branch: String,
+    base_fetch_interval: Duration,
 ) -> mpsc::Receiver<GitPollResult> {
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || {
-        let mut poller = GitPoller::new(project_root, pool);
+        let mut poller =
+            GitPoller::with_base_branch(project_root, pool, base_branch, base_fetch_interval);
         // The first cycle refreshes everything; later cycles honor the adaptive
         // cadence unless a wake forces a full refresh.
         let mut force_all = true;
@@ -2311,6 +2314,8 @@ fn spawn_project_workers(
         git_pool.clone(),
         suspended.clone(),
         git_wake_rx,
+        project.config.base_branch.clone(),
+        Duration::from_secs(project.config.base_fetch_interval_secs),
     );
 
     let (pr_wake_tx, pr_wake_rx) = mpsc::channel::<github_poll::Wake>();
@@ -2492,6 +2497,10 @@ fn drain_project_workers(
             live.worktree_branches = git_result.branches;
             live.git_poll_done = true;
             git_data_changed = true;
+            needs_redraw = true;
+        }
+        if live.base_sync != git_result.base {
+            live.base_sync = git_result.base;
             needs_redraw = true;
         }
     }

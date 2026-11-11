@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::types::WorktreeStatus;
 
@@ -86,6 +87,17 @@ impl Drop for PoolPermit<'_> {
 pub struct GitPollResult {
     pub statuses: HashMap<String, WorktreeStatus>,
     pub branches: HashMap<String, String>,
+    /// How far the main checkout is behind `origin/<base_branch>`. `None`
+    /// when the remote branch cannot be resolved (no remote, unfetched, or a
+    /// differently named default branch).
+    pub base: Option<BaseSync>,
+}
+
+/// The main checkout's position relative to its base branch's remote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaseSync {
+    pub branch: String,
+    pub behind: u64,
 }
 
 /// Per-worktree scheduling and cached data. Owned by a single `GitPoller`
@@ -105,6 +117,10 @@ struct WorktreeState {
 pub struct GitPoller {
     project_root: std::path::PathBuf,
     pool: GitStatusPool,
+    /// Branch whose remote counterpart is tracked for the base-sync
+    /// indicator and `p` pull.
+    base_branch: String,
+    base_fetch_interval: Duration,
     /// Monotonic cycle counter driving cold-worktree scheduling.
     cycle: u32,
     /// Per-worktree schedule + cached status, keyed by directory name.
@@ -113,16 +129,37 @@ pub struct GitPoller {
     /// batched `git worktree list` (independent clones). `None` means "resolved
     /// and confirmed to have no usable branch", so we don't rev-parse again.
     branch_fallback: HashMap<String, Option<String>>,
+    /// When `origin/<base_branch>` was last fetched. Fetching is network I/O,
+    /// so it runs on its own interval rather than every poll cycle; the
+    /// behind-count itself is a cheap local rev-list recomputed each cycle.
+    last_base_fetch: Option<Instant>,
 }
 
 impl GitPoller {
     pub fn new(project_root: std::path::PathBuf, pool: GitStatusPool) -> Self {
+        Self::with_base_branch(
+            project_root,
+            pool,
+            crate::config::DEFAULT_BASE_BRANCH.to_string(),
+            Duration::from_secs(crate::config::DEFAULT_BASE_FETCH_INTERVAL_SECS),
+        )
+    }
+
+    pub fn with_base_branch(
+        project_root: std::path::PathBuf,
+        pool: GitStatusPool,
+        base_branch: String,
+        base_fetch_interval: Duration,
+    ) -> Self {
         GitPoller {
             project_root,
             pool,
+            base_branch,
+            base_fetch_interval,
             cycle: 0,
             worktrees: HashMap::new(),
             branch_fallback: HashMap::new(),
+            last_base_fetch: None,
         }
     }
 
@@ -136,7 +173,12 @@ impl GitPoller {
         let mut branches = HashMap::new();
 
         let Ok(entries) = std::fs::read_dir(&self.project_root) else {
-            return GitPollResult { statuses, branches };
+            let base = self.poll_base();
+            return GitPollResult {
+                statuses,
+                branches,
+                base,
+            };
         };
 
         // One `git worktree list --porcelain` resolves every worktree's branch,
@@ -188,7 +230,31 @@ impl GitPoller {
         self.worktrees.retain(|name, _| seen.contains(name));
         self.branch_fallback.retain(|name, _| seen.contains(name));
 
-        GitPollResult { statuses, branches }
+        let base = self.poll_base();
+
+        GitPollResult {
+            statuses,
+            branches,
+            base,
+        }
+    }
+
+    /// Refresh the base-branch position: fetch `origin/<base_branch>` when the
+    /// fetch interval has elapsed, then recompute the behind-count locally.
+    fn poll_base(&mut self) -> Option<BaseSync> {
+        let branch = self.base_branch.clone();
+        let main_dir = self.project_root.join("main");
+
+        let fetch_due = self
+            .last_base_fetch
+            .is_none_or(|last| last.elapsed() >= self.base_fetch_interval);
+        if fetch_due {
+            let _ = git_output(&main_dir, &["fetch", "--quiet", "origin", &branch]);
+            self.last_base_fetch = Some(Instant::now());
+        }
+
+        let behind = base_behind(&main_dir, &branch)?;
+        Some(BaseSync { branch, behind })
     }
 
     /// Whether a worktree should be refreshed this cycle. Ensures a
@@ -273,6 +339,60 @@ pub fn poll_all_worktrees(project_root: &Path, skip: &HashSet<String>) -> GitPol
         }
     };
     poller.poll(&classify, true)
+}
+
+/// Commits `origin/<branch>` has that the checkout's HEAD does not. `None`
+/// when the remote-tracking ref does not exist.
+pub fn base_behind(main_dir: &Path, branch: &str) -> Option<u64> {
+    let range = format!("HEAD..origin/{branch}");
+    let stdout = git_output(main_dir, &["rev-list", "--count", &range])?;
+    stdout.trim().parse().ok()
+}
+
+/// Fast-forward the checkout at `main_dir` to `origin/<branch>`. Refuses when
+/// the checkout is on another branch or dirty — pulling under someone's feet
+/// is worse than asking them to do it themselves.
+pub fn pull_base(main_dir: &Path, branch: &str) -> Result<String, String> {
+    let head = git_output(main_dir, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .ok_or_else(|| "Cannot resolve the main checkout's branch".to_string())?;
+    let head = head.trim();
+    if head != branch {
+        return Err(format!(
+            "Main checkout is on '{head}', not '{branch}' — pull skipped"
+        ));
+    }
+
+    let status = git_output(main_dir, &["status", "--porcelain"])
+        .ok_or_else(|| "Cannot read the main checkout's status".to_string())?;
+    if !status.trim().is_empty() {
+        return Err(format!(
+            "Main checkout has uncommitted changes — pull '{branch}' yourself when it is clean"
+        ));
+    }
+
+    let output = crate::external::git_command()
+        .arg("-C")
+        .arg(main_dir)
+        .args(["pull", "--ff-only", "origin", branch])
+        .output()
+        .map_err(|e| format!("git pull failed to start: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let cause = stderr
+            .lines()
+            .last()
+            .unwrap_or("git pull failed")
+            .to_string();
+        return Err(cause);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.contains("Already up to date") {
+        Ok(format!("'{branch}' already up to date"))
+    } else {
+        Ok(format!("Pulled '{branch}'"))
+    }
 }
 
 fn list_worktree_branches(project_root: &Path) -> HashMap<String, String> {
@@ -636,5 +756,144 @@ detached
     fn test_is_due_cold_on_multiplier() {
         assert!(is_due(PollClass::Cold, 8, 4));
         assert!(!is_due(PollClass::Cold, 7, 4));
+    }
+
+    fn fixture_repo() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin.git");
+        let main = tmp.path().join("main");
+        let run = |dir: &Path, args: &[&str]| {
+            let out = crate::external::git_command()
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        std::fs::create_dir(&origin).unwrap();
+        run(&origin, &["init", "-q", "--bare", "-b", "main"]);
+        std::fs::create_dir(&main).unwrap();
+        run(&main, &["init", "-q", "-b", "main"]);
+        run(
+            &main,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        run(
+            &main,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=T",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "one",
+            ],
+        );
+        run(&main, &["push", "-q", "origin", "main"]);
+        (tmp, origin, main)
+    }
+
+    fn commit_and_push(main: &Path, msg: &str) {
+        for args in [
+            vec![
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=T",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                msg,
+            ],
+            vec!["push", "-q", "origin", "main"],
+        ] {
+            let out = crate::external::git_command()
+                .arg("-C")
+                .arg(main)
+                .args(&args)
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+        }
+    }
+
+    #[test]
+    fn base_behind_counts_unpulled_remote_commits() {
+        let (_tmp, _origin, main) = fixture_repo();
+        assert_eq!(base_behind(&main, "main"), Some(0));
+
+        // Advance the remote past the local checkout: commit + push, then
+        // rewind the local branch.
+        commit_and_push(&main, "two");
+        let out = crate::external::git_command()
+            .arg("-C")
+            .arg(&main)
+            .args(["reset", "-q", "--hard", "HEAD~1"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+
+        assert_eq!(base_behind(&main, "main"), Some(1));
+    }
+
+    #[test]
+    fn base_behind_is_none_without_the_remote_branch() {
+        let (_tmp, _origin, main) = fixture_repo();
+        assert_eq!(base_behind(&main, "trunk"), None);
+    }
+
+    #[test]
+    fn pull_base_fast_forwards_a_clean_checkout() {
+        let (_tmp, _origin, main) = fixture_repo();
+        commit_and_push(&main, "two");
+        let out = crate::external::git_command()
+            .arg("-C")
+            .arg(&main)
+            .args(["reset", "-q", "--hard", "HEAD~1"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(base_behind(&main, "main"), Some(1));
+
+        assert_eq!(pull_base(&main, "main"), Ok("Pulled 'main'".to_string()));
+        assert_eq!(base_behind(&main, "main"), Some(0));
+
+        assert_eq!(
+            pull_base(&main, "main"),
+            Ok("'main' already up to date".to_string())
+        );
+    }
+
+    #[test]
+    fn pull_base_refuses_another_branch() {
+        let (_tmp, _origin, main) = fixture_repo();
+        let out = crate::external::git_command()
+            .arg("-C")
+            .arg(&main)
+            .args(["checkout", "-q", "-b", "feature"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+
+        let err = pull_base(&main, "main").unwrap_err();
+        assert!(err.contains("on 'feature', not 'main'"), "{err}");
+    }
+
+    #[test]
+    fn pull_base_refuses_a_dirty_checkout() {
+        let (_tmp, _origin, main) = fixture_repo();
+        std::fs::write(main.join("dirty.txt"), "x").unwrap();
+
+        let err = pull_base(&main, "main").unwrap_err();
+        assert!(err.contains("uncommitted changes"), "{err}");
     }
 }

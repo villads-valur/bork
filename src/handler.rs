@@ -1001,6 +1001,38 @@ fn handle_normal(
             PostAction::None
         }
 
+        Action::PullBase => {
+            let config = &app.context_project(ctx).config;
+            let branch = config.base_branch.clone();
+            let main_dir = config.project_root.join("main");
+
+            app.begin_busy();
+            app.set_message(format!("Pulling '{branch}'..."));
+            let tx = ch.action_tx.clone();
+            let git_wake_tx = ch.git_wake_tx.clone();
+
+            thread::spawn(move || {
+                let outcome = crate::external::git::pull_base(&main_dir, &branch);
+                // Refresh the behind-count (and worktree statuses) right away
+                // rather than waiting out the poll interval.
+                let _ = git_wake_tx.send(());
+                let result = match outcome {
+                    Ok(message) => ActionResult {
+                        message,
+                        ..Default::default()
+                    },
+                    Err(message) => ActionResult {
+                        message,
+                        message_kind: MessageKind::Warning,
+                        ..Default::default()
+                    },
+                };
+                let _ = tx.send(result);
+            });
+
+            PostAction::None
+        }
+
         Action::OpenPR => {
             let project = app.context_project(ctx);
             let issues = project.target_issues(&q);
@@ -2913,6 +2945,8 @@ mod tests {
             orchestrator_prompt: None,
             setup_script: None,
             teardown_script: None,
+            base_branch: "main".to_string(),
+            base_fetch_interval_secs: 900,
             done_session_ttl: DEFAULT_DONE_SESSION_TTL,
             debug: false,
             auto_import_reviews: true,
@@ -5710,6 +5744,8 @@ mod tests {
             orchestrator_prompt: None,
             setup_script: None,
             teardown_script: None,
+            base_branch: "main".to_string(),
+            base_fetch_interval_secs: 900,
             done_session_ttl: DEFAULT_DONE_SESSION_TTL,
             debug: false,
             auto_import_reviews: true,

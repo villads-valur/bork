@@ -44,6 +44,14 @@ pub fn render_header(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(ratatui::style::Color::Yellow),
         ));
     }
+    if let Some(base) = app.active_project().live.base_sync.as_ref() {
+        if base.behind > 0 {
+            title_spans.push(Span::styled(
+                format!(" {} \u{2193}{} ", base.branch, base.behind),
+                Style::default().fg(ratatui::style::Color::Yellow),
+            ));
+        }
+    }
     if app.active_project().config.debug {
         title_spans.push(Span::styled(
             " [DEBUG]",
