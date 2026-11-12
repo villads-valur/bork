@@ -1689,11 +1689,7 @@ impl Project {
 
     /// Run `change` (e.g. a filter toggle) and put the cursor back on the card
     /// it was on, if that card is still visible in the selected column.
-    pub fn keep_selected_issue<T>(
-        &mut self,
-        query: &str,
-        change: impl FnOnce(&mut Self) -> T,
-    ) -> T {
+    fn keep_selected_issue<T>(&mut self, query: &str, change: impl FnOnce(&mut Self) -> T) -> T {
         let selected = self.selected_issue(query).map(|issue| issue.id.clone());
         let result = change(self);
 
@@ -8936,7 +8932,7 @@ mod tests {
             linked_issue("bork-4", &["bork-2"]),
         ]);
         let ctx = app.action_context();
-        app.active_project_mut().selected_row[0] = 3;
+        app.active_project_mut().selected_row[Column::Todo.index()] = 3;
         let selected = |app: &App| app.active_project().selected_issue("").unwrap().id.clone();
         assert_eq!(selected(&app), "bork-4");
 
