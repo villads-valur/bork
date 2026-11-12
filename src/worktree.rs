@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context};
@@ -98,6 +98,27 @@ fn commits_behind_upstream(main_dir: &Path) -> Option<(String, u32)> {
     Some((upstream, behind))
 }
 
+/// The project's `main/` checkout, or an error saying how to get one. A
+/// project can be registered without it: `bork import` restores the board
+/// even when the clone fails (no access, SAML SSO not authorized).
+fn require_main_repo(project_root: &Path) -> anyhow::Result<PathBuf> {
+    let main_dir = project_root.join("main");
+    if main_dir.join(".git").exists() {
+        return Ok(main_dir);
+    }
+    if main_dir.exists() {
+        bail!(
+            "{} is not a git repo. Bork worktrees are created from the project's main/ checkout.",
+            main_dir.display()
+        );
+    }
+    bail!(
+        "{} is missing, so there's nothing to create worktrees from. Clone the project's repo into it first (`git clone <url> {}`); a `bork import` whose clone failed leaves it out.",
+        main_dir.display(),
+        main_dir.display()
+    );
+}
+
 pub fn create_worktree_in(
     config: &config::AppConfig,
     issue_id: &str,
@@ -118,13 +139,7 @@ pub fn create_worktree_in(
         );
     }
 
-    let main_dir = config.project_root.join("main");
-    if !main_dir.join(".git").exists() {
-        bail!(
-            "No git repo found at {}/main. Are you in a bork project?",
-            config.project_root.display()
-        );
-    }
+    let main_dir = require_main_repo(&config.project_root)?;
 
     let worktree_dir = match slug {
         Some(s) => format!("{}-{}", issue_id, s),
@@ -269,13 +284,7 @@ pub fn remove_worktree_in(
     removal: Removal,
 ) -> anyhow::Result<Removed> {
     let force = removal != Removal::Safe;
-    let main_dir = config.project_root.join("main");
-    if !main_dir.join(".git").exists() {
-        bail!(
-            "No git repo found at {}/main. Are you in a bork project?",
-            config.project_root.display()
-        );
-    }
+    let main_dir = require_main_repo(&config.project_root)?;
 
     let worktree_path = config.project_root.join(worktree_dir);
     if !worktree_path.exists() {
@@ -486,6 +495,24 @@ mod tests {
             cloud_agents: false,
             agent_launch: std::collections::HashMap::new(),
         }
+    }
+
+    #[test]
+    fn a_project_without_main_says_to_clone_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        write_bork_files(&project);
+        let cfg = test_config(&project);
+
+        let err = create_worktree_in(&cfg, "bork-1", Some("x"), None, None).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("main is missing"), "{message}");
+        assert!(message.contains("git clone"), "{message}");
+        assert!(!project.join("bork-1-x").exists());
+
+        fs::create_dir_all(project.join("main")).unwrap();
+        let err = create_worktree_in(&cfg, "bork-1", Some("x"), None, None).unwrap_err();
+        assert!(format!("{err:#}").contains("is not a git repo"));
     }
 
     #[test]

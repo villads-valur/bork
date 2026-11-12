@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::Stdio;
 
@@ -70,18 +71,71 @@ pub fn extract_repo_name(repo: &str) -> anyhow::Result<String> {
 
 /// Clone `url` into `main_dir` (a container's `main/`) with live progress
 /// output. Shared by `bork init` and `bork import`.
+///
+/// git's stderr is passed through as it arrives and also kept, so a failure
+/// carries git's own reason (a SAML SSO block, a missing repo) instead of
+/// just the exit code, which matters for the import summary printed after
+/// the progress has scrolled away.
 pub fn clone_repo(url: &str, main_dir: &Path) -> anyhow::Result<()> {
-    let status = crate::external::git_command()
+    let mut child = crate::external::git_command()
         .args(["clone", "--progress", "--", url])
         .arg(main_dir)
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
+        .stderr(Stdio::piped())
+        .spawn()
         .context("Failed to run git clone")?;
+    let mut captured = Vec::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        let mut buf = [0u8; 4096];
+        let mut out = std::io::stderr();
+        loop {
+            match stderr.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let _ = out.write_all(&buf[..n]);
+                    let _ = out.flush();
+                    captured.extend_from_slice(&buf[..n]);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+    }
+    let status = child.wait().context("Failed to run git clone")?;
     if !status.success() {
-        bail!("git clone failed (exit code: {})", status);
+        let reason = clone_failure_reason(&String::from_utf8_lossy(&captured));
+        match reason {
+            Some(reason) => bail!("git clone failed: {reason}"),
+            None => bail!("git clone failed (exit code: {})", status),
+        }
     }
     Ok(())
+}
+
+/// The useful part of a failed clone's stderr: every message line, minus
+/// progress (lines git rewrites with `\r`, or that end in `, done.`) and the
+/// "Cloning into" banner, joined into one line. Adds a hint for GitHub's
+/// SAML SSO block, since git's text doesn't say how to fix it.
+fn clone_failure_reason(stderr: &str) -> Option<String> {
+    let lines: Vec<&str> = stderr
+        .split('\n')
+        .filter(|line| !line.contains('\r'))
+        .map(|line| line.trim())
+        .map(|line| line.strip_prefix("remote:").map_or(line, str::trim))
+        .filter(|line| {
+            !line.is_empty() && !line.starts_with("Cloning into") && !line.ends_with(", done.")
+        })
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let mut reason = lines.join(" ");
+    if reason.contains("SAML SSO") {
+        reason.push_str(
+            " (authorize your token or SSH key for the organization, e.g. `gh auth refresh`, then retry)",
+        );
+    }
+    Some(reason)
 }
 
 /// Initialize a new bork project by cloning a git repo and scaffolding the
@@ -198,6 +252,55 @@ mod tests {
         let config_dir = tmp.join("xdg-config");
         let _ = fs::create_dir_all(&config_dir);
         crate::global_config::with_test_config_home(&config_dir, test);
+    }
+
+    // --- clone_failure_reason ---
+
+    #[test]
+    fn clone_failure_reason_explains_a_saml_block_over_ssh() {
+        let stderr = "Cloning into '/tmp/x/main'...\n\
+            ERROR: The 'acme' organization has enabled or enforced SAML SSO.\n\
+            To access this repository, you must use an SSH key authorized for this organization.\n\
+            \n\
+            fatal: Could not read from remote repository.\n";
+        let reason = clone_failure_reason(stderr).unwrap();
+        assert!(
+            reason.starts_with("ERROR: The 'acme' organization has enabled or enforced SAML SSO.")
+        );
+        assert!(reason.contains("fatal: Could not read from remote repository."));
+        assert!(reason.contains("gh auth refresh"));
+        assert!(!reason.contains("Cloning into"));
+    }
+
+    #[test]
+    fn clone_failure_reason_strips_remote_prefix_and_progress() {
+        let stderr = "Cloning into 'main'...\n\
+            remote: Enumerating objects: 5, done.\n\
+            Receiving objects:  20% (1/5)\rReceiving objects: 100% (5/5), done.\n\
+            remote: Repository not found.\n\
+            fatal: repository 'https://github.com/acme/gone.git/' not found\n";
+        assert_eq!(
+            clone_failure_reason(stderr).unwrap(),
+            "Repository not found. fatal: repository 'https://github.com/acme/gone.git/' not found"
+        );
+    }
+
+    #[test]
+    fn clone_failure_reason_is_none_without_a_message() {
+        assert_eq!(clone_failure_reason(""), None);
+        assert_eq!(clone_failure_reason("Cloning into 'main'...\n"), None);
+    }
+
+    #[test]
+    fn clone_repo_error_carries_gits_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = clone_repo(
+            tmp.path().join("missing.git").to_str().unwrap(),
+            &tmp.path().join("main"),
+        )
+        .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("does not exist"), "{message}");
     }
 
     // --- normalize_repo_url ---
