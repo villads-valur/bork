@@ -863,6 +863,10 @@ enum IssueCommand {
         /// Show only issues linked to this issue id (its connected component)
         #[arg(long)]
         linked: Option<String>,
+
+        /// List deleted issues that can still be restored
+        #[arg(long, conflicts_with_all = ["column", "linked"])]
+        deleted: bool,
     },
 
     /// Create a new issue
@@ -993,10 +997,28 @@ enum IssueCommand {
         id: String,
     },
 
-    /// Delete an issue
+    /// Delete an issue. It stays restorable for `keep_deleted_days` (30 by
+    /// default); see `restore` and `purge`
     Delete {
         /// Issue ID (e.g. bork-1)
         id: String,
+    },
+
+    /// Put a deleted issue back with its id, fields, sessions and links
+    Restore {
+        /// Issue ID (e.g. bork-1)
+        id: String,
+    },
+
+    /// Permanently remove deleted issues and their saved plans
+    Purge {
+        /// Deleted issue ID (e.g. bork-1)
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        id: Option<String>,
+
+        /// Purge every deleted issue
+        #[arg(long)]
+        all: bool,
     },
 
     /// Forget an issue's stored agent session so the next launch starts fresh
@@ -1481,13 +1503,18 @@ fn run_backup_status() -> anyhow::Result<()> {
     let now = app::unix_now();
     println!("files:");
     for (file, s) in records {
-        let ago = format_age(now.saturating_sub(s.last_run_at));
+        let ago = ops::format_age(now.saturating_sub(s.last_run_at));
         let result = if s.ok {
             format!("ok {ago} ago")
         } else {
             let since = s
                 .last_success_at
-                .map(|t| format!(", last success {} ago", format_age(now.saturating_sub(t))))
+                .map(|t| {
+                    format!(
+                        ", last success {} ago",
+                        ops::format_age(now.saturating_sub(t))
+                    )
+                })
                 .unwrap_or_default();
             format!("FAILED {ago} ago: {}{since}", s.error.unwrap_or_default())
         };
@@ -1505,15 +1532,6 @@ fn run_backup_status() -> anyhow::Result<()> {
         }
     }
     Ok(())
-}
-
-fn format_age(secs: u64) -> String {
-    match secs {
-        0..60 => format!("{secs}s"),
-        60..3600 => format!("{}m", secs / 60),
-        3600..86_400 => format!("{}h", secs / 3600),
-        _ => format!("{}d", secs / 86_400),
-    }
 }
 
 fn format_size(bytes: u64) -> String {
@@ -1597,6 +1615,7 @@ const CONFIG_KEYS: &[(&str, ConfigKeyKind)] = &[
     ("auto_import_authored_prs", ConfigKeyKind::Bool),
     ("debug", ConfigKeyKind::Bool),
     ("done_session_ttl", ConfigKeyKind::U64),
+    ("keep_deleted_days", ConfigKeyKind::U64),
     ("agent_kind", ConfigKeyKind::Agent),
     ("agent_mode", ConfigKeyKind::Mode),
     ("default_prompt", ConfigKeyKind::Str),
@@ -1655,6 +1674,7 @@ fn resolved_config_value(config: &config::AppConfig, key: &str) -> Option<String
         "auto_import_authored_prs" => Some(config.auto_import_authored_prs.to_string()),
         "debug" => Some(config.debug.to_string()),
         "done_session_ttl" => Some(config.done_session_ttl.to_string()),
+        "keep_deleted_days" => Some(config.keep_deleted_days.to_string()),
         "agent_kind" => Some(config.agent_kind.to_string()),
         "agent_mode" => Some(config.agent_mode.to_string()),
         "default_prompt" => Some(config.default_prompt.clone().unwrap_or_default()),
@@ -1704,6 +1724,33 @@ fn run_config_command(command: ConfigCommand) -> anyhow::Result<()> {
     }
 }
 
+/// Purge deleted issues past `keep_deleted_days`. Best effort: a failure is a
+/// warning, since the command the user ran already succeeded.
+fn purge_expired_deleted(project_root: &Path) {
+    match ops::purge_deleted(project_root, ops::PurgeTarget::Expired) {
+        Ok(purged) => {
+            for entry in purged {
+                eprintln!(
+                    "Purged {} (deleted over the keep_deleted_days limit)",
+                    entry.issue.id
+                );
+            }
+        }
+        Err(e) => eprintln!("bork: warning: couldn't purge old deleted issues: {e:#}"),
+    }
+}
+
+/// [`purge_expired_deleted`] for the TUI, which can't print: a failure goes to
+/// `.bork/errors.log`.
+fn purge_expired_deleted_quietly(project_root: &Path) {
+    if let Err(e) = ops::purge_deleted(project_root, ops::PurgeTarget::Expired) {
+        config::append_error_log(
+            project_root,
+            &[format!("Couldn't purge old deleted issues: {e:#}")],
+        );
+    }
+}
+
 fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
     let project_root = config::find_project_root();
 
@@ -1712,7 +1759,13 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
             json,
             column,
             linked,
+            deleted,
         } => {
+            if deleted {
+                purge_expired_deleted(&project_root);
+                println!("{}", ops::list_deleted(&project_root, json)?);
+                return Ok(());
+            }
             let output = ops::list_issues(
                 &project_root,
                 &ops::ListOptions {
@@ -1832,7 +1885,34 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
         }
         IssueCommand::Delete { id } => {
             let issue = ops::delete_issue(&project_root, &id)?;
-            println!("Deleted {}: \"{}\"", issue.id, issue.title);
+            println!(
+                "Deleted {}: \"{}\" (restore with `bork issue restore {}`)",
+                issue.id, issue.title, issue.id
+            );
+            purge_expired_deleted(&project_root);
+            Ok(())
+        }
+        IssueCommand::Restore { id } => {
+            let issue = ops::restore_issue(&project_root, &id)?;
+            println!("Restored {}: \"{}\"", issue.id, issue.title);
+            if !issue.linked_issues.is_empty() {
+                println!("Linked:   {}", issue.linked_issues.join(", "));
+            }
+            Ok(())
+        }
+        IssueCommand::Purge { id, all } => {
+            let target = match id.as_deref() {
+                Some(id) => ops::PurgeTarget::One(id),
+                None if all => ops::PurgeTarget::All,
+                None => anyhow::bail!("Pass an issue id or --all"),
+            };
+            let purged = ops::purge_deleted(&project_root, target)?;
+            if purged.is_empty() {
+                println!("No deleted issues to purge");
+            }
+            for entry in &purged {
+                println!("Purged {}: \"{}\"", entry.issue.id, entry.issue.title);
+            }
             Ok(())
         }
         IssueCommand::Launch { id } => external::agent::exec_launch(&project_root, &id),
@@ -2677,6 +2757,7 @@ fn run_tui() -> anyhow::Result<()> {
 
     if has_local_project {
         config = config::load_config_from(&local_root);
+        purge_expired_deleted_quietly(&local_root);
         state = config::load_state(&local_root);
         config::ensure_agent_status_dir(&config.project_root);
     } else {
@@ -2689,6 +2770,7 @@ fn run_tui() -> anyhow::Result<()> {
         }
         let entry = &registered[0];
         config = config::load_config_from(&entry.path);
+        purge_expired_deleted_quietly(&entry.path);
         state = config::load_state(&entry.path);
         config::ensure_agent_status_dir(&config.project_root);
     }
@@ -2749,6 +2831,7 @@ fn run_tui() -> anyhow::Result<()> {
             continue;
         }
         let proj_config = config::load_config_from(&entry.path);
+        purge_expired_deleted_quietly(&entry.path);
         let proj_state = config::load_state(&entry.path);
         app.add_background_project(proj_config, proj_state);
     }
@@ -3005,7 +3088,8 @@ fn run_tui() -> anyhow::Result<()> {
             needs_redraw = true;
             action_results_arrived = true;
             app.busy_count = app.busy_count.saturating_sub(1);
-            app.show_message(result.message, result.message_kind);
+            let message_kind = result.message_kind;
+            app.show_message(result.message, message_kind);
 
             if let Some((project_id, outcome)) = result.prune_outcome {
                 if let Some(project) = app.find_project_mut(&project_id) {
@@ -3019,9 +3103,7 @@ fn run_tui() -> anyhow::Result<()> {
                 handler::queue_force_prune(&mut app, project_id, outcome.plan_not_saved());
             }
 
-            for (project_id, issue_id) in result.issues_to_delete {
-                handler::delete_issue_from_app(&mut app, &project_id, &issue_id);
-            }
+            handler::delete_issues_from_app(&mut app, result.issues_to_delete, message_kind);
 
             for (project_id, issue_id) in result.issues_to_archive {
                 handler::archive_issue_in_app(&mut app, &project_id, &issue_id);

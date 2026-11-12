@@ -545,6 +545,15 @@ pub struct IssueDraft {
     pub model: Option<String>,
 }
 
+/// An issue removed from the board but kept restorable until it is purged.
+/// The issue is stored as it was, including its sessions, PR/Linear links and
+/// `linked_issues`, so a restore can put the links on both sides back.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeletedIssue {
+    pub issue: Issue,
+    pub deleted_at: u64,
+}
+
 impl Issue {
     /// Baseline issue with all optional/legacy fields empty. Combine with
     /// struct update syntax for variations:
