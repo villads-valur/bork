@@ -120,6 +120,15 @@ bork issue reset-session bork-1
 bork issue reset-session bork-1 --agent codex    # a different agent's stored session
 ```
 
+### Attach an existing agent session
+
+Store a session id on an agentic issue so the next launch resumes that conversation (e.g. a recreated issue, or a session started outside bork). It goes under the issue's agent, or under `--agent` when passed too. The id must exist for that agent; a live session running that agent is killed.
+
+```bash
+bork issue update bork-1 --session 3f2c9a1e-...                  # the issue's current agent
+bork issue update bork-1 --agent claude --session 3f2c9a1e-...   # switch to claude and attach
+```
+
 ### Delete an issue
 
 ```bash

@@ -238,6 +238,38 @@ pub struct UpdateOptions {
     /// New model; an empty string clears it.
     pub model: Option<String>,
     pub kind: Option<IssueKind>,
+    /// Existing session id to attach under the issue's (new) agent.
+    pub session: Option<String>,
+}
+
+/// Attach `session_id` to `issue`'s current agent so its next launch resumes
+/// it. `exists` is the agent's `has_session` check, injected for tests.
+/// Returns whether the live tmux session must be killed first.
+fn attach_session(
+    issue: &mut Issue,
+    session_id: String,
+    exists: impl Fn(AgentKind, &str) -> bool,
+) -> anyhow::Result<bool> {
+    let session_id = session_id.trim().to_string();
+    if session_id.is_empty() {
+        anyhow::bail!(
+            "{}: session id is empty; use `bork issue reset-session {}` to forget a session",
+            issue.id,
+            issue.id
+        );
+    }
+    if !issue.kind.is_agentic() {
+        anyhow::bail!(
+            "{} is a {} issue; only agentic issues have agent sessions",
+            issue.id,
+            issue.kind
+        );
+    }
+    let agent = issue.agent_kind;
+    if !exists(agent, &session_id) {
+        anyhow::bail!("{agent} has no session '{session_id}'");
+    }
+    Ok(issue.attach_session(session_id))
 }
 
 pub fn update_issue(
@@ -291,12 +323,20 @@ pub fn update_issue(
     if let Some(kind) = opts.kind {
         session_stale |= issue.set_kind(kind);
     }
+    // After the agent and kind changes, so `--agent X --session S` attaches to
+    // X, and a kind change that clears the sessions doesn't drop S.
+    if let Some(session_id) = opts.session {
+        session_stale |= attach_session(issue, session_id, |agent, sid| {
+            agent::provider(agent).has_session(project_root, sid)
+        })?;
+    }
 
     if session_stale {
         // Kill any live session so it isn't re-attached with the old kind's
-        // prompt and cwd, or the old agent's process. A failed cleanup
-        // aborts here, before the state is persisted below, so it cannot
-        // leave an untracked old agent running against saved changes.
+        // prompt and cwd, the old agent's process, or a conversation other
+        // than the attached session. A failed cleanup aborts here, before the
+        // state is persisted below, so it cannot leave an untracked old agent
+        // running against saved changes.
         let config = config::load_config_from(project_root);
         agent::terminate_session(project_root, &issue.session_name(&config.project_name))?;
     }
@@ -982,6 +1022,7 @@ mod tests {
             root,
             "test-1",
             UpdateOptions {
+                session: None,
                 title: Some("Updated title".into()),
                 column: Some(Column::InProgress),
                 agent_kind: None,
@@ -1020,6 +1061,7 @@ mod tests {
             root,
             "test-1",
             UpdateOptions {
+                session: None,
                 title: None,
                 column: Some(Column::Done),
                 agent_kind: None,
@@ -1057,6 +1099,7 @@ mod tests {
             root,
             "test-1",
             UpdateOptions {
+                session: None,
                 title: None,
                 column: Some(Column::Todo),
                 agent_kind: None,
@@ -1115,6 +1158,7 @@ mod tests {
                 prompt: None,
                 model: None,
                 kind: Some(IssueKind::Orchestrator),
+                session: None,
             },
         )
         .unwrap();
@@ -1459,6 +1503,197 @@ mod tests {
     }
 
     #[test]
+    fn update_session_attaches_to_the_current_agent() {
+        let dir = setup_project();
+        let root = dir.path();
+        issue_with_session(root, AgentKind::OpenCode, "ses_old");
+        edit_stored_issue(root, |issue| {
+            issue.sessions.insert(AgentKind::Claude, "uuid-1".into());
+        });
+
+        let updated = update_issue(
+            root,
+            "test-1",
+            UpdateOptions {
+                session: Some(" ses_recovered ".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let stored = &config::load_state(root).issues[0];
+        assert_eq!(stored.current_session_id(), Some("ses_recovered"));
+        assert_eq!(
+            stored.sessions.get(&AgentKind::Claude).map(String::as_str),
+            Some("uuid-1")
+        );
+        assert_eq!(updated.current_session_id(), Some("ses_recovered"));
+    }
+
+    #[test]
+    fn update_session_keeps_setup_pending_for_a_fresh_worktree() {
+        let dir = setup_project();
+        let root = dir.path();
+        issue_without_session(root, AgentKind::OpenCode);
+        edit_stored_issue(root, |issue| issue.worktree = Some("test-1-fresh".into()));
+
+        update_issue(
+            root,
+            "test-1",
+            UpdateOptions {
+                session: Some("ses_recovered".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Reloading must not treat the attached session as proof setup ran.
+        assert!(!config::load_state(root).issues[0].setup_ran);
+    }
+
+    #[test]
+    fn update_session_with_agent_attaches_to_the_new_agent() {
+        let dir = setup_project();
+        let root = dir.path();
+        issue_with_session(root, AgentKind::Claude, "uuid-1");
+
+        update_issue(
+            root,
+            "test-1",
+            UpdateOptions {
+                agent_kind: Some(AgentKind::OpenCode),
+                session: Some("ses_recovered".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let sessions = &config::load_state(root).issues[0].sessions;
+        assert_eq!(
+            sessions.get(&AgentKind::OpenCode).map(String::as_str),
+            Some("ses_recovered")
+        );
+        assert_eq!(
+            sessions.get(&AgentKind::Claude).map(String::as_str),
+            Some("uuid-1")
+        );
+    }
+
+    #[test]
+    fn update_session_survives_a_kind_change_that_clears_sessions() {
+        let dir = setup_project();
+        let root = dir.path();
+        issue_with_session(root, AgentKind::OpenCode, "ses_old");
+
+        update_issue(
+            root,
+            "test-1",
+            UpdateOptions {
+                kind: Some(IssueKind::Orchestrator),
+                session: Some("ses_orch".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let stored = &config::load_state(root).issues[0];
+        assert_eq!(stored.kind, IssueKind::Orchestrator);
+        assert_eq!(stored.current_session_id(), Some("ses_orch"));
+    }
+
+    #[test]
+    fn update_session_rejects_a_todo_issue_and_saves_nothing() {
+        let dir = setup_project();
+        let root = dir.path();
+        issue_without_session(root, AgentKind::OpenCode);
+        edit_stored_issue(root, |issue| issue.kind = IssueKind::NonAgentic);
+
+        let err = update_issue(
+            root,
+            "test-1",
+            UpdateOptions {
+                title: Some("Renamed".into()),
+                session: Some("ses_x".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("only agentic issues"));
+        let stored = &config::load_state(root).issues[0];
+        assert!(stored.sessions.is_empty());
+        assert_eq!(stored.title, "Launch by hand");
+    }
+
+    #[test]
+    fn update_session_rejects_switching_to_todo_in_the_same_update() {
+        let dir = setup_project();
+        let root = dir.path();
+        issue_without_session(root, AgentKind::OpenCode);
+
+        let result = update_issue(
+            root,
+            "test-1",
+            UpdateOptions {
+                kind: Some(IssueKind::NonAgentic),
+                session: Some("ses_x".into()),
+                ..Default::default()
+            },
+        );
+
+        assert!(result.is_err());
+        let stored = &config::load_state(root).issues[0];
+        assert_eq!(stored.kind, IssueKind::Agentic);
+        assert!(stored.sessions.is_empty());
+    }
+
+    #[test]
+    fn update_session_rejects_an_empty_id() {
+        let dir = setup_project();
+        let root = dir.path();
+        issue_with_session(root, AgentKind::OpenCode, "ses_old");
+
+        let err = update_issue(
+            root,
+            "test-1",
+            UpdateOptions {
+                session: Some("  ".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("reset-session"));
+        assert_eq!(
+            config::load_state(root).issues[0].current_session_id(),
+            Some("ses_old")
+        );
+    }
+
+    #[test]
+    fn attach_session_rejects_a_session_the_agent_does_not_have() {
+        let mut issue = Issue::new("test-1", "Recreated", Column::Todo, AgentKind::Claude);
+
+        let err = attach_session(&mut issue, "uuid-gone".into(), |_, _| false).unwrap_err();
+
+        assert!(err.to_string().contains("uuid-gone"));
+        assert!(issue.sessions.is_empty());
+    }
+
+    #[test]
+    fn attach_session_checks_the_issues_agent() {
+        let mut issue = Issue::new("test-1", "Recreated", Column::Todo, AgentKind::Claude);
+
+        let kills = attach_session(&mut issue, "uuid-1".into(), |agent, sid| {
+            agent == AgentKind::Claude && sid == "uuid-1"
+        })
+        .unwrap();
+
+        assert!(kills);
+        assert_eq!(issue.current_session_id(), Some("uuid-1"));
+    }
+
+    #[test]
     fn update_agent_keeps_stored_sessions() {
         let dir = setup_project();
         let root = dir.path();
@@ -1792,6 +2027,7 @@ mod tests {
             dir.path(),
             "nope-1",
             UpdateOptions {
+                session: None,
                 title: Some("X".into()),
                 column: None,
                 agent_kind: None,
