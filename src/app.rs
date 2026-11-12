@@ -1319,10 +1319,7 @@ impl Project {
                     return false;
                 }
             }
-            if claimed_pr_numbers.contains(&pr.number) || new_pr_numbers.contains(&pr.number) {
-                return false;
-            }
-            true
+            !(claimed_pr_numbers.contains(&pr.number) || new_pr_numbers.contains(&pr.number))
         };
 
         let mut new_pr_numbers: HashSet<u32> = HashSet::new();
