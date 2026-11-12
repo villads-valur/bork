@@ -1678,12 +1678,24 @@ impl Project {
     /// the selected card is found again by id; the filter turns itself off
     /// once nothing needs you, rather than leave an empty board.
     pub fn keep_selection<T>(&mut self, query: &str, refresh: impl FnOnce(&mut Self) -> T) -> T {
-        let selected = self.selected_issue(query).map(|issue| issue.id.clone());
-        let result = refresh(self);
+        self.keep_selected_issue(query, |project| {
+            let result = refresh(project);
+            if project.attention_filter && project.attention_count() == 0 {
+                project.attention_filter = false;
+            }
+            result
+        })
+    }
 
-        if self.attention_filter && self.attention_count() == 0 {
-            self.attention_filter = false;
-        }
+    /// Run `change` (e.g. a filter toggle) and put the cursor back on the card
+    /// it was on, if that card is still visible in the selected column.
+    pub fn keep_selected_issue<T>(
+        &mut self,
+        query: &str,
+        change: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let selected = self.selected_issue(query).map(|issue| issue.id.clone());
+        let result = change(self);
 
         let row = Column::from_index(self.selected_column).and_then(|column| {
             self.issues_in_column(column, query)
@@ -3019,7 +3031,7 @@ impl App {
             None => return,
         };
         self.context_project_mut(ctx)
-            .keep_selection(&query, |project| project.link_filter = Some(anchor));
+            .keep_selected_issue(&query, |project| project.link_filter = Some(anchor));
     }
 
     /// Cards that need you across the visible swimlanes only.
@@ -3057,8 +3069,7 @@ impl App {
         let query = self.search_query.clone();
         for id in self.visible_swimlanes() {
             if let Some(project) = self.find_project_mut(&id) {
-                project.attention_filter = on;
-                project.clamp_all_rows(&query);
+                project.keep_selected_issue(&query, |project| project.attention_filter = on);
             }
         }
     }
@@ -3066,7 +3077,7 @@ impl App {
     pub fn clear_link_filter(&mut self, ctx: &ActionContext) {
         let query = self.search_query.clone();
         self.context_project_mut(ctx)
-            .keep_selection(&query, |project| project.link_filter = None);
+            .keep_selected_issue(&query, |project| project.link_filter = None);
     }
 
     pub fn open_link_picker(&mut self, ctx: &ActionContext) {
@@ -3597,6 +3608,46 @@ mod tests {
         app.toggle_attention_filter(&ctx);
 
         assert!(!app.project().attention_filter);
+    }
+
+    #[test]
+    fn attention_filter_toggle_keeps_the_selected_issue() {
+        let mut app = test_app(vec![
+            issue_linked_to_pr("bork-1", 8, None),
+            issue_linked_to_pr("bork-2", 7, None),
+            issue_linked_to_pr("bork-3", 8, None),
+            issue_linked_to_pr("bork-4", 7, None),
+        ]);
+        app.project_mut().live.user_prs = vec![test_pr(7, "feature")];
+        let column = Column::CodeReview.index();
+        app.project_mut().selected_column = column;
+        app.project_mut().selected_row[column] = 3;
+        let ctx = app.action_context();
+        let selected = |app: &App| app.project().selected_issue("").unwrap().id.clone();
+        assert_eq!(selected(&app), "bork-4");
+
+        app.toggle_attention_filter(&ctx);
+        assert_eq!(selected(&app), "bork-4");
+
+        app.project_mut().move_selection_up();
+        assert_eq!(selected(&app), "bork-2");
+
+        app.toggle_attention_filter(&ctx);
+        assert!(!app.project().attention_filter);
+        assert_eq!(selected(&app), "bork-2");
+    }
+
+    #[test]
+    fn attention_filter_toggle_keeps_quiet_swimlanes_filtered() {
+        let (mut app, ids) = attention_app(&["alpha", "beta"]);
+        app.find_project_mut(&ids[0]).unwrap().live.user_prs = vec![test_pr(7, "feature")];
+        app.sidebar.as_mut().unwrap().swimlanes = vec![ids[0].clone(), ids[1].clone()];
+        let ctx = app.action_context();
+
+        app.toggle_attention_filter(&ctx);
+
+        assert!(app.find_project(&ids[0]).unwrap().attention_filter);
+        assert!(app.find_project(&ids[1]).unwrap().attention_filter);
     }
 
     #[test]
