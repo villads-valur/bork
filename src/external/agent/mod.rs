@@ -248,6 +248,9 @@ pub fn launch_session(issue: &Issue, config: &AppConfig) -> Result<LaunchOutcome
     let before = provider.snapshot_session_ids(&config.project_root);
 
     tmux::create_session(&session_name, cwd)?;
+    // tmux otherwise names the window after the running command, which for a
+    // versioned install (Claude Code's `versions/2.1.322`) is the version.
+    let _ = tmux::rename_window(&session_name, provider.display_name());
     let started = start_in_session(&session_name, cwd, &launch_cmd, &handoff);
     let (session_id, setup_ran, replaced_lost_session) = match started {
         Ok(started) => started,
