@@ -230,6 +230,9 @@ fn undo_last(app: &mut App) {
         app.set_warning("Nothing to undo");
         return;
     };
+    // Apply a CLI write from since the last poll first, so a restore, purge
+    // or edit made there wins over the undo.
+    project.merge_external_state_if_changed();
     let reverted = entry.revert(project);
     if reverted == 0 {
         app.set_warning("Couldn't undo, the issues changed since");
@@ -5112,6 +5115,38 @@ mod tests {
         let other = &app.project().issues[0];
         assert_eq!(other.title, "Renamed by an agent");
         assert_eq!(other.linked_issues, vec!["bork-1".to_string()]);
+    }
+
+    #[test]
+    fn undo_delete_picks_up_a_cli_restore_from_before_the_next_poll() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let mut app = app_with_issues();
+        app.project_mut().config.project_root = root.to_path_buf();
+        confirm_delete(&mut app, &["bork-1"]);
+        // The TUI flushes the delete.
+        let project = app.project_mut();
+        crate::config::save_state(&project.to_state(), root).unwrap();
+        project.update_base_snapshot();
+
+        // The CLI restores and edits the issue before the TUI polls again.
+        crate::ops::restore_issue(root, "bork-1").unwrap();
+        let mut state = crate::config::load_state(root);
+        let restored = state.issues.iter_mut().find(|i| i.id == "bork-1").unwrap();
+        restored.title = "Edited from the CLI".into();
+        crate::config::save_state(&state, root).unwrap();
+        // Same-second writes can share an mtime, so mark the file as unseen.
+        app.project_mut().last_state_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
+
+        act(&mut app, Action::Undo);
+        let restored: Vec<_> = app
+            .project()
+            .issues
+            .iter()
+            .filter(|i| i.id == "bork-1")
+            .collect();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].title, "Edited from the CLI");
     }
 
     #[test]

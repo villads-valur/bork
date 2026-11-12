@@ -488,23 +488,31 @@ pub fn restore_deleted(
         );
     }
     let mut issue = deleted.remove(pos).issue;
-    restore_links(issues, &mut issue);
+    restore_links(issues, deleted, &mut issue);
     issues.push(issue.clone());
     Ok(issue)
 }
 
 /// Re-add `restored`'s id to every issue it links to, keeping links symmetric.
-/// Links to issues no longer on the board are dropped from `restored`.
-fn restore_links(issues: &mut [Issue], restored: &mut Issue) {
+/// A link to an issue that is still deleted is handed to that issue's entry,
+/// so restoring it later reconnects both sides whatever the restore order.
+/// Links to issues that are gone for good are dropped.
+fn restore_links(issues: &mut [Issue], deleted: &mut [DeletedIssue], restored: &mut Issue) {
     restored.linked_issues.retain(|linked_id| {
-        let Some(idx) = find_issue_index(issues, linked_id) else {
-            return false;
-        };
-        let other = &mut issues[idx];
-        if !other.is_linked_to(&restored.id) {
-            other.linked_issues.push(restored.id.clone());
+        if let Some(idx) = find_issue_index(issues, linked_id) {
+            let other = &mut issues[idx];
+            if !other.is_linked_to(&restored.id) {
+                other.linked_issues.push(restored.id.clone());
+            }
+            return true;
         }
-        true
+        if let Ok(idx) = find_deleted_index(deleted, linked_id, None) {
+            let other = &mut deleted[idx].issue;
+            if !other.is_linked_to(&restored.id) {
+                other.linked_issues.push(restored.id.clone());
+            }
+        }
+        false
     });
 }
 
@@ -1837,6 +1845,38 @@ mod tests {
         for id in ["test-2", "test-3"] {
             let other = state.issues.iter().find(|i| i.id == id).unwrap();
             assert_eq!(other.linked_issues, vec!["test-1".to_string()]);
+        }
+    }
+
+    #[test]
+    fn restore_keeps_links_between_deleted_issues_in_either_order() {
+        for restore_order in [["test-1", "test-2"], ["test-2", "test-1"]] {
+            let dir = setup_project();
+            let root = dir.path();
+            create_titled(root, "A");
+            create_titled(root, "B");
+            link_issues(root, "test-1", "test-2").unwrap();
+            delete_issue(root, "test-1").unwrap();
+            delete_issue(root, "test-2").unwrap();
+
+            for id in restore_order {
+                restore_issue(root, id).unwrap();
+            }
+            let state = config::load_state(root);
+            let links = |id: &str| {
+                let issue = state.issues.iter().find(|i| i.id == id).unwrap();
+                issue.linked_issues.clone()
+            };
+            assert_eq!(
+                links("test-1"),
+                vec!["test-2".to_string()],
+                "{restore_order:?}"
+            );
+            assert_eq!(
+                links("test-2"),
+                vec!["test-1".to_string()],
+                "{restore_order:?}"
+            );
         }
     }
 

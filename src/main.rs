@@ -130,12 +130,7 @@ fn wait_while_suspended(suspended: &AtomicBool) {
 }
 
 fn flush_project_state(project: &mut Project) {
-    let current_mtime = config::state_mtime(&project.config.project_root);
-    if current_mtime != project.last_state_mtime {
-        if let Some(new_state) = config::try_load_state(&project.config.project_root) {
-            project.merge_external_state(new_state);
-        }
-    }
+    project.merge_external_state_if_changed();
 
     let _ = config::save_state(&project.to_state(), &project.config.project_root);
     project.state_dirty = false;

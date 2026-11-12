@@ -339,6 +339,19 @@ impl Project {
         self.last_state_mtime = crate::config::state_mtime(&self.config.project_root);
     }
 
+    /// Merge state.json into memory when another writer changed it since we
+    /// last read or wrote it. An unreadable file is skipped, like the poll.
+    pub fn merge_external_state_if_changed(&mut self) {
+        let current_mtime = crate::config::state_mtime(&self.config.project_root);
+        if current_mtime == self.last_state_mtime {
+            return;
+        }
+        if let Some(file_state) = crate::config::try_load_state(&self.config.project_root) {
+            self.merge_external_state(file_state);
+            self.last_state_mtime = current_mtime;
+        }
+    }
+
     pub fn merge_external_state(&mut self, file_state: AppState) {
         // Timestamps only move forward, so the later value wins regardless
         // of whether it came from memory or an external writer.
