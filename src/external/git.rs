@@ -87,9 +87,10 @@ impl Drop for PoolPermit<'_> {
 pub struct GitPollResult {
     pub statuses: HashMap<String, WorktreeStatus>,
     pub branches: HashMap<String, String>,
-    /// How far the main checkout is behind `origin/<base_branch>`. `None`
-    /// when the remote branch cannot be resolved (no remote, unfetched, or a
-    /// differently named default branch).
+    /// How far the main checkout is behind the origin counterpart of the
+    /// branch it is on. `None` when that remote branch cannot be resolved
+    /// (no remote, unfetched, or a detached HEAD with no matching remote
+    /// branch).
     pub base: Option<BaseSync>,
 }
 
@@ -117,8 +118,8 @@ struct WorktreeState {
 pub struct GitPoller {
     project_root: std::path::PathBuf,
     pool: GitStatusPool,
-    /// Branch whose remote counterpart is tracked for the base-sync
-    /// indicator and `p` pull.
+    /// Configured base branch, used as the fallback for the base-sync
+    /// indicator when the main checkout is on a detached HEAD.
     base_branch: String,
     base_fetch_interval: Duration,
     /// Monotonic cycle counter driving cold-worktree scheduling.
@@ -239,11 +240,19 @@ impl GitPoller {
         }
     }
 
-    /// Refresh the base-branch position: fetch `origin/<base_branch>` when the
-    /// fetch interval has elapsed, then recompute the behind-count locally.
+    /// Refresh the base-branch position: fetch the main checkout's branch
+    /// from origin when the fetch interval has elapsed, then recompute the
+    /// behind-count locally.
     fn poll_base(&mut self) -> Option<BaseSync> {
-        let branch = self.base_branch.clone();
         let main_dir = self.project_root.join("main");
+
+        // Follow the checkout's actual branch (e.g. 'master' while the
+        // configured base_branch is 'main'). A detached HEAD has nothing to
+        // pull; fall back to the configured base branch there.
+        let branch = match git_output(&main_dir, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+            Some(head) if head.trim() != "HEAD" => head.trim().to_string(),
+            _ => self.base_branch.clone(),
+        };
 
         let fetch_due = self
             .last_base_fetch
@@ -349,9 +358,9 @@ pub fn base_behind(main_dir: &Path, branch: &str) -> Option<u64> {
     stdout.trim().parse().ok()
 }
 
-/// Fast-forward the checkout at `main_dir` to `origin/<branch>`. Refuses when
-/// the checkout is on another branch or dirty — pulling under someone's feet
-/// is worse than asking them to do it themselves.
+/// Fast-forward the checkout at `main_dir` to the origin counterpart of the
+/// branch it is on. Refuses when the checkout is dirty — pulling under
+/// someone's feet is worse than asking them to do it themselves.
 pub fn pull_base(main_dir: &Path) -> Result<String, String> {
     // Pull whatever branch the main checkout is actually on (e.g. a repo
     // whose default branch is 'master' while bork's base_branch is 'main').
@@ -841,6 +850,40 @@ detached
         assert!(out.status.success());
 
         assert_eq!(base_behind(&main, "main"), Some(1));
+    }
+
+    #[test]
+    fn poll_base_follows_the_checkouts_branch() {
+        let (_tmp, _origin, main) = fixture_repo();
+        let pool = GitStatusPool::new(1);
+        let mut poller = GitPoller::with_base_branch(
+            main.parent().unwrap().to_path_buf(),
+            pool,
+            "main".to_string(),
+            Duration::from_secs(900),
+        );
+
+        // A checkout on 'master' (base_branch is 'main') is measured against
+        // 'origin/master' and reported under 'master'.
+        for args in [
+            vec!["checkout", "-q", "-b", "master"],
+            vec!["push", "-q", "origin", "master"],
+        ] {
+            let out = crate::external::git_command()
+                .arg("-C")
+                .arg(&main)
+                .args(&args)
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+        }
+
+        let sync = poller
+            .poll(&|_| PollClass::Skip, false)
+            .base
+            .expect("base sync");
+        assert_eq!(sync.branch, "master");
+        assert_eq!(sync.behind, 0);
     }
 
     #[test]
