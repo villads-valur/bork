@@ -269,9 +269,7 @@ fn attach_session(
     if !exists(agent, &session_id) {
         anyhow::bail!("{agent} has no session '{session_id}'");
     }
-    let kills = issue.attaching_kills_session(agent, &session_id);
-    issue.attach_session(agent, session_id);
-    Ok(kills)
+    Ok(issue.attach_session(session_id))
 }
 
 pub fn update_issue(
@@ -336,9 +334,9 @@ pub fn update_issue(
     if session_stale {
         // Kill any live session so it isn't re-attached with the old kind's
         // prompt and cwd, the old agent's process, or a conversation other
-        // than the attached session. A failed cleanup
-        // aborts here, before the state is persisted below, so it cannot
-        // leave an untracked old agent running against saved changes.
+        // than the attached session. A failed cleanup aborts here, before the
+        // state is persisted below, so it cannot leave an untracked old agent
+        // running against saved changes.
         let config = config::load_config_from(project_root);
         agent::terminate_session(project_root, &issue.session_name(&config.project_name))?;
     }
@@ -1504,10 +1502,6 @@ mod tests {
         assert!(!again.removed);
     }
 
-    fn update_session(root: &Path, opts: UpdateOptions) -> anyhow::Result<Issue> {
-        update_issue(root, "test-1", opts)
-    }
-
     #[test]
     fn update_session_attaches_to_the_current_agent() {
         let dir = setup_project();
@@ -1517,8 +1511,9 @@ mod tests {
             issue.sessions.insert(AgentKind::Claude, "uuid-1".into());
         });
 
-        let updated = update_session(
+        let updated = update_issue(
             root,
+            "test-1",
             UpdateOptions {
                 session: Some(" ses_recovered ".into()),
                 ..Default::default()
@@ -1541,8 +1536,9 @@ mod tests {
         let root = dir.path();
         issue_with_session(root, AgentKind::Claude, "uuid-1");
 
-        update_session(
+        update_issue(
             root,
+            "test-1",
             UpdateOptions {
                 agent_kind: Some(AgentKind::OpenCode),
                 session: Some("ses_recovered".into()),
@@ -1568,8 +1564,9 @@ mod tests {
         let root = dir.path();
         issue_with_session(root, AgentKind::OpenCode, "ses_old");
 
-        update_session(
+        update_issue(
             root,
+            "test-1",
             UpdateOptions {
                 kind: Some(IssueKind::Orchestrator),
                 session: Some("ses_orch".into()),
@@ -1590,8 +1587,9 @@ mod tests {
         issue_without_session(root, AgentKind::OpenCode);
         edit_stored_issue(root, |issue| issue.kind = IssueKind::NonAgentic);
 
-        let err = update_session(
+        let err = update_issue(
             root,
+            "test-1",
             UpdateOptions {
                 title: Some("Renamed".into()),
                 session: Some("ses_x".into()),
@@ -1612,8 +1610,9 @@ mod tests {
         let root = dir.path();
         issue_without_session(root, AgentKind::OpenCode);
 
-        let result = update_session(
+        let result = update_issue(
             root,
+            "test-1",
             UpdateOptions {
                 kind: Some(IssueKind::NonAgentic),
                 session: Some("ses_x".into()),
@@ -1633,8 +1632,9 @@ mod tests {
         let root = dir.path();
         issue_with_session(root, AgentKind::OpenCode, "ses_old");
 
-        let err = update_session(
+        let err = update_issue(
             root,
+            "test-1",
             UpdateOptions {
                 session: Some("  ".into()),
                 ..Default::default()
