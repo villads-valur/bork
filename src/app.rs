@@ -2001,24 +2001,48 @@ pub use crate::dialog_state::{DialogField, DialogState};
 
 /// 3-way merge of the deleted list, keyed by id and delete time. An entry
 /// either side added since base is kept; one either side removed since base
-/// (restored or purged) stays removed.
+/// (restored or purged) stays removed. An entry on both sides only changes
+/// when a restore hands it a link, so the file's version wins when memory's
+/// is untouched, and links from both are kept when both changed.
 fn merge_deleted_issues(
     memory: &[DeletedIssue],
     base: &[DeletedIssue],
     file: &[DeletedIssue],
 ) -> Vec<DeletedIssue> {
     let key = |entry: &DeletedIssue| (entry.issue.id.to_lowercase(), entry.deleted_at);
-    let base_keys: HashSet<_> = base.iter().map(key).collect();
-    let file_keys: HashSet<_> = file.iter().map(key).collect();
+    let base_by_key: HashMap<_, &DeletedIssue> = base.iter().map(|e| (key(e), e)).collect();
+    let file_by_key: HashMap<_, &DeletedIssue> = file.iter().map(|e| (key(e), e)).collect();
     let memory_keys: HashSet<_> = memory.iter().map(key).collect();
-    let mut merged: Vec<DeletedIssue> = memory
-        .iter()
-        .filter(|entry| file_keys.contains(&key(entry)) || !base_keys.contains(&key(entry)))
-        .cloned()
-        .collect();
+
+    let mut merged = Vec::new();
+    for entry in memory {
+        let entry_key = key(entry);
+        let base_entry = base_by_key.get(&entry_key).copied();
+        let Some(file_entry) = file_by_key.get(&entry_key).copied() else {
+            // Missing from the file: removed there if base had it, else new here.
+            if base_entry.is_none() {
+                merged.push(entry.clone());
+            }
+            continue;
+        };
+        if base_entry == Some(entry) {
+            merged.push(file_entry.clone());
+            continue;
+        }
+        let mut kept = entry.clone();
+        for linked_id in &file_entry.issue.linked_issues {
+            if !kept.issue.is_linked_to(linked_id) {
+                kept.issue.linked_issues.push(linked_id.clone());
+            }
+        }
+        merged.push(kept);
+    }
     merged.extend(
         file.iter()
-            .filter(|entry| !memory_keys.contains(&key(entry)) && !base_keys.contains(&key(entry)))
+            .filter(|entry| {
+                let entry_key = key(entry);
+                !memory_keys.contains(&entry_key) && !base_by_key.contains_key(&entry_key)
+            })
             .cloned(),
     );
     merged.sort_by_key(|entry| entry.deleted_at);
@@ -8631,6 +8655,27 @@ mod tests {
         let merged = merge_deleted_issues(&memory, &base, &file);
         let ids: Vec<_> = merged.iter().map(|e| e.issue.id.as_str()).collect();
         assert_eq!(ids, ["x", "z", "w"]);
+    }
+
+    #[test]
+    fn merge_deleted_issues_keeps_a_link_handed_over_by_a_restore() {
+        let entry = |links: &[&str]| {
+            let mut issue = test_issue("b", Column::Todo);
+            issue.linked_issues = links.iter().map(|id| id.to_string()).collect();
+            DeletedIssue {
+                issue,
+                deleted_at: 7,
+            }
+        };
+        let base = vec![entry(&[])];
+
+        // A CLI restore of "a" handed its link to b's entry; memory is untouched.
+        let merged = merge_deleted_issues(&base, &base, &[entry(&["a"])]);
+        assert_eq!(merged[0].issue.linked_issues, ["a"]);
+
+        // Both sides handed b a link (undo in the TUI, restore in the CLI).
+        let merged = merge_deleted_issues(&[entry(&["c"])], &base, &[entry(&["a"])]);
+        assert_eq!(merged[0].issue.linked_issues, ["c", "a"]);
     }
 
     #[test]
