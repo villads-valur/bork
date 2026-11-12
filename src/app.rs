@@ -3018,9 +3018,8 @@ impl App {
             }
             None => return,
         };
-        let project = self.context_project_mut(ctx);
-        project.link_filter = Some(anchor);
-        project.clamp_all_rows(&query);
+        self.context_project_mut(ctx)
+            .keep_selection(&query, |project| project.link_filter = Some(anchor));
     }
 
     /// Cards that need you across the visible swimlanes only.
@@ -3066,9 +3065,8 @@ impl App {
 
     pub fn clear_link_filter(&mut self, ctx: &ActionContext) {
         let query = self.search_query.clone();
-        let project = self.context_project_mut(ctx);
-        project.link_filter = None;
-        project.clamp_all_rows(&query);
+        self.context_project_mut(ctx)
+            .keep_selection(&query, |project| project.link_filter = None);
     }
 
     pub fn open_link_picker(&mut self, ctx: &ActionContext) {
@@ -8876,6 +8874,30 @@ mod tests {
         app.toggle_link_filter(&ctx);
         assert!(app.active_project().link_filter.is_none());
         assert!(app.message.is_some());
+    }
+
+    #[test]
+    fn link_filter_toggle_keeps_the_selected_issue() {
+        let mut app = test_app(vec![
+            test_issue("bork-1", Column::Todo),
+            linked_issue("bork-2", &["bork-4"]),
+            test_issue("bork-3", Column::Todo),
+            linked_issue("bork-4", &["bork-2"]),
+        ]);
+        let ctx = app.action_context();
+        app.active_project_mut().selected_row[0] = 3;
+        let selected = |app: &App| app.active_project().selected_issue("").unwrap().id.clone();
+        assert_eq!(selected(&app), "bork-4");
+
+        app.toggle_link_filter(&ctx);
+        assert_eq!(selected(&app), "bork-4");
+
+        app.active_project_mut().move_selection_up();
+        assert_eq!(selected(&app), "bork-2");
+
+        app.toggle_link_filter(&ctx);
+        assert!(app.active_project().link_filter.is_none());
+        assert_eq!(selected(&app), "bork-2");
     }
 
     #[test]
