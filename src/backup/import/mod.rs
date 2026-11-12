@@ -2442,11 +2442,11 @@ mod tests {
         crate::global_config::with_test_config_home(home.path(), || {
             let report = import(&file, &opts(dest.path())).unwrap();
             let p = &report.projects[0];
-            assert!(
-                matches!(p.repo, Some(RepoOutcome::Failed { .. })),
-                "{:?}",
-                p.repo
-            );
+            let Some(RepoOutcome::Failed { error, .. }) = &p.repo else {
+                panic!("{:?}", p.repo);
+            };
+            // git's own reason, not just the exit code.
+            assert!(error.contains("does not exist"), "{error}");
             assert!(report.render().contains("clone it into main/ yourself"));
             // A project without its code isn't usable: the CLI exits non-zero.
             assert!(report.failed());
