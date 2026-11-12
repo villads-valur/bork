@@ -679,6 +679,20 @@ impl Issue {
         self.sessions.remove(&agent);
     }
 
+    /// Whether attaching `session_id` for `agent` means killing the live tmux
+    /// session: it runs the current agent, and re-attaching it would keep a
+    /// different conversation going than the one the next launch resumes.
+    pub fn attaching_kills_session(&self, agent: AgentKind, session_id: &str) -> bool {
+        agent == self.agent_kind
+            && self.sessions.get(&agent).map(String::as_str) != Some(session_id)
+    }
+
+    /// Store `session_id` as `agent`'s session so its next launch resumes it.
+    /// Callers check `attaching_kills_session()` first and kill before attaching.
+    pub fn attach_session(&mut self, agent: AgentKind, session_id: String) {
+        self.sessions.insert(agent, session_id);
+    }
+
     /// Whether a landed launch result's detected session id still applies to
     /// this issue. A kind change while detection was polling means `set_kind`
     /// invalidated everything the launch produced; an agent change means the
@@ -1217,6 +1231,41 @@ mod tests {
         assert_eq!(
             issue.sessions.get(&original_agent).map(String::as_str),
             Some("ses_abc")
+        );
+    }
+
+    #[test]
+    fn attaching_a_new_session_for_the_current_agent_kills_the_live_one() {
+        let issue = issue_with_session_state(IssueKind::Agentic);
+        assert!(issue.attaching_kills_session(issue.agent_kind, "ses_new"));
+
+        let fresh = test_issue("bork-2", Column::InProgress);
+        // A live session without a recorded id is still a different conversation.
+        assert!(fresh.attaching_kills_session(fresh.agent_kind, "ses_new"));
+    }
+
+    #[test]
+    fn attaching_the_same_session_or_another_agent_keeps_the_live_one() {
+        let issue = issue_with_session_state(IssueKind::Agentic);
+        assert!(!issue.attaching_kills_session(issue.agent_kind, "ses_abc"));
+        let other = if issue.agent_kind == AgentKind::Codex {
+            AgentKind::Claude
+        } else {
+            AgentKind::Codex
+        };
+        assert!(!issue.attaching_kills_session(other, "ses_new"));
+    }
+
+    #[test]
+    fn attach_session_replaces_only_that_agents_session() {
+        let mut issue = issue_with_session_state(IssueKind::Agentic);
+        let original_agent = issue.agent_kind;
+        issue.sessions.insert(AgentKind::Pi, "pi-1".into());
+        issue.attach_session(original_agent, "ses_new".into());
+        assert_eq!(issue.current_session_id(), Some("ses_new"));
+        assert_eq!(
+            issue.sessions.get(&AgentKind::Pi).map(String::as_str),
+            Some("pi-1")
         );
     }
 

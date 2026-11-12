@@ -2020,6 +2020,16 @@ mod tests {
         assert!(prompt.is_none());
     }
 
+    #[test]
+    fn attached_session_resumes_on_next_launch() {
+        let mut issue = test_issue(AgentKind::Claude, AgentMode::Build);
+        issue.attach_session(AgentKind::Claude, "uuid-attached".to_string());
+        let config = test_config();
+        let (cmd, _, prompt) = agent_cmd(&issue, &config, "bork-bork-1", "/tmp/status");
+        assert!(cmd.contains("--resume 'uuid-attached'"));
+        assert!(prompt.is_none());
+    }
+
     // --- setup_prefix ---
 
     #[test]
