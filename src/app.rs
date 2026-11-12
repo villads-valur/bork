@@ -1953,6 +1953,14 @@ pub enum ConfirmAction {
     RemoveProject { project_id: ProjectId },
 }
 
+impl ConfirmAction {
+    /// Whether Enter answers yes. A delete needs an explicit `y`, so a stray
+    /// Enter (right after `d`, next to `D` for Move to Done) can't confirm it.
+    pub fn enter_confirms(&self) -> bool {
+        !matches!(self, ConfirmAction::DeleteIssue { .. })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinearPickerContext {
     Import,

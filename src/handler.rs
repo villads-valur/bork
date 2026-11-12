@@ -709,10 +709,9 @@ fn handle_normal(
         Action::DeleteIssue => {
             let project = app.context_project(ctx);
             let issues = project.target_issues(&q);
-            let message = delete_confirm_message(project, &issues);
-            if message.is_empty() {
+            let Some(message) = delete_confirm_message(project, &issues) else {
                 return PostAction::None;
-            }
+            };
             let issue_ids = issues.iter().map(|issue| issue.id.clone()).collect();
             app.start_confirm(
                 message,
@@ -2456,13 +2455,17 @@ fn handle_confirm(
     action_tx: &mpsc::Sender<ActionResult>,
 ) {
     let action = match action {
-        // A delete needs an explicit `y`, so a stray Enter can't confirm it.
-        Action::ConfirmDefault
-            if matches!(app.pending_confirm, Some(ConfirmAction::DeleteIssue { .. })) =>
-        {
-            Action::ConfirmNo
+        Action::ConfirmDefault => {
+            let confirms = app
+                .pending_confirm
+                .as_ref()
+                .is_some_and(ConfirmAction::enter_confirms);
+            if confirms {
+                Action::ConfirmYes
+            } else {
+                Action::ConfirmNo
+            }
         }
-        Action::ConfirmDefault => Action::ConfirmYes,
         other => other,
     };
     match action {
@@ -2786,14 +2789,14 @@ pub fn archive_issue_in_app(app: &mut App, project_id: &ProjectId, issue_id: &st
 }
 
 /// The delete prompt: what is being deleted, plus anything that makes it
-/// costly (an orchestrator, links to other issues, a running session). Empty
+/// costly (an orchestrator, links to other issues, a running session). None
 /// when there is nothing to delete.
-fn delete_confirm_message(project: &Project, issues: &[&Issue]) -> String {
+fn delete_confirm_message(project: &Project, issues: &[&Issue]) -> Option<String> {
     let running =
         |issue: &Issue| project.is_session_alive(&issue.session_name(&project.config.project_name));
     let mut details = Vec::new();
     let subject = match issues {
-        [] => return String::new(),
+        [] => return None,
         [issue] => {
             if issue.kind == IssueKind::Orchestrator {
                 details.push("orchestrator".to_string());
@@ -2823,7 +2826,9 @@ fn delete_confirm_message(project: &Project, issues: &[&Issue]) -> String {
     } else {
         format!(" ({})", details.join(", "))
     };
-    format!("Delete {subject}{details}? y to delete, n to cancel")
+    Some(format!(
+        "Delete {subject}{details}? y to delete, n to cancel"
+    ))
 }
 
 /// Delete confirmed issues and record them as one undoable action. When the
@@ -2833,27 +2838,20 @@ pub fn delete_issues_from_app(
     deletions: Vec<(ProjectId, String)>,
     kind: MessageKind,
 ) {
-    let mut changes = Vec::new();
-    let mut undo_project = None;
-    for (project_id, issue_id) in deletions {
-        let Some(entry) = delete_issue_from_app(app, &project_id, &issue_id) else {
-            continue;
-        };
-        // The undo slot holds one project's action; deletes only ever come
-        // from one project at a time.
-        if undo_project.get_or_insert_with(|| project_id.clone()) != &project_id {
-            continue;
-        }
-        changes.push(Change::Delete {
-            issue: Box::new(entry.issue),
-            deleted_at: entry.deleted_at,
-        });
-    }
-    let Some(project_id) = undo_project else {
+    // Deletes come from one confirm prompt, so they share a project.
+    let Some(project_id) = deletions.first().map(|(project_id, _)| project_id.clone()) else {
         return;
     };
+    let changes: Vec<Change> = deletions
+        .iter()
+        .filter_map(|(project_id, issue_id)| delete_issue_from_app(app, project_id, issue_id))
+        .map(|entry| Change::Delete {
+            issue_id: entry.issue.id,
+            deleted_at: entry.deleted_at,
+        })
+        .collect();
     let label = match changes.as_slice() {
-        [Change::Delete { issue, .. }] => format!("Deleted {}", issue.id),
+        [Change::Delete { issue_id, .. }] => format!("Deleted {issue_id}"),
         _ => format!("Deleted {}", count_of(changes.len(), "issue")),
     };
     let undo_message = format!("{} · u to undo", label);

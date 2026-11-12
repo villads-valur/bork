@@ -24,14 +24,14 @@ pub enum Change {
     },
     /// The issue was moved to the deleted list at `deleted_at`. Undo restores
     /// that exact entry, so a CLI restore or purge since wins.
-    Delete { issue: Box<Issue>, deleted_at: u64 },
+    Delete { issue_id: String, deleted_at: u64 },
 }
 
 impl Change {
     fn issue_id(&self) -> &str {
         match self {
             Change::Column { issue_id, .. } => issue_id,
-            Change::Delete { issue, .. } => &issue.id,
+            Change::Delete { issue_id, .. } => issue_id,
         }
     }
 
@@ -72,10 +72,13 @@ impl Change {
                 to,
                 done_at_before,
             } => project.restore_column(issue_id, *to, *from, *done_at_before),
-            Change::Delete { issue, deleted_at } => crate::ops::restore_deleted(
+            Change::Delete {
+                issue_id,
+                deleted_at,
+            } => crate::ops::restore_deleted(
                 &mut project.issues,
                 &mut project.deleted_issues,
-                &issue.id,
+                issue_id,
                 Some(*deleted_at),
             )
             .is_ok(),

@@ -1760,15 +1760,17 @@ fn purge_expired_deleted(project_root: &Path) {
     }
 }
 
-/// [`purge_expired_deleted`] for the TUI, which can't print: a failure goes to
+/// Load a project's state for the TUI, purging deleted issues past
+/// `keep_deleted_days` first. The TUI can't print, so a failed purge goes to
 /// `.bork/errors.log`.
-fn purge_expired_deleted_quietly(project_root: &Path) {
+fn load_state_for_tui(project_root: &Path) -> config::AppState {
     if let Err(e) = ops::purge_deleted(project_root, ops::PurgeTarget::Expired) {
         config::append_error_log(
             project_root,
             &[format!("Couldn't purge old deleted issues: {e:#}")],
         );
     }
+    config::load_state(project_root)
 }
 
 fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
@@ -2777,8 +2779,7 @@ fn run_tui() -> anyhow::Result<()> {
 
     if has_local_project {
         config = config::load_config_from(&local_root);
-        purge_expired_deleted_quietly(&local_root);
-        state = config::load_state(&local_root);
+        state = load_state_for_tui(&local_root);
         config::ensure_agent_status_dir(&config.project_root);
     } else {
         let registered = global_config::list_projects();
@@ -2790,8 +2791,7 @@ fn run_tui() -> anyhow::Result<()> {
         }
         let entry = &registered[0];
         config = config::load_config_from(&entry.path);
-        purge_expired_deleted_quietly(&entry.path);
-        state = config::load_state(&entry.path);
+        state = load_state_for_tui(&entry.path);
         config::ensure_agent_status_dir(&config.project_root);
     }
 
@@ -2851,8 +2851,7 @@ fn run_tui() -> anyhow::Result<()> {
             continue;
         }
         let proj_config = config::load_config_from(&entry.path);
-        purge_expired_deleted_quietly(&entry.path);
-        let proj_state = config::load_state(&entry.path);
+        let proj_state = load_state_for_tui(&entry.path);
         app.add_background_project(proj_config, proj_state);
     }
     app.sync_with_registry(&registry);
@@ -3108,8 +3107,7 @@ fn run_tui() -> anyhow::Result<()> {
             needs_redraw = true;
             action_results_arrived = true;
             app.busy_count = app.busy_count.saturating_sub(1);
-            let message_kind = result.message_kind;
-            app.show_message(result.message, message_kind);
+            app.show_message(result.message, result.message_kind);
 
             if let Some((project_id, outcome)) = result.prune_outcome {
                 if let Some(project) = app.find_project_mut(&project_id) {
@@ -3123,7 +3121,7 @@ fn run_tui() -> anyhow::Result<()> {
                 handler::queue_force_prune(&mut app, project_id, outcome.plan_not_saved());
             }
 
-            handler::delete_issues_from_app(&mut app, result.issues_to_delete, message_kind);
+            handler::delete_issues_from_app(&mut app, result.issues_to_delete, result.message_kind);
 
             for (project_id, issue_id) in result.issues_to_archive {
                 handler::archive_issue_in_app(&mut app, &project_id, &issue_id);

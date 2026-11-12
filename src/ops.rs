@@ -59,6 +59,22 @@ fn find_issue_index(issues: &[Issue], id: &str) -> Option<usize> {
     issues.iter().position(|i| i.id.to_lowercase() == lower)
 }
 
+/// Position of the deleted entry for `id`, or an error naming it. With
+/// `deleted_at`, only that exact entry matches.
+fn find_deleted_index(
+    deleted: &[DeletedIssue],
+    id: &str,
+    deleted_at: Option<u64>,
+) -> anyhow::Result<usize> {
+    deleted
+        .iter()
+        .position(|entry| {
+            entry.issue.id.eq_ignore_ascii_case(id)
+                && deleted_at.is_none_or(|at| entry.deleted_at == at)
+        })
+        .ok_or_else(|| anyhow::anyhow!("No deleted issue '{}'", id))
+}
+
 fn now_epoch() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -201,33 +217,7 @@ fn format_issue_table(issues: &[&Issue], _project_name: &str) -> anyhow::Result<
         })
         .collect();
 
-    let widths: [usize; 6] = std::array::from_fn(|col| {
-        let header_w = headers[col].len();
-        let max_row_w = rows.iter().map(|r| r[col].len()).max().unwrap_or(0);
-        header_w.max(max_row_w)
-    });
-
-    let mut out = String::new();
-
-    for (i, header) in headers.iter().enumerate() {
-        if i > 0 {
-            out.push_str("  ");
-        }
-        let _ = write!(out, "{:<width$}", header, width = widths[i]);
-    }
-    out.push('\n');
-
-    for row in &rows {
-        for (i, cell) in row.iter().enumerate() {
-            if i > 0 {
-                out.push_str("  ");
-            }
-            let _ = write!(out, "{:<width$}", cell, width = widths[i]);
-        }
-        out.push('\n');
-    }
-
-    Ok(out.trim_end().to_string())
+    Ok(format_table(&headers, &rows))
 }
 
 #[derive(Default)]
@@ -490,12 +480,7 @@ pub fn restore_deleted(
     issue_id: &str,
     deleted_at: Option<u64>,
 ) -> anyhow::Result<Issue> {
-    let Some(pos) = deleted.iter().position(|entry| {
-        entry.issue.id.eq_ignore_ascii_case(issue_id)
-            && deleted_at.is_none_or(|at| entry.deleted_at == at)
-    }) else {
-        anyhow::bail!("No deleted issue '{}'", issue_id);
-    };
+    let pos = find_deleted_index(deleted, issue_id, deleted_at)?;
     if find_issue_index(issues, issue_id).is_some() {
         anyhow::bail!(
             "Can't restore {}: an issue with that id is already on the board",
@@ -512,12 +497,10 @@ pub fn restore_deleted(
 /// Links to issues no longer on the board are dropped from `restored`.
 fn restore_links(issues: &mut [Issue], restored: &mut Issue) {
     restored.linked_issues.retain(|linked_id| {
-        let Some(other) = issues
-            .iter_mut()
-            .find(|issue| issue.id.eq_ignore_ascii_case(linked_id))
-        else {
+        let Some(idx) = find_issue_index(issues, linked_id) else {
             return false;
         };
+        let other = &mut issues[idx];
         if !other.is_linked_to(&restored.id) {
             other.linked_issues.push(restored.id.clone());
         }
@@ -563,13 +546,7 @@ pub fn purge_deleted(
     let mut state = config::load_state(project_root);
     let purged = match target {
         PurgeTarget::One(issue_id) => {
-            let Some(pos) = state
-                .deleted_issues
-                .iter()
-                .position(|entry| entry.issue.id.eq_ignore_ascii_case(issue_id))
-            else {
-                anyhow::bail!("No deleted issue '{}'", issue_id);
-            };
+            let pos = find_deleted_index(&state.deleted_issues, issue_id, None)?;
             vec![state.deleted_issues.remove(pos)]
         }
         PurgeTarget::All => std::mem::take(&mut state.deleted_issues),
