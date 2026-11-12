@@ -746,9 +746,11 @@ impl Issue {
     #[must_use]
     pub fn migrate_legacy_fields(&mut self) -> Option<String> {
         let legacy_session = self.session_id.take();
-        if legacy_session.is_some() || !self.sessions.is_empty() {
-            // A recorded or legacy id proves a launch happened, so the
-            // one-time worktree setup must not run again.
+        if legacy_session.is_some() {
+            // A legacy id proves a launch happened before `setup_ran` existed,
+            // so the one-time worktree setup must not run again. States with
+            // a `sessions` map already store `setup_ran`, which can be false
+            // next to a session (an attached one, or a re-attached worktree).
             self.setup_ran = true;
         }
 
@@ -1593,6 +1595,26 @@ mod tests {
         // Legacy field never serializes back out.
         let out = serde_json::to_string(&issue).unwrap();
         assert!(!out.contains("\"session_id\""));
+    }
+
+    #[test]
+    fn migration_keeps_a_stored_setup_ran_false_next_to_sessions() {
+        // An attached session or a re-attached worktree has a session but no
+        // setup run yet in this worktree; loading must not mark it as run.
+        let json = r#"{
+            "id": "bork-1",
+            "title": "Test",
+            "column": "Todo",
+            "agent_kind": "Claude",
+            "agent_mode": "Plan",
+            "prompt": null,
+            "worktree": "bork-1-fresh",
+            "sessions": {"Claude": "uuid-attached"},
+            "setup_ran": false
+        }"#;
+        let mut issue: Issue = serde_json::from_str(json).unwrap();
+        assert_eq!(issue.migrate_legacy_fields(), None);
+        assert!(!issue.setup_ran);
     }
 
     // --- AgentStatus ---

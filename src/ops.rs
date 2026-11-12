@@ -1531,6 +1531,27 @@ mod tests {
     }
 
     #[test]
+    fn update_session_keeps_setup_pending_for_a_fresh_worktree() {
+        let dir = setup_project();
+        let root = dir.path();
+        issue_without_session(root, AgentKind::OpenCode);
+        edit_stored_issue(root, |issue| issue.worktree = Some("test-1-fresh".into()));
+
+        update_issue(
+            root,
+            "test-1",
+            UpdateOptions {
+                session: Some("ses_recovered".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Reloading must not treat the attached session as proof setup ran.
+        assert!(!config::load_state(root).issues[0].setup_ran);
+    }
+
+    #[test]
     fn update_session_with_agent_attaches_to_the_new_agent() {
         let dir = setup_project();
         let root = dir.path();
