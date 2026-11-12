@@ -217,6 +217,7 @@ bork issue move bork-3 code-review
 bork issue update bork-3 --title "Fix OAuth flow"
 bork issue show bork-3
 bork issue reset-session bork-3           # next launch starts a new agent session
+bork issue update bork-3 --session <id>   # next launch resumes an existing agent session
 bork issue archive bork-3                 # cleanup when work is merged
 bork issue delete bork-3                  # undo with u in the TUI, or:
 bork issue restore bork-3
@@ -229,6 +230,8 @@ bork issue restore bork-3
 **Model per issue:** `--model <name>` on `create`, `start` and `update` is saved on the issue and passed to the agent as `--model <name>` on every launch and resume, e.g. `bork issue start "Review PR 42" --agent claude --model sonnet`. It replaces any `--model`/`-m` in `[agent.<name>].args`. Model names are agent-specific, so changing an issue's agent clears it. OpenCode's TUI has no `--model` flag, so `--model` on an opencode issue is an error. `bork issue update <id> --model ""` clears it.
 
 **Lost sessions:** if an issue's conversation is gone (Claude cleans up old transcripts after `cleanupPeriodDays`; Codex, Pi and Cursor sessions go when you delete them), bork notices on launch, starts a new session with the issue's prompt, and says so in the popup title and status bar. To start fresh on purpose, run `bork issue reset-session <id> [--agent <kind>]`, or edit the issue, focus the Agent field, press Backspace and save. If that agent's session is running, it's killed. The old conversation isn't deleted. OpenCode keeps sessions in a database bork doesn't read, so its sessions are always resumed.
+
+**Attaching a session:** to resume a conversation on another issue (say you recreated a deleted issue, or started the agent outside bork), run `bork issue update <id> --session <session-id> [--agent <kind>]`. The id is stored under the issue's agent (or `--agent`), the agent must still have that session, and only agentic issues and orchestrators take one. If that agent's session is running, it's killed so the next launch resumes the attached one.
 
 **Archive options:** `bork issue archive <id> [--force]` kills the issue's tmux session, runs the configured `teardown_script` inside the worktree, removes the worktree, and moves the issue to Done. `--force` proceeds past a failing teardown and discards uncommitted changes.
 

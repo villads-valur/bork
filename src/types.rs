@@ -688,6 +688,18 @@ impl Issue {
         self.sessions.remove(&agent);
     }
 
+    /// Store `session_id` as the current agent's session so its next launch
+    /// resumes it.
+    ///
+    /// Returns `true` when the id changed. Callers should then kill any live
+    /// tmux session before saving, since re-attaching it would keep a
+    /// different conversation going than the one the next launch resumes.
+    #[must_use]
+    pub fn attach_session(&mut self, session_id: String) -> bool {
+        let previous = self.sessions.insert(self.agent_kind, session_id);
+        previous.as_deref() != self.current_session_id()
+    }
+
     /// Whether a landed launch result's detected session id still applies to
     /// this issue. A kind change while detection was polling means `set_kind`
     /// invalidated everything the launch produced; an agent change means the
@@ -743,9 +755,11 @@ impl Issue {
     #[must_use]
     pub fn migrate_legacy_fields(&mut self) -> Option<String> {
         let legacy_session = self.session_id.take();
-        if legacy_session.is_some() || !self.sessions.is_empty() {
-            // A recorded or legacy id proves a launch happened, so the
-            // one-time worktree setup must not run again.
+        if legacy_session.is_some() {
+            // A legacy id proves a launch happened before `setup_ran` existed,
+            // so the one-time worktree setup must not run again. States with
+            // a `sessions` map already store `setup_ran`, which can be false
+            // next to a session (an attached one, or a re-attached worktree).
             self.setup_ran = true;
         }
 
@@ -1230,6 +1244,34 @@ mod tests {
     }
 
     #[test]
+    fn attaching_a_new_session_asks_to_kill_the_live_one() {
+        let mut issue = issue_with_session_state(IssueKind::Agentic);
+        assert!(issue.attach_session("ses_new".into()));
+
+        let mut fresh = test_issue("bork-2", Column::InProgress);
+        // A live session without a recorded id is still a different conversation.
+        assert!(fresh.attach_session("ses_new".into()));
+    }
+
+    #[test]
+    fn attaching_the_stored_session_keeps_the_live_one() {
+        let mut issue = issue_with_session_state(IssueKind::Agentic);
+        assert!(!issue.attach_session("ses_abc".into()));
+    }
+
+    #[test]
+    fn attach_session_replaces_only_the_current_agents_session() {
+        let mut issue = issue_with_session_state(IssueKind::Agentic);
+        issue.sessions.insert(AgentKind::Pi, "pi-1".into());
+        assert!(issue.attach_session("ses_new".into()));
+        assert_eq!(issue.current_session_id(), Some("ses_new"));
+        assert_eq!(
+            issue.sessions.get(&AgentKind::Pi).map(String::as_str),
+            Some("pi-1")
+        );
+    }
+
+    #[test]
     fn attach_worktree_resets_setup_for_fresh_checkout() {
         // A re-attached worktree is a fresh checkout: the setup script must
         // run again even though a session was recorded in the old one.
@@ -1562,6 +1604,26 @@ mod tests {
         // Legacy field never serializes back out.
         let out = serde_json::to_string(&issue).unwrap();
         assert!(!out.contains("\"session_id\""));
+    }
+
+    #[test]
+    fn migration_keeps_a_stored_setup_ran_false_next_to_sessions() {
+        // An attached session or a re-attached worktree has a session but no
+        // setup run yet in this worktree; loading must not mark it as run.
+        let json = r#"{
+            "id": "bork-1",
+            "title": "Test",
+            "column": "Todo",
+            "agent_kind": "Claude",
+            "agent_mode": "Plan",
+            "prompt": null,
+            "worktree": "bork-1-fresh",
+            "sessions": {"Claude": "uuid-attached"},
+            "setup_ran": false
+        }"#;
+        let mut issue: Issue = serde_json::from_str(json).unwrap();
+        assert_eq!(issue.migrate_legacy_fields(), None);
+        assert!(!issue.setup_ran);
     }
 
     // --- AgentStatus ---

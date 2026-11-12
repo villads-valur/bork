@@ -989,6 +989,11 @@ enum IssueCommand {
         /// Change issue kind (agentic, todo, orchestrator)
         #[arg(long, value_parser = parse_issue_kind)]
         kind: Option<IssueKind>,
+
+        /// Attach an existing agent session id so the next launch resumes it
+        /// (stored under the issue's agent, or --agent when passed)
+        #[arg(long)]
+        session: Option<String>,
     },
 
     /// Archive an issue: kill its session, run teardown, remove its worktree
@@ -1867,7 +1872,9 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
             prompt,
             model,
             kind,
+            session,
         } => {
+            let attaching = session.is_some();
             let issue = ops::update_issue(
                 &project_root,
                 &id,
@@ -1879,9 +1886,16 @@ fn run_issue_command(command: IssueCommand) -> anyhow::Result<()> {
                     prompt,
                     model,
                     kind,
+                    session,
                 },
             )?;
             println!("Updated {}: \"{}\"", issue.id, issue.title);
+            if let Some(sid) = issue.current_session_id().filter(|_| attaching) {
+                println!(
+                    "Attached {} session {sid}; the next launch resumes it",
+                    issue.agent_kind
+                );
+            }
             Ok(())
         }
         IssueCommand::Archive { id, force } => {
