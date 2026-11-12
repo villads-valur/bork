@@ -129,10 +129,15 @@ bork issue update bork-1 --session 3f2c9a1e-...                  # the issue's c
 bork issue update bork-1 --agent claude --session 3f2c9a1e-...   # switch to claude and attach
 ```
 
-### Delete an issue
+### Delete and restore an issue
+
+A delete keeps the issue restorable (with its id, sessions, PR/Linear links and the links on other issues) for `keep_deleted_days` (30 by default). In the TUI, `u` undoes a delete for 10 seconds.
 
 ```bash
 bork issue delete bork-1
+bork issue list --deleted          # restorable issues (--json for machine output)
+bork issue restore bork-1
+bork issue purge bork-1            # or --all; also removes plans/<id>/
 ```
 
 ## Integrations

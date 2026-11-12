@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::global_config::global_config_dir;
 use crate::toml_lite::{self, Table};
-use crate::types::{AgentKind, AgentMode, Issue};
+use crate::types::{AgentKind, AgentMode, DeletedIssue, Issue};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -44,6 +44,9 @@ pub struct AppConfig {
     pub prune_threshold: u64,
     /// Minimum seconds between auto-prune prompts.
     pub auto_prune_check_interval: u64,
+    /// Days a deleted issue stays restorable (`bork issue restore`) before
+    /// it is purged. `0` purges on the next sweep.
+    pub keep_deleted_days: u64,
     /// Experimental Cursor cloud agents. Off by default; set it in one
     /// project's `.bork/config.toml` to try it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -96,6 +99,7 @@ impl AppConfig {
 pub const DEFAULT_DONE_SESSION_TTL: u64 = 300;
 pub const DEFAULT_PRUNE_THRESHOLD: u64 = 10;
 pub const DEFAULT_AUTO_PRUNE_CHECK_INTERVAL: u64 = 86_400;
+pub const DEFAULT_KEEP_DELETED_DAYS: u64 = 30;
 
 pub const DEFAULT_AGENT_MODE: AgentMode = AgentMode::Plan;
 
@@ -134,6 +138,7 @@ impl Default for AppConfig {
             agents_allowlist: None,
             prune_threshold: DEFAULT_PRUNE_THRESHOLD,
             auto_prune_check_interval: DEFAULT_AUTO_PRUNE_CHECK_INTERVAL,
+            keep_deleted_days: DEFAULT_KEEP_DELETED_DAYS,
             cloud_agents: false,
             agent_launch: HashMap::new(),
         }
@@ -146,6 +151,9 @@ pub struct AppState {
     /// Unix timestamp of the last completed prune. `None` if never pruned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_prune_at: Option<u64>,
+    /// Deleted issues that can still be restored, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deleted_issues: Vec<DeletedIssue>,
 }
 
 /// Walk up from cwd looking for a `.bork/` directory.
@@ -245,6 +253,7 @@ pub struct PartialConfig {
     pub agents_allowlist: Option<Vec<AgentKind>>,
     pub prune_threshold: Option<u64>,
     pub auto_prune_check_interval: Option<u64>,
+    pub keep_deleted_days: Option<u64>,
     pub cloud_agents: Option<bool>,
     /// Per-agent launch overrides parsed from `[agent.<name>]` sections.
     pub agent_launch: HashMap<AgentKind, PartialAgentLaunch>,
@@ -311,6 +320,7 @@ impl PartialConfig {
             auto_prune_check_interval: other
                 .auto_prune_check_interval
                 .or(self.auto_prune_check_interval),
+            keep_deleted_days: other.keep_deleted_days.or(self.keep_deleted_days),
             cloud_agents: other.cloud_agents.or(self.cloud_agents),
             agent_launch,
         }
@@ -364,6 +374,9 @@ fn materialize(merged: PartialConfig, project_root: &Path) -> AppConfig {
         auto_prune_check_interval: merged
             .auto_prune_check_interval
             .unwrap_or(DEFAULT_AUTO_PRUNE_CHECK_INTERVAL),
+        keep_deleted_days: merged
+            .keep_deleted_days
+            .unwrap_or(DEFAULT_KEEP_DELETED_DAYS),
         cloud_agents: merged.cloud_agents.unwrap_or(false),
         agent_launch,
     }
@@ -473,6 +486,7 @@ fn partial_from_table(table: &Table) -> PartialConfig {
     let auto_prune_check_interval = table
         .get("auto_prune_check_interval")
         .and_then(|v| v.as_u64());
+    let keep_deleted_days = table.get("keep_deleted_days").and_then(|v| v.as_u64());
     let cloud_agents = table.get("cloud_agents").and_then(|v| v.as_bool());
     let agent_launch = collect_agent_launch(table);
 
@@ -493,6 +507,7 @@ fn partial_from_table(table: &Table) -> PartialConfig {
         agents_allowlist,
         prune_threshold,
         auto_prune_check_interval,
+        keep_deleted_days,
         cloud_agents,
         agent_launch,
     }
@@ -565,7 +580,11 @@ pub fn try_load_state(project_root: &Path) -> Option<AppState> {
         }
     };
     let mut legacy_stores = crate::external::agent::LegacySessionStores::new(project_root);
-    for issue in &mut state.issues {
+    let deleted = state
+        .deleted_issues
+        .iter_mut()
+        .map(|entry| &mut entry.issue);
+    for issue in state.issues.iter_mut().chain(deleted) {
         if let Some(sid) = issue.migrate_legacy_fields() {
             if let Some(owner) = legacy_stores.attribute(&sid, issue.agent_kind) {
                 issue.sessions.entry(owner).or_insert(sid);
@@ -1192,10 +1211,47 @@ auto_prune_check_interval = 3600
     }
 
     #[test]
+    fn keep_deleted_days_defaults_to_30_and_project_overrides_global() {
+        assert_eq!(merge_to_app("", "").keep_deleted_days, 30);
+        let cfg = merge_to_app("keep_deleted_days = 7", "keep_deleted_days = 0");
+        assert_eq!(cfg.keep_deleted_days, 0);
+        assert_eq!(
+            merge_to_app("keep_deleted_days = 7", "").keep_deleted_days,
+            7
+        );
+    }
+
+    #[test]
+    fn state_roundtrips_deleted_issues_and_loads_without_them() {
+        let state = AppState {
+            issues: Vec::new(),
+            last_prune_at: None,
+            deleted_issues: vec![DeletedIssue {
+                issue: Issue::new(
+                    "bork-1",
+                    "Gone",
+                    crate::types::Column::Todo,
+                    AgentKind::Claude,
+                ),
+                deleted_at: 1_700_000_000,
+            }],
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let back: AppState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.deleted_issues, state.deleted_issues);
+
+        let old: AppState = serde_json::from_str(r#"{"issues":[]}"#).unwrap();
+        assert!(old.deleted_issues.is_empty());
+        let empty = serde_json::to_string(&old).unwrap();
+        assert!(!empty.contains("deleted_issues"));
+    }
+
+    #[test]
     fn state_roundtrips_last_prune_at() {
         let state = AppState {
             issues: Vec::new(),
             last_prune_at: Some(1_700_000_000),
+            deleted_issues: Vec::new(),
         };
         let json = serde_json::to_string(&state).unwrap();
         let roundtrip: AppState = serde_json::from_str(&json).unwrap();
@@ -1383,6 +1439,7 @@ args = ["--dangerously-skip-permissions"]
                 AgentKind::OpenCode,
             )],
             last_prune_at: None,
+            deleted_issues: Vec::new(),
         };
         save_state(&state, dir.path()).unwrap();
         let loaded = load_state(dir.path());
@@ -1593,6 +1650,7 @@ args = ["--dangerously-skip-permissions"]
         let state = AppState {
             issues: vec![cloud_issue.clone(), unconfirmed.clone()],
             last_prune_at: None,
+            deleted_issues: Vec::new(),
         };
 
         save_state(&state, dir.path()).unwrap();

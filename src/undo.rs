@@ -3,7 +3,7 @@
 //! An action records an `UndoEntry` holding the field-level `Change`s it made.
 //! Undo reverts each change only if the issue still looks the way the action
 //! left it, so edits made since (by agents, the CLI or pollers) are never
-//! clobbered. Only column moves are recorded today; new kinds of undoable
+//! clobbered. Column moves and deletes are recorded; new kinds of undoable
 //! action add a `Change` variant.
 
 use std::time::{Duration, Instant};
@@ -22,18 +22,23 @@ pub enum Change {
         to: Column,
         done_at_before: Option<u64>,
     },
+    /// The issue was moved to the deleted list at `deleted_at`. Undo restores
+    /// that exact entry, so a CLI restore or purge since wins.
+    Delete { issue_id: String, deleted_at: u64 },
 }
 
 impl Change {
     fn issue_id(&self) -> &str {
         match self {
             Change::Column { issue_id, .. } => issue_id,
+            Change::Delete { issue_id, .. } => issue_id,
         }
     }
 
     fn is_noop(&self) -> bool {
         match self {
             Change::Column { from, to, .. } => from == to,
+            Change::Delete { .. } => false,
         }
     }
 
@@ -53,6 +58,7 @@ impl Change {
                 *to = *next_to;
                 true
             }
+            _ => false,
         }
     }
 
@@ -66,6 +72,16 @@ impl Change {
                 to,
                 done_at_before,
             } => project.restore_column(issue_id, *to, *from, *done_at_before),
+            Change::Delete {
+                issue_id,
+                deleted_at,
+            } => crate::ops::restore_deleted(
+                &mut project.issues,
+                &mut project.deleted_issues,
+                issue_id,
+                Some(*deleted_at),
+            )
+            .is_ok(),
         }
     }
 }

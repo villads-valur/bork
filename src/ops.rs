@@ -19,20 +19,29 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::agent_config;
 use crate::config;
 use crate::external::agent;
-use crate::types::{AgentKind, AgentMode, Column, Issue, IssueDraft, IssueKind, CLOUD_KIND_LOCKED};
+use crate::types::{
+    AgentKind, AgentMode, Column, DeletedIssue, Issue, IssueDraft, IssueKind, CLOUD_KIND_LOCKED,
+};
 use crate::ui::styles::truncate;
 use crate::worktree;
 
-pub fn next_issue_id(issues: &[Issue], project_name: &str) -> String {
-    next_issue_id_after(issues, project_name, 0)
+pub fn next_issue_id(issues: &[Issue], deleted: &[DeletedIssue], project_name: &str) -> String {
+    next_issue_id_after(issues, deleted, project_name, 0)
 }
 
 /// Next free `{project}-{n}` ID, skipping `offset` extra slots. The offset
 /// supports batch-creating issues before any of them is pushed to the list.
-pub fn next_issue_id_after(issues: &[Issue], project_name: &str, offset: u32) -> String {
+/// Deleted issues still hold their IDs, so restoring one never clashes.
+pub fn next_issue_id_after(
+    issues: &[Issue],
+    deleted: &[DeletedIssue],
+    project_name: &str,
+    offset: u32,
+) -> String {
     let prefix = format!("{}-", project_name);
     let max_num = issues
         .iter()
+        .chain(deleted.iter().map(|entry| &entry.issue))
         .filter_map(|issue| {
             issue
                 .id
@@ -48,6 +57,22 @@ pub fn next_issue_id_after(issues: &[Issue], project_name: &str, offset: u32) ->
 fn find_issue_index(issues: &[Issue], id: &str) -> Option<usize> {
     let lower = id.to_lowercase();
     issues.iter().position(|i| i.id.to_lowercase() == lower)
+}
+
+/// Position of the deleted entry for `id`, or an error naming it. With
+/// `deleted_at`, only that exact entry matches.
+fn find_deleted_index(
+    deleted: &[DeletedIssue],
+    id: &str,
+    deleted_at: Option<u64>,
+) -> anyhow::Result<usize> {
+    deleted
+        .iter()
+        .position(|entry| {
+            entry.issue.id.eq_ignore_ascii_case(id)
+                && deleted_at.is_none_or(|at| entry.deleted_at == at)
+        })
+        .ok_or_else(|| anyhow::anyhow!("No deleted issue '{}'", id))
 }
 
 fn now_epoch() -> u64 {
@@ -118,6 +143,63 @@ pub fn list_issues(project_root: &Path, opts: &ListOptions) -> anyhow::Result<St
     format_issue_table(&issues, &config.project_name)
 }
 
+/// Deleted issues that can still be restored, newest first.
+pub fn list_deleted(project_root: &Path, json: bool) -> anyhow::Result<String> {
+    let state = config::load_state(project_root);
+    let mut entries: Vec<&DeletedIssue> = state.deleted_issues.iter().collect();
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.deleted_at));
+
+    if json {
+        return Ok(serde_json::to_string_pretty(&entries)?);
+    }
+    if entries.is_empty() {
+        return Ok("No deleted issues.".to_string());
+    }
+
+    let now = now_epoch();
+    let headers = ["ID", "TITLE", "KIND", "DELETED", "LINKS"];
+    let rows: Vec<[String; 5]> = entries
+        .iter()
+        .map(|entry| {
+            [
+                entry.issue.id.clone(),
+                truncate(&entry.issue.title, 40),
+                entry.issue.kind.to_string(),
+                format!("{} ago", format_age(now.saturating_sub(entry.deleted_at))),
+                entry.issue.linked_issues.join(", "),
+            ]
+        })
+        .collect();
+    Ok(format_table(&headers, &rows))
+}
+
+pub fn format_age(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m", secs / 60),
+        3600..86_400 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86_400),
+    }
+}
+
+fn format_table<const N: usize>(headers: &[&str; N], rows: &[[String; N]]) -> String {
+    let widths: [usize; N] = std::array::from_fn(|col| {
+        let max_row_w = rows.iter().map(|r| r[col].chars().count()).max();
+        headers[col].len().max(max_row_w.unwrap_or(0))
+    });
+    let mut out = String::new();
+    for row in std::iter::once(&headers.map(str::to_string)).chain(rows) {
+        let line: Vec<String> = row
+            .iter()
+            .zip(widths)
+            .map(|(cell, width)| format!("{:<width$}", cell, width = width))
+            .collect();
+        out.push_str(line.join("  ").trim_end());
+        out.push('\n');
+    }
+    out.trim_end().to_string()
+}
+
 fn format_issue_table(issues: &[&Issue], _project_name: &str) -> anyhow::Result<String> {
     let headers = ["ID", "TITLE", "COLUMN", "AGENT", "MODE", "WORKTREE"];
 
@@ -135,33 +217,7 @@ fn format_issue_table(issues: &[&Issue], _project_name: &str) -> anyhow::Result<
         })
         .collect();
 
-    let widths: [usize; 6] = std::array::from_fn(|col| {
-        let header_w = headers[col].len();
-        let max_row_w = rows.iter().map(|r| r[col].len()).max().unwrap_or(0);
-        header_w.max(max_row_w)
-    });
-
-    let mut out = String::new();
-
-    for (i, header) in headers.iter().enumerate() {
-        if i > 0 {
-            out.push_str("  ");
-        }
-        let _ = write!(out, "{:<width$}", header, width = widths[i]);
-    }
-    out.push('\n');
-
-    for row in &rows {
-        for (i, cell) in row.iter().enumerate() {
-            if i > 0 {
-                out.push_str("  ");
-            }
-            let _ = write!(out, "{:<width$}", cell, width = widths[i]);
-        }
-        out.push('\n');
-    }
-
-    Ok(out.trim_end().to_string())
+    Ok(format_table(&headers, &rows))
 }
 
 #[derive(Default)]
@@ -197,7 +253,7 @@ pub fn create_issue(project_root: &Path, opts: CreateOptions) -> anyhow::Result<
     let config = config::load_config_from(project_root);
     let mut state = config::load_state(project_root);
 
-    let id = next_issue_id(&state.issues, &config.project_name);
+    let id = next_issue_id(&state.issues, &state.deleted_issues, &config.project_name);
     let column = opts.column.unwrap_or(Column::Todo);
     let kind = opts.kind.unwrap_or(IssueKind::Agentic);
     let agent_kind = opts
@@ -423,17 +479,159 @@ pub fn delete_issue(project_root: &Path, issue_id: &str) -> anyhow::Result<Issue
     let session_name = state.issues[idx].session_name(&config.project_name);
     agent::terminate_session(project_root, &session_name)?;
 
-    let removed = state.issues.remove(idx);
-    remove_link_references(&mut state.issues, &removed.id);
+    let removed = soft_delete(
+        &mut state.issues,
+        &mut state.deleted_issues,
+        idx,
+        now_epoch(),
+    );
     config::save_state(&state, project_root)?;
-    crate::issue_plan::remove_saved_plans(project_root, &removed.id).map_err(|e| {
-        e.context(format!(
-            "Deleted {} but couldn't remove its saved plans",
-            removed.id
-        ))
-    })?;
+    Ok(removed.issue)
+}
 
-    Ok(removed)
+/// Move `issues[idx]` to the deleted list and strip its id from the other
+/// issues' links. The deleted entry keeps the issue's own `linked_issues`, so
+/// [`restore_deleted`] can put both sides back. Its saved plans stay until the
+/// entry is purged.
+pub fn soft_delete(
+    issues: &mut Vec<Issue>,
+    deleted: &mut Vec<DeletedIssue>,
+    idx: usize,
+    now: u64,
+) -> DeletedIssue {
+    let issue = issues.remove(idx);
+    remove_link_references(issues, &issue.id);
+    deleted.retain(|entry| !entry.issue.id.eq_ignore_ascii_case(&issue.id));
+    let entry = DeletedIssue {
+        issue,
+        deleted_at: now,
+    };
+    deleted.push(entry.clone());
+    entry
+}
+
+/// Put a deleted issue back on the board with its original id and fields.
+/// With `deleted_at`, only that exact entry is restored (undo uses this, so it
+/// never brings back a later delete of the same id). Links are re-added on the
+/// issues that still exist; links to issues that are gone are dropped.
+pub fn restore_deleted(
+    issues: &mut Vec<Issue>,
+    deleted: &mut Vec<DeletedIssue>,
+    issue_id: &str,
+    deleted_at: Option<u64>,
+) -> anyhow::Result<Issue> {
+    let pos = find_deleted_index(deleted, issue_id, deleted_at)?;
+    if find_issue_index(issues, issue_id).is_some() {
+        anyhow::bail!(
+            "Can't restore {}: an issue with that id is already on the board",
+            deleted[pos].issue.id
+        );
+    }
+    let mut issue = deleted.remove(pos).issue;
+    restore_links(issues, deleted, &mut issue);
+    issues.push(issue.clone());
+    Ok(issue)
+}
+
+/// Re-add `restored`'s id to every issue it links to, keeping links symmetric.
+/// A link to an issue that is still deleted is handed to that issue's entry,
+/// so restoring it later reconnects both sides whatever the restore order.
+/// Links to issues that are gone for good are dropped.
+fn restore_links(issues: &mut [Issue], deleted: &mut [DeletedIssue], restored: &mut Issue) {
+    restored.linked_issues.retain(|linked_id| {
+        if let Some(idx) = find_issue_index(issues, linked_id) {
+            let other = &mut issues[idx];
+            if !other.is_linked_to(&restored.id) {
+                other.linked_issues.push(restored.id.clone());
+            }
+            return true;
+        }
+        if let Ok(idx) = find_deleted_index(deleted, linked_id, None) {
+            let other = &mut deleted[idx].issue;
+            if !other.is_linked_to(&restored.id) {
+                other.linked_issues.push(restored.id.clone());
+            }
+        }
+        false
+    });
+}
+
+/// Deleted entries older than `keep_days`, removed from `deleted`.
+pub fn take_expired(
+    deleted: &mut Vec<DeletedIssue>,
+    now: u64,
+    keep_days: u64,
+) -> Vec<DeletedIssue> {
+    let max_age = keep_days.saturating_mul(86_400);
+    let (expired, kept) = std::mem::take(deleted)
+        .into_iter()
+        .partition(|entry| now.saturating_sub(entry.deleted_at) >= max_age);
+    *deleted = kept;
+    expired
+}
+
+pub fn restore_issue(project_root: &Path, issue_id: &str) -> anyhow::Result<Issue> {
+    let mut state = config::load_state(project_root);
+    let issue = restore_deleted(&mut state.issues, &mut state.deleted_issues, issue_id, None)?;
+    config::save_state(&state, project_root)?;
+    Ok(issue)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PurgeTarget<'a> {
+    One(&'a str),
+    All,
+    /// Entries older than the `keep_deleted_days` config.
+    Expired,
+}
+
+/// Permanently remove deleted issues and their saved plans. Returns the
+/// purged entries.
+pub fn purge_deleted(
+    project_root: &Path,
+    target: PurgeTarget<'_>,
+) -> anyhow::Result<Vec<DeletedIssue>> {
+    let mut state = config::load_state(project_root);
+    let purged = match target {
+        PurgeTarget::One(issue_id) => {
+            let pos = find_deleted_index(&state.deleted_issues, issue_id, None)?;
+            vec![state.deleted_issues.remove(pos)]
+        }
+        PurgeTarget::All => std::mem::take(&mut state.deleted_issues),
+        PurgeTarget::Expired => {
+            let keep_days = config::load_config_from(project_root).keep_deleted_days;
+            take_expired(&mut state.deleted_issues, now_epoch(), keep_days)
+        }
+    };
+    if purged.is_empty() {
+        return Ok(purged);
+    }
+    config::save_state(&state, project_root)?;
+    remove_purged_plans(project_root, &state.issues, &purged)?;
+    Ok(purged)
+}
+
+/// Remove the saved plans of purged issues. Skips an id that is back on the
+/// board (restored by another writer), since the plan is its own again.
+pub fn remove_purged_plans(
+    project_root: &Path,
+    issues: &[Issue],
+    purged: &[DeletedIssue],
+) -> anyhow::Result<()> {
+    let mut failed = Vec::new();
+    for entry in purged {
+        let id = &entry.issue.id;
+        if find_issue_index(issues, id).is_some() {
+            continue;
+        }
+        if let Err(e) = crate::issue_plan::remove_saved_plans(project_root, id) {
+            failed.push(format!("{id}: {e:#}"));
+        }
+    }
+    if !failed.is_empty() {
+        anyhow::bail!("Couldn't remove saved plans ({})", failed.join("; "));
+    }
+    Ok(())
 }
 
 /// Drop `removed_id` from every issue's `linked_issues`, keeping links symmetric
@@ -884,7 +1082,7 @@ mod tests {
 
     #[test]
     fn next_id_empty() {
-        assert_eq!(next_issue_id(&[], "bork"), "bork-1");
+        assert_eq!(next_issue_id(&[], &[], "bork"), "bork-1");
     }
 
     #[test]
@@ -893,20 +1091,20 @@ mod tests {
             test_issue("bork-1", Column::Todo),
             test_issue("bork-3", Column::Todo),
         ];
-        assert_eq!(next_issue_id(&issues, "bork"), "bork-4");
+        assert_eq!(next_issue_id(&issues, &[], "bork"), "bork-4");
     }
 
     #[test]
     fn next_id_ignores_non_matching_prefix() {
         let issues = vec![test_issue("vil-123", Column::Todo)];
-        assert_eq!(next_issue_id(&issues, "bork"), "bork-1");
+        assert_eq!(next_issue_id(&issues, &[], "bork"), "bork-1");
     }
 
     #[test]
     fn next_id_after_skips_offset_slots() {
         let issues = vec![test_issue("bork-2", Column::Todo)];
-        assert_eq!(next_issue_id_after(&issues, "bork", 0), "bork-3");
-        assert_eq!(next_issue_id_after(&issues, "bork", 2), "bork-5");
+        assert_eq!(next_issue_id_after(&issues, &[], "bork", 0), "bork-3");
+        assert_eq!(next_issue_id_after(&issues, &[], "bork", 2), "bork-5");
     }
 
     #[test]
@@ -1807,7 +2005,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_removes_the_saved_plans_and_archive_keeps_them() {
+    fn delete_and_archive_keep_the_saved_plans_until_purge() {
         let dir = setup_project();
         let root = dir.path();
         crate::issue_plan::test_support::enable_backups(root);
@@ -1833,9 +2031,189 @@ mod tests {
 
         delete_issue(root, "test-1").unwrap();
         archive_issue(root, "test-2", false).unwrap();
+        assert!(root.join("plans/test-1/planning.md").exists());
+        assert!(root.join("plans/test-2/planning.md").exists());
 
+        let purged = purge_deleted(root, PurgeTarget::One("test-1")).unwrap();
+        assert_eq!(purged[0].issue.id, "test-1");
         assert!(!root.join("plans/test-1").exists());
         assert!(root.join("plans/test-2/planning.md").exists());
+    }
+
+    fn create_titled(root: &Path, title: &str) -> Issue {
+        create_issue(
+            root,
+            CreateOptions {
+                title: title.into(),
+                column: None,
+                agent_kind: None,
+                agent_mode: None,
+                prompt: None,
+                model: None,
+                kind: None,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn restore_after_delete_brings_back_the_issue_and_both_sides_of_links() {
+        let dir = setup_project();
+        let root = dir.path();
+        for title in ["Orchestrator", "Sub one", "Sub two"] {
+            create_titled(root, title);
+        }
+        link_issues(root, "test-1", "test-2").unwrap();
+        link_issues(root, "test-1", "test-3").unwrap();
+        let before = config::load_state(root).issues[0].clone();
+
+        delete_issue(root, "test-1").unwrap();
+        let state = config::load_state(root);
+        assert!(state.issues.iter().all(|i| i.linked_issues.is_empty()));
+        assert_eq!(state.deleted_issues[0].issue, before);
+
+        let restored = restore_issue(root, "TEST-1").unwrap();
+        assert_eq!(restored, before);
+        let state = config::load_state(root);
+        assert!(state.deleted_issues.is_empty());
+        assert_eq!(state.issues.len(), 3);
+        for id in ["test-2", "test-3"] {
+            let other = state.issues.iter().find(|i| i.id == id).unwrap();
+            assert_eq!(other.linked_issues, vec!["test-1".to_string()]);
+        }
+    }
+
+    #[test]
+    fn restore_keeps_links_between_deleted_issues_in_either_order() {
+        for restore_order in [["test-1", "test-2"], ["test-2", "test-1"]] {
+            let dir = setup_project();
+            let root = dir.path();
+            create_titled(root, "A");
+            create_titled(root, "B");
+            link_issues(root, "test-1", "test-2").unwrap();
+            delete_issue(root, "test-1").unwrap();
+            delete_issue(root, "test-2").unwrap();
+
+            for id in restore_order {
+                restore_issue(root, id).unwrap();
+            }
+            let state = config::load_state(root);
+            let links = |id: &str| {
+                let issue = state.issues.iter().find(|i| i.id == id).unwrap();
+                issue.linked_issues.clone()
+            };
+            assert_eq!(
+                links("test-1"),
+                vec!["test-2".to_string()],
+                "{restore_order:?}"
+            );
+            assert_eq!(
+                links("test-2"),
+                vec!["test-1".to_string()],
+                "{restore_order:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn restore_drops_links_to_issues_that_are_gone() {
+        let dir = setup_project();
+        let root = dir.path();
+        for title in ["A", "B", "C"] {
+            create_titled(root, title);
+        }
+        link_issues(root, "test-1", "test-2").unwrap();
+        link_issues(root, "test-1", "test-3").unwrap();
+        delete_issue(root, "test-1").unwrap();
+        delete_issue(root, "test-3").unwrap();
+        purge_deleted(root, PurgeTarget::One("test-3")).unwrap();
+
+        let restored = restore_issue(root, "test-1").unwrap();
+        assert_eq!(restored.linked_issues, vec!["test-2".to_string()]);
+    }
+
+    #[test]
+    fn restore_fails_for_an_unknown_id() {
+        let dir = setup_project();
+        assert!(restore_issue(dir.path(), "test-9").is_err());
+    }
+
+    #[test]
+    fn restore_refuses_an_id_already_on_the_board() {
+        let mut issues = vec![test_issue("bork-1", Column::Todo)];
+        let mut deleted = vec![DeletedIssue {
+            issue: test_issue("bork-1", Column::Done),
+            deleted_at: 5,
+        }];
+        assert!(restore_deleted(&mut issues, &mut deleted, "bork-1", None).is_err());
+        assert_eq!(deleted.len(), 1);
+    }
+
+    #[test]
+    fn new_issue_never_takes_a_deleted_issues_id() {
+        let dir = setup_project();
+        let root = dir.path();
+        create_titled(root, "A");
+        create_titled(root, "B");
+        delete_issue(root, "test-2").unwrap();
+        assert_eq!(create_titled(root, "C").id, "test-3");
+    }
+
+    #[test]
+    fn take_expired_keeps_entries_inside_the_window() {
+        let day = 86_400;
+        let entry = |id: &str, deleted_at: u64| DeletedIssue {
+            issue: test_issue(id, Column::Todo),
+            deleted_at,
+        };
+        let now = 100 * day;
+        let mut deleted = vec![entry("old", now - 31 * day), entry("new", now - 29 * day)];
+        let expired = take_expired(&mut deleted, now, 30);
+        assert_eq!(expired[0].issue.id, "old");
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].issue.id, "new");
+    }
+
+    #[test]
+    fn purge_all_and_expired() {
+        let dir = setup_project();
+        let root = dir.path();
+        create_titled(root, "A");
+        create_titled(root, "B");
+        delete_issue(root, "test-1").unwrap();
+        delete_issue(root, "test-2").unwrap();
+
+        assert!(purge_deleted(root, PurgeTarget::Expired)
+            .unwrap()
+            .is_empty());
+        fs::write(
+            root.join(".bork/config.toml"),
+            "project_name = \"test\"\nkeep_deleted_days = 0\n",
+        )
+        .unwrap();
+        assert_eq!(purge_deleted(root, PurgeTarget::Expired).unwrap().len(), 2);
+
+        let c = create_titled(root, "C");
+        delete_issue(root, &c.id).unwrap();
+        assert_eq!(purge_deleted(root, PurgeTarget::All).unwrap().len(), 1);
+        assert!(config::load_state(root).deleted_issues.is_empty());
+    }
+
+    #[test]
+    fn list_deleted_shows_restorable_issues() {
+        let dir = setup_project();
+        let root = dir.path();
+        assert_eq!(list_deleted(root, false).unwrap(), "No deleted issues.");
+        create_titled(root, "Goalie duty");
+        delete_issue(root, "test-1").unwrap();
+
+        let table = list_deleted(root, false).unwrap();
+        assert!(table.starts_with("ID"));
+        assert!(table.contains("test-1  Goalie duty"));
+        let json: serde_json::Value =
+            serde_json::from_str(&list_deleted(root, true).unwrap()).unwrap();
+        assert_eq!(json[0]["issue"]["id"], "test-1");
+        assert!(json[0]["deleted_at"].as_u64().is_some());
     }
 
     #[test]

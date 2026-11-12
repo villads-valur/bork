@@ -159,7 +159,8 @@ fn map_sidebar_key(key: KeyEvent) -> Action {
 
 fn map_confirm_key(key: KeyEvent) -> Action {
     match key.code {
-        KeyCode::Char('y') | KeyCode::Enter => Action::ConfirmYes,
+        KeyCode::Char('y') => Action::ConfirmYes,
+        KeyCode::Enter => Action::ConfirmDefault,
         KeyCode::Char('n') | KeyCode::Esc => Action::ConfirmNo,
         _ => Action::Noop,
     }
@@ -566,7 +567,7 @@ mod tests {
     #[test]
     fn confirm_yes() {
         assert_eq!(map_confirm_key(key(KeyCode::Char('y'))), Action::ConfirmYes);
-        assert_eq!(map_confirm_key(key(KeyCode::Enter)), Action::ConfirmYes);
+        assert_eq!(map_confirm_key(key(KeyCode::Enter)), Action::ConfirmDefault);
     }
 
     #[test]

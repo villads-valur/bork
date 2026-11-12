@@ -492,6 +492,7 @@ mod tests {
             agents_allowlist: None,
             prune_threshold: crate::config::DEFAULT_PRUNE_THRESHOLD,
             auto_prune_check_interval: crate::config::DEFAULT_AUTO_PRUNE_CHECK_INTERVAL,
+            keep_deleted_days: crate::config::DEFAULT_KEEP_DELETED_DAYS,
             cloud_agents: false,
             agent_launch: std::collections::HashMap::new(),
         }

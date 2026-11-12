@@ -12,7 +12,8 @@ use crate::external::{agent, browser, github, tmux, tuicr};
 use crate::global_config::ReloadResult;
 use crate::input::Action;
 use crate::types::{
-    AgentKind, Column, Issue, IssueDraft, IssueKind, LinkedGithubPr, LinkedLinear, PrImportSource,
+    AgentKind, Column, DeletedIssue, Issue, IssueDraft, IssueKind, LinkedGithubPr, LinkedLinear,
+    PrImportSource,
 };
 use crate::undo::{self, Change, ColumnSnapshot, UndoEntry, UNDO_WINDOW};
 use crate::worktree::{ForceRequired, Removal};
@@ -229,6 +230,9 @@ fn undo_last(app: &mut App) {
         app.set_warning("Nothing to undo");
         return;
     };
+    // Apply a CLI write from since the last poll first, so a restore, purge
+    // or edit made there wins over the undo.
+    project.merge_external_state_if_changed();
     let reverted = entry.revert(project);
     if reverted == 0 {
         app.set_warning("Couldn't undo, the issues changed since");
@@ -708,10 +712,8 @@ fn handle_normal(
         Action::DeleteIssue => {
             let project = app.context_project(ctx);
             let issues = project.target_issues(&q);
-            let message = match issues.as_slice() {
-                [] => return PostAction::None,
-                [issue] => format!("Delete {}: {}? (y/n)", issue.id, issue.title),
-                _ => format!("Delete {}? (y/n)", count_of(issues.len(), "issue")),
+            let Some(message) = delete_confirm_message(project, &issues) else {
+                return PostAction::None;
             };
             let issue_ids = issues.iter().map(|issue| issue.id.clone()).collect();
             app.start_confirm(
@@ -2455,6 +2457,20 @@ fn handle_confirm(
     _ctx: &ActionContext,
     action_tx: &mpsc::Sender<ActionResult>,
 ) {
+    let action = match action {
+        Action::ConfirmDefault => {
+            let confirms = app
+                .pending_confirm
+                .as_ref()
+                .is_some_and(ConfirmAction::enter_confirms);
+            if confirms {
+                Action::ConfirmYes
+            } else {
+                Action::ConfirmNo
+            }
+        }
+        other => other,
+    };
     match action {
         Action::ConfirmYes => {
             if let Some(confirm_action) = app.take_confirm_action() {
@@ -2496,20 +2512,12 @@ fn handle_confirm(
                                 format!("Deleted {} and killed session", issue.id),
                                 format!("Deleted {}", issue.id),
                             );
+                            // Saved plans stay until the deleted issue is
+                            // purged, so a restore gets them back.
                             if result.message_kind != MessageKind::Error {
                                 result
                                     .issues_to_delete
                                     .push((project_id.clone(), issue.id.clone()));
-                                if let Err(e) = crate::issue_plan::remove_saved_plans(
-                                    &config.project_root,
-                                    &issue.id,
-                                ) {
-                                    result.message = format!(
-                                        "Deleted {} but couldn't remove its saved plans: {e}",
-                                        issue.id
-                                    );
-                                    result.message_kind = MessageKind::Warning;
-                                }
                             }
                             result
                         },
@@ -2783,21 +2791,100 @@ pub fn archive_issue_in_app(app: &mut App, project_id: &ProjectId, issue_id: &st
     true
 }
 
-pub fn delete_issue_from_app(app: &mut App, project_id: &ProjectId, issue_id: &str) -> bool {
-    let query = app.search_query.clone();
-    let Some(project) = app.find_project_mut(project_id) else {
-        return false;
+/// The delete prompt: what is being deleted, plus anything that makes it
+/// costly (an orchestrator, links to other issues, a running session). None
+/// when there is nothing to delete.
+fn delete_confirm_message(project: &Project, issues: &[&Issue]) -> Option<String> {
+    let running =
+        |issue: &Issue| project.is_session_alive(&issue.session_name(&project.config.project_name));
+    let mut details = Vec::new();
+    let subject = match issues {
+        [] => return None,
+        [issue] => {
+            if issue.kind == IssueKind::Orchestrator {
+                details.push("orchestrator".to_string());
+            }
+            if issue.has_links() {
+                details.push(format!("{} linked", issue.linked_issues.len()));
+            }
+            if running(issue) {
+                details.push("session running".to_string());
+            }
+            format!("{}: {}", issue.id, issue.title)
+        }
+        _ => {
+            let linked = issues.iter().filter(|issue| issue.has_links()).count();
+            let live = issues.iter().filter(|issue| running(issue)).count();
+            if linked > 0 {
+                details.push(format!("{linked} with links"));
+            }
+            if live > 0 {
+                details.push(format!("{live} running"));
+            }
+            count_of(issues.len(), "issue")
+        }
     };
-    let Some(index) = project
+    let details = if details.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", details.join(", "))
+    };
+    Some(format!(
+        "Delete {subject}{details}? y to delete, n to cancel"
+    ))
+}
+
+/// Delete confirmed issues and record them as one undoable action. When the
+/// deletes all succeeded (`kind` is Info), the status bar offers the undo.
+pub fn delete_issues_from_app(
+    app: &mut App,
+    deletions: Vec<(ProjectId, String)>,
+    kind: MessageKind,
+) {
+    // Deletes come from one confirm prompt, so they share a project.
+    let Some(project_id) = deletions.first().map(|(project_id, _)| project_id.clone()) else {
+        return;
+    };
+    let changes: Vec<Change> = deletions
+        .iter()
+        .filter_map(|(project_id, issue_id)| delete_issue_from_app(app, project_id, issue_id))
+        .map(|entry| Change::Delete {
+            issue_id: entry.issue.id,
+            deleted_at: entry.deleted_at,
+        })
+        .collect();
+    let label = match changes.as_slice() {
+        [Change::Delete { issue_id, .. }] => format!("Deleted {issue_id}"),
+        _ => format!("Deleted {}", count_of(changes.len(), "issue")),
+    };
+    let undo_message = format!("{} · u to undo", label);
+    if undo::record(&mut app.undo, UndoEntry::new(project_id, label, changes))
+        && kind == MessageKind::Info
+    {
+        app.show_message_for(undo_message, MessageKind::Info, UNDO_WINDOW);
+    }
+}
+
+/// Move an issue to its project's deleted list. Returns the deleted entry.
+pub fn delete_issue_from_app(
+    app: &mut App,
+    project_id: &ProjectId,
+    issue_id: &str,
+) -> Option<DeletedIssue> {
+    let query = app.search_query.clone();
+    let project = app.find_project_mut(project_id)?;
+    let index = project
         .issues
         .iter()
-        .position(|issue| issue.id.eq_ignore_ascii_case(issue_id))
-    else {
-        return false;
-    };
+        .position(|issue| issue.id.eq_ignore_ascii_case(issue_id))?;
 
-    let removed = project.issues.remove(index);
-    crate::ops::remove_link_references(&mut project.issues, &removed.id);
+    let entry = crate::ops::soft_delete(
+        &mut project.issues,
+        &mut project.deleted_issues,
+        index,
+        crate::app::unix_now(),
+    );
+    let removed = &entry.issue;
     if project
         .link_filter
         .as_deref()
@@ -2808,7 +2895,7 @@ pub fn delete_issue_from_app(app: &mut App, project_id: &ProjectId, issue_id: &s
     project.marked_issues.remove(&removed.id.to_lowercase());
     project.clamp_all_rows(&query);
     project.mark_dirty();
-    true
+    Some(entry)
 }
 
 fn launch_and_report(issue: Issue, config: AppConfig) -> ActionResult {
@@ -2920,6 +3007,7 @@ mod tests {
             agents_allowlist: None,
             prune_threshold: crate::config::DEFAULT_PRUNE_THRESHOLD,
             auto_prune_check_interval: crate::config::DEFAULT_AUTO_PRUNE_CHECK_INTERVAL,
+            keep_deleted_days: crate::config::DEFAULT_KEEP_DELETED_DAYS,
             cloud_agents: false,
             agent_launch: std::collections::HashMap::new(),
         }
@@ -4946,10 +5034,187 @@ mod tests {
         assert_eq!(app.input_mode, InputMode::Normal);
         assert_eq!(app.project().issues.len(), 3);
 
-        assert!(delete_issue_from_app(&mut app, &project_id, "bork-1"));
+        assert!(delete_issue_from_app(&mut app, &project_id, "bork-1").is_some());
         assert_eq!(app.project().issues.len(), 2);
         assert_eq!(app.project().issues[0].id, "bork-2");
+        assert_eq!(app.project().deleted_issues[0].issue.id, "bork-1");
         assert!(app.project().state_dirty);
+    }
+
+    /// bork-1 is an orchestrator with a Claude session, a PR and links to
+    /// bork-2 and bork-3.
+    fn app_with_linked_orchestrator() -> App {
+        let mut app = app_with_issues();
+        let issues = &mut app.project_mut().issues;
+        issues[0].kind = IssueKind::Orchestrator;
+        issues[0]
+            .sessions
+            .insert(AgentKind::Claude, "claude-session-1".into());
+        issues[0].github_pr_links.push(LinkedGithubPr {
+            number: 42,
+            imported: false,
+            import_source: None,
+        });
+        issues[0].linked_issues = vec!["bork-2".into(), "bork-3".into()];
+        issues[1].linked_issues = vec!["bork-1".into()];
+        issues[2].linked_issues = vec!["bork-1".into()];
+        app
+    }
+
+    fn confirm_delete(app: &mut App, ids: &[&str]) {
+        let project_id = app.project().id();
+        let deletions = ids
+            .iter()
+            .map(|id| (project_id.clone(), id.to_string()))
+            .collect();
+        delete_issues_from_app(app, deletions, MessageKind::Info);
+    }
+
+    #[test]
+    fn undo_after_delete_restores_issue_and_both_sides_of_links() {
+        let mut app = app_with_linked_orchestrator();
+        let original = app.project().issues[0].clone();
+        confirm_delete(&mut app, &["bork-1"]);
+        assert!(app.project().issues[1].linked_issues.is_empty());
+        assert!(app
+            .message
+            .as_ref()
+            .is_some_and(|(text, _)| text.contains("u to undo")));
+
+        act(&mut app, Action::Undo);
+
+        let project = app.project();
+        let restored = project.issues.iter().find(|i| i.id == "bork-1").unwrap();
+        assert_eq!(restored, &original);
+        assert!(project.deleted_issues.is_empty());
+        for id in ["bork-2", "bork-3"] {
+            let other = project.issues.iter().find(|i| i.id == id).unwrap();
+            assert_eq!(other.linked_issues, vec!["bork-1".to_string()]);
+        }
+    }
+
+    #[test]
+    fn undo_reverts_bulk_delete_in_one_step() {
+        let mut app = app_with_issues();
+        confirm_delete(&mut app, &["bork-1", "bork-3"]);
+        assert_eq!(app.project().issues.len(), 1);
+
+        act(&mut app, Action::Undo);
+        let mut ids: Vec<_> = app.project().issues.iter().map(|i| i.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, ["bork-1", "bork-2", "bork-3"]);
+    }
+
+    #[test]
+    fn undo_delete_keeps_changes_made_since() {
+        let mut app = app_with_linked_orchestrator();
+        confirm_delete(&mut app, &["bork-1"]);
+        app.project_mut().issues[0].title = "Renamed by an agent".into();
+
+        act(&mut app, Action::Undo);
+        let other = &app.project().issues[0];
+        assert_eq!(other.title, "Renamed by an agent");
+        assert_eq!(other.linked_issues, vec!["bork-1".to_string()]);
+    }
+
+    #[test]
+    fn undo_delete_picks_up_a_cli_restore_from_before_the_next_poll() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let mut app = app_with_issues();
+        app.project_mut().config.project_root = root.to_path_buf();
+        confirm_delete(&mut app, &["bork-1"]);
+        // The TUI flushes the delete.
+        let project = app.project_mut();
+        crate::config::save_state(&project.to_state(), root).unwrap();
+        project.update_base_snapshot();
+
+        // The CLI restores and edits the issue before the TUI polls again.
+        crate::ops::restore_issue(root, "bork-1").unwrap();
+        let mut state = crate::config::load_state(root);
+        let restored = state.issues.iter_mut().find(|i| i.id == "bork-1").unwrap();
+        restored.title = "Edited from the CLI".into();
+        crate::config::save_state(&state, root).unwrap();
+        // Same-second writes can share an mtime, so mark the file as unseen.
+        app.project_mut().last_state_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
+
+        act(&mut app, Action::Undo);
+        let restored: Vec<_> = app
+            .project()
+            .issues
+            .iter()
+            .filter(|i| i.id == "bork-1")
+            .collect();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].title, "Edited from the CLI");
+    }
+
+    #[test]
+    fn undo_delete_skips_an_issue_restored_since() {
+        let mut app = app_with_issues();
+        confirm_delete(&mut app, &["bork-1"]);
+        // Restored by the CLI and picked up by the merge before the undo.
+        let project = app.project_mut();
+        crate::ops::restore_deleted(
+            &mut project.issues,
+            &mut project.deleted_issues,
+            "bork-1",
+            None,
+        )
+        .unwrap();
+        project.issues.last_mut().unwrap().title = "Edited after restore".into();
+
+        act(&mut app, Action::Undo);
+        let restored: Vec<_> = app
+            .project()
+            .issues
+            .iter()
+            .filter(|i| i.id == "bork-1")
+            .collect();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].title, "Edited after restore");
+    }
+
+    #[test]
+    fn enter_cancels_a_delete_prompt() {
+        let mut app = app_with_issues();
+        act(&mut app, Action::DeleteIssue);
+        act(&mut app, Action::ConfirmDefault);
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert!(app.pending_confirm.is_none());
+        assert!(app.project().deleted_issues.is_empty());
+    }
+
+    #[test]
+    fn enter_still_confirms_other_prompts() {
+        let mut app = app_with_issues();
+        act(&mut app, Action::ArchiveIssue);
+        act(&mut app, Action::ConfirmDefault);
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert!(app.pending_confirm.is_none());
+        assert!(app.busy_count > 0);
+    }
+
+    #[test]
+    fn delete_prompt_names_the_issue_and_its_links() {
+        let mut app = app_with_linked_orchestrator();
+        act(&mut app, Action::DeleteIssue);
+        assert_eq!(
+            app.confirm_message.as_deref(),
+            Some("Delete bork-1: Test issue bork-1 (orchestrator, 2 linked)? y to delete, n to cancel")
+        );
+    }
+
+    #[test]
+    fn bulk_delete_prompt_counts_issues_with_links() {
+        let mut app = app_with_linked_orchestrator();
+        app.project_mut().marked_issues.insert("bork-1".into());
+        app.project_mut().marked_issues.insert("bork-2".into());
+        act(&mut app, Action::DeleteIssue);
+        assert_eq!(
+            app.confirm_message.as_deref(),
+            Some("Delete 2 issues (2 with links)? y to delete, n to cancel")
+        );
     }
 
     #[test]
@@ -5717,6 +5982,7 @@ mod tests {
             agents_allowlist: None,
             prune_threshold: crate::config::DEFAULT_PRUNE_THRESHOLD,
             auto_prune_check_interval: crate::config::DEFAULT_AUTO_PRUNE_CHECK_INTERVAL,
+            keep_deleted_days: crate::config::DEFAULT_KEEP_DELETED_DAYS,
             cloud_agents: false,
             agent_launch: std::collections::HashMap::new(),
         }
@@ -5727,6 +5993,7 @@ mod tests {
             test_config_named("alpha"),
             crate::config::AppState {
                 last_prune_at: None,
+                deleted_issues: Vec::new(),
                 issues: vec![test_issue("alpha-1", Column::Todo)],
             },
         );
@@ -5734,6 +6001,7 @@ mod tests {
             test_config_named("beta"),
             crate::config::AppState {
                 last_prune_at: None,
+                deleted_issues: Vec::new(),
                 issues: vec![test_issue("beta-1", Column::InProgress)],
             },
         );
@@ -5741,6 +6009,7 @@ mod tests {
             test_config_named("gamma"),
             crate::config::AppState {
                 last_prune_at: None,
+                deleted_issues: Vec::new(),
                 issues: vec![test_issue("gamma-1", Column::Todo)],
             },
         );

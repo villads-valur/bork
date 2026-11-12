@@ -24,8 +24,9 @@ use crate::external::linear::{LinearIssue, LinearProject};
 use crate::prune::{PruneAction, PruneCandidate};
 use crate::types::{
     cloud_card_status, AgentKind, AgentStatus, AgentStatusInfo, ChecksStatus, CloudAgent,
-    CloudRunInfo, Column, GithubStack, Issue, IssueKind, LinkedGithubPr, MergeBlocker,
-    PrImportBaseline, PrImportSource, PrState, PrStatus, ReviewDecision, WorktreeStatus,
+    CloudRunInfo, Column, DeletedIssue, GithubStack, Issue, IssueKind, LinkedGithubPr,
+    MergeBlocker, PrImportBaseline, PrImportSource, PrState, PrStatus, ReviewDecision,
+    WorktreeStatus,
 };
 use crate::undo::UndoEntry;
 use crate::worktree::ForceRequired;
@@ -185,6 +186,9 @@ pub struct Project {
     pub live: LiveState,
     pub state_dirty: bool,
     pub base_issues: Vec<Issue>,
+    /// Deleted issues that can still be restored (persisted in state.json).
+    pub deleted_issues: Vec<DeletedIssue>,
+    pub base_deleted_issues: Vec<DeletedIssue>,
     pub last_state_mtime: Option<SystemTime>,
     /// Unix timestamp of the last completed prune, persisted in state.json.
     pub last_prune_at: Option<u64>,
@@ -220,6 +224,7 @@ impl Project {
         let AppState {
             mut issues,
             last_prune_at,
+            deleted_issues,
         } = state;
         let now = unix_now();
         for issue in &mut issues {
@@ -251,6 +256,8 @@ impl Project {
             base_issues,
             last_state_mtime,
             last_prune_at,
+            base_deleted_issues: deleted_issues.clone(),
+            deleted_issues,
             last_auto_prune_check: None,
             last_config_mtime,
             render_cache: RefCell::new(RenderCache::default()),
@@ -313,6 +320,7 @@ impl Project {
         let state = AppState {
             issues: self.issues.clone(),
             last_prune_at: self.last_prune_at,
+            deleted_issues: self.deleted_issues.clone(),
         };
         // Compile-time coverage guard: forces a build error when `AppState`
         // grows a field, so a new persisted field can't be silently dropped
@@ -320,13 +328,28 @@ impl Project {
         let AppState {
             issues: _,
             last_prune_at: _,
+            deleted_issues: _,
         } = &state;
         state
     }
 
     pub fn update_base_snapshot(&mut self) {
         self.base_issues = self.issues.clone();
+        self.base_deleted_issues = self.deleted_issues.clone();
         self.last_state_mtime = crate::config::state_mtime(&self.config.project_root);
+    }
+
+    /// Merge state.json into memory when another writer changed it since we
+    /// last read or wrote it. An unreadable file is skipped, like the poll.
+    pub fn merge_external_state_if_changed(&mut self) {
+        let current_mtime = crate::config::state_mtime(&self.config.project_root);
+        if current_mtime == self.last_state_mtime {
+            return;
+        }
+        if let Some(file_state) = crate::config::try_load_state(&self.config.project_root) {
+            self.merge_external_state(file_state);
+            self.last_state_mtime = current_mtime;
+        }
     }
 
     pub fn merge_external_state(&mut self, file_state: AppState) {
@@ -334,11 +357,14 @@ impl Project {
         // of whether it came from memory or an external writer.
         self.last_prune_at = self.last_prune_at.max(file_state.last_prune_at);
         let file_issues = file_state.issues;
+        let file_deleted = file_state.deleted_issues;
 
         if !self.state_dirty {
             // No local changes pending, safe to fully replace
             self.issues = file_issues.clone();
             self.base_issues = file_issues;
+            self.deleted_issues = file_deleted.clone();
+            self.base_deleted_issues = file_deleted;
             self.clear_stale_link_filter();
             self.clear_stale_marks();
             self.clamp_all_rows("");
@@ -346,15 +372,19 @@ impl Project {
         }
 
         // 3-way merge: base (last known disk state) vs memory vs file
-        let file_ids: HashSet<String> = file_issues.iter().map(|i| i.id.clone()).collect();
+        let file_ids: HashSet<&str> = file_issues.iter().map(|i| i.id.as_str()).collect();
+        let base_ids: HashSet<&str> = self.base_issues.iter().map(|i| i.id.as_str()).collect();
         let memory_ids: HashSet<String> = self.issues.iter().map(|i| i.id.clone()).collect();
 
-        // Remove issues that were deleted externally
-        self.issues.retain(|i| file_ids.contains(&i.id));
+        // Remove issues that were deleted externally. One missing from both
+        // base and file was added here (created, or restored by undo) and stays.
+        self.issues
+            .retain(|i| file_ids.contains(i.id.as_str()) || !base_ids.contains(i.id.as_str()));
 
-        // Add issues that were created externally
+        // Add issues that were created externally. One in base but gone from
+        // memory was deleted here, and that delete wins.
         for file_issue in &file_issues {
-            if !memory_ids.contains(&file_issue.id) {
+            if !memory_ids.contains(&file_issue.id) && !base_ids.contains(file_issue.id.as_str()) {
                 self.issues.push(file_issue.clone());
             }
         }
@@ -379,7 +409,13 @@ impl Project {
             merge_issue_fields(issue, base_issue, file_issue);
         }
 
+        self.deleted_issues = merge_deleted_issues(
+            &self.deleted_issues,
+            &self.base_deleted_issues,
+            &file_deleted,
+        );
         self.base_issues = file_issues;
+        self.base_deleted_issues = file_deleted;
         self.clear_stale_link_filter();
         self.clear_stale_marks();
         self.clamp_all_rows("");
@@ -1670,7 +1706,12 @@ impl Project {
     }
 
     fn next_issue_id_after(&self, offset: u32) -> String {
-        crate::ops::next_issue_id_after(&self.issues, &self.config.project_name, offset)
+        crate::ops::next_issue_id_after(
+            &self.issues,
+            &self.deleted_issues,
+            &self.config.project_name,
+            offset,
+        )
     }
 
     /// Apply a background refresh without moving the cursor off its card.
@@ -1933,6 +1974,14 @@ pub enum ConfirmAction {
     RemoveProject { project_id: ProjectId },
 }
 
+impl ConfirmAction {
+    /// Whether Enter answers yes. A delete needs an explicit `y`, so a stray
+    /// Enter (right after `d`, next to `D` for Move to Done) can't confirm it.
+    pub fn enter_confirms(&self) -> bool {
+        !matches!(self, ConfirmAction::DeleteIssue { .. })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinearPickerContext {
     Import,
@@ -1957,6 +2006,56 @@ impl ImportSource {
 }
 
 pub use crate::dialog_state::{DialogField, DialogState};
+
+/// 3-way merge of the deleted list, keyed by id and delete time. An entry
+/// either side added since base is kept; one either side removed since base
+/// (restored or purged) stays removed. An entry on both sides only changes
+/// when a restore hands it a link, so the file's version wins when memory's
+/// is untouched, and links from both are kept when both changed.
+fn merge_deleted_issues(
+    memory: &[DeletedIssue],
+    base: &[DeletedIssue],
+    file: &[DeletedIssue],
+) -> Vec<DeletedIssue> {
+    let key = |entry: &DeletedIssue| (entry.issue.id.to_lowercase(), entry.deleted_at);
+    let base_by_key: HashMap<_, &DeletedIssue> = base.iter().map(|e| (key(e), e)).collect();
+    let file_by_key: HashMap<_, &DeletedIssue> = file.iter().map(|e| (key(e), e)).collect();
+    let memory_keys: HashSet<_> = memory.iter().map(key).collect();
+
+    let mut merged = Vec::new();
+    for entry in memory {
+        let entry_key = key(entry);
+        let base_entry = base_by_key.get(&entry_key).copied();
+        let Some(file_entry) = file_by_key.get(&entry_key).copied() else {
+            // Missing from the file: removed there if base had it, else new here.
+            if base_entry.is_none() {
+                merged.push(entry.clone());
+            }
+            continue;
+        };
+        if base_entry == Some(entry) {
+            merged.push(file_entry.clone());
+            continue;
+        }
+        let mut kept = entry.clone();
+        for linked_id in &file_entry.issue.linked_issues {
+            if !kept.issue.is_linked_to(linked_id) {
+                kept.issue.linked_issues.push(linked_id.clone());
+            }
+        }
+        merged.push(kept);
+    }
+    merged.extend(
+        file.iter()
+            .filter(|entry| {
+                let entry_key = key(entry);
+                !memory_keys.contains(&entry_key) && !base_by_key.contains_key(&entry_key)
+            })
+            .cloned(),
+    );
+    merged.sort_by_key(|entry| entry.deleted_at);
+    merged
+}
 
 /// 3-way field merge: for each field, if file diverged from base but memory didn't,
 /// take the file value. If both diverged, memory wins.
@@ -3180,6 +3279,7 @@ mod tests {
             agents_allowlist: None,
             prune_threshold: crate::config::DEFAULT_PRUNE_THRESHOLD,
             auto_prune_check_interval: crate::config::DEFAULT_AUTO_PRUNE_CHECK_INTERVAL,
+            keep_deleted_days: crate::config::DEFAULT_KEEP_DELETED_DAYS,
             cloud_agents: false,
             agent_launch: std::collections::HashMap::new(),
         }
@@ -3266,6 +3366,7 @@ mod tests {
         let state = AppState {
             issues,
             last_prune_at: None,
+            deleted_issues: Vec::new(),
         };
         App::new(test_config(), state)
     }
@@ -3662,6 +3763,7 @@ mod tests {
     fn attention_app(names: &[&str]) -> (App, Vec<ProjectId>) {
         let state = |name: &str| AppState {
             last_prune_at: None,
+            deleted_issues: Vec::new(),
             issues: vec![issue_linked_to_pr(&format!("{name}-1"), 7, None)],
         };
         let mut app = App::new(test_config_named(names[0]), state(names[0]));
@@ -5920,6 +6022,7 @@ mod tests {
         issue.done_at = None;
         let state = AppState {
             last_prune_at: None,
+            deleted_issues: Vec::new(),
             issues: vec![issue],
         };
         let app = App::new(test_config(), state);
@@ -5935,6 +6038,7 @@ mod tests {
         issue.done_at = Some(1000);
         let state = AppState {
             last_prune_at: None,
+            deleted_issues: Vec::new(),
             issues: vec![issue],
         };
         let app = App::new(test_config(), state);
@@ -5947,6 +6051,7 @@ mod tests {
         issue.done_at = None;
         let state = AppState {
             last_prune_at: None,
+            deleted_issues: Vec::new(),
             issues: vec![issue],
         };
         let app = App::new(test_config(), state);
@@ -7276,6 +7381,7 @@ mod tests {
             test_config_named("alpha"),
             AppState {
                 last_prune_at: None,
+                deleted_issues: Vec::new(),
                 issues: vec![
                     test_issue_titled("alpha-1", "Fix login", Column::Todo),
                     test_issue_titled("alpha-2", "Add feature", Column::Todo),
@@ -7286,6 +7392,7 @@ mod tests {
             test_config_named("beta"),
             AppState {
                 last_prune_at: None,
+                deleted_issues: Vec::new(),
                 issues: vec![
                     test_issue_titled("beta-1", "Fix crash", Column::Todo),
                     test_issue_titled("beta-2", "Dark mode", Column::Todo),
@@ -7337,6 +7444,7 @@ mod tests {
             test_config_named("alpha"),
             AppState {
                 last_prune_at: None,
+                deleted_issues: Vec::new(),
                 issues: vec![
                     test_issue_titled("alpha-1", "Fix login", Column::Todo),
                     test_issue_titled("alpha-2", "Add feature", Column::Todo),
@@ -7347,6 +7455,7 @@ mod tests {
             test_config_named("beta"),
             AppState {
                 last_prune_at: None,
+                deleted_issues: Vec::new(),
                 issues: vec![
                     test_issue_titled("beta-1", "Fix crash", Column::Todo),
                     test_issue_titled("beta-2", "Dark mode", Column::Todo),
@@ -7378,6 +7487,7 @@ mod tests {
             test_config_named("alpha"),
             AppState {
                 last_prune_at: None,
+                deleted_issues: Vec::new(),
                 issues: vec![
                     test_issue_titled("alpha-1", "Fix login", Column::Todo),
                     test_issue_titled("alpha-2", "Add feature", Column::Todo),
@@ -7388,6 +7498,7 @@ mod tests {
             test_config_named("beta"),
             AppState {
                 last_prune_at: None,
+                deleted_issues: Vec::new(),
                 issues: vec![test_issue_titled("beta-1", "Fix crash", Column::Todo)],
             },
         );
@@ -7416,6 +7527,7 @@ mod tests {
             test_config_named("alpha"),
             AppState {
                 last_prune_at: None,
+                deleted_issues: Vec::new(),
                 issues: vec![
                     test_issue_titled("alpha-1", "Fix login", Column::Todo),
                     test_issue_titled("alpha-2", "Add feature", Column::Todo),
@@ -7426,6 +7538,7 @@ mod tests {
             test_config_named("beta"),
             AppState {
                 last_prune_at: None,
+                deleted_issues: Vec::new(),
                 issues: vec![test_issue_titled("beta-1", "Fix crash", Column::Todo)],
             },
         );
@@ -7654,6 +7767,7 @@ mod tests {
             agents_allowlist: None,
             prune_threshold: crate::config::DEFAULT_PRUNE_THRESHOLD,
             auto_prune_check_interval: crate::config::DEFAULT_AUTO_PRUNE_CHECK_INTERVAL,
+            keep_deleted_days: crate::config::DEFAULT_KEEP_DELETED_DAYS,
             cloud_agents: false,
             agent_launch: std::collections::HashMap::new(),
         }
@@ -7664,6 +7778,7 @@ mod tests {
             test_config_named("alpha"),
             AppState {
                 last_prune_at: None,
+                deleted_issues: Vec::new(),
                 issues: vec![test_issue("alpha-1", Column::Todo)],
             },
         );
@@ -7671,6 +7786,7 @@ mod tests {
             test_config_named("beta"),
             AppState {
                 last_prune_at: None,
+                deleted_issues: Vec::new(),
                 issues: vec![
                     test_issue("beta-1", Column::Todo),
                     test_issue("beta-2", Column::InProgress),
@@ -7681,6 +7797,7 @@ mod tests {
             test_config_named("gamma"),
             AppState {
                 last_prune_at: None,
+                deleted_issues: Vec::new(),
                 issues: vec![test_issue("gamma-1", Column::CodeReview)],
             },
         );
@@ -8399,6 +8516,7 @@ mod tests {
     fn test_project(issues: Vec<Issue>) -> Project {
         let state = AppState {
             last_prune_at: None,
+            deleted_issues: Vec::new(),
             issues: issues.clone(),
         };
         let mut project = Project::new(test_config(), state);
@@ -8416,6 +8534,7 @@ mod tests {
         // External writer recorded a later prune.
         let file_state = AppState {
             last_prune_at: Some(200),
+            deleted_issues: Vec::new(),
             issues: vec![],
         };
         project.merge_external_state(file_state);
@@ -8433,6 +8552,7 @@ mod tests {
 
         let file_state = AppState {
             last_prune_at: None,
+            deleted_issues: Vec::new(),
             issues: vec![test_issue("b", Column::InProgress)],
         };
         project.merge_external_state(file_state);
@@ -8449,6 +8569,7 @@ mod tests {
 
         let file_state = AppState {
             last_prune_at: None,
+            deleted_issues: Vec::new(),
             issues: vec![
                 test_issue("a", Column::Todo),
                 test_issue("b", Column::InProgress),
@@ -8472,6 +8593,7 @@ mod tests {
 
         let file_state = AppState {
             last_prune_at: None,
+            deleted_issues: Vec::new(),
             issues: vec![test_issue("a", Column::Todo)],
         };
         project.merge_external_state(file_state);
@@ -8494,6 +8616,7 @@ mod tests {
         file_issue.title = "Renamed externally".to_string();
         let file_state = AppState {
             last_prune_at: None,
+            deleted_issues: Vec::new(),
             issues: vec![file_issue],
         };
         project.merge_external_state(file_state);
@@ -8513,24 +8636,91 @@ mod tests {
     fn merge_dirty_locally_added_issue_kept() {
         let mut project = test_project(vec![test_issue("a", Column::Todo)]);
 
-        // Locally add a new issue (not in base)
+        // Locally add a new issue (not in base), e.g. created or restored by undo
         project.issues.push(test_issue("local-new", Column::Todo));
         project.mark_dirty();
 
         // External file still only has "a"
         let file_state = AppState {
             last_prune_at: None,
+            deleted_issues: Vec::new(),
             issues: vec![test_issue("a", Column::Todo)],
         };
         project.merge_external_state(file_state);
 
-        // "local-new" is not in file_ids, so it gets removed by retain.
-        // This is correct: if an external process is the source of truth for
-        // what issues exist, a locally-added issue that isn't in the file
-        // should be removed. The dirty flush would have persisted it first
-        // in the normal flow (flush happens after merge).
-        assert_eq!(project.issues.len(), 1);
-        assert_eq!(project.issues[0].id, "a");
+        // Missing from both base and file means it was added here, not
+        // deleted elsewhere, so it survives until the flush writes it.
+        let ids: Vec<_> = project.issues.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, ["a", "local-new"]);
+    }
+
+    #[test]
+    fn merge_dirty_keeps_a_local_delete_when_the_file_changed() {
+        let mut project = test_project(vec![
+            test_issue("a", Column::Todo),
+            test_issue("b", Column::Todo),
+        ]);
+        let removed = project.issues.remove(0);
+        project.deleted_issues.push(DeletedIssue {
+            issue: removed,
+            deleted_at: 100,
+        });
+        project.mark_dirty();
+
+        // A CLI write since base touched "a" and added "c".
+        let mut a = test_issue("a", Column::Todo);
+        a.title = "Edited elsewhere".into();
+        let file_state = AppState {
+            last_prune_at: None,
+            deleted_issues: Vec::new(),
+            issues: vec![
+                a,
+                test_issue("b", Column::Todo),
+                test_issue("c", Column::Todo),
+            ],
+        };
+        project.merge_external_state(file_state);
+
+        let ids: Vec<_> = project.issues.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, ["b", "c"]);
+        assert_eq!(project.deleted_issues.len(), 1);
+    }
+
+    #[test]
+    fn merge_deleted_issues_keeps_both_sides_changes() {
+        let entry = |id: &str, at: u64| DeletedIssue {
+            issue: test_issue(id, Column::Todo),
+            deleted_at: at,
+        };
+        // Base had x and y. Memory deleted z; the file restored y and deleted w.
+        let base = vec![entry("x", 1), entry("y", 2)];
+        let memory = vec![entry("x", 1), entry("y", 2), entry("z", 3)];
+        let file = vec![entry("x", 1), entry("w", 4)];
+
+        let merged = merge_deleted_issues(&memory, &base, &file);
+        let ids: Vec<_> = merged.iter().map(|e| e.issue.id.as_str()).collect();
+        assert_eq!(ids, ["x", "z", "w"]);
+    }
+
+    #[test]
+    fn merge_deleted_issues_keeps_a_link_handed_over_by_a_restore() {
+        let entry = |links: &[&str]| {
+            let mut issue = test_issue("b", Column::Todo);
+            issue.linked_issues = links.iter().map(|id| id.to_string()).collect();
+            DeletedIssue {
+                issue,
+                deleted_at: 7,
+            }
+        };
+        let base = vec![entry(&[])];
+
+        // A CLI restore of "a" handed its link to b's entry; memory is untouched.
+        let merged = merge_deleted_issues(&base, &base, &[entry(&["a"])]);
+        assert_eq!(merged[0].issue.linked_issues, ["a"]);
+
+        // Both sides handed b a link (undo in the TUI, restore in the CLI).
+        let merged = merge_deleted_issues(&[entry(&["c"])], &base, &[entry(&["a"])]);
+        assert_eq!(merged[0].issue.linked_issues, ["c", "a"]);
     }
 
     #[test]
@@ -8545,6 +8735,7 @@ mod tests {
         // External change removes 2 issues
         let file_state = AppState {
             last_prune_at: None,
+            deleted_issues: Vec::new(),
             issues: vec![test_issue("a", Column::Todo)],
         };
         project.merge_external_state(file_state);
@@ -8572,6 +8763,7 @@ mod tests {
 
         let file_state = AppState {
             last_prune_at: None,
+            deleted_issues: Vec::new(),
             issues: vec![test_issue("new", Column::Todo)],
         };
         project.merge_external_state(file_state);
@@ -8590,6 +8782,7 @@ mod tests {
 
         let file_state = AppState {
             last_prune_at: None,
+            deleted_issues: Vec::new(),
             issues: issues.clone(),
         };
         project.merge_external_state(file_state);
@@ -8608,6 +8801,7 @@ mod tests {
         ];
         let file_state = AppState {
             last_prune_at: None,
+            deleted_issues: Vec::new(),
             issues: new_issues.clone(),
         };
         project.merge_external_state(file_state);

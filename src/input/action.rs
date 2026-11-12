@@ -42,6 +42,8 @@ pub enum Action {
     DeleteIssue,
     ArchiveIssue,
     ConfirmYes,
+    /// Enter in a y/n prompt: yes, except for prompts that default to no.
+    ConfirmDefault,
     ConfirmNo,
     DialogChar(char),
     DialogBackspace,
