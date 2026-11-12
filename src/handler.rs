@@ -1002,17 +1002,15 @@ fn handle_normal(
         }
 
         Action::PullBase => {
-            let config = &app.context_project(ctx).config;
-            let branch = config.base_branch.clone();
-            let main_dir = config.project_root.join("main");
+            let main_dir = app.context_project(ctx).config.project_root.join("main");
 
             app.begin_busy();
-            app.set_message(format!("Pulling '{branch}'..."));
+            app.set_message("Pulling the main checkout...");
             let tx = ch.action_tx.clone();
             let git_wake_tx = ch.git_wake_tx.clone();
 
             thread::spawn(move || {
-                let outcome = crate::external::git::pull_base(&main_dir, &branch);
+                let outcome = crate::external::git::pull_base(&main_dir);
                 // Refresh the behind-count (and worktree statuses) right away
                 // rather than waiting out the poll interval.
                 let _ = git_wake_tx.send(());

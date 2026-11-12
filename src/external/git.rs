@@ -352,15 +352,13 @@ pub fn base_behind(main_dir: &Path, branch: &str) -> Option<u64> {
 /// Fast-forward the checkout at `main_dir` to `origin/<branch>`. Refuses when
 /// the checkout is on another branch or dirty — pulling under someone's feet
 /// is worse than asking them to do it themselves.
-pub fn pull_base(main_dir: &Path, branch: &str) -> Result<String, String> {
-    let head = git_output(main_dir, &["rev-parse", "--abbrev-ref", "HEAD"])
+pub fn pull_base(main_dir: &Path) -> Result<String, String> {
+    // Pull whatever branch the main checkout is actually on (e.g. a repo
+    // whose default branch is 'master' while bork's base_branch is 'main').
+    let branch = git_output(main_dir, &["rev-parse", "--abbrev-ref", "HEAD"])
         .ok_or_else(|| "Cannot resolve the main checkout's branch".to_string())?;
-    let head = head.trim();
-    if head != branch {
-        return Err(format!(
-            "Main checkout is on '{head}', not '{branch}' — pull skipped"
-        ));
-    }
+    let branch = branch.trim().to_string();
+    let branch = branch.as_str();
 
     let status = git_output(main_dir, &["status", "--porcelain"])
         .ok_or_else(|| "Cannot read the main checkout's status".to_string())?;
@@ -864,28 +862,45 @@ detached
         assert!(out.status.success());
         assert_eq!(base_behind(&main, "main"), Some(1));
 
-        assert_eq!(pull_base(&main, "main"), Ok("Pulled 'main'".to_string()));
+        assert_eq!(pull_base(&main), Ok("Pulled 'main'".to_string()));
         assert_eq!(base_behind(&main, "main"), Some(0));
 
         assert_eq!(
-            pull_base(&main, "main"),
+            pull_base(&main),
             Ok("'main' already up to date".to_string())
         );
     }
 
     #[test]
-    fn pull_base_refuses_another_branch() {
+    fn pull_base_pulls_whatever_branch_the_checkout_is_on() {
         let (_tmp, _origin, main) = fixture_repo();
-        let out = crate::external::git_command()
-            .arg("-C")
-            .arg(&main)
-            .args(["checkout", "-q", "-b", "feature"])
-            .output()
-            .unwrap();
-        assert!(out.status.success());
+        // A checkout on a non-base branch (e.g. 'master') still gets pulled.
+        for args in [
+            vec!["checkout", "-q", "-b", "master"],
+            vec![
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=T",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "on master",
+            ],
+            vec!["push", "-q", "origin", "master"],
+            vec!["reset", "-q", "--hard", "HEAD~1"],
+        ] {
+            let out = crate::external::git_command()
+                .arg("-C")
+                .arg(&main)
+                .args(&args)
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+        }
 
-        let err = pull_base(&main, "main").unwrap_err();
-        assert!(err.contains("on 'feature', not 'main'"), "{err}");
+        assert_eq!(pull_base(&main), Ok("Pulled 'master'".to_string()));
     }
 
     #[test]
@@ -893,7 +908,7 @@ detached
         let (_tmp, _origin, main) = fixture_repo();
         std::fs::write(main.join("dirty.txt"), "x").unwrap();
 
-        let err = pull_base(&main, "main").unwrap_err();
+        let err = pull_base(&main).unwrap_err();
         assert!(err.contains("uncommitted changes"), "{err}");
     }
 }
