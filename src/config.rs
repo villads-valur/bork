@@ -1211,6 +1211,42 @@ auto_prune_check_interval = 3600
     }
 
     #[test]
+    fn keep_deleted_days_defaults_to_30_and_project_overrides_global() {
+        assert_eq!(merge_to_app("", "").keep_deleted_days, 30);
+        let cfg = merge_to_app("keep_deleted_days = 7", "keep_deleted_days = 0");
+        assert_eq!(cfg.keep_deleted_days, 0);
+        assert_eq!(
+            merge_to_app("keep_deleted_days = 7", "").keep_deleted_days,
+            7
+        );
+    }
+
+    #[test]
+    fn state_roundtrips_deleted_issues_and_loads_without_them() {
+        let state = AppState {
+            issues: Vec::new(),
+            last_prune_at: None,
+            deleted_issues: vec![DeletedIssue {
+                issue: Issue::new(
+                    "bork-1",
+                    "Gone",
+                    crate::types::Column::Todo,
+                    AgentKind::Claude,
+                ),
+                deleted_at: 1_700_000_000,
+            }],
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let back: AppState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.deleted_issues, state.deleted_issues);
+
+        let old: AppState = serde_json::from_str(r#"{"issues":[]}"#).unwrap();
+        assert!(old.deleted_issues.is_empty());
+        let empty = serde_json::to_string(&old).unwrap();
+        assert!(!empty.contains("deleted_issues"));
+    }
+
+    #[test]
     fn state_roundtrips_last_prune_at() {
         let state = AppState {
             issues: Vec::new(),

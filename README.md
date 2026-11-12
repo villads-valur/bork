@@ -143,7 +143,10 @@ bork --help
 | `bork issue update <id>` | Update issue fields |
 | `bork issue move <id> <column>` | Move an issue to a column |
 | `bork issue archive <id>` | Kill session, run teardown, remove worktree, move to Done |
-| `bork issue delete <id>` | Delete an issue |
+| `bork issue delete <id>` | Delete an issue (restorable for `keep_deleted_days`, 30 by default) |
+| `bork issue restore <id>` | Put a deleted issue back with its id, sessions and links |
+| `bork issue list --deleted` | List deleted issues that can still be restored |
+| `bork issue purge <id>` / `--all` | Permanently remove deleted issues and their saved plans |
 | `bork integration attach-linear <id> <identifier>` | Link a Linear ticket to an issue (can attach multiple) |
 | `bork integration attach-linear-project <id> <url-or-slug>` | Link a Linear project to an orchestrator issue (can attach multiple) |
 | `bork integration detach-linear-project <id> <url-or-slug>` | Unlink a Linear project from an issue |
@@ -215,7 +218,8 @@ bork issue update bork-3 --title "Fix OAuth flow"
 bork issue show bork-3
 bork issue reset-session bork-3           # next launch starts a new agent session
 bork issue archive bork-3                 # cleanup when work is merged
-bork issue delete bork-3
+bork issue delete bork-3                  # undo with u in the TUI, or:
+bork issue restore bork-3
 ```
 
 **Create options:** `--column` (todo, in-progress, code-review, done), `--agent` (opencode, claude, codex, pi), `--mode` (plan, build, yolo), `--prompt`, `--model`, `--kind` (agentic, todo, orchestrator).

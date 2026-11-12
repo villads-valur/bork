@@ -75,7 +75,7 @@ const SECTIONS: &[Section] = &[
             ("K / J", "Move up / down"),
             ("D", "Move to Done"),
             ("T", "Move to To Do"),
-            ("u", "Undo last move"),
+            ("u", "Undo last move or delete"),
         ],
     },
     Section {

@@ -120,10 +120,15 @@ bork issue reset-session bork-1
 bork issue reset-session bork-1 --agent codex    # a different agent's stored session
 ```
 
-### Delete an issue
+### Delete and restore an issue
+
+A delete keeps the issue restorable (with its id, sessions, PR/Linear links and the links on other issues) for `keep_deleted_days` (30 by default). In the TUI, `u` undoes a delete for 10 seconds.
 
 ```bash
 bork issue delete bork-1
+bork issue list --deleted          # restorable issues (--json for machine output)
+bork issue restore bork-1
+bork issue purge bork-1            # or --all; also removes plans/<id>/
 ```
 
 ## Integrations

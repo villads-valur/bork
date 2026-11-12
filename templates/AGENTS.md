@@ -55,7 +55,9 @@ bork issue show {project_name}-1              # Show details
 bork issue update {project_name}-1 --title "New title" --column code-review
 bork issue move {project_name}-1 done         # Move to column
 bork issue archive {project_name}-1           # Kill session + teardown + remove worktree + Done
-bork issue delete {project_name}-1            # Delete
+bork issue delete {project_name}-1            # Delete (restorable for 30 days)
+bork issue restore {project_name}-1           # Restore a deleted issue with its links
+bork issue list --deleted                     # Deleted issues that can be restored
 bork integration attach-linear {project_name}-1 VIL-123   # Link Linear ticket
 bork integration attach-pr {project_name}-1 42             # Link GitHub PR (issue ID optional inside an agent session)
 bork integration detach-linear {project_name}-1 VIL-123   # Unlink a Linear ticket

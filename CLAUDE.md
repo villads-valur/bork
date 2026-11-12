@@ -60,7 +60,7 @@ src/
 ├── agent_config.rs   # Agent preferences from layered config + PATH detection
 ├── toml_lite.rs      # Shared minimal TOML reader for config files
 ├── handler.rs        # Action dispatch, state mutations, dialog submit/confirm
-├── undo.rs           # Single-slot undo (UndoEntry + per-field Change variants, 10s window)
+├── undo.rs           # Single-slot undo (UndoEntry + Change variants: column moves, deletes; 10s window)
 ├── config.rs         # Config/state persistence (atomic writes)
 ├── global_config.rs  # Global project registry (~/.config/bork/projects.json)
 ├── types.rs          # Domain types (Issue, Column, AgentKind, IssueKind, PrStatus, etc.)
@@ -68,7 +68,7 @@ src/
 ├── init.rs           # `bork init` subcommand (clone repo, scaffold .bork/ directory)
 ├── lock.rs           # Single-instance PID file lock + signal handlers (SIGTERM, SIGHUP)
 ├── worktree.rs       # `bork worktree` subcommand (create git worktree, register with state)
-├── issue_plan.rs     # Save an issue's plan before its worktree is removed; drop `plans/<id>/` on delete
+├── issue_plan.rs     # Save an issue's plan before its worktree is removed; drop `plans/<id>/` on purge
 ├── backup/           # Backups (library; `bork backup` CLI in main.rs is a thin layer)
 │   ├── mod.rs        # Selection, plan/run (one tar.gz, skip when unchanged), is_due, save_issue_plan
 │   ├── config.rs     # `[backup]`: enabled (project file), path (global file)
@@ -166,7 +166,7 @@ Legacy: `~/.config/bork/agents.toml` is no longer read (bork-119). A one-line st
 - Per project: `.bork/state.json` + `.bork/config.toml` (symlinks followed), every container entry except `main/`, worktrees (union of `git worktree list`, `issue.worktree` and dirs with a `.git` entry), nested checkouts at any depth (dirs with a `.git` entry) and ephemeral files, plus each live worktree's `.claude/planning.md` as `_issues/<issue-id>/planning.md`. Skipped checkouts (nested at any depth, or standalone top-level clones with a `.git` dir) that have no remote are reported as `local_only_repos` in the plan, outcome and status record, and printed as a warning by the CLI.
 - Unchanged content (fingerprint over manifest without `created_at` + every file) skips the write. Read errors other than NotFound fail the run and keep the previous file. The path may not be inside a registered project.
 - `backup::save_issue_plan(root, issue_id, worktree_dir)` copies a worktree's plan into the container's `plans/<issue-id>/planning.md` (no-op when backups are off).
-- Removal paths save plans through `issue_plan::save_before_removal`, called inside both removal primitives: `worktree::remove_worktree_in` (archive, takes the issue id) and `prune::execute_removals` (`PruneTarget` carries the issue id; orphans have none and save to `plans/_orphans/<worktree>/` via `backup::save_orphan_plan`). Don't add a removal path that bypasses them. The plan is saved before the teardown, and a failed save stops before the teardown runs, keeping the worktree (`ForceRequired::PlanNotSaved`, `RemoveOutcome::PlanNotSaved`) until forced. The TUI's force retry runs the still-due teardown for those (`ConfirmAction::ArchiveIssue.teardown_due`); `Removal::ForceSkipTeardown` skips both the save and the teardown, so a TUI retry never overwrites the saved plan with what the teardown left (a CLI `--force` run is a fresh `Removal::Force`, which saves the current plan again). Forcing happens via the TUI y/n prompt or `--force` on `bork issue archive` / `bork prune`, and a forced loss is logged to `.bork/errors.log`. Deleting an issue removes `plans/<issue-id>/` (`issue_plan::remove_saved_plans`, backups-on projects only), which for an orchestrator is its live plan. Plan paths come from `backup::issue_plan_dir` / `PLANS_DIR`.
+- Removal paths save plans through `issue_plan::save_before_removal`, called inside both removal primitives: `worktree::remove_worktree_in` (archive, takes the issue id) and `prune::execute_removals` (`PruneTarget` carries the issue id; orphans have none and save to `plans/_orphans/<worktree>/` via `backup::save_orphan_plan`). Don't add a removal path that bypasses them. The plan is saved before the teardown, and a failed save stops before the teardown runs, keeping the worktree (`ForceRequired::PlanNotSaved`, `RemoveOutcome::PlanNotSaved`) until forced. The TUI's force retry runs the still-due teardown for those (`ConfirmAction::ArchiveIssue.teardown_due`); `Removal::ForceSkipTeardown` skips both the save and the teardown, so a TUI retry never overwrites the saved plan with what the teardown left (a CLI `--force` run is a fresh `Removal::Force`, which saves the current plan again). Forcing happens via the TUI y/n prompt or `--force` on `bork issue archive` / `bork prune`, and a forced loss is logged to `.bork/errors.log`. Purging a deleted issue removes `plans/<issue-id>/` (`issue_plan::remove_saved_plans` via `ops::remove_purged_plans`, backups-on projects only), which for an orchestrator is its live plan; a delete keeps it so a restore gets it back. Plan paths come from `backup::issue_plan_dir` / `PLANS_DIR`.
 - Runs are serialized with a required flock on `~/.config/bork/backup.lock`.
 - `bork import [file]` (`backup/import/`, see the module docs): any backup file path; without one, `backup::full_backup_file()`.
   - Before writing: `manifest.version` first; every target and name checked (duplicates, names registered elsewhere, an unreadable `projects.json`); per target, refuse a symlink, a repo, an existing dir inside a repo (real path), and a (dev, inode) clash with an earlier target.
@@ -243,8 +243,19 @@ Issues can be tied to other issues in the same project via a symmetric `linked_i
 - **Auto-link on spawn**: agent sessions export `BORK_ISSUE_ID`; `bork issue start` links the new issue back to the spawning issue (or to `--link <id>`) when the target resolves in the same project. This ties an orchestrator to the sub-issues it spawns.
 - **Manual links**: `bork integration link <a> <b>` / `unlink <a> <b>`, or the TUI link picker (`c`, model after `linear_picker`).
 - **Filter**: `f` toggles the board to the selected issue's connected component; `Esc`/`f` clears. `bork issue list --linked <id>` does the same from the CLI.
-- Cards show a cyan `∞N` badge (link count). Deleting an issue strips its id from every other issue's `linked_issues` (`ops::remove_link_references`).
+- Cards show a cyan `∞N` badge (link count). Deleting an issue strips its id from every other issue's `linked_issues` (`ops::remove_link_references`); the deleted entry keeps its own `linked_issues`, so a restore re-adds both sides (`ops::restore_deleted`).
 - Any new `Issue` field (including `linked_issues`) must be added to `merge_issue_fields` in `app.rs` or concurrent TUI edits drop CLI-written values.
+
+## Deleted Issues
+
+A delete is soft: `ops::soft_delete` moves the issue to `AppState.deleted_issues` (`DeletedIssue { issue, deleted_at }`) with all its fields, sessions and links, and strips its id from the other issues. The tmux session is still killed, and saved plans stay until purge.
+
+- **Undo**: a TUI delete records `Change::Delete` (bulk = one entry), so `u` restores within the 10s window. It restores only that exact entry (id + `deleted_at`) and skips it when a live issue has the id, so a CLI restore or purge since wins.
+- **Restore**: `ops::restore_deleted` (CLI `bork issue restore`, and undo) puts the issue back with its original id and re-adds links on issues that still exist; links to gone issues are dropped.
+- **Purge**: `bork issue purge <id>|--all`, or automatically after `keep_deleted_days` (default 30, `0` = next sweep) when the TUI loads a project and on `bork issue delete` / `list --deleted`. Purging removes `plans/<id>/`.
+- **IDs**: `ops::next_issue_id` counts deleted ids too, so a new issue never takes one that could still be restored.
+- **Merge**: `merge_external_state` is 3-way for presence too: a memory issue is dropped only when it's in base and gone from the file, and a file issue is added only when it isn't in base (so a local delete or undo survives a concurrent CLI write). `deleted_issues` merges as a 3-way set (`merge_deleted_issues`).
+- **Confirm**: the delete prompt names the issue, whether it's an orchestrator, its link count and a running session. Only `y` confirms; Enter maps to `Action::ConfirmDefault`, which is "no" for deletes and "yes" for the other prompts.
 
 ## Loading indicators
 
