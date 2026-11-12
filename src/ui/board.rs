@@ -152,32 +152,24 @@ fn render_column(
         return;
     }
 
-    let viewport_start = if selected_row < max_cards {
-        0
-    } else {
-        selected_row - max_cards + 1
-    };
-    let viewport_end = (viewport_start + max_cards).min(count);
+    let viewport = compute_viewport(selected_row, count, max_cards, card_h, inner.height);
+    let (viewport_start, viewport_end) = (viewport.start, viewport.end);
 
-    let has_above = viewport_start > 0;
     let has_below = viewport_end < count;
 
-    let mut y_offset = 0u16;
-
-    if has_above {
+    if viewport.show_above {
         let indicator = Line::from(Span::styled(
             format!("  {} more above", viewport_start),
             styles::dim_style(),
         ));
         let indicator_area = Rect::new(inner.x, inner.y, inner.width, 1);
         frame.render_widget(Paragraph::new(indicator), indicator_area);
-        y_offset += 1;
     }
 
     for (visible_idx, (_global_idx, issue)) in
         issues[viewport_start..viewport_end].iter().enumerate()
     {
-        let card_y = inner.y + y_offset + (visible_idx as u16 * card_h);
+        let card_y = inner.y + viewport.card_offset(visible_idx, card_h);
         if card_y + card_h > inner.y + inner.height {
             break;
         }
@@ -214,5 +206,162 @@ fn render_column(
         ));
         let indicator_area = Rect::new(inner.x, indicator_y, inner.width, 1);
         frame.render_widget(Paragraph::new(indicator), indicator_area);
+    }
+}
+
+struct Viewport {
+    start: usize,
+    end: usize,
+    show_above: bool,
+}
+
+impl Viewport {
+    fn card_offset(&self, visible_idx: usize, card_h: u16) -> u16 {
+        u16::from(self.show_above) + visible_idx as u16 * card_h
+    }
+}
+
+/// Compute the `[start, end)` window of cards to render, keeping
+/// `selected_row` visible.
+///
+/// `max_cards` is a floor division of `inner_height`, so a scrolled window
+/// with zero slack has no row for the "N more above" indicator. It then drops
+/// its top card to free one; with a single card there is nothing to drop, and
+/// the indicator is hidden so the selected card still fits.
+fn compute_viewport(
+    selected_row: usize,
+    count: usize,
+    max_cards: usize,
+    card_h: u16,
+    inner_height: u16,
+) -> Viewport {
+    let start = if selected_row < max_cards {
+        0
+    } else {
+        selected_row - max_cards + 1
+    };
+    let end = (start + max_cards).min(count);
+
+    if start == 0 {
+        return Viewport {
+            start,
+            end,
+            show_above: false,
+        };
+    }
+
+    // Once scrolled, the selection is the bottom row of a full window.
+    let has_slack = max_cards as u16 * card_h < inner_height;
+    if has_slack {
+        return Viewport {
+            start,
+            end,
+            show_above: true,
+        };
+    }
+
+    if max_cards > 1 {
+        return Viewport {
+            start: start + 1,
+            end,
+            show_above: true,
+        };
+    }
+
+    Viewport {
+        start,
+        end,
+        show_above: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_selected_card_fits(
+        selected_row: usize,
+        count: usize,
+        card_h: u16,
+        inner_height: u16,
+    ) -> Viewport {
+        let max_cards = (inner_height / card_h) as usize;
+        let viewport = compute_viewport(selected_row, count, max_cards, card_h, inner_height);
+        assert!(
+            (viewport.start..viewport.end).contains(&selected_row),
+            "selection {selected_row} outside window {}..{}",
+            viewport.start,
+            viewport.end
+        );
+        let card_y = viewport.card_offset(selected_row - viewport.start, card_h);
+        assert!(
+            card_y + card_h <= inner_height,
+            "selected card at row {card_y} (height {card_h}) overflows inner_height {inner_height}"
+        );
+        viewport
+    }
+
+    #[test]
+    fn viewport_with_slack_keeps_the_full_window() {
+        let viewport = assert_selected_card_fits(9, 10, CARD_HEIGHT, 29);
+        assert_eq!(
+            (viewport.start, viewport.end, viewport.show_above),
+            (6, 10, true)
+        );
+    }
+
+    #[test]
+    fn viewport_without_slack_drops_a_card_for_the_above_indicator() {
+        let viewport = assert_selected_card_fits(9, 10, CARD_HEIGHT, 28);
+        assert_eq!(
+            (viewport.start, viewport.end, viewport.show_above),
+            (7, 10, true)
+        );
+    }
+
+    #[test]
+    fn viewport_at_the_scroll_boundary_stays_unscrolled() {
+        let viewport = assert_selected_card_fits(3, 10, CARD_HEIGHT, 28);
+        assert_eq!(
+            (viewport.start, viewport.end, viewport.show_above),
+            (0, 4, false)
+        );
+    }
+
+    #[test]
+    fn single_card_viewport_without_slack_hides_the_above_indicator() {
+        let viewport = assert_selected_card_fits(3, 10, CARD_HEIGHT, CARD_HEIGHT);
+        assert_eq!(
+            (viewport.start, viewport.end, viewport.show_above),
+            (3, 4, false)
+        );
+    }
+
+    #[test]
+    fn mid_column_selection_shows_both_indicators() {
+        let viewport = assert_selected_card_fits(5, 10, CARD_HEIGHT, 28);
+        assert_eq!(
+            (viewport.start, viewport.end, viewport.show_above),
+            (3, 6, true)
+        );
+        assert!(viewport.end < 10);
+    }
+
+    #[test]
+    fn medium_cards_without_slack_drop_a_card_for_the_above_indicator() {
+        let viewport = assert_selected_card_fits(9, 10, CARD_HEIGHT_MEDIUM, 24);
+        assert_eq!(
+            (viewport.start, viewport.end, viewport.show_above),
+            (7, 10, true)
+        );
+    }
+
+    #[test]
+    fn single_medium_card_without_slack_hides_the_above_indicator() {
+        let viewport = assert_selected_card_fits(3, 10, CARD_HEIGHT_MEDIUM, CARD_HEIGHT_MEDIUM);
+        assert_eq!(
+            (viewport.start, viewport.end, viewport.show_above),
+            (3, 4, false)
+        );
     }
 }
