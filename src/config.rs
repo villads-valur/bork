@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
@@ -635,6 +636,29 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         let _ = fs::remove_file(&tmp_path);
     }
     result
+}
+
+/// Run `f` while holding an exclusive lock on the project's state file, so
+/// concurrent bork processes serialize their load-modify-save sequences.
+/// The lock is a blocking `flock` on `.bork/state.lock`; the OS releases it
+/// when the file closes, including if the process dies mid-operation.
+pub fn with_state_lock<T>(
+    project_root: &Path,
+    f: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let dir = config_dir(project_root);
+    fs::create_dir_all(&dir)?;
+
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("state.lock"))?;
+    if unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+
+    f()
 }
 
 pub fn save_state(state: &AppState, project_root: &Path) -> anyhow::Result<()> {

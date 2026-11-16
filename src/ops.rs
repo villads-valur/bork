@@ -263,6 +263,10 @@ pub fn default_agent_mode(config: &config::AppConfig, agent_kind: AgentKind) -> 
 }
 
 pub fn create_issue(project_root: &Path, opts: CreateOptions) -> anyhow::Result<Issue> {
+    config::with_state_lock(project_root, || create_issue_locked(project_root, opts))
+}
+
+fn create_issue_locked(project_root: &Path, opts: CreateOptions) -> anyhow::Result<Issue> {
     let config = config::load_config_from(project_root);
     let mut state = config::load_state(project_root);
 
@@ -1177,6 +1181,41 @@ mod tests {
         let issues = vec![test_issue("bork-2", Column::Todo)];
         assert_eq!(next_issue_id_after(&issues, &[], "bork", 0), "bork-3");
         assert_eq!(next_issue_id_after(&issues, &[], "bork", 2), "bork-5");
+    }
+
+    #[test]
+    fn concurrent_creates_get_distinct_ids_and_keep_every_issue() {
+        const CREATORS: usize = 12;
+        let dir = setup_project();
+        let root = dir.path();
+        let start = std::sync::Barrier::new(CREATORS);
+
+        std::thread::scope(|scope| {
+            for n in 0..CREATORS {
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    create_issue(
+                        root,
+                        CreateOptions {
+                            title: format!("Creator {n}"),
+                            column: None,
+                            agent_kind: None,
+                            agent_mode: None,
+                            prompt: None,
+                            model: None,
+                            kind: None,
+                        },
+                    )
+                    .unwrap();
+                });
+            }
+        });
+
+        let state = config::load_state(root);
+        let ids: HashSet<&str> = state.issues.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(state.issues.len(), CREATORS);
+        assert_eq!(ids.len(), CREATORS);
     }
 
     #[test]
