@@ -451,23 +451,23 @@ pub fn pane_current_command(target: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Rename `session`'s current window. An explicit name also switches off
-/// tmux's `automatic-rename` for that window, so the name survives the
-/// command inside it exiting.
-pub fn rename_window(session: &str, window_name: &str) -> Result<(), AppError> {
+/// Rename the window `target` names; a bare session name means its current
+/// window. An explicit name also switches off tmux's `automatic-rename` for
+/// that window, so the name survives the command inside it exiting.
+pub fn rename_window(target: &str, window_name: &str) -> Result<(), AppError> {
     let status = tmux()
-        .args(["rename-window", "-t", session, window_name])
+        .args(["rename-window", "-t", target, window_name])
         .stderr(Stdio::null())
         .status()
         .map_err(|e| {
             AppError::Tmux(format!(
-                "failed to rename window to '{window_name}' in '{session}': {e}"
+                "failed to rename window '{target}' to '{window_name}': {e}"
             ))
         })?;
 
     if !status.success() {
         return Err(AppError::Tmux(format!(
-            "tmux rename-window failed for '{session}' -> '{window_name}'"
+            "tmux rename-window failed for '{target}' -> '{window_name}'"
         )));
     }
 
