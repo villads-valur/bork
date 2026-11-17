@@ -646,6 +646,7 @@ mod tests {
             merge_blocker: None,
             merge_queue: None,
             unresolved_threads: 0,
+            stack: None,
         }
     }
 

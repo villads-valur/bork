@@ -31,6 +31,10 @@ pub enum Action {
     SyncPRs,
     BackupNow,
     OpenPR,
+    /// Check or uncheck the highlighted PR in the stack details popup.
+    StackToggle,
+    /// Open the checked PRs in the stack details popup, or the highlighted one.
+    StackOpenPicked,
     OpenAllPRs,
     OpenLinear,
     AssignWorktree,
@@ -76,7 +80,6 @@ pub enum Action {
     LinearPickerRefresh,
     PickerSwitchTab,
     AttachStack,
-    ExpandStack,
     CloseStack,
     StackDown,
     StackUp,

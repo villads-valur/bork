@@ -22,11 +22,12 @@ pub fn map_key_to_action(
         InputMode::Search => map_search_key(key),
         InputMode::LinearPicker => map_linear_picker_key(key),
         InputMode::StackDetails => match key.code {
-            KeyCode::Esc | KeyCode::Char('s') | KeyCode::Char('q') => Action::CloseStack,
+            KeyCode::Esc | KeyCode::Char('q') => Action::CloseStack,
             KeyCode::Down | KeyCode::Char('j') => Action::StackDown,
             KeyCode::Up | KeyCode::Char('k') => Action::StackUp,
-            KeyCode::Char('o') => Action::OpenPR,
-            KeyCode::Char('O') => Action::OpenAllPRs,
+            KeyCode::Char(' ') => Action::StackToggle,
+            KeyCode::Enter => Action::StackOpenPicked,
+            KeyCode::Char('o') | KeyCode::Char('O') => Action::OpenAllPRs,
             KeyCode::Char('R') => Action::OpenReviewPR,
             KeyCode::Char('P') => Action::SyncPRs,
             _ => Action::Noop,
@@ -114,7 +115,6 @@ fn map_normal_key(key: KeyEvent, swimlane_count: usize) -> Action {
         KeyCode::Char('P') => Action::SyncPRs,
         KeyCode::Char('B') => Action::BackupNow,
         KeyCode::Char('o') => Action::OpenPR,
-        KeyCode::Char('s') => Action::ExpandStack,
         KeyCode::Char('O') => Action::OpenLinear,
         KeyCode::Char('w') => Action::AssignWorktree,
         KeyCode::Char('W') => Action::OpenPruneDialog,
@@ -459,6 +459,14 @@ mod tests {
             map_normal_key(key(KeyCode::Char('G')), 1),
             Action::ScrollToBottom
         );
+    }
+
+    #[test]
+    fn stack_details_space_picks_enter_opens_and_o_opens_all() {
+        let map = |code| map_key_to_action(key(code), InputMode::StackDetails, None, 1);
+        assert_eq!(map(KeyCode::Char(' ')), Action::StackToggle);
+        assert_eq!(map(KeyCode::Enter), Action::StackOpenPicked);
+        assert_eq!(map(KeyCode::Char('o')), Action::OpenAllPRs);
     }
 
     #[test]

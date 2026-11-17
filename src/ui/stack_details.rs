@@ -1,11 +1,11 @@
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{App, Project};
-use crate::types::{GithubStackPullRequest, PrState};
+use crate::app::{App, Project, StackDetailsState};
+use crate::types::{GithubStackPullRequest, PrState, StackPosition};
 use crate::ui::{card, styles};
 
 pub fn render(frame: &mut Frame, app: &App) {
@@ -65,13 +65,7 @@ pub fn render(frame: &mut Frame, app: &App) {
             )
         });
         render_members(
-            frame,
-            app,
-            project,
-            details.selected,
-            inner,
-            &summary,
-            &members,
+            frame, app, project, details, inner, &summary, &members, true,
         );
         return;
     }
@@ -117,22 +111,28 @@ pub fn render(frame: &mut Frame, app: &App) {
         frame,
         app,
         project,
-        details.selected,
+        details,
         inner,
         &summary,
         &project.detail_members(issue),
+        false,
     );
 }
 
+/// `group_by_stack` puts a header above each run of PRs from one stack, for
+/// linked PRs that can span several stacks.
+#[allow(clippy::too_many_arguments)]
 fn render_members(
     frame: &mut Frame,
     app: &App,
     project: &Project,
-    selected: usize,
+    details: &StackDetailsState,
     inner: Rect,
     summary: &str,
     members: &[GithubStackPullRequest],
+    group_by_stack: bool,
 ) {
+    let selected = details.selected.min(members.len().saturating_sub(1));
     let missing_statuses = members
         .iter()
         .filter(|pr| pr.state == PrState::Open && project.pr_by_number(pr.number).is_none())
@@ -144,47 +144,38 @@ fn render_members(
         Rect::new(inner.x, inner.y, inner.width, 1),
     );
 
-    let visible = inner.height.saturating_sub(3) as usize;
-    let offset = selected
-        .min(members.len().saturating_sub(1))
-        .saturating_sub(visible.saturating_sub(1));
-    for (row, member) in members.iter().skip(offset).take(visible).enumerate() {
-        let pr = project.pr_by_number(member.number);
-        let mut status_spans = if member.state != PrState::Open {
-            vec![Span::styled(
-                format!(" {}", member.state),
-                styles::dim_style(),
-            )]
-        } else if pr.is_none() && project.live.github_loading() {
-            Vec::new()
-        } else {
-            pr.map(card::pr_spans).unwrap_or_else(|| {
-                vec![Span::styled(
-                    format!(" {}", project.live.missing_github_status()),
-                    styles::dim_style(),
-                )]
-            })
-        };
-        if project.review_pending_for(member.number) {
-            status_spans.push(Span::styled(
-                " · your review",
-                Style::default().fg(styles::ACCENT),
-            ));
+    let positions: Vec<_> = members
+        .iter()
+        .map(|member| project.pr_stack_position(member.number))
+        .collect();
+    let show_headers = group_by_stack && positions.iter().any(Option::is_some);
+    let mut lines: Vec<Line> = Vec::with_capacity(members.len());
+    let mut selected_line = 0;
+    for (index, (member, position)) in members.iter().zip(&positions).enumerate() {
+        let stack = position.map(|position| position.stack);
+        let previous_stack = index
+            .checked_sub(1)
+            .map(|previous| positions[previous].map(|position| position.stack));
+        if show_headers && previous_stack != Some(stack) {
+            lines.push(group_header(stack));
         }
-        let pointer = if offset + row == selected { "▸" } else { " " };
-        let prefix = format!("{pointer}{:>2} #{} ", offset + row + 1, member.number);
-        let title = pr
-            .map(|pr| pr.title.as_str())
-            .unwrap_or(&member.head_branch);
-        let budget = (inner.width as usize).saturating_sub(
-            prefix.chars().count() + status_spans.iter().map(Span::width).sum::<usize>() + 2,
-        );
-        let mut spans = vec![
-            Span::styled(prefix, styles::dim_style()),
-            Span::raw(styles::truncate(title, budget)),
-        ];
-        spans.extend(status_spans);
-        let line = Line::from(spans);
+        if index == selected {
+            selected_line = lines.len();
+        }
+        let checked = details.checked.contains(&member.number);
+        lines.push(member_line(
+            project,
+            member,
+            *position,
+            index == selected,
+            checked,
+            inner.width,
+        ));
+    }
+
+    let visible = inner.height.saturating_sub(3) as usize;
+    let offset = (selected_line + 1).saturating_sub(visible);
+    for (row, line) in lines.into_iter().skip(offset).take(visible).enumerate() {
         frame.render_widget(
             Paragraph::new(line),
             Rect::new(inner.x, inner.y + row as u16 + 2, inner.width, 1),
@@ -193,9 +184,13 @@ fn render_members(
     let footer = if let Some((message, _)) = &app.message {
         message.clone()
     } else {
+        let picked = match details.checked.len() {
+            0 => String::new(),
+            count => format!("{count} picked  "),
+        };
         format!(
-            "j/k move  o open  O open all  R review all  P refresh  Esc close  {}/{}",
-            (offset + visible).min(members.len()),
+            "Space pick  Enter open  o open all  R review  P refresh  Esc close  {picked}{}/{}",
+            selected + 1,
             members.len()
         )
     };
@@ -213,4 +208,67 @@ fn render_members(
     if loading {
         super::status_bar::render_loading_spinner(frame, app, footer_area);
     }
+}
+
+fn group_header(stack: Option<u32>) -> Line<'static> {
+    let text = match stack {
+        Some(number) => format!("Stack #{number}"),
+        None => "Not in a stack".to_string(),
+    };
+    Line::from(Span::styled(
+        text,
+        Style::default()
+            .fg(styles::ACCENT)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn member_line(
+    project: &Project,
+    member: &GithubStackPullRequest,
+    position: Option<StackPosition>,
+    selected: bool,
+    checked: bool,
+    width: u16,
+) -> Line<'static> {
+    let pr = project.pr_by_number(member.number);
+    let mut status_spans = if member.state != PrState::Open {
+        vec![Span::styled(
+            format!(" {}", member.state),
+            styles::dim_style(),
+        )]
+    } else if pr.is_none() && project.live.github_loading() {
+        Vec::new()
+    } else {
+        pr.map(card::pr_spans).unwrap_or_else(|| {
+            vec![Span::styled(
+                format!(" {}", project.live.missing_github_status()),
+                styles::dim_style(),
+            )]
+        })
+    };
+    if project.review_pending_for(member.number) {
+        status_spans.push(Span::styled(
+            " · your review",
+            Style::default().fg(styles::ACCENT),
+        ));
+    }
+    let pointer = if selected { "▸" } else { " " };
+    let checkbox = if checked { "[x]" } else { "[ ]" };
+    let position = position
+        .map(|position| format!("{}/{} ", position.position, position.size))
+        .unwrap_or_default();
+    let prefix = format!("{pointer}{checkbox} {position}#{} ", member.number);
+    let title = pr
+        .map(|pr| pr.title.as_str())
+        .unwrap_or(&member.head_branch);
+    let budget = (width as usize).saturating_sub(
+        prefix.chars().count() + status_spans.iter().map(Span::width).sum::<usize>() + 2,
+    );
+    let mut spans = vec![
+        Span::styled(prefix, styles::dim_style()),
+        Span::raw(styles::truncate(title, budget)),
+    ];
+    spans.extend(status_spans);
+    Line::from(spans)
 }

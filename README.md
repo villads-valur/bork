@@ -280,7 +280,7 @@ bork update --check   # force a fresh check without pulling
 | `Ctrl+P` | Toggle project sidebar |
 | `P` | Force-sync PR statuses from GitHub |
 | `Shift+B` | Back up now (see [Backups](#backups)) |
-| `o` | Open PR in browser (if issue has a matching PR, or all marked issues' PRs) |
+| `o` | Open the issue's PR in the browser. With an attached stack or several linked PRs, list them to pick from (`oo` opens all). With marked issues, open all their PRs |
 | `t` | Open project-root terminal in tmux |
 | `/` | Search / filter board |
 | `?` | Show keybinding help overlay |
@@ -631,7 +631,7 @@ Small stacks show connected PR rows; larger stacks show a count and check summar
 Merged and closed PRs remain visible in the expanded list. Stack cards omit diff
 counts. Individual PRs show additions/deletions, or `draft` while still in draft.
 Linked issues and Linear IDs sit at bottom-left. Selecting a stack issue shows
-`s view stack` in the app shortcut bar.
+`o view stack` in the app shortcut bar.
 Orchestrator and todo cards show their type beside the issue ID in the border.
 
 Stack controls appear only when the repository supports GitHub's stack API;
@@ -639,8 +639,12 @@ no CLI extension is required. Without `gh`, live GitHub details are hidden and
 saved links remain editable. Loading is separate from errors. Failed refreshes
 keep cached status and show the error in the picker or stack details.
 
-- **s** expands the stack into a scrollable panel; **j/k** navigates and **Esc** closes.
-- **o** opens the selected PR; **O** opens all open PRs in the attached stack, in stack order.
+- **o** lists the issue's PRs in a scrollable panel: the attached stack, or every
+  linked PR when there is more than one. **j/k** navigates and **Esc** closes.
+  Linked PRs from different stacks are grouped under their stack, and each PR
+  shows its position in its stack (`2/3`).
+- **Space** picks PRs, **Enter** opens the picked PRs (or the highlighted one),
+  and **o** opens all open PRs, so **oo** from the board opens everything.
 - **R** reviews each open PR separately with `tuicr pr <number>`. After exiting a
   review, press Enter for the next PR or `q` to stop. This needs a tuicr version
   with the `pr` subcommand; an issue worktree is not required.
