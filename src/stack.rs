@@ -114,8 +114,9 @@ impl Project {
         self.grouped_by_stack(open_first(&members))
     }
 
-    /// Keep each stack's PRs together in stack order, ahead of PRs outside
-    /// any stack. The sort is stable, so open PRs stay first within a group.
+    /// Keep each stack's PRs together in stack order, merged ones included,
+    /// ahead of PRs outside any stack. The sort is stable, so PRs outside a
+    /// stack keep their open-first order.
     fn grouped_by_stack(
         &self,
         mut members: Vec<GithubStackPullRequest>,
@@ -123,7 +124,6 @@ impl Project {
         members.sort_by_key(|member| {
             let position = self.pr_stack_position(member.number);
             (
-                member.state != PrState::Open,
                 position.is_none(),
                 position.map(|position| (position.stack, position.position)),
             )
