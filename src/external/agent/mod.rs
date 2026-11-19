@@ -247,7 +247,19 @@ pub fn launch_session(issue: &Issue, config: &AppConfig) -> Result<LaunchOutcome
     let provider = provider(issue.agent_kind);
     let before = provider.snapshot_session_ids(&config.project_root);
 
-    tmux::create_session(&session_name, cwd)?;
+    // The launch command exports these for the agent too; setting them on
+    // the session keeps status hooks working when the agent is restarted
+    // by hand in the pane.
+    let status_dir_str = status_dir.to_str().unwrap_or("");
+    tmux::create_session_with_env(
+        &session_name,
+        cwd,
+        &[
+            (BORK_SESSION_VAR, &session_name),
+            ("BORK_STATUS_DIR", status_dir_str),
+            (BORK_ISSUE_ID_VAR, &issue.id),
+        ],
+    )?;
     let started = start_in_session(&session_name, cwd, &launch_cmd, &handoff);
     let (session_id, setup_ran, replaced_lost_session) = match started {
         Ok(started) => started,

@@ -145,15 +145,30 @@ pub fn list_sessions() -> HashSet<String> {
 }
 
 pub fn create_session(name: &str, cwd: &Path) -> Result<(), AppError> {
-    let status = tmux()
-        .args([
-            "new-session",
-            "-d",
-            "-s",
-            name,
-            "-c",
-            cwd.to_str().unwrap_or("."),
-        ])
+    create_session_with_env(name, cwd, &[])
+}
+
+/// Like `create_session`, but the session's shells start with `env` set, so a
+/// command typed into the pane later (say `claude -r` after the agent exits)
+/// inherits it too.
+pub fn create_session_with_env(
+    name: &str,
+    cwd: &Path,
+    env: &[(&str, &str)],
+) -> Result<(), AppError> {
+    let mut command = tmux();
+    command.args([
+        "new-session",
+        "-d",
+        "-s",
+        name,
+        "-c",
+        cwd.to_str().unwrap_or("."),
+    ]);
+    for (key, value) in env {
+        command.arg("-e").arg(format!("{key}={value}"));
+    }
+    let status = command
         .stderr(Stdio::null())
         .status()
         .map_err(|e| AppError::Tmux(format!("failed to create session '{name}': {e}")))?;
@@ -638,6 +653,32 @@ mod tests {
                 "should be harmless: {stderr}"
             );
         }
+    }
+
+    #[test]
+    fn commands_typed_into_the_pane_later_see_the_session_env() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux is not installed");
+            return;
+        }
+        let session = format!("bork-env-{}", std::process::id());
+        let cwd = std::env::temp_dir();
+        create_session_with_env(&session, &cwd, &[("BORK_SESSION", "bork-bork-7")]).unwrap();
+        send_keys(&session, "sh -c 'echo seen-$BORK_SESSION'").unwrap();
+        let mut history = String::new();
+        for _ in 0..50 {
+            history = capture_pane_history(&session, 50);
+            if history.lines().any(|line| line.starts_with("seen-")) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let _ = kill_session(&session);
+
+        assert!(
+            history.lines().any(|line| line == "seen-bork-bork-7"),
+            "{history}"
+        );
     }
 
     #[test]
