@@ -53,7 +53,7 @@ const CLAUDE_HOOKS: &str = r#"{
       "hooks": [
         {
           "type": "command",
-          "command": "KIND=$(cat | grep -o '\"notification_type\":\"[^\"]*\"' | head -1 | cut -d'\"' -f4); case \"$KIND\" in idle_prompt) S=Idle;; elicitation_dialog|elicitation_url_dialog|agent_needs_input) S=WaitingInput;; *) S=;; esac; { [ -n \"$S\" ] && [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"%s\",\"updated_at\":%s}' \"$S\" \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\"; } || true"
+          "command": "KIND=$(cat | grep -o '\"notification_type\":\"[^\"]*\"' | head -1 | cut -d'\"' -f4); case \"$KIND\" in idle_prompt) S=Idle;; elicitation_dialog|elicitation_url_dialog|agent_needs_input) S=WaitingInput;; *) S=;; esac; { [ -n \"$S\" ] && [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"%s\",\"activity\":\"%s\",\"updated_at\":%s}' \"$S\" \"$KIND\" \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\"; } || true"
         }
       ]
     }
@@ -773,6 +773,11 @@ mod tests {
                 expected,
                 "{kind}"
             );
+            // bork treats a waiting status without an activity as left by
+            // the old hooks, so the prompt has to be named.
+            if expected.is_some() {
+                assert_eq!(status.unwrap()["activity"], kind, "{kind}");
+            }
         }
     }
 

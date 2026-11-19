@@ -190,8 +190,12 @@ fn format_status_line(ctx: &CardContext) -> Line<'static> {
 
     let is_review = ctx.issue.primary_pr_import_source() == Some(PrImportSource::ReviewRequested);
 
+    // The activity names the tool a busy agent is running. On a waiting
+    // status it names the prompt, and "needs approval" says it better.
     let status_label = match ctx.activity {
-        Some(activity) if !activity.is_empty() => activity.to_string(),
+        Some(activity) if !activity.is_empty() && ctx.agent_status == AgentStatus::Busy => {
+            activity.to_string()
+        }
         _ => ctx.agent_status.to_string(),
     };
 

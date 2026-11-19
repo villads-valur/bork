@@ -829,6 +829,17 @@ impl Project {
             if !live.active_sessions.contains(&session_name) {
                 return AgentStatus::Stopped;
             }
+            // Claude hooks older than bork 0ad6424 wrote these after you'd
+            // already answered (and on every idle reminder), without an
+            // activity. Agents keep the hooks they started with, so such
+            // files linger; only the current hooks name the open prompt.
+            let legacy_waiting = matches!(
+                info.status,
+                AgentStatus::WaitingInput | AgentStatus::WaitingApproval
+            ) && info.activity.as_deref().is_none_or(str::is_empty);
+            if legacy_waiting {
+                return AgentStatus::Idle;
+            }
             return info.status;
         }
 
@@ -4437,17 +4448,59 @@ mod tests {
         assert_eq!(app.project().attention_count(), 1);
     }
 
+    /// As the current hooks write it: every status names what it's on.
     fn set_agent_status(app: &mut App, session: &str, status: AgentStatus) {
+        set_agent_status_info(app, session, status, Some("AskUserQuestion"));
+    }
+
+    fn set_agent_status_info(
+        app: &mut App,
+        session: &str,
+        status: AgentStatus,
+        activity: Option<&str>,
+    ) {
         let live = &mut app.project_mut().live;
         live.active_sessions.insert(session.to_string());
         live.agent_statuses.insert(
             session.to_string(),
             AgentStatusInfo {
                 status,
-                activity: None,
+                activity: activity.map(str::to_string),
                 updated_at: 0,
             },
         );
+    }
+
+    #[test]
+    fn a_waiting_status_from_the_old_hooks_reads_as_idle() {
+        // Old hooks wrote these after you answered, or on the idle reminder,
+        // and never named the prompt.
+        for status in [AgentStatus::WaitingInput, AgentStatus::WaitingApproval] {
+            let mut app = test_app(vec![test_issue("bork-1", Column::CodeReview)]);
+            set_agent_status_info(&mut app, "bork-bork-1", status, None);
+            let issue = app.project().issues[0].clone();
+
+            assert_eq!(
+                app.project().resolved_agent_status(&issue),
+                AgentStatus::Idle,
+                "{status}"
+            );
+            assert_eq!(app.project().attention_count(), 0, "{status}");
+        }
+    }
+
+    #[test]
+    fn a_permission_prompt_needs_you_without_an_activity() {
+        // PermissionRequest has always written it, old hooks and new.
+        let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
+        set_agent_status_info(
+            &mut app,
+            "bork-bork-1",
+            AgentStatus::WaitingPermission,
+            None,
+        );
+
+        assert_eq!(attention_of(&app), Some(Attention::AgentBlocked));
     }
 
     #[test]
