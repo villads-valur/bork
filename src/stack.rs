@@ -1,5 +1,7 @@
 use crate::app::Project;
-use crate::types::{ChecksStatus, GithubStack, GithubStackPullRequest, Issue, PrState, PrStatus};
+use crate::types::{
+    ChecksStatus, GithubStack, GithubStackPullRequest, Issue, PrState, PrStatus, StackPosition,
+};
 
 impl Project {
     pub fn linked_pr_numbers(&self) -> Vec<u32> {
@@ -19,6 +21,28 @@ impl Project {
             .github_stacks
             .iter()
             .find(|stack| stack.number == number)
+    }
+
+    /// Where PR `number` sits in its GitHub stack: from its own status, or
+    /// from a fetched stack's member list.
+    pub fn pr_stack_position(&self, number: u32) -> Option<StackPosition> {
+        self.pr_by_number(number)
+            .and_then(|pr| pr.stack)
+            .or_else(|| self.stack_position(number))
+    }
+
+    fn stack_position(&self, number: u32) -> Option<StackPosition> {
+        self.live.github_stacks.iter().find_map(|stack| {
+            let index = stack
+                .pull_requests
+                .iter()
+                .position(|pr| pr.number == number)?;
+            Some(StackPosition {
+                stack: stack.number,
+                position: index + 1,
+                size: stack.pull_requests.len(),
+            })
+        })
     }
 
     pub fn pr_by_number(&self, number: u32) -> Option<&PrStatus> {
@@ -87,7 +111,24 @@ impl Project {
                 },
             })
             .collect();
-        open_first(&members)
+        self.grouped_by_stack(open_first(&members))
+    }
+
+    /// Keep each stack's PRs together in stack order, merged ones included,
+    /// ahead of PRs outside any stack. The sort is stable, so PRs outside a
+    /// stack keep their open-first order.
+    fn grouped_by_stack(
+        &self,
+        mut members: Vec<GithubStackPullRequest>,
+    ) -> Vec<GithubStackPullRequest> {
+        members.sort_by_key(|member| {
+            let position = self.pr_stack_position(member.number);
+            (
+                position.is_none(),
+                position.map(|position| (position.stack, position.position)),
+            )
+        });
+        members
     }
 
     /// Rows in the details popup: the attached stack's members, or the issue's

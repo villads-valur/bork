@@ -531,29 +531,6 @@ fn handle_normal(
         }
     }
     match action {
-        Action::ExpandStack => {
-            let project = app.context_project(ctx);
-            let Some(issue) = project.selected_issue(&q) else {
-                return PostAction::None;
-            };
-            if issue.github_stack.is_some()
-                && (project.live.gh_missing || project.live.stacks_unsupported)
-            {
-                return PostAction::None;
-            }
-            if issue.has_pr() {
-                app.stack_details = Some(crate::app::StackDetailsState {
-                    project_id: ctx.project_id.clone(),
-                    issue_id: issue.id.clone(),
-                    selected: 0,
-                });
-                app.message = None;
-                app.input_mode = InputMode::StackDetails;
-            } else {
-                app.set_message("Attach a stack with Ctrl+s in the GitHub picker");
-            }
-            PostAction::None
-        }
         Action::Quit => {
             app.should_quit = true;
             PostAction::None
@@ -1006,6 +983,13 @@ fn handle_normal(
         Action::OpenPR => {
             let project = app.context_project(ctx);
             let issues = project.target_issues(&q);
+            if let [issue] = issues.as_slice() {
+                if lists_several_prs(project, issue) {
+                    let issue_id = issue.id.clone();
+                    open_stack_details(app, ctx, issue_id);
+                    return PostAction::None;
+                }
+            }
             let mut numbers: Vec<u32> = Vec::new();
             let mut failures = Vec::new();
             for issue in &issues {
@@ -1902,6 +1886,31 @@ fn import_github_pr(app: &mut App, ctx: &ActionContext) {
     app.close_linear_picker();
 }
 
+/// Whether `o` on `issue` lists its PRs to pick from instead of opening one:
+/// an attached stack, or more than one linked PR, merged ones included.
+fn lists_several_prs(project: &Project, issue: &Issue) -> bool {
+    if issue.github_stack.is_some() {
+        return !(project.live.gh_missing || project.live.stacks_unsupported);
+    }
+    project.detail_members(issue).len() > 1
+}
+
+fn open_stack_details(app: &mut App, ctx: &ActionContext, issue_id: String) {
+    app.stack_details = Some(crate::app::StackDetailsState {
+        project_id: ctx.project_id.clone(),
+        issue_id,
+        selected: 0,
+        checked: Vec::new(),
+    });
+    app.message = None;
+    app.input_mode = InputMode::StackDetails;
+}
+
+fn close_stack_details(app: &mut App) {
+    app.stack_details = None;
+    app.input_mode = InputMode::Normal;
+}
+
 fn handle_stack_details(app: &mut App, action: Action, ch: &ActionChannels<'_>) -> PostAction {
     let Some(details) = &app.stack_details else {
         return PostAction::None;
@@ -1920,43 +1929,77 @@ fn handle_stack_details(app: &mut App, action: Action, ch: &ActionChannels<'_>) 
         })
         .cloned();
     if action == Action::CloseStack || issue.as_ref().is_none_or(|issue| !issue.has_pr()) {
-        app.stack_details = None;
-        app.input_mode = InputMode::Normal;
+        close_stack_details(app);
         return PostAction::None;
     }
     let Some(issue) = issue else {
         return PostAction::None;
     };
+    let member_count = app.context_project(&ctx).detail_members(&issue).len();
+    let selected = selected.min(member_count.saturating_sub(1));
     match action {
         Action::StackDown | Action::StackUp => {
-            let count = app.context_project(&ctx).detail_members(&issue).len();
             if let Some(details) = &mut app.stack_details {
                 if action == Action::StackDown {
-                    details.selected = (details.selected + 1).min(count.saturating_sub(1));
+                    details.selected = (selected + 1).min(member_count.saturating_sub(1));
                 } else {
-                    details.selected = details.selected.saturating_sub(1);
+                    details.selected = selected.saturating_sub(1);
                 }
             }
         }
         Action::SyncPRs => {
             let _ = ch.pr_wake_tx.send(crate::github_poll::Wake::Refresh);
         }
-        Action::OpenPR => {
-            let project = app.context_project(&ctx);
-            let Some(number) = project
+        Action::StackToggle => {
+            let member = app
+                .context_project(&ctx)
                 .detail_members(&issue)
                 .get(selected)
+                .map(|member| member.number);
+            if let (Some(number), Some(details)) = (member, &mut app.stack_details) {
+                if let Some(index) = details.checked.iter().position(|n| *n == number) {
+                    details.checked.remove(index);
+                } else {
+                    details.checked.push(number);
+                }
+            }
+        }
+        Action::StackOpenPicked => {
+            let checked = app
+                .stack_details
+                .as_ref()
+                .map(|details| details.checked.clone())
+                .unwrap_or_default();
+            let project = app.context_project(&ctx);
+            let members = project.detail_members(&issue);
+            let mut numbers: Vec<u32> = members
+                .iter()
                 .map(|member| member.number)
-            else {
+                .filter(|number| checked.contains(number))
+                .collect();
+            if numbers.is_empty() {
+                numbers.extend(members.get(selected).map(|member| member.number));
+            }
+            if numbers.is_empty() {
                 app.set_warning("No PR selected");
                 return PostAction::None;
-            };
+            }
             let cwd = project.config.project_root.join("main");
-            spawn_open_prs(app, ch, cwd, vec![number], String::new());
+            spawn_open_prs(app, ch, cwd, numbers, String::new());
+            close_stack_details(app);
         }
-        Action::OpenAllPRs | Action::OpenReviewPR => {
-            return open_pr_group(app, action, &ctx, &issue, ch)
+        Action::OpenAllPRs => {
+            let opens = app
+                .context_project(&ctx)
+                .detail_open_numbers(&issue)
+                .is_ok();
+            let post = open_pr_group(app, action, &ctx, &issue, ch);
+            if opens {
+                close_stack_details(app);
+            }
+            return post;
         }
+        Action::OpenReviewPR => return open_pr_group(app, action, &ctx, &issue, ch),
         _ => {}
     }
     PostAction::None
@@ -3055,6 +3098,7 @@ mod tests {
                 merge_blocker: None,
                 merge_queue: None,
                 unresolved_threads: 0,
+                stack: None,
             };
             members.push(GithubStackPullRequest {
                 number,
@@ -3369,7 +3413,7 @@ mod tests {
             ..test_issue("bork-1", Column::Todo)
         });
         app.project_mut().live.pr_loading_more = true;
-        act(&mut app, Action::ExpandStack);
+        act(&mut app, Action::OpenPR);
         for missing in [false, true] {
             if missing {
                 app.project_mut().live.pr_statuses_by_number.remove(&1);
@@ -3540,7 +3584,7 @@ mod tests {
         let saved: Issue = serde_json::from_str(&json).unwrap();
         assert_eq!(saved.github_stack, Some(42));
         app.project_mut().issues[0] = saved;
-        act(&mut app, Action::ExpandStack);
+        act(&mut app, Action::OpenPR);
         assert_eq!(app.input_mode, InputMode::StackDetails);
         assert!(app.message.is_none());
     }
@@ -3564,7 +3608,7 @@ mod tests {
             ..test_issue("bork-1", Column::CodeReview)
         });
         app.project_mut().selected_column = Column::CodeReview.index();
-        act(&mut app, Action::ExpandStack);
+        act(&mut app, Action::OpenPR);
         assert_eq!(app.input_mode, InputMode::StackDetails);
         for _ in 0..5 {
             act(&mut app, Action::StackDown);
@@ -3597,7 +3641,7 @@ mod tests {
             ..test_issue("bork-1", Column::Todo)
         };
         app.project_mut().issues.push(issue);
-        act(&mut app, Action::ExpandStack);
+        act(&mut app, Action::OpenPR);
         for _ in 0..150 {
             act(&mut app, Action::StackDown);
         }
@@ -5886,6 +5930,144 @@ mod tests {
         assert_eq!(*kind, MessageKind::Warning);
     }
 
+    fn link_prs(app: &mut App, numbers: &[u32]) {
+        app.project_mut().issues[0].github_pr_links = numbers
+            .iter()
+            .map(|&number| LinkedGithubPr {
+                number,
+                imported: false,
+                import_source: None,
+            })
+            .collect();
+    }
+
+    fn stacked_pr(number: u32) -> crate::types::GithubStackPullRequest {
+        crate::types::GithubStackPullRequest {
+            number,
+            state: crate::types::PrState::Open,
+            is_draft: false,
+            head_branch: String::new(),
+        }
+    }
+
+    #[test]
+    fn open_pr_on_a_card_with_several_prs_opens_the_details_popup() {
+        let mut app = app_with_issues();
+        link_prs(&mut app, &[11, 12]);
+
+        act(&mut app, Action::OpenPR);
+
+        assert_eq!(app.input_mode, InputMode::StackDetails);
+        assert_eq!(app.stack_details.as_ref().unwrap().issue_id, "bork-1");
+    }
+
+    #[test]
+    fn stack_toggle_picks_and_unpicks_the_highlighted_pr() {
+        let mut app = app_with_issues();
+        link_prs(&mut app, &[11, 12, 13]);
+        act(&mut app, Action::OpenPR);
+
+        act(&mut app, Action::StackDown);
+        act(&mut app, Action::StackToggle);
+        act(&mut app, Action::StackDown);
+        act(&mut app, Action::StackToggle);
+        act(&mut app, Action::StackToggle);
+
+        assert_eq!(app.stack_details.as_ref().unwrap().checked, vec![12]);
+    }
+
+    #[test]
+    fn stack_toggle_after_the_list_shrinks_picks_the_last_row() {
+        let mut app = app_with_issues();
+        link_prs(&mut app, &[11, 12, 13]);
+        act(&mut app, Action::OpenPR);
+        act(&mut app, Action::StackDown);
+        act(&mut app, Action::StackDown);
+        link_prs(&mut app, &[11, 12]);
+
+        act(&mut app, Action::StackToggle);
+
+        assert_eq!(app.stack_details.as_ref().unwrap().checked, vec![12]);
+    }
+
+    #[test]
+    fn a_merged_pr_stays_in_its_stack_group() {
+        let mut app = app_with_issues();
+        link_prs(&mut app, &[20, 11, 12]);
+        let mut merged = stacked_pr(11);
+        merged.state = crate::types::PrState::Merged;
+        app.project_mut().live.github_stacks = vec![crate::types::GithubStack {
+            number: 5,
+            url: String::new(),
+            base_ref: "main".to_string(),
+            open: true,
+            pull_requests: vec![merged, stacked_pr(12)],
+        }];
+        app.project_mut().live.pr_statuses_by_number.insert(
+            11,
+            crate::types::PrStatus {
+                number: 11,
+                title: String::new(),
+                url: String::new(),
+                author: String::new(),
+                state: crate::types::PrState::Merged,
+                is_draft: false,
+                checks: None,
+                review: None,
+                additions: 0,
+                deletions: 0,
+                head_branch: String::new(),
+                is_cross_repository: false,
+                merge_blocker: None,
+                merge_queue: None,
+                unresolved_threads: 0,
+                stack: None,
+            },
+        );
+        let issue = app.project().issues[0].clone();
+
+        let order: Vec<u32> = app
+            .project()
+            .linked_pr_members(&issue)
+            .iter()
+            .map(|member| member.number)
+            .collect();
+
+        assert_eq!(order, vec![11, 12, 20]);
+    }
+
+    #[test]
+    fn linked_prs_are_grouped_by_stack_in_stack_order() {
+        let mut app = app_with_issues();
+        link_prs(&mut app, &[20, 12, 11]);
+        app.project_mut().live.github_stacks = vec![crate::types::GithubStack {
+            number: 5,
+            url: String::new(),
+            base_ref: "main".to_string(),
+            open: true,
+            pull_requests: vec![stacked_pr(10), stacked_pr(11), stacked_pr(12)],
+        }];
+        let issue = app.project().issues[0].clone();
+
+        let rows: Vec<_> = app
+            .project()
+            .linked_pr_members(&issue)
+            .iter()
+            .map(|member| {
+                let position = app.project().pr_stack_position(member.number);
+                (
+                    member.number,
+                    position.map(|p| (p.stack, p.position, p.size)),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            rows,
+            vec![(11, Some((5, 2, 3))), (12, Some((5, 3, 3))), (20, None)]
+        );
+    }
+
     #[test]
     fn open_linear_no_url_shows_warning() {
         let mut app = app_with_issues();
@@ -6547,6 +6729,7 @@ mod tests {
             merge_blocker: None,
             merge_queue: None,
             unresolved_threads: 0,
+            stack: None,
         };
         app.projects[0]
             .live

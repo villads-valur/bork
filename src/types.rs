@@ -1006,6 +1006,8 @@ pub struct PrStatus {
     /// Unresolved review threads (inline comments that can be resolved).
     #[serde(default)]
     pub unresolved_threads: u32,
+    #[serde(default)]
+    pub stack: Option<StackPosition>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1015,6 +1017,15 @@ pub struct GithubStack {
     pub base_ref: String,
     pub open: bool,
     pub pull_requests: Vec<GithubStackPullRequest>,
+}
+
+/// Where a PR sits in its GitHub stack: `position` of `size`, counted from
+/// the stack's first member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackPosition {
+    pub stack: u32,
+    pub position: usize,
+    pub size: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1085,6 +1096,7 @@ mod tests {
             merge_blocker: None,
             merge_queue: None,
             unresolved_threads: 0,
+            stack: None,
         };
         let cloned = pr.clone();
         assert_eq!(cloned.number, 1);

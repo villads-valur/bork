@@ -1832,6 +1832,8 @@ pub struct StackDetailsState {
     pub project_id: ProjectId,
     pub issue_id: String,
     pub selected: usize,
+    /// PR numbers picked with Space; Enter opens these.
+    pub checked: Vec<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -3388,6 +3390,7 @@ mod tests {
             merge_blocker: None,
             merge_queue: None,
             unresolved_threads: 0,
+            stack: None,
         }
     }
 
@@ -7329,6 +7332,7 @@ mod tests {
             merge_blocker: None,
             merge_queue: None,
             unresolved_threads: 0,
+            stack: None,
         };
         app.project_mut()
             .live
