@@ -26,7 +26,7 @@ pub mod status;
 pub use archive::{abort_in_flight, in_flight, stop_new_runs};
 
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
@@ -751,20 +751,7 @@ fn lock_backups() -> anyhow::Result<File> {
     let dir = crate::global_config::global_config_dir();
     fs::create_dir_all(&dir)?;
     let path = dir.join("backup.lock");
-    let file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&path)
-        .with_context(|| format!("opening {}", path.display()))?;
-    let fd = std::os::unix::io::AsRawFd::as_raw_fd(&file);
-    // SAFETY: fd is a valid descriptor owned by `file` for the call's duration.
-    if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("locking {}", path.display()));
-    }
-    Ok(file)
+    crate::config::lock_exclusive(&path).with_context(|| format!("locking {}", path.display()))
 }
 
 #[cfg(test)]

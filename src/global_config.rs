@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -104,20 +104,7 @@ pub fn save_global_config(config: &GlobalConfig) -> anyhow::Result<()> {
 fn lock_config_file() -> Option<File> {
     let dir = global_config_dir();
     let _ = fs::create_dir_all(&dir);
-    let lock_path = dir.join("projects.lock");
-    let file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
-        .ok()?;
-    let fd = std::os::unix::io::AsRawFd::as_raw_fd(&file);
-    let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
-    if ret != 0 {
-        return None;
-    }
-    Some(file)
+    crate::config::lock_exclusive(&dir.join("projects.lock")).ok()
 }
 
 pub(crate) fn normalize_path(path: &Path) -> PathBuf {
