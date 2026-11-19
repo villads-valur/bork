@@ -16,9 +16,10 @@ pub struct AppConfig {
     pub project_name: String,
     pub project_root: PathBuf,
     pub agent_kind: AgentKind,
-    /// Default agent mode for new issues when `--mode` is omitted (CLI) or no
-    /// explicit mode is chosen (TUI dialog).
-    pub agent_mode: AgentMode,
+    /// Configured `default_mode`, if any. `None` lets each entry point pick
+    /// its own fallback: `default_agent_mode()` for the TUI and `issue create`,
+    /// `ops::start_agent_mode()` for `issue start`.
+    pub agent_mode: Option<AgentMode>,
     pub default_prompt: Option<String>,
     pub review_prompt: Option<String>,
     pub stack_review_prompt: Option<String>,
@@ -71,6 +72,12 @@ pub struct AgentLaunchConfig {
 }
 
 impl AppConfig {
+    /// Mode for new issues when none is given: the configured `default_mode`,
+    /// else plan.
+    pub fn default_agent_mode(&self) -> AgentMode {
+        self.agent_mode.unwrap_or(DEFAULT_AGENT_MODE)
+    }
+
     /// Look up the configured launch override for an agent, if any.
     pub fn agent_launch_for(&self, kind: AgentKind) -> Option<&AgentLaunchConfig> {
         self.agent_launch.get(&kind)
@@ -124,7 +131,7 @@ impl Default for AppConfig {
             project_name: default_project_name(&project_root),
             project_root,
             agent_kind: AgentKind::OpenCode,
-            agent_mode: DEFAULT_AGENT_MODE,
+            agent_mode: None,
             default_prompt: None,
             review_prompt: None,
             stack_review_prompt: None,
@@ -358,7 +365,7 @@ fn materialize(merged: PartialConfig, project_root: &Path) -> AppConfig {
         project_name,
         project_root: project_root.to_path_buf(),
         agent_kind: merged.agent_kind.unwrap_or(AgentKind::OpenCode),
-        agent_mode: merged.agent_mode.unwrap_or(DEFAULT_AGENT_MODE),
+        agent_mode: merged.agent_mode,
         default_prompt: merged.default_prompt,
         review_prompt: merged.review_prompt,
         stack_review_prompt: merged.stack_review_prompt,
@@ -966,21 +973,22 @@ teardown_script = "docker compose down"
     }
 
     #[test]
-    fn materialize_defaults_agent_mode_to_plan_when_unset() {
+    fn default_agent_mode_is_plan_when_unset() {
         let cfg = merge_to_app("", "");
-        assert_eq!(cfg.agent_mode, AgentMode::Plan);
+        assert_eq!(cfg.agent_mode, None);
+        assert_eq!(cfg.default_agent_mode(), AgentMode::Plan);
     }
 
     #[test]
     fn merge_project_agent_mode_overrides_global() {
         let cfg = merge_to_app(r#"default_mode = "plan""#, r#"agent_mode = "yolo""#);
-        assert_eq!(cfg.agent_mode, AgentMode::Yolo);
+        assert_eq!(cfg.agent_mode, Some(AgentMode::Yolo));
     }
 
     #[test]
     fn merge_global_agent_mode_used_when_project_unset() {
         let cfg = merge_to_app(r#"default_mode = "build""#, "");
-        assert_eq!(cfg.agent_mode, AgentMode::Build);
+        assert_eq!(cfg.agent_mode, Some(AgentMode::Build));
     }
 
     #[test]

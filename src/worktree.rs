@@ -478,7 +478,7 @@ mod tests {
             project_name: "bork".into(),
             project_root: project.to_path_buf(),
             agent_kind: crate::types::AgentKind::OpenCode,
-            agent_mode: crate::types::AgentMode::Plan,
+            agent_mode: None,
             default_prompt: None,
             review_prompt: None,
             stack_review_prompt: None,

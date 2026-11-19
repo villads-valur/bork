@@ -1512,7 +1512,7 @@ mod tests {
             project_name: "bork".to_string(),
             project_root: std::path::PathBuf::from("/tmp/test"),
             agent_kind: AgentKind::OpenCode,
-            agent_mode: AgentMode::Plan,
+            agent_mode: None,
             default_prompt: Some("The source code is in main/.".to_string()),
             review_prompt: None,
             stack_review_prompt: None,
