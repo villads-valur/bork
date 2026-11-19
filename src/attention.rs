@@ -25,7 +25,8 @@ pub enum Attention {
     /// the needs-you count and filter: the queue owns it. Failed or
     /// cancelled puts it back on the owner.
     Queue(MergeQueueState),
-    /// The card's agent is stopped on a permission prompt or a plan approval.
+    /// The card's agent is stopped on a permission prompt, a plan approval or
+    /// a question for you.
     AgentBlocked,
     /// The card's agent reported an error.
     AgentError,

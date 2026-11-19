@@ -1061,9 +1061,9 @@ impl Project {
 
     fn agent_attention(&self, issue: &Issue) -> Option<Attention> {
         match self.resolved_agent_status(issue) {
-            AgentStatus::WaitingPermission | AgentStatus::WaitingApproval => {
-                Some(Attention::AgentBlocked)
-            }
+            AgentStatus::WaitingPermission
+            | AgentStatus::WaitingApproval
+            | AgentStatus::WaitingInput => Some(Attention::AgentBlocked),
             AgentStatus::Error => Some(Attention::AgentError),
             _ => None,
         }
@@ -4452,7 +4452,11 @@ mod tests {
 
     #[test]
     fn an_agent_blocked_on_you_needs_you_and_passes_the_filter() {
-        for status in [AgentStatus::WaitingPermission, AgentStatus::WaitingApproval] {
+        for status in [
+            AgentStatus::WaitingPermission,
+            AgentStatus::WaitingApproval,
+            AgentStatus::WaitingInput,
+        ] {
             let mut app = test_app(vec![
                 test_issue("bork-1", Column::InProgress),
                 test_issue("bork-2", Column::InProgress),
@@ -4485,13 +4489,7 @@ mod tests {
 
     #[test]
     fn a_working_or_finished_agent_is_quiet() {
-        // Claude's idle Notification also reports WaitingInput, so it means
-        // "finished and idle" as often as "asked you something".
-        for status in [
-            AgentStatus::Busy,
-            AgentStatus::Idle,
-            AgentStatus::WaitingInput,
-        ] {
+        for status in [AgentStatus::Busy, AgentStatus::Idle] {
             let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
             set_agent_status(&mut app, "bork-bork-1", status);
 

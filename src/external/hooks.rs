@@ -53,7 +53,7 @@ const CLAUDE_HOOKS: &str = r#"{
       "hooks": [
         {
           "type": "command",
-          "command": "cat > /dev/null; { [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"WaitingInput\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\"; } || true"
+          "command": "KIND=$(cat | grep -o '\"notification_type\":\"[^\"]*\"' | head -1 | cut -d'\"' -f4); case \"$KIND\" in idle_prompt) S=Idle;; elicitation_dialog|elicitation_url_dialog|agent_needs_input) S=WaitingInput;; *) S=;; esac; { [ -n \"$S\" ] && [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"%s\",\"updated_at\":%s}' \"$S\" \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\"; } || true"
         }
       ]
     }
@@ -704,7 +704,7 @@ mod tests {
     /// Runs every Claude hook for `event_name` whose matcher covers `tool`
     /// (a regex in Claude; plain alternation here), feeding `stdin`, and
     /// returns the status file it leaves behind.
-    fn run_claude_hook(event_name: &str, tool: &str, stdin: &str) -> serde_json::Value {
+    fn run_claude_hook(event_name: &str, tool: &str, stdin: &str) -> Option<serde_json::Value> {
         let dir = tempfile::tempdir().unwrap();
         let events = parse_hook_entries(CLAUDE_HOOKS, None);
         for entry in events[event_name].as_array().unwrap() {
@@ -731,8 +731,8 @@ mod tests {
                 assert!(child.wait().unwrap().success());
             }
         }
-        let written = fs::read_to_string(dir.path().join("bork-bork-1.json")).unwrap();
-        serde_json::from_str(&written).unwrap()
+        let written = fs::read_to_string(dir.path().join("bork-bork-1.json")).ok()?;
+        Some(serde_json::from_str(&written).unwrap())
     }
 
     fn tool_input(tool: &str) -> String {
@@ -746,9 +746,33 @@ mod tests {
             ("AskUserQuestion", "WaitingInput"),
             ("Bash", "Busy"),
         ] {
-            let status = run_claude_hook("PreToolUse", tool, &tool_input(tool));
+            let status = run_claude_hook("PreToolUse", tool, &tool_input(tool)).unwrap();
             assert_eq!(status["status"], expected, "{tool}");
             assert_eq!(status["activity"], tool, "{tool}");
+        }
+    }
+
+    #[test]
+    fn claude_notifications_only_report_idle_or_a_real_question() {
+        for (kind, expected) in [
+            // Claude finished about a minute ago. Also clears a plan or
+            // question you dismissed with Esc, which fires no other hook.
+            ("idle_prompt", Some("Idle")),
+            ("elicitation_dialog", Some("WaitingInput")),
+            ("agent_needs_input", Some("WaitingInput")),
+            // PermissionRequest already wrote the blocked status; leave it.
+            ("permission_prompt", None),
+            ("auth_success", None),
+        ] {
+            let stdin = format!(
+                r#"{{"hook_event_name":"Notification","message":"m","notification_type":"{kind}"}}"#
+            );
+            let status = run_claude_hook("Notification", "", &stdin);
+            assert_eq!(
+                status.as_ref().and_then(|s| s["status"].as_str()),
+                expected,
+                "{kind}"
+            );
         }
     }
 
@@ -757,7 +781,7 @@ mod tests {
         // PostToolUse fires after you approve the plan or answer the
         // question, so the agent is working again, not waiting on you.
         for tool in ["ExitPlanMode", "AskUserQuestion"] {
-            let status = run_claude_hook("PostToolUse", tool, &tool_input(tool));
+            let status = run_claude_hook("PostToolUse", tool, &tool_input(tool)).unwrap();
             assert_eq!(status["status"], "Busy", "{tool}");
         }
     }
