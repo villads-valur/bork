@@ -511,6 +511,12 @@ pub struct Issue {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cloud: Option<CloudAgent>,
 
+    /// Set when the card's authored PR closed while its session was still
+    /// running and sync moved it to Done instead of removing it. The Done
+    /// TTL leaves such a session alone, and sync never moves the card again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub parked_after_pr_close: bool,
+
     // --- Legacy singular fields (read-only, for migration from old state.json) ---
     #[serde(default, skip_serializing)]
     pub session_id: Option<String>,
@@ -586,6 +592,7 @@ impl Issue {
             stack_review_import: None,
             linked_issues: Vec::new(),
             cloud: None,
+            parked_after_pr_close: false,
             session_id: None,
             linear_id: None,
             linear_identifier: None,

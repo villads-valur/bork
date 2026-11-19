@@ -1257,10 +1257,10 @@ impl Project {
         for issue in &mut self.issues {
             if is_gone_authored_import(issue)
                 && has_live_session(issue)
-                && issue.column != Column::Done
+                && !issue.parked_after_pr_close
             {
-                issue.column = Column::Done;
-                issue.done_at = Some(parked_at);
+                issue.move_to_column(Column::Done, parked_at);
+                issue.parked_after_pr_close = true;
                 parked += 1;
             }
         }
@@ -1461,7 +1461,7 @@ impl Project {
         }
         if parked > 0 {
             parts.push(format!(
-                "Moved {} merged PR{} to Done, session still running",
+                "Moved {} closed PR{} to Done, session still running",
                 parked,
                 if parked == 1 { "" } else { "s" }
             ));
@@ -1563,7 +1563,7 @@ impl Project {
             .iter()
             .enumerate()
             .filter(|(_, issue)| {
-                if issue.column != Column::Done {
+                if issue.column != Column::Done || issue.parked_after_pr_close {
                     return false;
                 }
                 let Some(done_at) = issue.done_at else {
@@ -2113,6 +2113,7 @@ fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
         pr_import_baseline: _,
         stack_review_import: _,
         linked_issues: _,
+        parked_after_pr_close: _,
         // Merged field-wise in merge_cloud_fields().
         cloud: _,
         // Merged entry-wise, interleaved with the kind/orchestrator logic below.
@@ -2161,6 +2162,7 @@ fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
     merge_field!(pr_import_baseline);
     merge_field!(stack_review_import);
     merge_field!(linked_issues);
+    merge_field!(parked_after_pr_close);
 
     merge_cloud_fields(memory, base, file);
 
@@ -5354,26 +5356,81 @@ mod tests {
         assert_eq!(app.project().issues, before);
     }
 
-    #[test]
-    fn merged_authored_pr_with_live_session_moves_to_done_instead_of_vanishing() {
+    /// An app with one authored PR card whose session is alive, and the PR
+    /// already gone from the live set. Returns the card's session name.
+    fn app_with_closed_pr_and_live_session() -> (App, String) {
         let mut app = test_app(vec![]);
         app.project_mut().live.pr_poll_done = true;
         app.project_mut().live.user_prs = vec![test_pr(1, "my-feature")];
         app.project_mut().sync_prs_as_issues();
         let session = app.project().issues[0].session_name(&app.project().config.project_name);
-        app.project_mut().live.active_sessions.insert(session);
+        app.project_mut()
+            .live
+            .active_sessions
+            .insert(session.clone());
         app.project_mut().live.user_prs.clear();
+        (app, session)
+    }
+
+    #[test]
+    fn merged_authored_pr_with_live_session_moves_to_done_instead_of_vanishing() {
+        let (mut app, _) = app_with_closed_pr_and_live_session();
 
         let (changed, message) = app.project_mut().sync_prs_as_issues();
 
         assert!(changed);
         assert_eq!(app.project().issues.len(), 1);
         assert_eq!(app.project().issues[0].column, Column::Done);
-        assert!(app.project().issues[0].done_at.is_some());
+        assert!(app.project().issues[0].parked_after_pr_close);
         assert_eq!(
             message.as_deref(),
-            Some("Moved 1 merged PR to Done, session still running")
+            Some("Moved 1 closed PR to Done, session still running")
         );
+    }
+
+    #[test]
+    fn parked_card_session_outlives_the_done_ttl() {
+        let (mut app, _) = app_with_closed_pr_and_live_session();
+        app.project_mut().sync_prs_as_issues();
+        let done_at = app.project().issues[0].done_at.unwrap();
+        let ttl = app.project().config.done_session_ttl;
+
+        let cleanup = app
+            .project()
+            .issues_needing_session_cleanup(done_at + ttl * 10);
+
+        assert!(cleanup.is_empty());
+    }
+
+    #[test]
+    fn parked_card_is_left_alone_by_later_syncs() {
+        let (mut app, _) = app_with_closed_pr_and_live_session();
+        app.project_mut().sync_prs_as_issues();
+
+        assert_eq!(app.project_mut().sync_prs_as_issues(), (false, None));
+        assert_eq!(app.project().issues[0].column, Column::Done);
+    }
+
+    #[test]
+    fn parked_card_moved_back_to_in_progress_stays_there() {
+        let (mut app, _) = app_with_closed_pr_and_live_session();
+        app.project_mut().sync_prs_as_issues();
+        app.project_mut().issues[0].move_to_column(Column::InProgress, unix_now());
+
+        assert_eq!(app.project_mut().sync_prs_as_issues(), (false, None));
+        assert_eq!(app.project().issues[0].column, Column::InProgress);
+    }
+
+    #[test]
+    fn parked_card_is_removed_once_its_session_ends() {
+        let (mut app, session) = app_with_closed_pr_and_live_session();
+        app.project_mut().sync_prs_as_issues();
+        app.project_mut().live.active_sessions.remove(&session);
+
+        let (changed, _) = app.project_mut().sync_prs_as_issues();
+
+        assert!(changed);
+        assert!(app.project().issues.is_empty());
     }
 
     #[test]
