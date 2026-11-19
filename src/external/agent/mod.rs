@@ -214,9 +214,25 @@ pub struct LaunchOutcome {
     pub replaced_lost_session: bool,
 }
 
+/// Create `session` with its first window named after the agent.
+fn create_agent_session(session: &str, cwd: &Path, agent_name: &str) -> Result<(), AppError> {
+    tmux::create_session(session, cwd)?;
+    name_agent_window(session, agent_name);
+    Ok(())
+}
+
+/// tmux otherwise names the window after the running command, which for a
+/// versioned install (Claude Code's `versions/2.1.322`) is the version.
+/// `:^` is the first window whatever `base-index` is and whichever window is
+/// current. Best effort: a failed rename only leaves tmux's own name.
+fn name_agent_window(session: &str, agent_name: &str) {
+    let _ = tmux::rename_window(&format!("{session}:^"), agent_name);
+}
+
 /// Launch an agent session for an issue.
 /// Creates a tmux session with two windows:
-///   1. The agent launched at the project root with issue context
+///   1. The agent launched at the project root with issue context, in a
+///      window named after the agent
 ///   2. A bare terminal
 ///
 /// The pane only gets a short `bork issue launch <id>` line; that command
@@ -247,7 +263,7 @@ pub fn launch_session(issue: &Issue, config: &AppConfig) -> Result<LaunchOutcome
     let provider = provider(issue.agent_kind);
     let before = provider.snapshot_session_ids(&config.project_root);
 
-    tmux::create_session(&session_name, cwd)?;
+    create_agent_session(&session_name, cwd, provider.display_name())?;
     let started = start_in_session(&session_name, cwd, &launch_cmd, &handoff);
     let (session_id, setup_ran, replaced_lost_session) = match started {
         Ok(started) => started,
@@ -980,6 +996,43 @@ mod tests {
     use super::*;
 
     const TEST_DEFAULT: &str = "The source code is in main/.";
+
+    #[test]
+    fn the_agent_names_the_first_window_even_when_another_is_current() {
+        if !tmux::tmux_available() {
+            eprintln!("skipping: tmux is not installed");
+            return;
+        }
+
+        let session = format!("bork-agent-window-{}", std::process::id());
+        let cwd = std::env::temp_dir();
+        tmux::create_session(&session, &cwd).unwrap();
+        tmux::create_window(&session, "terminal", &cwd).unwrap();
+        tmux::select_window(&session, "terminal").unwrap();
+
+        name_agent_window(&session, "Claude");
+        let windows = tmux::window_names(&session);
+        let _ = tmux::kill_session(&session);
+
+        assert_eq!(windows, ["Claude", "terminal"]);
+    }
+
+    #[test]
+    fn an_agent_session_starts_with_its_window_named_after_the_agent() {
+        if !tmux::tmux_available() {
+            eprintln!("skipping: tmux is not installed");
+            return;
+        }
+
+        let session = format!("bork-agent-session-{}", std::process::id());
+        let cwd = std::env::temp_dir();
+        create_agent_session(&session, &cwd, "Codex").unwrap();
+        tmux::create_window(&session, "terminal", &cwd).unwrap();
+        let windows = tmux::window_names(&session);
+        let _ = tmux::kill_session(&session);
+
+        assert_eq!(windows, ["Codex", "terminal"]);
+    }
 
     fn linear(identifier: &str, url: &str) -> LinkedLinear {
         LinkedLinear {
