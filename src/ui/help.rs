@@ -89,6 +89,7 @@ const SECTIONS: &[Section] = &[
             ("!", "Only cards that need you"),
             ("P", "Sync PRs"),
             ("Shift+B", "Back up now"),
+            ("p", "Pull the main checkout's branch"),
             ("W", "Prune worktrees"),
             ("o", "Open PR / stack"),
             ("s", "Expand stack or PRs"),

@@ -30,6 +30,13 @@ pub struct AppConfig {
     /// Shell command run inside a worktree right before it is removed by
     /// `bork issue archive` (e.g. stopping services, dropping databases).
     pub teardown_script: Option<String>,
+    /// Branch whose remote counterpart the header tracks and `p` pulls.
+    /// The git poller fetches `origin/<base_branch>` every
+    /// `base_fetch_interval_secs` and the header shows how far the main
+    /// checkout is behind it. The indicator stays hidden when the remote
+    /// branch does not exist.
+    pub base_branch: String,
+    pub base_fetch_interval_secs: u64,
     pub done_session_ttl: u64,
     pub debug: bool,
     /// Auto-create issues from PRs the user has been requested to review.
@@ -97,6 +104,10 @@ impl AppConfig {
 }
 
 pub const DEFAULT_DONE_SESSION_TTL: u64 = 300;
+pub const DEFAULT_BASE_BRANCH: &str = "main";
+/// A fetch is network I/O on the poll thread; 15 minutes keeps the indicator
+/// honest without turning the poller into a fetch loop.
+pub const DEFAULT_BASE_FETCH_INTERVAL_SECS: u64 = 900;
 pub const DEFAULT_PRUNE_THRESHOLD: u64 = 10;
 pub const DEFAULT_AUTO_PRUNE_CHECK_INTERVAL: u64 = 86_400;
 pub const DEFAULT_KEEP_DELETED_DAYS: u64 = 30;
@@ -131,6 +142,8 @@ impl Default for AppConfig {
             orchestrator_prompt: None,
             setup_script: None,
             teardown_script: None,
+            base_branch: DEFAULT_BASE_BRANCH.to_string(),
+            base_fetch_interval_secs: DEFAULT_BASE_FETCH_INTERVAL_SECS,
             done_session_ttl: DEFAULT_DONE_SESSION_TTL,
             debug: false,
             auto_import_reviews: true,
@@ -246,6 +259,8 @@ pub struct PartialConfig {
     pub orchestrator_prompt: Option<String>,
     pub setup_script: Option<String>,
     pub teardown_script: Option<String>,
+    pub base_branch: Option<String>,
+    pub base_fetch_interval_secs: Option<u64>,
     pub done_session_ttl: Option<u64>,
     pub debug: Option<bool>,
     pub auto_import_reviews: Option<bool>,
@@ -309,6 +324,10 @@ impl PartialConfig {
             orchestrator_prompt: other.orchestrator_prompt.or(self.orchestrator_prompt),
             setup_script: other.setup_script.or(self.setup_script),
             teardown_script: other.teardown_script.or(self.teardown_script),
+            base_branch: other.base_branch.or(self.base_branch),
+            base_fetch_interval_secs: other
+                .base_fetch_interval_secs
+                .or(self.base_fetch_interval_secs),
             done_session_ttl: other.done_session_ttl.or(self.done_session_ttl),
             debug: other.debug.or(self.debug),
             auto_import_reviews: other.auto_import_reviews.or(self.auto_import_reviews),
@@ -365,6 +384,12 @@ fn materialize(merged: PartialConfig, project_root: &Path) -> AppConfig {
         orchestrator_prompt: merged.orchestrator_prompt,
         setup_script: merged.setup_script,
         teardown_script: merged.teardown_script,
+        base_branch: merged
+            .base_branch
+            .unwrap_or_else(|| DEFAULT_BASE_BRANCH.to_string()),
+        base_fetch_interval_secs: merged
+            .base_fetch_interval_secs
+            .unwrap_or(DEFAULT_BASE_FETCH_INTERVAL_SECS),
         done_session_ttl: merged.done_session_ttl.unwrap_or(DEFAULT_DONE_SESSION_TTL),
         debug: merged.debug.unwrap_or(false),
         auto_import_reviews: merged.auto_import_reviews.unwrap_or(true),
@@ -468,6 +493,14 @@ fn partial_from_table(table: &Table) -> PartialConfig {
         .and_then(|v| v.as_str())
         .map(str::to_string);
 
+    let base_branch = table
+        .get("base_branch")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let base_fetch_interval_secs = table
+        .get("base_fetch_interval_secs")
+        .and_then(|v| v.as_u64());
+
     let done_session_ttl = table.get("done_session_ttl").and_then(|v| v.as_u64());
     let debug = table.get("debug").and_then(|v| v.as_bool());
     let auto_import_reviews = table.get("auto_import_reviews").and_then(|v| v.as_bool());
@@ -500,6 +533,8 @@ fn partial_from_table(table: &Table) -> PartialConfig {
         orchestrator_prompt,
         setup_script,
         teardown_script,
+        base_branch,
+        base_fetch_interval_secs,
         done_session_ttl,
         debug,
         auto_import_reviews,
