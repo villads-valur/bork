@@ -893,7 +893,8 @@ enum IssueCommand {
         #[arg(long, value_parser = parse_agent_kind)]
         agent: Option<AgentKind>,
 
-        /// Agent mode (plan, build, yolo)
+        /// Agent mode (plan, build, yolo). Defaults to the configured default_mode,
+        /// else yolo (claude/codex) or build.
         #[arg(long, value_parser = parse_agent_mode)]
         mode: Option<AgentMode>,
 
@@ -1697,7 +1698,9 @@ fn resolved_config_value(config: &config::AppConfig, key: &str) -> Option<String
         "done_session_ttl" => Some(config.done_session_ttl.to_string()),
         "keep_deleted_days" => Some(config.keep_deleted_days.to_string()),
         "agent_kind" => Some(config.agent_kind.to_string()),
-        "agent_mode" => Some(config.default_agent_mode().to_string()),
+        "agent_mode" => Some(
+            ops::default_agent_mode(config, agent_config::default_agent_for(config)).to_string(),
+        ),
         "default_prompt" => Some(config.default_prompt.clone().unwrap_or_default()),
         "review_prompt" => Some(config.review_prompt.clone().unwrap_or_default()),
         "stack_review_prompt" => Some(config.stack_review_prompt.clone().unwrap_or_default()),
@@ -2089,19 +2092,13 @@ fn find_project_root_from(path: &Path) -> Option<PathBuf> {
 
 fn start_issue(project_root: &Path, opts: StartIssueOptions) -> anyhow::Result<StartIssueReport> {
     let config = config::load_config_from(project_root);
-    let agent_kind = opts
-        .agent_kind
-        .unwrap_or_else(|| agent_config::default_agent_for(&config));
-    let agent_mode = opts
-        .agent_mode
-        .unwrap_or_else(|| ops::start_agent_mode(&config, agent_kind));
     let mut issue = ops::create_issue(
         project_root,
         ops::CreateOptions {
             title: opts.title.clone(),
             column: None,
-            agent_kind: Some(agent_kind),
-            agent_mode: Some(agent_mode),
+            agent_kind: opts.agent_kind,
+            agent_mode: opts.agent_mode,
             prompt: opts.prompt,
             model: opts.model,
             kind: Some(IssueKind::Agentic),

@@ -249,10 +249,9 @@ fn validate_model(model: &str, agent_kind: AgentKind) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Mode for `bork issue start` when `--mode` is omitted: the configured
-/// `default_mode`, else yolo for agents that support it and build for the
-/// rest. Started issues are spawned to do the work, so they skip plan mode.
-pub fn start_agent_mode(config: &config::AppConfig, agent_kind: AgentKind) -> AgentMode {
+/// Mode for a new issue when none is chosen: the configured `default_mode`,
+/// else yolo for agents that support it and build for the rest.
+pub fn default_agent_mode(config: &config::AppConfig, agent_kind: AgentKind) -> AgentMode {
     if let Some(mode) = config.agent_mode {
         return mode;
     }
@@ -273,7 +272,9 @@ pub fn create_issue(project_root: &Path, opts: CreateOptions) -> anyhow::Result<
     let agent_kind = opts
         .agent_kind
         .unwrap_or_else(|| agent_config::default_agent_for(&config));
-    let agent_mode = opts.agent_mode.unwrap_or(config.default_agent_mode());
+    let agent_mode = opts
+        .agent_mode
+        .unwrap_or_else(|| default_agent_mode(&config, agent_kind));
     if let Some(model) = opts.model.as_deref() {
         validate_model(model, agent_kind)?;
     }
@@ -1102,42 +1103,45 @@ mod tests {
     }
 
     #[test]
-    fn start_mode_falls_back_to_yolo_for_agents_that_support_it() {
+    fn default_mode_is_yolo_for_agents_that_support_it() {
         let config = config_with_mode(None);
         assert_eq!(
-            start_agent_mode(&config, AgentKind::Claude),
+            default_agent_mode(&config, AgentKind::Claude),
             AgentMode::Yolo
         );
-        assert_eq!(start_agent_mode(&config, AgentKind::Codex), AgentMode::Yolo);
+        assert_eq!(
+            default_agent_mode(&config, AgentKind::Codex),
+            AgentMode::Yolo
+        );
     }
 
     #[test]
-    fn start_mode_falls_back_to_build_without_yolo_support() {
+    fn default_mode_is_build_without_yolo_support() {
         let config = config_with_mode(None);
         assert_eq!(
-            start_agent_mode(&config, AgentKind::OpenCode),
+            default_agent_mode(&config, AgentKind::OpenCode),
             AgentMode::Build
         );
     }
 
     #[test]
-    fn start_mode_uses_configured_default_mode() {
+    fn default_mode_uses_configured_default_mode() {
         let config = config_with_mode(Some(AgentMode::Plan));
         assert_eq!(
-            start_agent_mode(&config, AgentKind::Claude),
+            default_agent_mode(&config, AgentKind::Claude),
             AgentMode::Plan
         );
     }
 
     #[test]
-    fn create_issue_falls_back_to_plan_without_configured_mode() {
+    fn create_issue_defaults_to_yolo_without_configured_mode() {
         let dir = setup_project();
         let issue = create_issue(
             dir.path(),
             CreateOptions {
                 title: "t".into(),
                 column: None,
-                agent_kind: None,
+                agent_kind: Some(AgentKind::Claude),
                 agent_mode: None,
                 prompt: None,
                 model: None,
@@ -1145,7 +1149,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(issue.agent_mode, AgentMode::Plan);
+        assert_eq!(issue.agent_mode, AgentMode::Yolo);
     }
 
     #[test]

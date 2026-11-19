@@ -225,7 +225,7 @@ bork issue restore bork-3
 
 **Create options:** `--column` (todo, in-progress, code-review, done), `--agent` (opencode, claude, codex, pi), `--mode` (plan, build, yolo), `--prompt`, `--model`, `--kind` (agentic, todo, orchestrator).
 
-**Start options:** `--prompt`, `--agent` (opencode, claude, codex), `--mode` (plan, build, yolo), `--model`, `--slug`, `--no-worktree`, `--project` (registered project name or path). Without `--mode`, `bork issue start` uses the configured `default_mode`, else yolo for claude/codex and build for other agents. It creates a worktree with a slug generated from the title. If a `setup_script` is configured, it runs inside the worktree before the agent starts.
+**Start options:** `--prompt`, `--agent` (opencode, claude, codex), `--mode` (plan, build, yolo), `--model`, `--slug`, `--no-worktree`, `--project` (registered project name or path). `bork issue start` creates a worktree with a slug generated from the title. If a `setup_script` is configured, it runs inside the worktree before the agent starts.
 
 **Model per issue:** `--model <name>` on `create`, `start` and `update` is saved on the issue and passed to the agent as `--model <name>` on every launch and resume, e.g. `bork issue start "Review PR 42" --agent claude --model sonnet`. It replaces any `--model`/`-m` in `[agent.<name>].args`. Model names are agent-specific, so changing an issue's agent clears it. OpenCode's TUI has no `--model` flag, so `--model` on an opencode issue is an error. `bork issue update <id> --model ""` clears it.
 
@@ -381,7 +381,7 @@ default_mode = "plan"
 
 In config files, `default_agent` and `default_mode` are aliases for `agent_kind` and `agent_mode`. The CLI requires `agent_kind` and `agent_mode`. Use one spelling for each setting in a file; if both appear, `agent_kind` and `agent_mode` take precedence.
 
-These defaults apply to new issues. Existing issues keep their saved agent and mode. Override either when creating an issue, or update an existing one:
+These defaults apply to new issues. Without `agent_mode`, new issues start in yolo for agents that support it (claude, codex) and build for the rest. Existing issues keep their saved agent and mode. Override either when creating an issue, or update an existing one:
 
 ```bash
 bork issue create "Investigate slow startup" --agent claude --mode plan

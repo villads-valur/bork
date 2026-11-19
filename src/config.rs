@@ -16,9 +16,8 @@ pub struct AppConfig {
     pub project_name: String,
     pub project_root: PathBuf,
     pub agent_kind: AgentKind,
-    /// Configured `default_mode`, if any. `None` lets each entry point pick
-    /// its own fallback: `default_agent_mode()` for the TUI and `issue create`,
-    /// `ops::start_agent_mode()` for `issue start`.
+    /// Configured `default_mode`, if any. Resolve the mode for a new issue
+    /// with `ops::default_agent_mode()`, which falls back per agent.
     pub agent_mode: Option<AgentMode>,
     pub default_prompt: Option<String>,
     pub review_prompt: Option<String>,
@@ -72,12 +71,6 @@ pub struct AgentLaunchConfig {
 }
 
 impl AppConfig {
-    /// Mode for new issues when none is given: the configured `default_mode`,
-    /// else plan.
-    pub fn default_agent_mode(&self) -> AgentMode {
-        self.agent_mode.unwrap_or(DEFAULT_AGENT_MODE)
-    }
-
     /// Look up the configured launch override for an agent, if any.
     pub fn agent_launch_for(&self, kind: AgentKind) -> Option<&AgentLaunchConfig> {
         self.agent_launch.get(&kind)
@@ -107,8 +100,6 @@ pub const DEFAULT_DONE_SESSION_TTL: u64 = 300;
 pub const DEFAULT_PRUNE_THRESHOLD: u64 = 10;
 pub const DEFAULT_AUTO_PRUNE_CHECK_INTERVAL: u64 = 86_400;
 pub const DEFAULT_KEEP_DELETED_DAYS: u64 = 30;
-
-pub const DEFAULT_AGENT_MODE: AgentMode = AgentMode::Plan;
 
 pub const DEFAULT_PROMPT_FALLBACK: &str = "The source code is in main/. Use `bork issue start \"Title\" --project <name-or-path> --prompt \"Details...\"` to spin off new issues with their own worktrees and agents.";
 
@@ -973,10 +964,9 @@ teardown_script = "docker compose down"
     }
 
     #[test]
-    fn default_agent_mode_is_plan_when_unset() {
+    fn agent_mode_is_unset_without_default_mode() {
         let cfg = merge_to_app("", "");
         assert_eq!(cfg.agent_mode, None);
-        assert_eq!(cfg.default_agent_mode(), AgentMode::Plan);
     }
 
     #[test]

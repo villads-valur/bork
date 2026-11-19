@@ -2810,7 +2810,7 @@ impl App {
         let github_available = p.can_browse_github();
         let mut state = DialogState::new(
             p.default_agent(),
-            p.config.default_agent_mode(),
+            crate::ops::default_agent_mode(&p.config, p.default_agent()),
             p.available_agents.clone(),
             p.linear_available,
             github_available,
@@ -5791,7 +5791,7 @@ mod tests {
         let config = test_config();
         let d = DialogState::new(
             config.agent_kind,
-            config.default_agent_mode(),
+            crate::ops::default_agent_mode(&config, config.agent_kind),
             crate::types::AgentKind::ALL.to_vec(),
             false,
             false,
