@@ -266,6 +266,7 @@ mod tests {
             merge_blocker: None,
             merge_queue: None,
             unresolved_threads: 0,
+            unresolved_thread_last_authors: Vec::new(),
         }
     }
 

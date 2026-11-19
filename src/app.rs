@@ -1044,12 +1044,12 @@ impl Project {
             .or_else(|| self.pr_attention(issue))
     }
 
-    /// Unresolved comments are an extra reason on top of `attention_for`, so
-    /// they count even when the card has another attention state.
+    /// Comments waiting on you are an extra reason on top of `attention_for`,
+    /// so they count even when the card has another attention state.
     pub fn needs_you(&self, issue: &Issue) -> bool {
         self.attention_for(issue)
             .is_some_and(|attention| attention.needs_you())
-            || self.unresolved_comments(issue) > 0
+            || self.comments_awaiting_you(issue) > 0
     }
 
     pub fn attention_count(&self) -> usize {
@@ -1132,6 +1132,20 @@ impl Project {
     /// open PRs, plus unposted tuicr drafts for its worktree or those PRs.
     /// Done cards never count.
     pub fn unresolved_comments(&self, issue: &Issue) -> u32 {
+        self.comment_count(issue, |pr| pr.unresolved_threads)
+    }
+
+    /// Like `unresolved_comments`, but leaves out threads where you spoke
+    /// last: those wait on the other side, like your review comments on
+    /// someone else's PR. Counts every thread while your login is unknown.
+    fn comments_awaiting_you(&self, issue: &Issue) -> u32 {
+        match self.live.github_user.as_deref() {
+            Some(me) => self.comment_count(issue, |pr| pr.threads_awaiting(me)),
+            None => self.unresolved_comments(issue),
+        }
+    }
+
+    fn comment_count(&self, issue: &Issue, threads: impl Fn(&PrStatus) -> u32) -> u32 {
         if issue.column == Column::Done {
             return 0;
         }
@@ -1151,7 +1165,7 @@ impl Project {
             .filter_map(|number| self.pr_by_number(number))
             .filter(|pr| pr.state == PrState::Open);
         for pr in open_prs {
-            total += pr.unresolved_threads + drafts.by_pr_url.get(&pr.url).copied().unwrap_or(0);
+            total += threads(pr) + drafts.by_pr_url.get(&pr.url).copied().unwrap_or(0);
         }
         total
     }
@@ -3388,6 +3402,7 @@ mod tests {
             merge_blocker: None,
             merge_queue: None,
             unresolved_threads: 0,
+            unresolved_thread_last_authors: Vec::new(),
         }
     }
 
@@ -4401,6 +4416,42 @@ mod tests {
 
         app.project_mut().live.review_requested_prs[0].unresolved_threads = 1;
         assert_eq!(attention_of(&app), None);
+        assert_eq!(app.project().attention_count(), 1);
+    }
+
+    #[test]
+    fn threads_where_you_spoke_last_wait_on_the_other_side() {
+        let mut app = test_app(vec![issue_linked_to_pr(
+            "bork-1",
+            7,
+            Some(PrImportSource::ReviewRequested),
+        )]);
+        let mut pr = test_pr(7, "feature");
+        pr.unresolved_threads = 2;
+        pr.unresolved_thread_last_authors = vec!["me".into(), "me".into()];
+        app.project_mut().live.review_requested_prs = vec![pr];
+        app.project_mut().live.github_user = Some("me".into());
+
+        // Your two review comments, no replies yet: shown, but not on you.
+        assert_eq!(comments_of(&app), 2);
+        assert_eq!(app.project().attention_count(), 0);
+
+        // The author replied on one of them.
+        app.project_mut().live.review_requested_prs[0].unresolved_thread_last_authors =
+            vec!["me".into(), "author".into()];
+        assert_eq!(app.project().attention_count(), 1);
+    }
+
+    #[test]
+    fn every_unresolved_thread_needs_you_while_your_login_is_unknown() {
+        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
+        let mut pr = test_pr(7, "feature");
+        pr.review = Some(crate::types::ReviewDecision::ReviewRequired);
+        pr.unresolved_threads = 1;
+        pr.unresolved_thread_last_authors = vec!["me".into()];
+        app.project_mut().live.review_requested_prs = vec![pr];
+        app.project_mut().live.github_user = None;
+
         assert_eq!(app.project().attention_count(), 1);
     }
 
@@ -7329,6 +7380,7 @@ mod tests {
             merge_blocker: None,
             merge_queue: None,
             unresolved_threads: 0,
+            unresolved_thread_last_authors: Vec::new(),
         };
         app.project_mut()
             .live

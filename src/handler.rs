@@ -3055,6 +3055,7 @@ mod tests {
                 merge_blocker: None,
                 merge_queue: None,
                 unresolved_threads: 0,
+                unresolved_thread_last_authors: Vec::new(),
             };
             members.push(GithubStackPullRequest {
                 number,
@@ -6547,6 +6548,7 @@ mod tests {
             merge_blocker: None,
             merge_queue: None,
             unresolved_threads: 0,
+            unresolved_thread_last_authors: Vec::new(),
         };
         app.projects[0]
             .live

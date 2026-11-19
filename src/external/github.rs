@@ -40,7 +40,7 @@ macro_rules! pr_fields {
     isInMergeQueue
     isMergeQueueEnabled
     additions deletions
-    reviewThreads(first: 100) { nodes { isResolved } }
+    reviewThreads(first: 100) { nodes { isResolved comments(last: 1) { nodes { author { login } } } } }
     "#,
             $queue,
             r#"
@@ -578,15 +578,27 @@ fn parse_pr_node(node: &serde_json::Value) -> Option<PrStatus> {
             _ => None,
         });
     let merge_queue = github_queue_state(node).or_else(|| trunk_queue_state(node));
-    let unresolved_threads = node
+    let unresolved: Vec<&serde_json::Value> = node
         .pointer("/reviewThreads/nodes")
         .and_then(|v| v.as_array())
-        .map_or(0, |threads| {
+        .map(|threads| {
             threads
                 .iter()
                 .filter(|thread| thread.get("isResolved").and_then(|v| v.as_bool()) == Some(false))
-                .count()
-        }) as u32;
+                .collect()
+        })
+        .unwrap_or_default();
+    let unresolved_threads = unresolved.len() as u32;
+    let unresolved_thread_last_authors = unresolved
+        .iter()
+        .map(|thread| {
+            thread
+                .pointer("/comments/nodes/0/author/login")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
 
     Some(PrStatus {
         number,
@@ -604,6 +616,7 @@ fn parse_pr_node(node: &serde_json::Value) -> Option<PrStatus> {
         merge_blocker,
         merge_queue,
         unresolved_threads,
+        unresolved_thread_last_authors,
     })
 }
 
@@ -1425,6 +1438,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unresolved_threads_record_who_spoke_last() {
+        let node = make_pr_node(
+            r#"{"reviewThreads": {"nodes": [
+                {"isResolved": false, "comments": {"nodes": [{"author": {"login": "me"}}]}},
+                {"isResolved": true, "comments": {"nodes": [{"author": {"login": "other"}}]}},
+                {"isResolved": false, "comments": {"nodes": [{"author": {"login": "author"}}]}},
+                {"isResolved": false, "comments": {"nodes": [{"author": null}]}}
+            ]}}"#,
+        );
+        let pr = parse_pr_node(&node).unwrap();
+
+        assert_eq!(pr.unresolved_thread_last_authors, ["me", "author", ""]);
+        assert_eq!(pr.threads_awaiting("Me"), 2);
+    }
+
     /// A PR node whose head commit carries these Trunk check runs, one
     /// check suite per inner list.
     fn pr_node_with_trunk_suites(suites: &[Vec<serde_json::Value>]) -> serde_json::Value {
@@ -1896,6 +1925,7 @@ mod tests {
             merge_blocker: None,
             merge_queue: None,
             unresolved_threads: 0,
+            unresolved_thread_last_authors: Vec::new(),
         }
     }
 

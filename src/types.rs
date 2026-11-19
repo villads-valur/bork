@@ -1006,6 +1006,24 @@ pub struct PrStatus {
     /// Unresolved review threads (inline comments that can be resolved).
     #[serde(default)]
     pub unresolved_threads: u32,
+    /// Who wrote the last comment on each unresolved thread, in no order
+    /// (empty login when GitHub doesn't say). Empty in caches written before
+    /// this field existed.
+    #[serde(default)]
+    pub unresolved_thread_last_authors: Vec<String>,
+}
+
+impl PrStatus {
+    /// Unresolved threads where someone other than `me` spoke last. A thread
+    /// you commented on last waits on the other side.
+    pub fn threads_awaiting(&self, me: &str) -> u32 {
+        let mine = self
+            .unresolved_thread_last_authors
+            .iter()
+            .filter(|author| author.eq_ignore_ascii_case(me))
+            .count() as u32;
+        self.unresolved_threads.saturating_sub(mine)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1085,6 +1103,7 @@ mod tests {
             merge_blocker: None,
             merge_queue: None,
             unresolved_threads: 0,
+            unresolved_thread_last_authors: Vec::new(),
         };
         let cloned = pr.clone();
         assert_eq!(cloned.number, 1);
