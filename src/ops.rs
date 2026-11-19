@@ -448,6 +448,27 @@ pub fn record_launch(
     config::save_state(&state, project_root)
 }
 
+/// Store `bork issue start`'s launch result: move a Todo card to In Progress
+/// and record the session. Returns the saved state.
+pub fn record_start(
+    project_root: &Path,
+    launched: &Issue,
+    session_id: Option<String>,
+    setup_ran: bool,
+) -> anyhow::Result<config::AppState> {
+    config::with_state_lock(project_root, || {
+        let mut state = config::load_state(project_root);
+        if let Some(saved) = state.issues.iter_mut().find(|i| i.id == launched.id) {
+            if saved.column == Column::Todo {
+                saved.column = Column::InProgress;
+            }
+            saved.record_launch(launched.kind, launched.agent_kind, session_id, setup_ran);
+        }
+        config::save_state(&state, project_root)?;
+        Ok(state)
+    })
+}
+
 pub struct SessionReset {
     pub issue_id: String,
     pub agent: AgentKind,
@@ -666,6 +687,10 @@ pub fn remove_link_references(issues: &mut [Issue], removed_id: &str) {
 /// Tie two issues together. Links are symmetric: each issue records the other's
 /// id. Both issues must exist in the same project; self-links are rejected.
 pub fn link_issues(project_root: &Path, a: &str, b: &str) -> anyhow::Result<(String, String)> {
+    config::with_state_lock(project_root, || link_issues_locked(project_root, a, b))
+}
+
+fn link_issues_locked(project_root: &Path, a: &str, b: &str) -> anyhow::Result<(String, String)> {
     let mut state = config::load_state(project_root);
 
     let idx_a = find_issue_index(&state.issues, a)
@@ -773,6 +798,16 @@ pub fn show_issue(project_root: &Path, issue_id: &str, json: bool) -> anyhow::Re
 }
 
 pub fn attach_linear(
+    project_root: &Path,
+    issue_id: &str,
+    linear_identifier: &str,
+) -> anyhow::Result<Issue> {
+    config::with_state_lock(project_root, || {
+        attach_linear_locked(project_root, issue_id, linear_identifier)
+    })
+}
+
+fn attach_linear_locked(
     project_root: &Path,
     issue_id: &str,
     linear_identifier: &str,
@@ -1195,19 +1230,7 @@ mod tests {
                 let start = &start;
                 scope.spawn(move || {
                     start.wait();
-                    create_issue(
-                        root,
-                        CreateOptions {
-                            title: format!("Creator {n}"),
-                            column: None,
-                            agent_kind: None,
-                            agent_mode: None,
-                            prompt: None,
-                            model: None,
-                            kind: None,
-                        },
-                    )
-                    .unwrap();
+                    create_issue(root, titled(format!("Creator {n}"))).unwrap();
                 });
             }
         });
@@ -1216,6 +1239,61 @@ mod tests {
         let ids: HashSet<&str> = state.issues.iter().map(|i| i.id.as_str()).collect();
         assert_eq!(state.issues.len(), CREATORS);
         assert_eq!(ids.len(), CREATORS);
+    }
+
+    #[test]
+    fn creates_racing_start_saves_keep_every_issue_and_launch() {
+        const STARTERS: usize = 6;
+        const CREATORS: usize = 6;
+        let dir = setup_project();
+        let root = dir.path();
+        let started: Vec<Issue> = (0..STARTERS)
+            .map(|n| create_issue(root, titled(format!("Started {n}"))).unwrap())
+            .collect();
+        let start = std::sync::Barrier::new(STARTERS + CREATORS);
+
+        std::thread::scope(|scope| {
+            for issue in &started {
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    record_start(root, issue, Some(format!("session-{}", issue.id)), false)
+                        .unwrap();
+                });
+            }
+            for n in 0..CREATORS {
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    create_issue(root, titled(format!("Creator {n}"))).unwrap();
+                });
+            }
+        });
+
+        let state = config::load_state(root);
+        let ids: HashSet<&str> = state.issues.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(state.issues.len(), STARTERS + CREATORS);
+        assert_eq!(ids.len(), STARTERS + CREATORS);
+        for launched in &started {
+            let saved = state.issues.iter().find(|i| i.id == launched.id).unwrap();
+            assert_eq!(saved.column, Column::InProgress);
+            assert_eq!(
+                saved.current_session_id(),
+                Some(format!("session-{}", launched.id).as_str())
+            );
+        }
+    }
+
+    fn titled(title: String) -> CreateOptions {
+        CreateOptions {
+            title,
+            column: None,
+            agent_kind: None,
+            agent_mode: None,
+            prompt: None,
+            model: None,
+            kind: None,
+        }
     }
 
     #[test]
