@@ -2807,7 +2807,7 @@ impl App {
         let github_available = p.can_browse_github();
         let mut state = DialogState::new(
             p.default_agent(),
-            p.config.agent_mode,
+            crate::ops::default_agent_mode(&p.config, p.default_agent()),
             p.available_agents.clone(),
             p.linear_available,
             github_available,
@@ -3262,7 +3262,7 @@ mod tests {
             project_name: "bork".into(),
             project_root: PathBuf::from("/tmp/test-bork"),
             agent_kind: AgentKind::OpenCode,
-            agent_mode: crate::types::AgentMode::Plan,
+            agent_mode: None,
             default_prompt: None,
             review_prompt: None,
             stack_review_prompt: None,
@@ -3314,7 +3314,10 @@ mod tests {
 
         assert!(project.available_agents.is_empty());
         assert_eq!(project.config.agent_kind, AgentKind::Claude);
-        assert_eq!(project.config.agent_mode, crate::types::AgentMode::Build);
+        assert_eq!(
+            project.config.agent_mode,
+            Some(crate::types::AgentMode::Build)
+        );
     }
 
     fn test_issue(id: &str, column: Column) -> Issue {
@@ -5785,7 +5788,7 @@ mod tests {
         let config = test_config();
         let d = DialogState::new(
             config.agent_kind,
-            config.agent_mode,
+            crate::ops::default_agent_mode(&config, config.agent_kind),
             crate::types::AgentKind::ALL.to_vec(),
             false,
             false,
@@ -7750,7 +7753,7 @@ mod tests {
             project_name: name.into(),
             project_root: PathBuf::from(format!("/tmp/test-{}", name)),
             agent_kind: AgentKind::OpenCode,
-            agent_mode: crate::types::AgentMode::Plan,
+            agent_mode: None,
             default_prompt: None,
             review_prompt: None,
             stack_review_prompt: None,
