@@ -57,12 +57,6 @@ fn match_ports_to_sessions(
             pid_to_session.insert(pid, session.clone());
         }
     }
-    let all_pane_pids: HashSet<u32> = pid_to_session.keys().copied().collect();
-    let parent_map: HashMap<u32, u32> = processes
-        .iter()
-        .map(|(&pid, info)| (pid, info.ppid))
-        .collect();
-
     let mut result: HashMap<String, Vec<u16>> = HashMap::new();
     for &(pid, port) in listening {
         if processes
@@ -71,9 +65,7 @@ fn match_ports_to_sessions(
         {
             continue;
         }
-        if let Some(session) =
-            find_ancestor_session(pid, &all_pane_pids, &pid_to_session, &parent_map)
-        {
+        if let Some(session) = find_ancestor_session(pid, &pid_to_session, processes) {
             result.entry(session).or_default().push(port);
         }
     }
@@ -101,20 +93,19 @@ fn is_agent_process(command: &str) -> bool {
 /// Walk up the process tree from `pid` looking for any tmux pane PID.
 fn find_ancestor_session(
     mut pid: u32,
-    pane_pids: &HashSet<u32>,
     pid_to_session: &HashMap<u32, String>,
-    parent_map: &HashMap<u32, u32>,
+    processes: &HashMap<u32, ProcessInfo>,
 ) -> Option<String> {
     let mut visited = HashSet::new();
     loop {
-        if pane_pids.contains(&pid) {
-            return pid_to_session.get(&pid).cloned();
+        if let Some(session) = pid_to_session.get(&pid) {
+            return Some(session.clone());
         }
         if !visited.insert(pid) {
             return None; // cycle detection
         }
-        match parent_map.get(&pid) {
-            Some(&ppid) if ppid != 0 && ppid != pid => pid = ppid,
+        match processes.get(&pid).map(|info| info.ppid) {
+            Some(ppid) if ppid != 0 && ppid != pid => pid = ppid,
             _ => return None,
         }
     }
@@ -310,13 +301,6 @@ mod tests {
     }
 
     #[test]
-    fn listeners_outside_tmux_sessions_are_ignored() {
-        let processes = parse_ps_output("PID PPID COMM\n10 1 -zsh\n500 1 node\n");
-        let result = match_ports_to_sessions(&session(10), &[(500, 3000)], &processes);
-        assert!(result.is_empty());
-    }
-
-    #[test]
     fn agent_names_match_every_supported_agent() {
         for name in ["claude", "codex", "opencode", "pi", "cursor-agent"] {
             assert!(is_agent_process(name), "{name}");
@@ -365,44 +349,46 @@ mod tests {
         assert_eq!(extract_port_from_name("no-port-here"), None);
     }
 
+    fn pane_100() -> HashMap<u32, String> {
+        [(100, "my-session".to_string())].into()
+    }
+
+    fn tree(parents: &[(u32, u32)]) -> HashMap<u32, ProcessInfo> {
+        parents
+            .iter()
+            .map(|&(pid, ppid)| {
+                let info = ProcessInfo {
+                    ppid,
+                    name: "sh".to_string(),
+                };
+                (pid, info)
+            })
+            .collect()
+    }
+
     #[test]
     fn find_ancestor_direct_match() {
-        let pane_pids: HashSet<u32> = [100].into();
-        let pid_to_session: HashMap<u32, String> = [(100, "my-session".to_string())].into();
-        let parent_map: HashMap<u32, u32> = [(100, 1)].into();
-
-        let result = find_ancestor_session(100, &pane_pids, &pid_to_session, &parent_map);
+        let result = find_ancestor_session(100, &pane_100(), &tree(&[(100, 1)]));
         assert_eq!(result, Some("my-session".to_string()));
     }
 
     #[test]
     fn find_ancestor_two_levels_up() {
-        let pane_pids: HashSet<u32> = [100].into();
-        let pid_to_session: HashMap<u32, String> = [(100, "my-session".to_string())].into();
-        let parent_map: HashMap<u32, u32> = [(300, 200), (200, 100), (100, 1)].into();
-
-        let result = find_ancestor_session(300, &pane_pids, &pid_to_session, &parent_map);
+        let processes = tree(&[(300, 200), (200, 100), (100, 1)]);
+        let result = find_ancestor_session(300, &pane_100(), &processes);
         assert_eq!(result, Some("my-session".to_string()));
     }
 
     #[test]
     fn find_ancestor_no_match() {
-        let pane_pids: HashSet<u32> = [100].into();
-        let pid_to_session: HashMap<u32, String> = [(100, "my-session".to_string())].into();
-        let parent_map: HashMap<u32, u32> = [(300, 200), (200, 1)].into();
-
-        let result = find_ancestor_session(300, &pane_pids, &pid_to_session, &parent_map);
-        assert_eq!(result, None);
+        let processes = tree(&[(300, 200), (200, 1)]);
+        assert_eq!(find_ancestor_session(300, &pane_100(), &processes), None);
     }
 
     #[test]
     fn find_ancestor_cycle_protection() {
-        let pane_pids: HashSet<u32> = [100].into();
-        let pid_to_session: HashMap<u32, String> = [(100, "my-session".to_string())].into();
         // Cycle: 200 -> 300 -> 200
-        let parent_map: HashMap<u32, u32> = [(200, 300), (300, 200)].into();
-
-        let result = find_ancestor_session(200, &pane_pids, &pid_to_session, &parent_map);
-        assert_eq!(result, None);
+        let processes = tree(&[(200, 300), (300, 200)]);
+        assert_eq!(find_ancestor_session(200, &pane_100(), &processes), None);
     }
 }
