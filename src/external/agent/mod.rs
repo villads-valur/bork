@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crate::config::{self, AppConfig};
 use crate::error::AppError;
-use crate::external::process::{self, BORK_ISSUE_ID_VAR, BORK_SESSION_VAR};
+use crate::external::process::{self, BORK_ISSUE_ID_VAR, BORK_SESSION_VAR, BORK_STATUS_DIR_VAR};
 use crate::external::{github, tmux};
 use crate::types::{
     AgentKind, AgentMode, Issue, IssueKind, LinkedGithubPr, LinkedLinear, PrImportSource,
@@ -256,7 +256,7 @@ pub fn launch_session(issue: &Issue, config: &AppConfig) -> Result<LaunchOutcome
         cwd,
         &[
             (BORK_SESSION_VAR, &session_name),
-            ("BORK_STATUS_DIR", status_dir_str),
+            (BORK_STATUS_DIR_VAR, status_dir_str),
             (BORK_ISSUE_ID_VAR, &issue.id),
         ],
     )?;
@@ -611,7 +611,7 @@ fn build_agent_cmd(
     prompt_path_str: &str,
 ) -> (String, Option<String>, Option<String>) {
     let env_prefix = format!(
-        "export {BORK_SESSION_VAR}='{}' BORK_STATUS_DIR='{}' {BORK_ISSUE_ID_VAR}='{}'",
+        "export {BORK_SESSION_VAR}='{}' {BORK_STATUS_DIR_VAR}='{}' {BORK_ISSUE_ID_VAR}='{}'",
         shell_escape_single_quotes(session_name),
         shell_escape_single_quotes(status_dir_str),
         shell_escape_single_quotes(&issue.id),

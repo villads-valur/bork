@@ -13,6 +13,10 @@ pub const BORK_SESSION_VAR: &str = "BORK_SESSION";
 /// so CLI calls from inside the session can default to that issue.
 pub const BORK_ISSUE_ID_VAR: &str = "BORK_ISSUE_ID";
 
+/// Env var exported into every agent pane with the dir its status hooks
+/// write to.
+pub const BORK_STATUS_DIR_VAR: &str = "BORK_STATUS_DIR";
+
 #[cfg(not(test))]
 const TERM_GRACE: Duration = Duration::from_secs(2);
 const KILL_GRACE: Duration = Duration::from_secs(1);

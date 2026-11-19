@@ -1136,13 +1136,9 @@ impl Project {
     }
 
     /// Like `unresolved_comments`, but leaves out threads where you spoke
-    /// last: those wait on the other side, like your review comments on
-    /// someone else's PR. Counts every thread while your login is unknown.
+    /// last (`PrStatus::threads_awaiting_you`).
     fn comments_awaiting_you(&self, issue: &Issue) -> u32 {
-        match self.live.github_user.as_deref() {
-            Some(me) => self.comment_count(issue, |pr| pr.threads_awaiting(me)),
-            None => self.unresolved_comments(issue),
-        }
+        self.comment_count(issue, PrStatus::threads_awaiting_you)
     }
 
     fn comment_count(&self, issue: &Issue, threads: impl Fn(&PrStatus) -> u32) -> u32 {
@@ -3402,7 +3398,8 @@ mod tests {
             merge_blocker: None,
             merge_queue: None,
             unresolved_threads: 0,
-            unresolved_thread_last_authors: Vec::new(),
+            unresolved_threads_by_you: 0,
+            updated_at: String::new(),
         }
     }
 
@@ -4428,30 +4425,15 @@ mod tests {
         )]);
         let mut pr = test_pr(7, "feature");
         pr.unresolved_threads = 2;
-        pr.unresolved_thread_last_authors = vec!["me".into(), "me".into()];
+        pr.unresolved_threads_by_you = 2;
         app.project_mut().live.review_requested_prs = vec![pr];
-        app.project_mut().live.github_user = Some("me".into());
 
         // Your two review comments, no replies yet: shown, but not on you.
         assert_eq!(comments_of(&app), 2);
         assert_eq!(app.project().attention_count(), 0);
 
         // The author replied on one of them.
-        app.project_mut().live.review_requested_prs[0].unresolved_thread_last_authors =
-            vec!["me".into(), "author".into()];
-        assert_eq!(app.project().attention_count(), 1);
-    }
-
-    #[test]
-    fn every_unresolved_thread_needs_you_while_your_login_is_unknown() {
-        let mut app = test_app(vec![issue_linked_to_pr("bork-1", 7, None)]);
-        let mut pr = test_pr(7, "feature");
-        pr.review = Some(crate::types::ReviewDecision::ReviewRequired);
-        pr.unresolved_threads = 1;
-        pr.unresolved_thread_last_authors = vec!["me".into()];
-        app.project_mut().live.review_requested_prs = vec![pr];
-        app.project_mut().live.github_user = None;
-
+        app.project_mut().live.review_requested_prs[0].unresolved_threads_by_you = 1;
         assert_eq!(app.project().attention_count(), 1);
     }
 
@@ -7380,7 +7362,8 @@ mod tests {
             merge_blocker: None,
             merge_queue: None,
             unresolved_threads: 0,
-            unresolved_thread_last_authors: Vec::new(),
+            unresolved_threads_by_you: 0,
+            updated_at: String::new(),
         };
         app.project_mut()
             .live
