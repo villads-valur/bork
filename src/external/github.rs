@@ -40,6 +40,7 @@ macro_rules! pr_fields {
     isInMergeQueue
     isMergeQueueEnabled
     additions deletions
+    updatedAt
     reviewThreads(first: 100) { nodes { isResolved } }
     "#,
             $queue,
@@ -578,15 +579,12 @@ fn parse_pr_node(node: &serde_json::Value) -> Option<PrStatus> {
             _ => None,
         });
     let merge_queue = github_queue_state(node).or_else(|| trunk_queue_state(node));
-    let unresolved_threads = node
-        .pointer("/reviewThreads/nodes")
-        .and_then(|v| v.as_array())
-        .map_or(0, |threads| {
-            threads
-                .iter()
-                .filter(|thread| thread.get("isResolved").and_then(|v| v.as_bool()) == Some(false))
-                .count()
-        }) as u32;
+    let unresolved_threads = count_unresolved_threads(node, |_| true);
+    let updated_at = node
+        .get("updatedAt")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
 
     Some(PrStatus {
         number,
@@ -604,7 +602,152 @@ fn parse_pr_node(node: &serde_json::Value) -> Option<PrStatus> {
         merge_blocker,
         merge_queue,
         unresolved_threads,
+        unresolved_threads_by_you: 0,
+        updated_at,
     })
+}
+
+fn count_unresolved_threads(
+    node: &serde_json::Value,
+    matches: impl Fn(&serde_json::Value) -> bool,
+) -> u32 {
+    node.pointer("/reviewThreads/nodes")
+        .and_then(|v| v.as_array())
+        .map_or(0, |threads| {
+            threads
+                .iter()
+                .filter(|thread| thread.get("isResolved").and_then(|v| v.as_bool()) == Some(false))
+                .filter(|thread| matches(thread))
+                .count()
+        }) as u32
+}
+
+/// Last-comment authorship per PR, keyed by repo and number, valid while the
+/// PR's `updatedAt` and unresolved count are unchanged. Asking GitHub for
+/// each thread's last comment multiplies the query's rate-limit cost by the
+/// thread page size (a 50-PR review search goes from 1 point to 51), so it
+/// stays out of the polled queries and is only re-asked when a PR changes.
+static THREADS_BY_YOU: Mutex<Option<HashMap<(String, u32), ThreadsByYou>>> = Mutex::new(None);
+
+struct ThreadsByYou {
+    updated_at: String,
+    unresolved: u32,
+    by_you: u32,
+}
+
+impl ThreadsByYou {
+    fn is_fresh_for(&self, pr: &PrStatus) -> bool {
+        self.updated_at == pr.updated_at && self.unresolved == pr.unresolved_threads
+    }
+}
+
+/// Sets `unresolved_threads_by_you` on the open PRs in `prs` that have
+/// unresolved threads. A failed lookup leaves it at 0, so every thread keeps
+/// counting as waiting on you.
+pub fn fill_threads_by_you(main_worktree: &Path, prs: &mut [PrStatus]) {
+    let Ok(repo) = get_repo_identity(main_worktree) else {
+        return;
+    };
+    let repo_key = format!("{}/{}", repo.owner, repo.name);
+    let candidates = |pr: &PrStatus| pr.state == PrState::Open && pr.unresolved_threads > 0;
+    let cache_key = |pr: &PrStatus| (repo_key.clone(), pr.number);
+
+    let mut stale: Vec<u32> = {
+        let guard = THREADS_BY_YOU.lock().unwrap_or_else(|e| e.into_inner());
+        prs.iter()
+            .filter(|pr| candidates(pr))
+            .filter(|pr| {
+                guard
+                    .as_ref()
+                    .and_then(|cache| cache.get(&cache_key(pr)))
+                    .is_none_or(|cached| !cached.is_fresh_for(pr))
+            })
+            .map(|pr| pr.number)
+            .collect()
+    };
+    stale.sort_unstable();
+    stale.dedup();
+
+    let mut fetched = HashMap::new();
+    for chunk in stale.chunks(50) {
+        if let Ok(counts) = fetch_threads_by_you(main_worktree, &repo, chunk) {
+            fetched.extend(counts);
+        }
+    }
+
+    let mut guard = THREADS_BY_YOU.lock().unwrap_or_else(|e| e.into_inner());
+    let cache = guard.get_or_insert_with(HashMap::new);
+    for pr in prs.iter_mut().filter(|pr| candidates(pr)) {
+        if let Some(&by_you) = fetched.get(&pr.number) {
+            let entry = ThreadsByYou {
+                updated_at: pr.updated_at.clone(),
+                unresolved: pr.unresolved_threads,
+                by_you,
+            };
+            cache.insert(cache_key(pr), entry);
+        }
+        if let Some(cached) = cache
+            .get(&cache_key(pr))
+            .filter(|cached| cached.is_fresh_for(pr))
+        {
+            pr.unresolved_threads_by_you = cached.by_you;
+        }
+    }
+}
+
+fn fetch_threads_by_you(
+    main_worktree: &Path,
+    repo: &RepoIdentity,
+    numbers: &[u32],
+) -> Result<HashMap<u32, u32>, String> {
+    let fields = numbers
+        .iter()
+        .map(|number| {
+            format!(
+                "pr{number}: pullRequest(number: {number}) {{ number reviewThreads(first: 100) {{ nodes {{ isResolved comments(last: 1) {{ nodes {{ viewerDidAuthor }} }} }} }} }}"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let query = format!(
+        "query($owner: String!, $repo: String!) {{ repository(owner: $owner, name: $repo) {{ {fields} }} }}"
+    );
+    let stdout = checked_gh_output(
+        crate::external::gh_command()
+            .args([
+                "api",
+                "graphql",
+                "-f",
+                &format!("query={query}"),
+                "-f",
+                &format!("owner={}", repo.owner),
+                "-f",
+                &format!("repo={}", repo.name),
+            ])
+            .current_dir(main_worktree)
+            .output(),
+    )?;
+    parse_threads_by_you(&stdout)
+}
+
+fn parse_threads_by_you(stdout: &str) -> Result<HashMap<u32, u32>, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(stdout).map_err(|_| "Invalid GitHub thread response".to_string())?;
+    let repository = value
+        .pointer("/data/repository")
+        .and_then(|v| v.as_object())
+        .ok_or("Invalid GitHub thread response")?;
+    Ok(repository
+        .values()
+        .filter_map(|node| {
+            let number = node.get("number")?.as_u64()? as u32;
+            let by_you = count_unresolved_threads(node, |thread| {
+                thread.pointer("/comments/nodes/0/viewerDidAuthor")
+                    == Some(&serde_json::Value::Bool(true))
+            });
+            Some((number, by_you))
+        })
+        .collect())
 }
 
 /// GitHub's native merge queue. An entry without a known state still means
@@ -1425,6 +1568,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn counts_unresolved_threads_where_you_spoke_last() {
+        let thread = |resolved: bool, mine: bool| {
+            format!(
+                r#"{{"isResolved": {resolved}, "comments": {{"nodes": [{{"viewerDidAuthor": {mine}}}]}}}}"#
+            )
+        };
+        let response = format!(
+            r#"{{"data": {{"repository": {{
+                "pr7": {{"number": 7, "reviewThreads": {{"nodes": [{}, {}, {}, {}]}}}},
+                "pr8": {{"number": 8, "reviewThreads": {{"nodes": []}}}}
+            }}}}}}"#,
+            thread(false, true),
+            thread(true, true),
+            thread(false, false),
+            thread(false, true),
+        );
+
+        let counts = parse_threads_by_you(&response).unwrap();
+
+        assert_eq!(counts, HashMap::from([(7, 2), (8, 0)]));
+    }
+
+    #[test]
+    fn parses_updated_at() {
+        let node = make_pr_node(r#"{"updatedAt": "2026-11-19T12:35:50Z"}"#);
+        assert_eq!(
+            parse_pr_node(&node).unwrap().updated_at,
+            "2026-11-19T12:35:50Z"
+        );
+    }
+
     /// A PR node whose head commit carries these Trunk check runs, one
     /// check suite per inner list.
     fn pr_node_with_trunk_suites(suites: &[Vec<serde_json::Value>]) -> serde_json::Value {
@@ -1896,6 +2071,8 @@ mod tests {
             merge_blocker: None,
             merge_queue: None,
             unresolved_threads: 0,
+            unresolved_threads_by_you: 0,
+            updated_at: String::new(),
         }
     }
 

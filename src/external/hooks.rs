@@ -22,27 +22,18 @@ const CLAUDE_HOOKS: &str = r#"{
       "hooks": [
         {
           "type": "command",
-          "command": "TOOL=$(cat | grep -o '\"tool_name\":\"[^\"]*\"' | head -1 | cut -d'\"' -f4); { [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"Busy\",\"activity\":\"%s\",\"updated_at\":%s}' \"$TOOL\" \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\"; } || true"
+          "command": "TOOL=$(cat | grep -o '\"tool_name\":\"[^\"]*\"' | head -1 | cut -d'\"' -f4); case \"$TOOL\" in ExitPlanMode) S=WaitingApproval;; AskUserQuestion) S=WaitingInput;; *) S=Busy;; esac; { [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"%s\",\"activity\":\"%s\",\"updated_at\":%s}' \"$S\" \"$TOOL\" \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\"; } || true"
         }
       ]
     }
   ],
   "PostToolUse": [
     {
-      "matcher": "AskUserQuestion",
+      "matcher": "AskUserQuestion|ExitPlanMode",
       "hooks": [
         {
           "type": "command",
-          "command": "cat > /dev/null; { [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"WaitingInput\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\"; } || true"
-        }
-      ]
-    },
-    {
-      "matcher": "ExitPlanMode",
-      "hooks": [
-        {
-          "type": "command",
-          "command": "cat > /dev/null; { [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"WaitingApproval\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\"; } || true"
+          "command": "cat > /dev/null; { [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"Busy\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\"; } || true"
         }
       ]
     }
@@ -62,7 +53,7 @@ const CLAUDE_HOOKS: &str = r#"{
       "hooks": [
         {
           "type": "command",
-          "command": "cat > /dev/null; { [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"WaitingInput\",\"updated_at\":%s}' \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\"; } || true"
+          "command": "KIND=$(cat | grep -o '\"notification_type\":\"[^\"]*\"' | head -1 | cut -d'\"' -f4); case \"$KIND\" in idle_prompt) S=Idle;; elicitation_dialog|elicitation_url_dialog|agent_needs_input) S=WaitingInput;; *) S=;; esac; { [ -n \"$S\" ] && [ -n \"$BORK_STATUS_DIR\" ] && [ -n \"$BORK_SESSION\" ] && printf '{\"status\":\"%s\",\"updated_at\":%s}' \"$S\" \"$(date +%s)000\" > \"$BORK_STATUS_DIR/$BORK_SESSION.json\"; } || true"
         }
       ]
     }
@@ -708,6 +699,91 @@ mod tests {
             }
         }
         assert!(count > 0, "expected at least one hook command");
+    }
+
+    /// Runs every Claude hook for `event_name` whose matcher covers `tool`
+    /// (a regex in Claude; plain alternation here), feeding `stdin`, and
+    /// returns the status file it leaves behind.
+    fn run_claude_hook(event_name: &str, tool: &str, stdin: &str) -> Option<serde_json::Value> {
+        let dir = tempfile::tempdir().unwrap();
+        let events = parse_hook_entries(CLAUDE_HOOKS, None);
+        for entry in events[event_name].as_array().unwrap() {
+            let matcher = entry.get("matcher").and_then(|v| v.as_str()).unwrap_or("*");
+            if matcher != "*" && !matcher.split('|').any(|name| name == tool) {
+                continue;
+            }
+            for hook in entry["hooks"].as_array().unwrap() {
+                let mut child = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(hook["command"].as_str().unwrap())
+                    .env("BORK_STATUS_DIR", dir.path())
+                    .env("BORK_SESSION", "bork-bork-1")
+                    .stdin(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                use std::io::Write;
+                child
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(stdin.as_bytes())
+                    .unwrap();
+                assert!(child.wait().unwrap().success());
+            }
+        }
+        let written = fs::read_to_string(dir.path().join("bork-bork-1.json")).ok()?;
+        Some(serde_json::from_str(&written).unwrap())
+    }
+
+    fn tool_input(tool: &str) -> String {
+        format!(r#"{{"hook_event_name":"PreToolUse","tool_name":"{tool}","tool_input":{{}}}}"#)
+    }
+
+    #[test]
+    fn claude_waits_on_you_while_a_plan_or_question_is_open() {
+        for (tool, expected) in [
+            ("ExitPlanMode", "WaitingApproval"),
+            ("AskUserQuestion", "WaitingInput"),
+            ("Bash", "Busy"),
+        ] {
+            let status = run_claude_hook("PreToolUse", tool, &tool_input(tool)).unwrap();
+            assert_eq!(status["status"], expected, "{tool}");
+            assert_eq!(status["activity"], tool, "{tool}");
+        }
+    }
+
+    #[test]
+    fn claude_notifications_only_report_idle_or_a_real_question() {
+        for (kind, expected) in [
+            // Claude finished about a minute ago. Also clears a plan or
+            // question you dismissed with Esc, which fires no other hook.
+            ("idle_prompt", Some("Idle")),
+            ("elicitation_dialog", Some("WaitingInput")),
+            ("agent_needs_input", Some("WaitingInput")),
+            // PermissionRequest already wrote the blocked status; leave it.
+            ("permission_prompt", None),
+            ("auth_success", None),
+        ] {
+            let stdin = format!(
+                r#"{{"hook_event_name":"Notification","message":"m","notification_type":"{kind}"}}"#
+            );
+            let status = run_claude_hook("Notification", "", &stdin);
+            assert_eq!(
+                status.as_ref().and_then(|s| s["status"].as_str()),
+                expected,
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_is_busy_again_once_you_answer_a_plan_or_question() {
+        // PostToolUse fires after you approve the plan or answer the
+        // question, so the agent is working again, not waiting on you.
+        for tool in ["ExitPlanMode", "AskUserQuestion"] {
+            let status = run_claude_hook("PostToolUse", tool, &tool_input(tool)).unwrap();
+            assert_eq!(status["status"], "Busy", "{tool}");
+        }
     }
 
     #[test]

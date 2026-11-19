@@ -1044,12 +1044,12 @@ impl Project {
             .or_else(|| self.pr_attention(issue))
     }
 
-    /// Unresolved comments are an extra reason on top of `attention_for`, so
-    /// they count even when the card has another attention state.
+    /// Comments waiting on you are an extra reason on top of `attention_for`,
+    /// so they count even when the card has another attention state.
     pub fn needs_you(&self, issue: &Issue) -> bool {
         self.attention_for(issue)
             .is_some_and(|attention| attention.needs_you())
-            || self.unresolved_comments(issue) > 0
+            || self.comments_awaiting_you(issue) > 0
     }
 
     pub fn attention_count(&self) -> usize {
@@ -1061,9 +1061,9 @@ impl Project {
 
     fn agent_attention(&self, issue: &Issue) -> Option<Attention> {
         match self.resolved_agent_status(issue) {
-            AgentStatus::WaitingPermission | AgentStatus::WaitingApproval => {
-                Some(Attention::AgentBlocked)
-            }
+            AgentStatus::WaitingPermission
+            | AgentStatus::WaitingApproval
+            | AgentStatus::WaitingInput => Some(Attention::AgentBlocked),
             AgentStatus::Error => Some(Attention::AgentError),
             _ => None,
         }
@@ -1132,6 +1132,16 @@ impl Project {
     /// open PRs, plus unposted tuicr drafts for its worktree or those PRs.
     /// Done cards never count.
     pub fn unresolved_comments(&self, issue: &Issue) -> u32 {
+        self.comment_count(issue, |pr| pr.unresolved_threads)
+    }
+
+    /// Like `unresolved_comments`, but leaves out threads where you spoke
+    /// last (`PrStatus::threads_awaiting_you`).
+    fn comments_awaiting_you(&self, issue: &Issue) -> u32 {
+        self.comment_count(issue, PrStatus::threads_awaiting_you)
+    }
+
+    fn comment_count(&self, issue: &Issue, threads: impl Fn(&PrStatus) -> u32) -> u32 {
         if issue.column == Column::Done {
             return 0;
         }
@@ -1151,7 +1161,7 @@ impl Project {
             .filter_map(|number| self.pr_by_number(number))
             .filter(|pr| pr.state == PrState::Open);
         for pr in open_prs {
-            total += pr.unresolved_threads + drafts.by_pr_url.get(&pr.url).copied().unwrap_or(0);
+            total += threads(pr) + drafts.by_pr_url.get(&pr.url).copied().unwrap_or(0);
         }
         total
     }
@@ -3388,6 +3398,8 @@ mod tests {
             merge_blocker: None,
             merge_queue: None,
             unresolved_threads: 0,
+            unresolved_threads_by_you: 0,
+            updated_at: String::new(),
         }
     }
 
@@ -4404,6 +4416,27 @@ mod tests {
         assert_eq!(app.project().attention_count(), 1);
     }
 
+    #[test]
+    fn threads_where_you_spoke_last_wait_on_the_other_side() {
+        let mut app = test_app(vec![issue_linked_to_pr(
+            "bork-1",
+            7,
+            Some(PrImportSource::ReviewRequested),
+        )]);
+        let mut pr = test_pr(7, "feature");
+        pr.unresolved_threads = 2;
+        pr.unresolved_threads_by_you = 2;
+        app.project_mut().live.review_requested_prs = vec![pr];
+
+        // Your two review comments, no replies yet: shown, but not on you.
+        assert_eq!(comments_of(&app), 2);
+        assert_eq!(app.project().attention_count(), 0);
+
+        // The author replied on one of them.
+        app.project_mut().live.review_requested_prs[0].unresolved_threads_by_you = 1;
+        assert_eq!(app.project().attention_count(), 1);
+    }
+
     fn set_agent_status(app: &mut App, session: &str, status: AgentStatus) {
         let live = &mut app.project_mut().live;
         live.active_sessions.insert(session.to_string());
@@ -4419,7 +4452,11 @@ mod tests {
 
     #[test]
     fn an_agent_blocked_on_you_needs_you_and_passes_the_filter() {
-        for status in [AgentStatus::WaitingPermission, AgentStatus::WaitingApproval] {
+        for status in [
+            AgentStatus::WaitingPermission,
+            AgentStatus::WaitingApproval,
+            AgentStatus::WaitingInput,
+        ] {
             let mut app = test_app(vec![
                 test_issue("bork-1", Column::InProgress),
                 test_issue("bork-2", Column::InProgress),
@@ -4452,13 +4489,7 @@ mod tests {
 
     #[test]
     fn a_working_or_finished_agent_is_quiet() {
-        // Claude's idle Notification also reports WaitingInput, so it means
-        // "finished and idle" as often as "asked you something".
-        for status in [
-            AgentStatus::Busy,
-            AgentStatus::Idle,
-            AgentStatus::WaitingInput,
-        ] {
+        for status in [AgentStatus::Busy, AgentStatus::Idle] {
             let mut app = test_app(vec![test_issue("bork-1", Column::InProgress)]);
             set_agent_status(&mut app, "bork-bork-1", status);
 
@@ -7329,6 +7360,8 @@ mod tests {
             merge_blocker: None,
             merge_queue: None,
             unresolved_threads: 0,
+            unresolved_threads_by_you: 0,
+            updated_at: String::new(),
         };
         app.project_mut()
             .live

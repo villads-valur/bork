@@ -266,6 +266,8 @@ mod tests {
             merge_blocker: None,
             merge_queue: None,
             unresolved_threads: 0,
+            unresolved_threads_by_you: 0,
+            updated_at: String::new(),
         }
     }
 

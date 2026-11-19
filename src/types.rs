@@ -1006,6 +1006,24 @@ pub struct PrStatus {
     /// Unresolved review threads (inline comments that can be resolved).
     #[serde(default)]
     pub unresolved_threads: u32,
+    /// Of `unresolved_threads`, those whose last comment is yours. Filled by
+    /// a separate, cached query (`github::fill_threads_by_you`); 0 when that
+    /// lookup hasn't run or failed.
+    #[serde(default)]
+    pub unresolved_threads_by_you: u32,
+    /// GitHub's `updatedAt`, which moves on every new comment.
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+impl PrStatus {
+    /// Unresolved threads where someone else spoke last. A thread you
+    /// commented on last waits on the other side, like your review comments
+    /// on someone else's PR before the author replies.
+    pub fn threads_awaiting_you(&self) -> u32 {
+        self.unresolved_threads
+            .saturating_sub(self.unresolved_threads_by_you)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1085,6 +1103,8 @@ mod tests {
             merge_blocker: None,
             merge_queue: None,
             unresolved_threads: 0,
+            unresolved_threads_by_you: 0,
+            updated_at: String::new(),
         };
         let cloned = pr.clone();
         assert_eq!(cloned.number, 1);

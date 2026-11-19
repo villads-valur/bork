@@ -362,6 +362,7 @@ pub fn fetch(path: &Path, request: &Request) -> Response {
         }
     };
     response.error = result.err();
+    github::fill_threads_by_you(path, &mut response.prs);
     if matches!(request, Request::Reviews | Request::Authored) && response.error.is_none() {
         response.github_user = github::fetch_current_user(path);
     }
@@ -646,6 +647,8 @@ mod tests {
             merge_blocker: None,
             merge_queue: None,
             unresolved_threads: 0,
+            unresolved_threads_by_you: 0,
+            updated_at: String::new(),
         }
     }
 
