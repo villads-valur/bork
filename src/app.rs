@@ -1234,22 +1234,40 @@ impl Project {
         // Remove authored pr_imported issues whose PR is no longer in the live set
         // (closed, merged, or from a stale/wrong repo identity).
         // Review-requested issues are NOT removed, they get moved to Done instead.
+        // So are authored ones whose session is still running: dropping the card
+        // would leave the tmux window and agent orphaned with nothing on the board.
+        let authored_prs_ready = self.live.authored_prs_ready != Some(false);
+        let is_gone_authored_import = |issue: &Issue| {
+            authored_prs_ready
+                && issue.github_stack.is_none()
+                && issue.is_any_pr_imported()
+                && issue.primary_pr_import_source() != Some(PrImportSource::ReviewRequested)
+                && !issue
+                    .github_pr_links
+                    .iter()
+                    .any(|l| live_authored_numbers.contains(&l.number))
+        };
+        let project_name = &self.config.project_name;
+        let active_sessions = &self.live.active_sessions;
+        let has_live_session =
+            |issue: &Issue| active_sessions.contains(&issue.session_name(project_name));
+
+        let mut parked = 0usize;
+        let parked_at = unix_now();
+        for issue in &mut self.issues {
+            if is_gone_authored_import(issue)
+                && has_live_session(issue)
+                && !issue.parked_after_pr_close
+            {
+                issue.move_to_column(Column::Done, parked_at);
+                issue.parked_after_pr_close = true;
+                parked += 1;
+            }
+        }
+
         let before = self.issues.len();
-        self.issues.retain(|issue| {
-            if self.live.authored_prs_ready == Some(false) {
-                return true;
-            }
-            if issue.github_stack.is_some() || !issue.is_any_pr_imported() {
-                return true;
-            }
-            if issue.primary_pr_import_source() == Some(PrImportSource::ReviewRequested) {
-                return true;
-            }
-            issue
-                .github_pr_links
-                .iter()
-                .any(|l| live_authored_numbers.contains(&l.number))
-        });
+        self.issues
+            .retain(|issue| !is_gone_authored_import(issue) || has_live_session(issue));
         let removed = before - self.issues.len();
 
         // A ReviewRequested tag is a one-time snapshot taken at import, and
@@ -1422,7 +1440,7 @@ impl Project {
         let added = new_issues.len();
         self.issues.append(&mut new_issues);
 
-        if added == 0 && removed == 0 && completed == 0 && retagged == 0 {
+        if added == 0 && removed == 0 && parked == 0 && completed == 0 && retagged == 0 {
             return (false, None);
         }
 
@@ -1439,6 +1457,13 @@ impl Project {
                 "Removed {} stale PR{}",
                 removed,
                 if removed == 1 { "" } else { "s" }
+            ));
+        }
+        if parked > 0 {
+            parts.push(format!(
+                "Moved {} closed PR{} to Done, session still running",
+                parked,
+                if parked == 1 { "" } else { "s" }
             ));
         }
         if completed > 0 {
@@ -1538,7 +1563,7 @@ impl Project {
             .iter()
             .enumerate()
             .filter(|(_, issue)| {
-                if issue.column != Column::Done {
+                if issue.column != Column::Done || issue.parked_after_pr_close {
                     return false;
                 }
                 let Some(done_at) = issue.done_at else {
@@ -2088,6 +2113,7 @@ fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
         pr_import_baseline: _,
         stack_review_import: _,
         linked_issues: _,
+        parked_after_pr_close: _,
         // Merged field-wise in merge_cloud_fields().
         cloud: _,
         // Merged entry-wise, interleaved with the kind/orchestrator logic below.
@@ -2136,6 +2162,7 @@ fn merge_issue_fields(memory: &mut Issue, base: &Issue, file: &Issue) {
     merge_field!(pr_import_baseline);
     merge_field!(stack_review_import);
     merge_field!(linked_issues);
+    merge_field!(parked_after_pr_close);
 
     merge_cloud_fields(memory, base, file);
 
@@ -5327,6 +5354,96 @@ mod tests {
         app.project_mut().live.review_prs_ready = Some(false);
         app.project_mut().sync_prs_as_issues();
         assert_eq!(app.project().issues, before);
+    }
+
+    /// An app with one authored PR card whose session is alive, and the PR
+    /// already gone from the live set. Returns the card's session name.
+    fn app_with_closed_pr_and_live_session() -> (App, String) {
+        let mut app = test_app(vec![]);
+        app.project_mut().live.pr_poll_done = true;
+        app.project_mut().live.user_prs = vec![test_pr(1, "my-feature")];
+        app.project_mut().sync_prs_as_issues();
+        let session = app.project().issues[0].session_name(&app.project().config.project_name);
+        app.project_mut()
+            .live
+            .active_sessions
+            .insert(session.clone());
+        app.project_mut().live.user_prs.clear();
+        (app, session)
+    }
+
+    #[test]
+    fn merged_authored_pr_with_live_session_moves_to_done_instead_of_vanishing() {
+        let (mut app, _) = app_with_closed_pr_and_live_session();
+
+        let (changed, message) = app.project_mut().sync_prs_as_issues();
+
+        assert!(changed);
+        assert_eq!(app.project().issues.len(), 1);
+        assert_eq!(app.project().issues[0].column, Column::Done);
+        assert!(app.project().issues[0].parked_after_pr_close);
+        assert_eq!(
+            message.as_deref(),
+            Some("Moved 1 closed PR to Done, session still running")
+        );
+    }
+
+    #[test]
+    fn parked_card_session_outlives_the_done_ttl() {
+        let (mut app, _) = app_with_closed_pr_and_live_session();
+        app.project_mut().sync_prs_as_issues();
+        let done_at = app.project().issues[0].done_at.unwrap();
+        let ttl = app.project().config.done_session_ttl;
+
+        let cleanup = app
+            .project()
+            .issues_needing_session_cleanup(done_at + ttl * 10);
+
+        assert!(cleanup.is_empty());
+    }
+
+    #[test]
+    fn parked_card_is_left_alone_by_later_syncs() {
+        let (mut app, _) = app_with_closed_pr_and_live_session();
+        app.project_mut().sync_prs_as_issues();
+
+        assert_eq!(app.project_mut().sync_prs_as_issues(), (false, None));
+        assert_eq!(app.project().issues[0].column, Column::Done);
+    }
+
+    #[test]
+    fn parked_card_moved_back_to_in_progress_stays_there() {
+        let (mut app, _) = app_with_closed_pr_and_live_session();
+        app.project_mut().sync_prs_as_issues();
+        app.project_mut().issues[0].move_to_column(Column::InProgress, unix_now());
+
+        assert_eq!(app.project_mut().sync_prs_as_issues(), (false, None));
+        assert_eq!(app.project().issues[0].column, Column::InProgress);
+    }
+
+    #[test]
+    fn parked_card_is_removed_once_its_session_ends() {
+        let (mut app, session) = app_with_closed_pr_and_live_session();
+        app.project_mut().sync_prs_as_issues();
+        app.project_mut().live.active_sessions.remove(&session);
+
+        let (changed, _) = app.project_mut().sync_prs_as_issues();
+
+        assert!(changed);
+        assert!(app.project().issues.is_empty());
+    }
+
+    #[test]
+    fn merged_authored_pr_without_a_session_is_removed() {
+        let mut app = test_app(vec![]);
+        app.project_mut().live.pr_poll_done = true;
+        app.project_mut().live.user_prs = vec![test_pr(1, "my-feature")];
+        app.project_mut().sync_prs_as_issues();
+        app.project_mut().live.user_prs.clear();
+
+        app.project_mut().sync_prs_as_issues();
+
+        assert!(app.project().issues.is_empty());
     }
 
     #[test]
