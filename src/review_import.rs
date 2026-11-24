@@ -232,7 +232,7 @@ impl Project {
                     requested_prs: requested,
                     generated_prompt: prompt,
                 }),
-                ..Issue::new(id, title, Column::CodeReview, self.default_agent())
+                ..self.new_issue(id, title, Column::CodeReview)
             });
             changed = true;
         }
@@ -651,5 +651,33 @@ mod tests {
             .issues
             .iter()
             .all(|issue| issue.agent_kind == AgentKind::Codex));
+    }
+
+    #[test]
+    fn imported_review_cards_start_in_the_configured_default_mode() {
+        let mut project = project();
+        project.config.agent_mode = Some(crate::types::AgentMode::Yolo);
+
+        sync(&mut project);
+
+        assert_eq!(project.issues.len(), 2);
+        assert!(project
+            .issues
+            .iter()
+            .all(|issue| issue.agent_mode == crate::types::AgentMode::Yolo));
+    }
+
+    #[test]
+    fn imported_review_cards_without_a_default_mode_use_the_agent_fallback() {
+        let mut project = project();
+        project.config.agent_kind = AgentKind::Claude;
+        project.available_agents = vec![AgentKind::Claude];
+
+        sync(&mut project);
+
+        assert!(project
+            .issues
+            .iter()
+            .all(|issue| issue.agent_mode == crate::types::AgentMode::Yolo));
     }
 }

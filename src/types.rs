@@ -449,8 +449,16 @@ pub struct PrImportBaseline {
     pub title: String,
     pub prompt: Option<String>,
     pub agent_kind: AgentKind,
+    /// Missing in states saved before imports followed `default_mode`; those
+    /// cards were always created in plan mode.
+    #[serde(default = "plan_mode")]
+    pub agent_mode: AgentMode,
     pub number: u32,
     pub source: PrImportSource,
+}
+
+fn plan_mode() -> AgentMode {
+    AgentMode::Plan
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -609,6 +617,7 @@ impl Issue {
                 import_source: Some(baseline.source),
             }],
             pr_import_baseline: Some(baseline.clone()),
+            agent_mode: baseline.agent_mode,
             ..Self::new(
                 &self.id,
                 &baseline.title,

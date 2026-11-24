@@ -312,6 +312,21 @@ impl Project {
             .unwrap_or(self.config.agent_kind)
     }
 
+    /// Blank card with this project's default agent and mode, for cards bork
+    /// creates without a dialog (imports). `Issue::new` alone means plan mode.
+    pub fn new_issue(
+        &self,
+        id: impl Into<String>,
+        title: impl Into<String>,
+        column: Column,
+    ) -> Issue {
+        let agent_kind = self.default_agent();
+        Issue {
+            agent_mode: crate::ops::default_agent_mode(&self.config, agent_kind),
+            ..Issue::new(id, title, column, agent_kind)
+        }
+    }
+
     pub fn mark_dirty(&mut self) {
         self.state_dirty = true;
     }
@@ -1492,12 +1507,13 @@ impl Project {
                 ))
             }
         };
-        let agent_kind = self.default_agent();
+        let base = self.new_issue(id, pr.title.clone(), Column::CodeReview);
         Issue {
             pr_import_baseline: Some(PrImportBaseline {
                 title: pr.title.clone(),
                 prompt: prompt.clone(),
-                agent_kind,
+                agent_kind: base.agent_kind,
+                agent_mode: base.agent_mode,
                 number: pr.number,
                 source,
             }),
@@ -1507,7 +1523,7 @@ impl Project {
                 imported: true,
                 import_source: Some(source),
             }],
-            ..Issue::new(id, pr.title.clone(), Column::CodeReview, agent_kind)
+            ..base
         }
     }
 
@@ -5362,6 +5378,33 @@ mod tests {
     }
 
     #[test]
+    fn plan_mode_import_saved_before_baselines_had_a_mode_is_still_untouched() {
+        let app = stack_import_fixture(PrImportSource::ReviewRequested);
+        let mut original = app.project().issues[1].clone();
+        original.agent_mode = crate::types::AgentMode::Plan;
+        let mut encoded = serde_json::to_value(&original).unwrap();
+        encoded["pr_import_baseline"]
+            .as_object_mut()
+            .unwrap()
+            .remove("agent_mode");
+
+        let loaded: Issue = serde_json::from_value(encoded).unwrap();
+
+        assert!(loaded.is_untouched_pr_import());
+    }
+
+    #[test]
+    fn import_with_a_changed_mode_is_not_untouched() {
+        let app = stack_import_fixture(PrImportSource::ReviewRequested);
+        let mut issue = app.project().issues[1].clone();
+        assert!(issue.is_untouched_pr_import());
+
+        issue.agent_mode = issue.agent_mode.toggle();
+
+        assert!(!issue.is_untouched_pr_import());
+    }
+
+    #[test]
     fn sync_prs_imports_open_pr_as_issue() {
         let mut app = test_app(vec![]);
         app.project_mut().live.user_prs = vec![test_pr(1, "feature/new")];
@@ -8544,6 +8587,7 @@ mod tests {
             title: "original".into(),
             prompt: None,
             agent_kind: AgentKind::OpenCode,
+            agent_mode: crate::types::AgentMode::Plan,
             number: 42,
             source: PrImportSource::Authored,
         });
