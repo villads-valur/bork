@@ -1744,12 +1744,7 @@ fn import_linear_issue(app: &mut App, ctx: &ActionContext) {
             url: linear_issue.url.clone(),
             imported: true,
         }],
-        ..Issue::new(
-            id,
-            linear_issue.title.clone(),
-            Column::Todo,
-            project.default_agent(),
-        )
+        ..project.new_issue(id, linear_issue.title.clone(), Column::Todo)
     };
 
     push_imported_todo(
@@ -1822,11 +1817,10 @@ fn import_linear_project(app: &mut App, ctx: &ActionContext) {
     let issue = Issue {
         kind: IssueKind::Orchestrator,
         linear_projects: vec![linear_project.to_link(true)],
-        ..Issue::new(
+        ..project.new_issue(
             project.next_issue_id(),
             linear_project.name.clone(),
             Column::Todo,
-            project.default_agent(),
         )
     };
 
@@ -1879,11 +1873,10 @@ fn import_github_pr(app: &mut App, ctx: &ActionContext) {
             imported: true,
             import_source: Some(PrImportSource::Authored),
         }],
-        ..Issue::new(
+        ..project.new_issue(
             project.next_issue_id(),
             pr.title.clone(),
             Column::CodeReview,
-            project.default_agent(),
         )
     };
 
@@ -2066,11 +2059,10 @@ fn attach_selected_stack(app: &mut App, ctx: &ActionContext) {
     }
     let issue = Issue {
         github_stack: Some(number),
-        ..Issue::new(
+        ..project.new_issue(
             project.next_issue_id(),
             pr.title().to_string(),
             Column::CodeReview,
-            project.default_agent(),
         )
     };
     let project = app.context_project_mut(ctx);

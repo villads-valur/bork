@@ -200,14 +200,11 @@ pub fn create_worktree_in(
     {
         issue.attach_worktree(worktree_dir.to_string());
     } else if let Some(title) = title {
+        let agent_kind = agent_config::default_agent_for(config);
         let issue = Issue {
             worktree: Some(worktree_dir.to_string()),
-            ..Issue::new(
-                issue_id,
-                title,
-                Column::Todo,
-                agent_config::default_agent_for(config),
-            )
+            agent_mode: crate::ops::default_agent_mode(config, agent_kind),
+            ..Issue::new(issue_id, title, Column::Todo, agent_kind)
         };
         state.issues.push(issue);
     } else {
