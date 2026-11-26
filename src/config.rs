@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
@@ -623,7 +624,11 @@ fn take_corrupt_flag(path: &Path) -> bool {
 /// any failure. The temp name (`<stem>.tmp.<pid>`) is what `sweep_stale_tmp_files`
 /// reclaims, so all writers share it.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
+    // The TUI saves from its main loop and from background threads, so the
+    // pid alone would give two concurrent writers the same temp file.
+    static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = path.with_extension(format!("tmp.{}-{seq}", std::process::id()));
     let result = (|| -> anyhow::Result<()> {
         let mut file = fs::File::create(&tmp_path)?;
         file.write_all(bytes)?;
@@ -679,8 +684,8 @@ pub fn sweep_stale_tmp_files(project_root: &Path) {
         let Some(name) = name.to_str() else {
             continue;
         };
-        // `atomic_write` names temps `<stem>.tmp.<pid>`, so match the shared
-        // `.tmp.<digits>` suffix across all writers rather than just state.
+        // `atomic_write` names temps `<stem>.tmp.<pid>-<seq>`, so match the
+        // shared suffix across all writers rather than just state.
         if !is_stale_tmp_name(name) {
             continue;
         }
@@ -697,13 +702,17 @@ pub fn sweep_stale_tmp_files(project_root: &Path) {
     }
 }
 
-/// True if `name` looks like an [`atomic_write`] temp file: a `.tmp.<pid>`
-/// suffix where `<pid>` is all digits (matching `with_extension("tmp.<pid>")`).
+/// True if `name` looks like an [`atomic_write`] temp file: a `.tmp.<pid>-<seq>`
+/// suffix, or the `.tmp.<pid>` that older versions wrote, with all-digit parts.
 fn is_stale_tmp_name(name: &str) -> bool {
-    let Some(pid) = name.rsplit_once(".tmp.").map(|(_, rest)| rest) else {
+    let Some(suffix) = name.rsplit_once(".tmp.").map(|(_, rest)| rest) else {
         return false;
     };
-    !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit())
+    let is_number = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    match suffix.split_once('-') {
+        Some((pid, seq)) => is_number(pid) && is_number(seq),
+        None => is_number(suffix),
+    }
 }
 
 /// Modification time of a project's `.bork/config.toml`, if it exists.
@@ -1537,6 +1546,37 @@ args = ["--dangerously-skip-permissions"]
         assert!(!is_stale_tmp_name("state.tmp."));
         assert!(!is_stale_tmp_name("state.tmp.abc"));
         assert!(!is_stale_tmp_name("notes.tmp.md"));
+        assert!(is_stale_tmp_name("state.tmp.12345-7"));
+        assert!(!is_stale_tmp_name("state.tmp.12345-"));
+        assert!(!is_stale_tmp_name("state.tmp.12345-x"));
+    }
+
+    #[test]
+    fn concurrent_writes_in_one_process_all_succeed() {
+        const WRITERS: usize = 16;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let start = std::sync::Barrier::new(WRITERS);
+
+        let results: Vec<anyhow::Result<()>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..WRITERS)
+                .map(|n| {
+                    let (path, start) = (&path, &start);
+                    scope.spawn(move || {
+                        start.wait();
+                        atomic_write(path, format!("writer {n}").repeat(10_000).as_bytes())
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        assert!(results.iter().all(|r| r.is_ok()), "{results:?}");
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(
+            (0..WRITERS).any(|n| written == format!("writer {n}").repeat(10_000)),
+            "the file must hold one writer's whole payload"
+        );
     }
 
     // --- Cursor cloud agents (bork-214) ---

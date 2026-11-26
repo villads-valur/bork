@@ -150,10 +150,7 @@ impl Cache {
         if std::fs::create_dir_all(parent).is_err() {
             return;
         }
-        let temp = path.with_extension(format!("tmp.{}", std::process::id()));
-        if std::fs::write(&temp, bytes).is_ok() {
-            let _ = std::fs::rename(&temp, path);
-        }
+        let _ = crate::config::atomic_write(path, &bytes);
     }
 
     pub fn snapshot(&self, targets: &Targets) -> PrPollResult {
