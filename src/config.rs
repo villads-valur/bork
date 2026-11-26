@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
@@ -635,6 +636,40 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         let _ = fs::remove_file(&tmp_path);
     }
     result
+}
+
+/// Run `f` while holding an exclusive lock on the project's state file, so
+/// concurrent bork processes serialize their load-modify-save sequences.
+/// The lock is a blocking `flock` on `.bork/state.lock`; the OS releases it
+/// when the file closes, including if the process dies mid-operation.
+///
+/// Must not nest: `flock` locks per open file, so calling this again from
+/// inside `f` opens a second file and blocks forever on the first lock.
+pub fn with_state_lock<T>(
+    project_root: &Path,
+    f: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let dir = config_dir(project_root);
+    fs::create_dir_all(&dir)?;
+
+    let _lock = lock_exclusive(&dir.join("state.lock"))?;
+    f()
+}
+
+/// Open (creating if needed) `path` and take a blocking exclusive `flock` on
+/// it. The lock is held until the returned file is dropped.
+pub fn lock_exclusive(path: &Path) -> std::io::Result<fs::File> {
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)?;
+    // SAFETY: the fd is a valid descriptor owned by `file` for the call's duration.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(file)
 }
 
 pub fn save_state(state: &AppState, project_root: &Path) -> anyhow::Result<()> {

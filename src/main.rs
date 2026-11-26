@@ -2126,7 +2126,6 @@ fn start_issue(project_root: &Path, opts: StartIssueOptions) -> anyhow::Result<S
         Some(result.worktree_dir)
     };
 
-    let launched_agent = issue.agent_kind;
     let outcome = external::agent::launch_session(&issue, &config)
         .map_err(|e| anyhow::anyhow!("Failed to launch agent: {e}"))?;
 
@@ -2139,20 +2138,12 @@ fn start_issue(project_root: &Path, opts: StartIssueOptions) -> anyhow::Result<S
         .or_else(session_issue_id)
         .filter(|id| !id.is_empty() && !id.eq_ignore_ascii_case(&issue.id));
 
-    // Reload state so we don't clobber concurrent updates that happened during launch
-    let mut state = config::load_state(project_root);
-    if let Some(saved) = state.issues.iter_mut().find(|i| i.id == issue.id) {
-        if saved.column == Column::Todo {
-            saved.column = Column::InProgress;
-        }
-        saved.record_launch(
-            issue.kind,
-            launched_agent,
-            outcome.agent_session_id,
-            outcome.setup_ran,
-        );
-    }
-    config::save_state(&state, project_root)?;
+    let state = ops::record_start(
+        project_root,
+        &issue,
+        outcome.agent_session_id,
+        outcome.setup_ran,
+    )?;
 
     let linked_to = link_target.and_then(|target| {
         let target_exists = state
