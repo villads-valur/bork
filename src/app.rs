@@ -5277,7 +5277,8 @@ mod tests {
             |i| i.title.push_str(" my notes"),
             |i| i.prompt = Some("custom notes".into()),
             |i| i.column = Column::Done,
-            |i| i.agent_mode = crate::types::AgentMode::Build,
+            // The imported mode depends on which agents are installed.
+            |i| i.agent_mode = i.agent_mode.toggle(),
             |i| i.kind = IssueKind::NonAgentic,
             |i| i.worktree = Some("worktree".into()),
             |i| {
